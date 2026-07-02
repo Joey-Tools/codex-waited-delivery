@@ -12,7 +12,7 @@ Use this skill when the user explicitly wants to test or use a delivery workflow
 This skill is historical/experimental compatibility infrastructure.
 
 - Do not silently replace `$change-delivery-workflow` with it.
-- Do not use it for PR readiness; use `$pr-readiness-review-workflow`.
+- Do not use it for PR readiness; use `$review-orchestration-playbook`.
 - Prefer `cbth` for new long-running task supervision and delivery experiments unless the user specifically asks to exercise waited-delivery.
 
 ## Execution Layer
