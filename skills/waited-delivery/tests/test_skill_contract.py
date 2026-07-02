@@ -12,7 +12,11 @@ class SkillContractTest(unittest.TestCase):
         skill = SKILL_PATH.read_text(encoding="utf-8")
 
         self.assertIn("$review-orchestration-playbook", skill)
-        self.assertIn("isolated_review stateful start --reviewer codex", skill)
+        self.assertIn(
+            "isolated_review stateful start --reviewer codex "
+            "--base-ref <base_sha> --head-ref <head_sha>",
+            skill,
+        )
         for retired_entrypoint in (
             "$pr-readiness-review-workflow",
             "$external-review-playbook",

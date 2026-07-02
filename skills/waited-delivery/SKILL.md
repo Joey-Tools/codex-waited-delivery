@@ -80,7 +80,7 @@ For actual verified hook integration on `codex-cli 0.116.0`, also see the repo-l
 - internal review
 - external review when the current environment can actually run it
 - final delivery summary for the parent
-- Internal review should prefer the pinned Codex lane through `isolated_review stateful start --reviewer codex`, not a spawned reviewer subagent, because writable parent runtime overrides can leak into child sessions and the helper preserves a durable terminal artifact. If the Codex runtime is deterministically unavailable only after a successful preflight, use the retained frozen workspace with the clean-context `reviewer` agent exactly as `$review-orchestration-playbook` specifies, then clean up through the helper.
+- Internal review should prefer the pinned Codex lane through `isolated_review stateful start --reviewer codex --base-ref <base_sha> --head-ref <head_sha>`, not a spawned reviewer subagent, because writable parent runtime overrides can leak into child sessions and the helper preserves a durable terminal artifact. If the Codex runtime is deterministically unavailable only after a successful preflight, use the retained frozen workspace with the clean-context `reviewer` agent exactly as `$review-orchestration-playbook` specifies, then clean up through the helper.
 - When the internal lane needs subagent-like progress reporting, drive it through the helper's `start` / `status` / `wait` / `final` actions instead of `spawn_agent`.
 - Keep the read-only custom `reviewer` agent only as an explicit weaker fallback when the helper-backed root lane is unavailable.
 - Do not route the internal-review phase through a default coding subagent.
