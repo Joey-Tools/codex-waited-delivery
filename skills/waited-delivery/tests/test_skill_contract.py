@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import pathlib
+import tempfile
 import unittest
+from unittest import mock
 
 
 SKILL_PATH = pathlib.Path(__file__).resolve().parents[1] / "SKILL.md"
@@ -11,7 +13,51 @@ DEPENDENCIES_PATH = (
 )
 
 
+def require_canonical_documentation(test_case: unittest.TestCase) -> None:
+    existing_paths = tuple(
+        path for path in (README_PATH, DEPENDENCIES_PATH) if path.exists()
+    )
+    if not existing_paths:
+        test_case.skipTest(
+            "repository-level dependency documentation is not packaged in "
+            "the private skill-only distribution"
+        )
+    if len(existing_paths) != 2:
+        test_case.fail(
+            "canonical dependency documentation is only partially available: "
+            + ", ".join(str(path) for path in existing_paths)
+        )
+
+
 class SkillContractTest(unittest.TestCase):
+    def test_private_distribution_skips_repository_documentation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with (
+                mock.patch(f"{__name__}.README_PATH", root / "README.md"),
+                mock.patch(
+                    f"{__name__}.DEPENDENCIES_PATH",
+                    root / "docs" / "DEPENDENCIES.md",
+                ),
+            ):
+                with self.assertRaises(unittest.SkipTest):
+                    require_canonical_documentation(self)
+
+    def test_partial_repository_documentation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            readme = root / "README.md"
+            readme.write_text("canonical\n", encoding="utf-8")
+            with (
+                mock.patch(f"{__name__}.README_PATH", readme),
+                mock.patch(
+                    f"{__name__}.DEPENDENCIES_PATH",
+                    root / "docs" / "DEPENDENCIES.md",
+                ),
+            ):
+                with self.assertRaises(AssertionError):
+                    require_canonical_documentation(self)
+
     def test_uses_unified_single_reviewer_contract(self) -> None:
         skill = SKILL_PATH.read_text(encoding="utf-8")
 
@@ -71,6 +117,7 @@ class SkillContractTest(unittest.TestCase):
                 self.assertNotIn(retired_semantics, skill)
 
     def test_documents_helper_as_transport_not_reviewer(self) -> None:
+        require_canonical_documentation(self)
         dependencies = DEPENDENCIES_PATH.read_text(encoding="utf-8")
         normalized = " ".join(dependencies.split())
 

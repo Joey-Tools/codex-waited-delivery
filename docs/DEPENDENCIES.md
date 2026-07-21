@@ -22,3 +22,9 @@ passed.
 Operators can avoid that layout dependency by passing `--external-helper` to
 the runner or bridge commands, or disable the readiness smoke when it is not
 needed. Neither choice changes the internal reviewer identity or count.
+
+The private overlay packages the `skills/waited-delivery` subtree without this
+repository-level README or dependency document. Distribution-profile contract
+tests therefore keep validating the synced skill and runtime in that layout,
+but skip only the canonical documentation assertions when both files are
+absent. A partial documentation layout remains an error.
