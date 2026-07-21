@@ -28,9 +28,11 @@ The current outer adapter already follows this rule: it may observe product-spec
 - `bind-parent-live`
   - patches parent metadata into an existing run when the ids or other outer-adapter metadata become known later
 - `attach-child-live`
-  - wraps `attach-child` and also propagates parent metadata from args or env
+  - wraps `attach-child`, rejects a blank child id before state mutation, and also propagates parent metadata from args or env
+- `finish-child-live`
+  - requires the exact attached `child_session_id` and wraps `finish-child` so the bridge can persist the child's matching terminal status after `wait` and before parent-owned review
 - `reconcile-live`
-  - wraps `reconcile-parent --json`
+  - requires that same exact child id and wraps `reconcile-parent --json`
 - `print-env-contract`
   - prints the current env keys expected by the bridge
 
@@ -40,7 +42,9 @@ The current outer adapter already follows this rule: it may observe product-spec
 2. It exports those fields as `WAITED_DELIVERY_*`.
 3. It calls `prepare-live`.
 4. The parent session or adapter spawns the delivery child and calls `attach-child-live`.
-5. After `wait` returns, it calls `reconcile-live`.
+5. After `wait` returns, it calls `finish-child-live` with the exact id recorded by `attach-child-live`.
+6. The parent forms the committed clean/frozen range and records its review phases.
+7. It calls `reconcile-live` with that same exact id only after every phase is terminal.
 
 ## Notes
 

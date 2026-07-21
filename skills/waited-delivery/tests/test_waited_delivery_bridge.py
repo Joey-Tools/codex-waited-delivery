@@ -115,6 +115,45 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
         payload = json.loads(completed.stdout)
         return pathlib.Path(payload["run_dir"])
 
+    def _commit_implementation(self) -> None:
+        self.assertEqual(git(self.repo, "add", "tracked.txt").returncode, 0)
+        git_commit(self.repo, "freeze implementation")
+
+    def _finish_child(self, run_dir: pathlib.Path, child_session_id: str) -> None:
+        attached = self._run_bridge(
+            "attach-child-live",
+            "--run-dir",
+            str(run_dir),
+            "--child-session-id",
+            child_session_id,
+        )
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        completed = self._run_bridge(
+            "finish-child-live",
+            "--run-dir",
+            str(run_dir),
+            "--child-status",
+            "completed",
+            "--child-session-id",
+            child_session_id,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["orchestration"]["child_status"], "completed")
+
+    def test_terminal_commands_require_child_session_id(self) -> None:
+        for command in ("finish-child-live", "reconcile-live"):
+            with self.subTest(command=command):
+                completed = self._run_bridge(
+                    command,
+                    "--run-dir",
+                    "/tmp/waited-delivery-run",
+                    "--child-status",
+                    "completed",
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("--child-session-id", completed.stderr)
+
     def test_prepare_live_uses_env_parent_metadata(self) -> None:
         completed = self._run_bridge(
             "prepare-live",
@@ -189,6 +228,8 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
 
     def test_reconcile_live_returns_json(self) -> None:
         run_dir = self._prepare_run_dir()
+        self._finish_child(run_dir, "child-env-2")
+        self._commit_implementation()
         for phase_name in ("tests", "docs_sync", "internal_review", "external_review"):
             completed = self._run_runner(
                 "record-phase",
@@ -200,6 +241,11 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
                 "passed",
                 "--summary",
                 f"{phase_name} passed",
+                *(
+                    ["--evidence", "reviewer terminal artifact"]
+                    if phase_name in ("internal_review", "external_review")
+                    else []
+                ),
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
         completed = self._run_bridge(

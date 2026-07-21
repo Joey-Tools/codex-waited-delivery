@@ -424,12 +424,22 @@ def _state_phase_statuses(state: dict[str, object]) -> list[str]:
 
 def _run_is_terminal(state: dict[str, object]) -> bool:
     overall_status = state.get("overall_status")
-    child_status = _state_orchestration(state).get("child_status")
+    orchestration = _state_orchestration(state)
+    child_status = orchestration.get("child_status")
+    child_session_id = orchestration.get("child_session_id")
+    phases = state.get("phases")
+    internal_review = (
+        phases.get("internal_review") if isinstance(phases, dict) else None
+    )
     phase_statuses = _state_phase_statuses(state)
     return (
         isinstance(overall_status, str)
         and overall_status != "pending"
         and child_status in CHILD_TERMINAL_STATUSES
+        and isinstance(child_session_id, str)
+        and bool(child_session_id.strip())
+        and isinstance(internal_review, dict)
+        and internal_review.get("status") in TERMINAL_PHASE_STATUSES
         and bool(phase_statuses)
         and all(status in TERMINAL_PHASE_STATUSES for status in phase_statuses)
     )
@@ -496,6 +506,11 @@ def _resolve_session_record(
         record = sessions.get(session_id)
         if record is None:
             raise UserError(f"unknown session id: {session_id}")
+        if run_dir and record["run_dir"] != run_dir:
+            raise UserError(
+                f"session {session_id} does not own run_dir={run_dir}; "
+                f"current run_dir={record['run_dir'] or 'none'}"
+            )
         return record
     if run_dir:
         for record in sessions.values():
@@ -592,12 +607,19 @@ def _build_stop_continuation_prompt(
     if not isinstance(child_status, str):
         child_status = "pending"
     child_session_id = orchestration.get("child_session_id")
-    if not isinstance(child_session_id, str) or not child_session_id:
+    if not isinstance(child_session_id, str) or not child_session_id.strip():
         child_session_id = None
     parent_prompt = artifacts.get("parent_prompt")
     if not isinstance(parent_prompt, str) or not parent_prompt:
         parent_prompt = str(run_dir / "parent-prompt.md")
     if child_status in CHILD_TERMINAL_STATUSES:
+        if child_session_id is None:
+            return (
+                "A waited-delivery run for this session records a terminal child status "
+                "without a nonblank child_session_id. Do not run reconciliation with a "
+                f"guessed identity. Inspect `{run_dir / 'state.json'}` and recover the exact "
+                "attached child id before replying."
+            )
         reconcile_cmd = [
             sys.executable,
             str(pathlib.Path(__file__).resolve()),
@@ -608,9 +630,9 @@ def _build_stop_continuation_prompt(
             str(run_dir),
             "--child-status",
             child_status,
+            "--child-session-id",
+            child_session_id,
         ]
-        if child_session_id:
-            reconcile_cmd.extend(["--child-session-id", child_session_id])
         return (
             "A waited-delivery run for this session is not reconciled yet. "
             f"Do not finish. Read `{parent_prompt}` and reconcile the active run with "
@@ -637,7 +659,7 @@ def _build_stop_fallback_prompt(
     if not isinstance(child_status, str):
         child_status = "pending"
     child_session_id = orchestration.get("child_session_id")
-    if not isinstance(child_session_id, str) or not child_session_id:
+    if not isinstance(child_session_id, str) or not child_session_id.strip():
         child_session_id = None
     lines = [
         "A waited-delivery run for this session is still active, but the stop-hook could not render the full continuation prompt.",
@@ -645,6 +667,12 @@ def _build_stop_fallback_prompt(
         f"Inspect state: {run_dir / 'state.json'}",
     ]
     if child_status in CHILD_TERMINAL_STATUSES:
+        if child_session_id is None:
+            lines.append(
+                "State is inconsistent: the child is terminal but child_session_id is "
+                "missing or blank. Recover the exact attached child id before reconciliation."
+            )
+            return "\n".join(lines)
         reconcile_cmd = [
             sys.executable,
             str(pathlib.Path(__file__).resolve()),
@@ -655,9 +683,9 @@ def _build_stop_fallback_prompt(
             str(run_dir),
             "--child-status",
             child_status,
+            "--child-session-id",
+            child_session_id,
         ]
-        if child_session_id:
-            reconcile_cmd.extend(["--child-session-id", child_session_id])
         lines.extend(
             [
                 "Then continue the waited-delivery flow and reconcile it before replying.",
@@ -690,7 +718,7 @@ def _state_child_session_id_hint(state: dict[str, object]) -> str | None:
     if not isinstance(orchestration, dict):
         return None
     child_session_id = orchestration.get("child_session_id")
-    if isinstance(child_session_id, str) and child_session_id:
+    if isinstance(child_session_id, str) and child_session_id.strip():
         return child_session_id
     return None
 
@@ -708,6 +736,12 @@ def _build_stop_last_resort_prompt(
         f"Inspect state: {run_dir / 'state.json'}",
     ]
     if child_status in CHILD_TERMINAL_STATUSES:
+        if not child_session_id or not child_session_id.strip():
+            lines.append(
+                "State is inconsistent: the child is terminal but child_session_id is "
+                "missing or blank. Recover the exact attached child id before reconciliation."
+            )
+            return "\n".join(lines)
         reconcile_cmd = [
             sys.executable,
             str(pathlib.Path(__file__).resolve()),
@@ -718,9 +752,9 @@ def _build_stop_last_resort_prompt(
             str(run_dir),
             "--child-status",
             child_status,
+            "--child-session-id",
+            child_session_id,
         ]
-        if child_session_id:
-            reconcile_cmd.extend(["--child-session-id", child_session_id])
         lines.extend(
             [
                 "Then reconcile the active run before replying.",
@@ -751,15 +785,20 @@ def _build_stop_emergency_prompt(
         f"Inspect state: {run_dir / 'state.json'}",
     ]
     if child_status in CHILD_TERMINAL_STATUSES:
+        if not child_session_id or not child_session_id.strip():
+            lines.append(
+                "State is inconsistent: the child is terminal but child_session_id is "
+                "missing or blank. Recover the exact attached child id before reconciliation."
+            )
+            return "\n".join(lines)
         command = (
             "python3 personal_codex/skills/waited-delivery/scripts/"
             "waited_delivery_hook_adapter.py reconcile-active-run"
             f" --repo {shlex.quote(str(repo_root))}"
             f" --run-dir {shlex.quote(str(run_dir))}"
             f" --child-status {shlex.quote(child_status)}"
+            f" --child-session-id {shlex.quote(child_session_id)}"
         )
-        if child_session_id:
-            command += f" --child-session-id {shlex.quote(child_session_id)}"
         lines.extend(
             [
                 "Then reconcile the active run before replying.",
@@ -994,6 +1033,35 @@ def _attach_child_active_run(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _finish_child_active_run(args: argparse.Namespace) -> int:
+    repo_root = _resolve_repo_root(args.repo, strict=True)
+    assert repo_root is not None
+    index_path, index = _load_index(repo_root)
+    record = _resolve_session_record(
+        index,
+        repo_root=repo_root,
+        session_id=args.session_id,
+        run_dir=args.run_dir,
+    )
+    bridge_args = [
+        "finish-child-live",
+        "--run-dir",
+        args.run_dir,
+        "--child-status",
+        args.child_status,
+        "--child-session-id",
+        args.child_session_id,
+    ]
+    exit_code = _run_bridge_passthrough(*bridge_args)
+    if exit_code == 0:
+        record["run_dir"] = args.run_dir
+        record["status"] = "active"
+        record["updated_at"] = _utc_now()
+        index["latest_session_id"] = record["session_id"]
+        _save_index(index_path, index)
+    return exit_code
+
+
 def _reconcile_active_run(args: argparse.Namespace) -> int:
     repo_root = _resolve_repo_root(args.repo, strict=True)
     assert repo_root is not None
@@ -1010,9 +1078,9 @@ def _reconcile_active_run(args: argparse.Namespace) -> int:
         args.run_dir,
         "--child-status",
         args.child_status,
+        "--child-session-id",
+        args.child_session_id,
     ]
-    if args.child_session_id:
-        bridge_args.extend(["--child-session-id", args.child_session_id])
     payload = _run_bridge_json(*bridge_args)
     state = _load_run_state(args.run_dir)
     if state is not None and _run_is_terminal(state):
@@ -1080,11 +1148,19 @@ def _build_parser() -> argparse.ArgumentParser:
     attach.add_argument("--session-id")
     attach.set_defaults(func=_attach_child_active_run)
 
+    finish = subparsers.add_parser("finish-child-active-run")
+    finish.add_argument("--repo", required=True)
+    finish.add_argument("--run-dir", required=True)
+    finish.add_argument("--child-status", required=True)
+    finish.add_argument("--child-session-id", required=True)
+    finish.add_argument("--session-id")
+    finish.set_defaults(func=_finish_child_active_run)
+
     reconcile = subparsers.add_parser("reconcile-active-run")
     reconcile.add_argument("--repo", required=True)
     reconcile.add_argument("--run-dir", required=True)
     reconcile.add_argument("--child-status", required=True)
-    reconcile.add_argument("--child-session-id")
+    reconcile.add_argument("--child-session-id", required=True)
     reconcile.add_argument("--session-id")
     reconcile.set_defaults(func=_reconcile_active_run)
 
