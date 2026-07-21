@@ -29,6 +29,7 @@ DEFAULT_PHASES = [
     "internal_review",
     "external_review",
 ]
+REVIEW_PHASES = {"internal_review", "external_review"}
 DEFAULT_EXTERNAL_HELPER = (
     pathlib.Path(__file__).resolve().parents[2]
     / "review-orchestration-playbook"
@@ -247,6 +248,16 @@ def _build_child_contract(state: WaitedDeliveryState) -> str:
         [
             "",
             "## Review Policy",
+            "- Implementation boundary: the main session completes implementation before spawning the child.",
+            "- Child review boundary: the child owns tests, docs sync, and verification of the already-implemented change; it must not mark `internal_review` or `external_review` as passed.",
+            "- Parent review boundary: after the child returns, the parent must form an authorized, committed, clean/frozen `base_sha..head_sha` before starting review.",
+            "- Dirty or untracked implementation state cannot count as reviewed.",
+            "- Runner enforcement: `record-phase` rejects a review `passed` result before the child is terminal, while implementation state is dirty/untracked, or when nonblank terminal review evidence is missing.",
+            "- Named internal single review: the parent directly launches exactly one fresh/clear-context Codex `reviewer` agent.",
+            "- Reviewer context: load `$review-orchestration-playbook` plus applicable `AGENTS.md` and repository guidance.",
+            "- Reviewer workspace: discover the fixed diff and necessary nearby context with tools inside the clean/frozen workspace.",
+            "- Reviewer handoff: do not precompute or paste the full diff into the prompt.",
+            "- Helper role: `isolated_review` is low-level compatibility/diagnostic tooling only; it cannot start, satisfy, substitute for, or count as the named internal single review.",
             f"- Primary external-review lane: `{review_policy['external_lane']}`",
             f"- Fallback lane: `{review_policy['fallback_lane']}`",
             f"- Fallback entrypoint: `{review_policy['fallback_entrypoint']}`",
@@ -272,6 +283,7 @@ def _build_child_contract(state: WaitedDeliveryState) -> str:
             "## Guardrails",
             "- Spawn no additional delivery children for this run.",
             "- Treat fallback readiness smoke as lane-availability evidence only, not as external-review coverage.",
+            "- Keep external fallback-readiness smoke separate from the named internal single review; it never adds or replaces an internal reviewer.",
             "- Convert any reviewer stall into a terminal result such as `blocked`, `unavailable`, or `decision_point` after bounded retries.",
             "- Return control as soon as a gate reaches the earliest decisive stopping point.",
         ]
@@ -333,14 +345,15 @@ def _build_child_prompt(run_dir: pathlib.Path, state: WaitedDeliveryState) -> st
         lines.append("2. Fallback readiness smoke is disabled for this run.")
     lines.extend(
         [
-            "3. For each delivery phase, mark it `running` before work begins:",
+            "3. For each child-owned delivery phase, mark it `running` before work begins:",
             f"   `{_runner_command('begin-phase', '--run-dir', str(run_dir), '--phase', '<phase>')}`",
             "4. As soon as a phase reaches a terminal result, persist it with `record-phase`:",
             f"   `{_runner_command('record-phase', '--run-dir', str(run_dir), '--phase', '<phase>', '--status', 'passed', '--summary', '<summary>')}`",
-            "5. If you stop early after a decisive failure or decision point, close untouched downstream phases before returning:",
+            "5. Do not mark `internal_review` or `external_review` as passed. The parent owns review after you return.",
+            "6. If you stop early after a decisive failure or decision point, close untouched downstream phases before returning:",
             f"   `{_runner_command('close-open-phases', '--run-dir', str(run_dir), '--status', 'blocked', '--summary', '<why downstream phases were not run>')}`",
-            "6. Do not call `finalize` from the child. The parent owns reconciliation after `wait` returns.",
-            "7. Return a concise terminal summary for the parent that matches the persisted phase states.",
+            "7. Do not call `finalize` from the child. The parent owns review and reconciliation after `wait` returns.",
+            "8. Return a concise terminal summary for the parent that matches the persisted child-owned phase states.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -356,8 +369,15 @@ def _build_parent_prompt(run_dir: pathlib.Path, state: WaitedDeliveryState) -> s
         f"1. Spawn exactly one delivery child for this run and give it `{state['artifacts']['child_prompt']}` as the bounded handoff payload.",
         f"2. As soon as the child session ID is known, persist it with: `{_runner_command('attach-child', '--run-dir', str(run_dir), '--child-session-id', '<child_session_id>')}`",
         "3. Immediately wait for that child. Do not summarize early and do not continue unrelated work while the child is active.",
-        f"4. When `wait` returns, reconcile the run with: `{_runner_command('reconcile-parent', '--run-dir', str(run_dir), '--child-status', '<completed|failed|interrupted>', '--child-session-id', '<child_session_id>')}`",
-        "5. Read the resulting `summary.md` and only then give the user the consolidated finish-line result.",
+        "4. When `wait` returns, inspect the child result and persist its terminal status before starting review:",
+        f"   `{_runner_command('finish-child', '--run-dir', str(run_dir), '--child-status', '<completed|failed|interrupted>', '--child-session-id', '<child_session_id>')}`",
+        "5. Do not claim review coverage while implementation changes remain dirty or untracked. When authorized, form a committed clean/frozen `base_sha..head_sha`; otherwise record `blocked` or `decision_point`.",
+        "6. Named internal single review means directly launching exactly one fresh/clear-context Codex `reviewer` agent. Require it to load `$review-orchestration-playbook` plus applicable `AGENTS.md` and repository guidance.",
+        "7. Give the reviewer only the goal, workspace path, immutable refs, focus, evidence budget, and output contract. Do not precompute or paste a full diff; the reviewer discovers the fixed diff and nearby context with tools inside the clean/frozen workspace.",
+        "8. `isolated_review` is low-level compatibility/diagnostic tooling only. It cannot start, satisfy, substitute for, or count as the named internal single review; its lifecycle does not add a reviewer.",
+        "9. Persist the named Codex artifact only as `internal_review`. Run `external_review` separately only when required, and never reuse the internal artifact for it. A fallback-readiness smoke is availability evidence only and never review coverage.",
+        f"10. Reconcile the run with: `{_runner_command('reconcile-parent', '--run-dir', str(run_dir), '--child-status', '<completed|failed|interrupted>', '--child-session-id', '<child_session_id>')}`",
+        "11. Read the resulting `summary.md` and only then give the user the consolidated finish-line result.",
         "",
         "Guardrails:",
         "- Do not spawn additional delivery children for this run.",
@@ -386,10 +406,12 @@ def _prepare(args: argparse.Namespace) -> int:
         args.run_id
         or f"{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
     )
+    phases_order = args.phase or list(DEFAULT_PHASES)
+    if "internal_review" not in phases_order:
+        raise UserError("phase order must include the required internal_review phase")
     run_dir = repo_root / ".codex-tmp" / "waited-delivery" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    phases_order = args.phase or list(DEFAULT_PHASES)
     state_path = run_dir / "state.json"
     contract_path = run_dir / "child-contract.md"
     child_prompt_path = run_dir / "child-prompt.md"
@@ -506,7 +528,13 @@ def _save_state(run_dir: pathlib.Path, state: WaitedDeliveryState) -> None:
 
 def _attach_child(args: argparse.Namespace) -> int:
     run_dir, state = _load_state_from_run_dir(args.run_dir)
+    if not args.child_session_id.strip():
+        raise UserError("attach-child requires a nonblank child session id")
     orchestration = state["orchestration"]
+    if orchestration["child_status"] != "pending" or orchestration["child_session_id"]:
+        raise UserError(
+            "cannot attach child after child orchestration has already started"
+        )
     orchestration["child_session_id"] = args.child_session_id
     orchestration["child_status"] = "running"
     orchestration["child_started_at"] = _utc_now()
@@ -561,6 +589,40 @@ def _begin_phase(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_review_pass(
+    state: WaitedDeliveryState, evidence: list[str]
+) -> None:
+    orchestration = state["orchestration"]
+    if orchestration["child_status"] not in CHILD_TERMINAL_STATUSES:
+        raise UserError("cannot record a passed review before the child is terminal")
+    child_session_id = orchestration["child_session_id"]
+    if not isinstance(child_session_id, str) or not child_session_id.strip():
+        raise UserError(
+            "cannot record a passed review without a nonblank attached child session id"
+        )
+    changed_files = _collect_changed_files(pathlib.Path(state["repo_root"]))
+    if changed_files:
+        sample = ", ".join(changed_files[:5])
+        suffix = "" if len(changed_files) <= 5 else ", ..."
+        raise UserError(
+            "cannot record a passed review while implementation state is "
+            f"dirty or untracked: {sample}{suffix}"
+        )
+    if not any(item.strip() for item in evidence):
+        raise UserError(
+            "cannot record a passed review without nonblank terminal reviewer evidence"
+        )
+
+
+def _validate_passed_reviews(state: WaitedDeliveryState) -> None:
+    if "internal_review" not in state["phases"]:
+        raise UserError("waited-delivery state is missing the required internal_review phase")
+    for phase_name in REVIEW_PHASES:
+        phase = state["phases"].get(phase_name)
+        if phase is not None and phase["status"] == "passed":
+            _validate_review_pass(state, phase["evidence"])
+
+
 def _record_phase(args: argparse.Namespace) -> int:
     run_dir, state = _load_state_from_run_dir(args.run_dir)
     phases = state["phases"]
@@ -568,6 +630,8 @@ def _record_phase(args: argparse.Namespace) -> int:
         raise UserError(f"unknown phase: {args.phase}")
     if args.status not in PHASE_STATUSES:
         raise UserError(f"unsupported status: {args.status}")
+    if args.phase in REVIEW_PHASES and args.status == "passed":
+        _validate_review_pass(state, list(args.evidence))
     phase = phases[args.phase]
     phase["status"] = args.status
     phase["summary"] = args.summary or ""
@@ -584,6 +648,15 @@ def _close_open_phases(args: argparse.Namespace) -> int:
         raise UserError(f"close-open-phases requires a terminal status: {args.status}")
     findings = list(args.finding)
     evidence = list(args.evidence)
+    if args.status == "passed" and any(
+        phase_name in REVIEW_PHASES
+        and state["phases"][phase_name]["status"] not in TERMINAL_PHASE_STATUSES
+        for phase_name in state["phases_order"]
+    ):
+        raise UserError(
+            "close-open-phases cannot mark review phases passed; record each "
+            "review phase with its own terminal evidence"
+        )
     updated = False
     for phase_name in state["phases_order"]:
         phase = state["phases"][phase_name]
@@ -600,16 +673,49 @@ def _close_open_phases(args: argparse.Namespace) -> int:
     return 0
 
 
+def _transition_child_terminal(
+    state: WaitedDeliveryState,
+    *,
+    child_status: str,
+    child_session_id: str | None,
+) -> None:
+    if child_status not in CHILD_TERMINAL_STATUSES:
+        raise UserError(f"unsupported child status: {child_status}")
+    orchestration = state["orchestration"]
+    attached_id = orchestration["child_session_id"]
+    if not attached_id:
+        raise UserError("cannot finish child before attach-child records its session id")
+    if not child_session_id or not child_session_id.strip():
+        raise UserError("child terminal transition requires a nonblank child session id")
+    if child_session_id != attached_id:
+        raise UserError(
+            "child session id does not match the attached child: "
+            f"expected {attached_id}, got {child_session_id}"
+        )
+    current_status = orchestration["child_status"]
+    if current_status == "running":
+        orchestration["child_status"] = child_status
+        orchestration["child_finished_at"] = _utc_now()
+        orchestration["updated_at"] = _utc_now()
+    elif current_status in CHILD_TERMINAL_STATUSES:
+        if current_status != child_status:
+            raise UserError(
+                "child terminal status does not match the recorded status: "
+                f"expected {current_status}, got {child_status}"
+            )
+    else:
+        raise UserError(
+            "cannot finish child before attach-child transitions it to running"
+        )
+
+
 def _finish_child(args: argparse.Namespace) -> int:
     run_dir, state = _load_state_from_run_dir(args.run_dir)
-    if args.child_status not in CHILD_TERMINAL_STATUSES:
-        raise UserError(f"unsupported child status: {args.child_status}")
-    orchestration = state["orchestration"]
-    orchestration["child_status"] = args.child_status
-    orchestration["child_finished_at"] = _utc_now()
-    orchestration["updated_at"] = _utc_now()
-    if args.child_session_id:
-        orchestration["child_session_id"] = args.child_session_id
+    _transition_child_terminal(
+        state,
+        child_status=args.child_status,
+        child_session_id=args.child_session_id,
+    )
     _save_state(run_dir, state)
     return 0
 
@@ -698,6 +804,18 @@ def _write_summary(
             "cannot finalize before child reaches terminal status: "
             f"{orchestration['child_status']}"
         )
+    child_session_id = orchestration["child_session_id"]
+    if (
+        orchestration["child_status"] in CHILD_TERMINAL_STATUSES
+        and (
+            not isinstance(child_session_id, str)
+            or not child_session_id.strip()
+        )
+    ):
+        raise UserError(
+            "cannot finalize a terminal run without a nonblank attached child session id"
+        )
+    _validate_passed_reviews(state)
     overall_status = _overall_status(state["phases"])
     state["overall_status"] = overall_status
     lines = [
@@ -752,14 +870,12 @@ def _finalize(args: argparse.Namespace) -> int:
 
 def _reconcile_parent(args: argparse.Namespace) -> int:
     run_dir, state = _load_state_from_run_dir(args.run_dir)
-    if args.child_status not in CHILD_TERMINAL_STATUSES:
-        raise UserError(f"unsupported child status: {args.child_status}")
+    _transition_child_terminal(
+        state,
+        child_status=args.child_status,
+        child_session_id=args.child_session_id,
+    )
     orchestration = state["orchestration"]
-    orchestration["child_status"] = args.child_status
-    orchestration["child_finished_at"] = _utc_now()
-    orchestration["updated_at"] = _utc_now()
-    if args.child_session_id:
-        orchestration["child_session_id"] = args.child_session_id
     summary_path = _write_summary(run_dir, state, require_terminal=True)
     if args.json:
         print(
@@ -808,7 +924,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--permission-mode",
         help="Optional parent permission mode from an outer hook or adapter.",
     )
-    prepare.add_argument("--phase", action="append", help="Override phase order.")
+    prepare.add_argument(
+        "--phase",
+        action="append",
+        help="Override phase order; every override must include internal_review.",
+    )
     prepare.add_argument(
         "--changed-file",
         action="append",
@@ -880,13 +1000,13 @@ def _build_parser() -> argparse.ArgumentParser:
     finish_child = subparsers.add_parser("finish-child")
     finish_child.add_argument("--run-dir", required=True)
     finish_child.add_argument("--child-status", required=True)
-    finish_child.add_argument("--child-session-id")
+    finish_child.add_argument("--child-session-id", required=True)
     finish_child.set_defaults(func=_finish_child)
 
     reconcile_parent = subparsers.add_parser("reconcile-parent")
     reconcile_parent.add_argument("--run-dir", required=True)
     reconcile_parent.add_argument("--child-status", required=True)
-    reconcile_parent.add_argument("--child-session-id")
+    reconcile_parent.add_argument("--child-session-id", required=True)
     reconcile_parent.add_argument(
         "--json",
         action="store_true",

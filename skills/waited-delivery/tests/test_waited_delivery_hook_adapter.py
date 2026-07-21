@@ -123,6 +123,47 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
     def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
         return run([sys.executable, str(RUNNER_PATH), *args])
 
+    def _commit_implementation(self) -> None:
+        self.assertEqual(git(self.repo, "add", "tracked.txt").returncode, 0)
+        git_commit(self.repo, "freeze implementation")
+
+    def _finish_child(
+        self, run_dir: str, session_id: str, child_session_id: str
+    ) -> None:
+        completed = self._run_adapter(
+            "finish-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dir,
+            "--child-status",
+            "completed",
+            "--child-session-id",
+            child_session_id,
+            "--session-id",
+            session_id,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        record = index["sessions"][session_id]
+        self.assertEqual(record["status"], "active")
+        self.assertEqual(record["run_dir"], run_dir)
+
+    def test_terminal_commands_require_child_session_id(self) -> None:
+        for command in ("finish-child-active-run", "reconcile-active-run"):
+            with self.subTest(command=command):
+                completed = self._run_adapter(
+                    command,
+                    "--repo",
+                    str(self.repo),
+                    "--run-dir",
+                    "/tmp/waited-delivery-run",
+                    "--child-status",
+                    "completed",
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("--child-session-id", completed.stderr)
+
     def _session_payload(
         self,
         *,
@@ -156,6 +197,59 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_terminal_stop_prompts_refuse_missing_child_identity(self) -> None:
+        module = self._load_adapter_module()
+        run_dir = self.repo / ".codex-tmp" / "waited-delivery" / "damaged-run"
+        state = {
+            "orchestration": {
+                "child_status": "completed",
+                "child_session_id": "   ",
+            },
+            "artifacts": {},
+        }
+        prompts = [
+            module._build_stop_continuation_prompt(self.repo, run_dir, state),
+            module._build_stop_fallback_prompt(self.repo, run_dir, state),
+            module._build_stop_last_resort_prompt(
+                self.repo,
+                run_dir,
+                child_status="completed",
+                child_session_id=None,
+            ),
+            module._build_stop_emergency_prompt(
+                self.repo,
+                run_dir,
+                child_status="completed",
+                child_session_id=None,
+            ),
+        ]
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertIn("child_session_id", prompt)
+                self.assertNotIn("reconcile-active-run", prompt)
+
+        terminal_state = {
+            "overall_status": "passed",
+            "orchestration": {
+                "child_status": "completed",
+                "child_session_id": "   ",
+            },
+            "phases": {
+                phase_name: {"status": "passed"}
+                for phase_name in (
+                    "tests",
+                    "docs_sync",
+                    "internal_review",
+                    "external_review",
+                )
+            },
+        }
+        self.assertFalse(module._run_is_terminal(terminal_state))
+        terminal_state["orchestration"]["child_session_id"] = "child-exact"
+        self.assertTrue(module._run_is_terminal(terminal_state))
+        del terminal_state["phases"]["internal_review"]
+        self.assertFalse(module._run_is_terminal(terminal_state))
 
     def test_user_prompt_submit_hook_records_session_metadata(self) -> None:
         completed = self._run_adapter(
@@ -792,6 +886,20 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         )
         self.assertEqual(prepare.returncode, 0, prepare.stderr)
         run_dir = json.loads(prepare.stdout)["run_dir"]
+        attached = self._run_adapter(
+            "attach-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dir,
+            "--child-session-id",
+            "child-1",
+            "--session-id",
+            "session-2",
+        )
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        self._finish_child(run_dir, "session-2", "child-1")
+        self._commit_implementation()
 
         for phase_name in ("tests", "docs_sync", "internal_review", "external_review"):
             completed = self._run_runner(
@@ -804,6 +912,11 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 "passed",
                 "--summary",
                 f"{phase_name} passed",
+                *(
+                    ["--evidence", "reviewer terminal artifact"]
+                    if phase_name in ("internal_review", "external_review")
+                    else []
+                ),
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
@@ -829,6 +942,55 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(record["status"], "completed")
         self.assertIsNone(record["run_dir"])
 
+    def test_finish_child_active_run_rejects_cross_session_run(self) -> None:
+        run_dirs: dict[str, str] = {}
+        for session_id in ("session-owner-a", "session-owner-b"):
+            observed = self._run_adapter(
+                "user-prompt-submit-hook",
+                input_payload=self._session_payload(session_id=session_id),
+            )
+            self.assertEqual(observed.returncode, 0, observed.stderr)
+            prepared = self._run_adapter(
+                "prepare-active-run",
+                "--repo",
+                str(self.repo),
+                "--goal",
+                "Verify session ownership",
+                "--external-helper",
+                str(self.fake_helper),
+                "--no-fallback-smoke",
+                "--session-id",
+                session_id,
+            )
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            run_dirs[session_id] = json.loads(prepared.stdout)["run_dir"]
+
+        completed = self._run_adapter(
+            "finish-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dirs["session-owner-b"],
+            "--child-status",
+            "completed",
+            "--child-session-id",
+            "child-owner-b",
+            "--session-id",
+            "session-owner-a",
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("does not own run_dir", completed.stderr)
+
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            index["sessions"]["session-owner-a"]["run_dir"],
+            run_dirs["session-owner-a"],
+        )
+        self.assertEqual(
+            index["sessions"]["session-owner-b"]["run_dir"],
+            run_dirs["session-owner-b"],
+        )
+
     def test_stop_hook_reconcile_prompt_includes_repo(self) -> None:
         self._run_adapter(
             "user-prompt-submit-hook",
@@ -848,6 +1010,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         )
         self.assertEqual(prepare.returncode, 0, prepare.stderr)
         run_dir = json.loads(prepare.stdout)["run_dir"]
+        self._commit_implementation()
 
         attach = self._run_adapter(
             "attach-child-active-run",
@@ -861,6 +1024,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             "session-3",
         )
         self.assertEqual(attach.returncode, 0, attach.stderr)
+        self._finish_child(run_dir, "session-3", "child-3")
 
         for phase_name in ("tests", "docs_sync", "internal_review", "external_review"):
             completed = self._run_runner(
@@ -873,6 +1037,11 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 "passed",
                 "--summary",
                 f"{phase_name} passed",
+                *(
+                    ["--evidence", "reviewer terminal artifact"]
+                    if phase_name in ("internal_review", "external_review")
+                    else []
+                ),
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
@@ -896,6 +1065,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertIn("reconcile-active-run", completed.stderr)
         self.assertIn("--repo", completed.stderr)
         self.assertIn(str(self.repo), completed.stderr)
+        self.assertIn("--child-session-id child-3", completed.stderr)
 
     def test_stop_hook_keeps_blocking_when_prompt_render_fails(self) -> None:
         fake_home = self.root / "home-stop-blocking"

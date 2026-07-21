@@ -150,6 +150,19 @@ def _attach_child_live(args: argparse.Namespace) -> int:
     return _run_runner(*runner_args)
 
 
+def _finish_child_live(args: argparse.Namespace) -> int:
+    runner_args = [
+        "finish-child",
+        "--run-dir",
+        args.run_dir,
+        "--child-status",
+        args.child_status,
+        "--child-session-id",
+        args.child_session_id,
+    ]
+    return _run_runner(*runner_args)
+
+
 def _reconcile_live(args: argparse.Namespace) -> int:
     runner_args = [
         "reconcile-parent",
@@ -157,10 +170,10 @@ def _reconcile_live(args: argparse.Namespace) -> int:
         args.run_dir,
         "--child-status",
         args.child_status,
+        "--child-session-id",
+        args.child_session_id,
         "--json",
     ]
-    if args.child_session_id:
-        runner_args.extend(["--child-session-id", args.child_session_id])
     return _run_runner(*runner_args)
 
 
@@ -227,10 +240,16 @@ def _build_parser() -> argparse.ArgumentParser:
     attach_child_live.add_argument("--permission-mode")
     attach_child_live.set_defaults(func=_attach_child_live)
 
+    finish_child_live = subparsers.add_parser("finish-child-live")
+    finish_child_live.add_argument("--run-dir", required=True)
+    finish_child_live.add_argument("--child-status", required=True)
+    finish_child_live.add_argument("--child-session-id", required=True)
+    finish_child_live.set_defaults(func=_finish_child_live)
+
     reconcile_live = subparsers.add_parser("reconcile-live")
     reconcile_live.add_argument("--run-dir", required=True)
     reconcile_live.add_argument("--child-status", required=True)
-    reconcile_live.add_argument("--child-session-id")
+    reconcile_live.add_argument("--child-session-id", required=True)
     reconcile_live.set_defaults(func=_reconcile_live)
 
     env_contract = subparsers.add_parser("print-env-contract")

@@ -3,7 +3,7 @@
 Historical and experimental child-and-wait delivery workflow tooling.
 
 See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for the optional review
-helper dependency.
+compatibility/diagnostic dependency used by external lane-readiness smoke.
 
 ## Test
 

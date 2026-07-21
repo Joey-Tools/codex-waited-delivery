@@ -13,7 +13,8 @@ The adapter adds one layer above the bridge:
 - `UserPromptSubmit` hook records the current session metadata in a repo-local session index
 - `prepare-active-run` resolves an unambiguous observed session and binds it to a new `run_dir`
 - `Stop` hook checks that session index and blocks premature finish while the run is still active
-- `reconcile-active-run` clears the active-run association once reconciliation finishes cleanly
+- `finish-child-active-run` requires the exact attached child id, records the child's terminal status, and preserves the active-run association for parent-owned review
+- `reconcile-active-run` requires that same exact child id and clears the active-run association only when reconciliation finishes cleanly with the required `internal_review` phase and a nonblank attached child identity
 
 This keeps hooks product-facing and lets the bridge remain product-agnostic.
 
@@ -51,7 +52,7 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   - blocks stop with a continuation prompt when the run is still active or not yet reconciled
   - uses `stop_hook_active` to avoid continuation loops
   - if continuation prompt rendering fails on an active run, it records diagnostics, falls back to a generic continuation prompt, and still blocks
-  - the fallback prompt preserves the current child terminal status and `child_session_id` when it suggests `reconcile-active-run`
+  - every prompt variant preserves the current child terminal status and exact `child_session_id` when it suggests `reconcile-active-run`; an inconsistent terminal state with no nonblank child id produces recovery guidance instead of an unexecutable command
   - if even that fallback prompt builder fails, the hook still blocks with a last-resort prompt; if that builder also fails, it falls through to a static emergency prompt that still carries terminal reconcile instructions
   - if writing that prompt to `stderr` fails, it falls back to the outer fail-open path instead of silently blocking with no message
   - outside the active-run blocking path, unexpected internal errors still record diagnostics and fail-open instead of breaking unrelated sessions
@@ -99,9 +100,16 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   - records the returned `run_dir` as the active run for that session
 - `attach-child-active-run`
   - requires `--run-dir` to already belong to one observed session
+  - rejects a blank `--child-session-id` without moving the child state to `running`
   - wraps `attach-child-live` while preserving the session metadata already recorded in the index
+- `finish-child-active-run`
+  - requires `--run-dir` to already belong to one observed session
+  - requires every supplied session/run selector to match the same index record
+  - requires `--child-session-id` to exactly match the id recorded at attachment, including terminal replays
+  - wraps `finish-child-live` after `wait` while keeping the association active for parent-owned review
 - `reconcile-active-run`
   - requires `--run-dir` to already belong to one observed session
+  - requires `--child-session-id` to exactly match the id recorded at attachment
   - wraps `reconcile-live`
   - clears the active-run association once the run is terminal and reconciled
 - `show-index`
