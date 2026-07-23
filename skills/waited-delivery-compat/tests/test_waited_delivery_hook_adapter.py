@@ -245,7 +245,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         )
         self.assertFalse((fake_home / ".codex" / "log").exists())
 
-    def test_hook_commands_reject_abbreviated_compatibility_flag_without_effects(
+    def test_hook_commands_without_exact_flag_are_inert_before_argparse(
         self,
     ) -> None:
         fake_home = self.root / "home-abbreviated-flag"
@@ -258,37 +258,172 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         env["HOME"] = str(fake_home)
         env.pop("CODEX_THREAD_ID", None)
 
-        payloads = {
-            "user-prompt-submit-hook": self._session_payload(
-                prompt="abbreviated flag must not read this prompt"
-            ),
-            "stop-hook": {
-                "session_id": "session-abbreviated",
-                "cwd": str(self.repo),
-                "last_assistant_message": (
-                    "abbreviated flag must not read this response"
+        cases = (
+            (
+                ("user-prompt-submit-hook", "--enable"),
+                self._session_payload(
+                    prompt="abbreviated flag must not read this prompt"
                 ),
-            },
-        }
-        for command, payload in payloads.items():
-            with self.subTest(command=command):
+            ),
+            (
+                ("stop-hook", "--unknown"),
+                {
+                    "session_id": "session-unknown",
+                    "cwd": str(self.repo),
+                    "last_assistant_message": (
+                        "unknown flag must not read this response"
+                    ),
+                },
+            ),
+            (
+                ("user-prompt-submit-hook", "--repo"),
+                self._session_payload(
+                    prompt="missing value must not read this prompt"
+                ),
+            ),
+            (
+                ("stop-hook", "--enable-compat-hook=true"),
+                {
+                    "session_id": "session-malformed",
+                    "cwd": str(self.repo),
+                    "last_assistant_message": (
+                        "malformed flag must not read this response"
+                    ),
+                },
+            ),
+            (
+                ("--enable", "stop-hook"),
+                {
+                    "session_id": "session-reordered",
+                    "cwd": str(self.repo),
+                    "last_assistant_message": (
+                        "reordered flag must not read this response"
+                    ),
+                },
+            ),
+            (
+                ("stop-hook", "--help"),
+                {
+                    "session_id": "session-help",
+                    "cwd": str(self.repo),
+                    "last_assistant_message": (
+                        "help flag must not read this response"
+                    ),
+                },
+            ),
+            (
+                ("--help", "user-prompt-submit-hook"),
+                self._session_payload(
+                    prompt="reordered help must not read this prompt"
+                ),
+            ),
+        )
+        for args, payload in cases:
+            with self.subTest(args=args):
                 completed = run(
                     [
                         sys.executable,
                         str(ADAPTER_PATH),
-                        command,
-                        "--enable",
+                        *args,
                     ],
                     env=env,
                     input_text=json.dumps(payload),
                 )
-                self.assertEqual(completed.returncode, 2)
-                self.assertEqual(completed.stdout, "")
-                self.assertIn("unrecognized arguments: --enable", completed.stderr)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout.strip(), "{}")
+                self.assertEqual(completed.stderr, "")
                 self.assertNotIn("must not read", completed.stderr)
 
         self.assertEqual(index_path.read_text(encoding="utf-8"), sentinel)
         self.assertFalse((fake_home / ".codex" / "log").exists())
+
+    def test_exact_flag_parse_errors_fail_open_without_running_hooks(self) -> None:
+        fake_home = self.root / "home-exact-malformed"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        index_path = adapter_dir / "index.json"
+        sentinel = "{legacy invalid json\n"
+        index_path.write_text(sentinel, encoding="utf-8")
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+
+        cases = (
+            (
+                "stop-hook",
+                "--enable-compat-hook",
+                "--unknown",
+            ),
+            (
+                "user-prompt-submit-hook",
+                "--enable-compat-hook",
+                "--repo",
+            ),
+            (
+                "--enable-compat-hook",
+                "stop-hook",
+            ),
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                completed = run(
+                    [sys.executable, str(ADAPTER_PATH), *args],
+                    env=env,
+                    input_text=json.dumps(
+                        {
+                            "session_id": "session-exact-malformed",
+                            "cwd": str(self.repo),
+                            "last_assistant_message": (
+                                "parse errors must not run the hook"
+                            ),
+                        }
+                    ),
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout.strip(), "{}")
+                self.assertIn("error:", completed.stderr)
+
+        self.assertEqual(index_path.read_text(encoding="utf-8"), sentinel)
+        self.assertFalse((fake_home / ".codex" / "log").exists())
+
+    def test_hook_and_non_hook_help_default_interactions(self) -> None:
+        exact_hook_help = run(
+            [
+                sys.executable,
+                str(ADAPTER_PATH),
+                "stop-hook",
+                "--enable-compat-hook",
+                "--help",
+            ],
+            input_text="help must not read stdin",
+        )
+        self.assertEqual(exact_hook_help.returncode, 0, exact_hook_help.stderr)
+        self.assertIn("--enable-compat-hook", exact_hook_help.stdout)
+        self.assertNotEqual(exact_hook_help.stdout.strip(), "{}")
+
+        top_level_help = run(
+            [sys.executable, str(ADAPTER_PATH), "--help"],
+        )
+        self.assertEqual(top_level_help.returncode, 0, top_level_help.stderr)
+        self.assertIn("prepare-active-run", top_level_help.stdout)
+        self.assertNotEqual(top_level_help.stdout.strip(), "{}")
+
+        no_command = run([sys.executable, str(ADAPTER_PATH)])
+        self.assertEqual(no_command.returncode, 2)
+        self.assertIn(
+            "the following arguments are required: command",
+            no_command.stderr,
+        )
+
+        non_hook_error = run(
+            [
+                sys.executable,
+                str(ADAPTER_PATH),
+                "show-index",
+                "--unknown",
+            ],
+        )
+        self.assertEqual(non_hook_error.returncode, 2)
+        self.assertIn("error:", non_hook_error.stderr)
 
     def test_exact_compatibility_flag_activates_hook_commands(self) -> None:
         submit = run(

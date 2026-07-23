@@ -24,6 +24,14 @@ INDEX_SCHEMA_VERSION = 1
 CURRENT_THREAD_ENV = "CODEX_THREAD_ID"
 HOOK_DEBUG_ENV = "WAITED_DELIVERY_HOOK_DEBUG"
 HOOK_COMMANDS = {"user-prompt-submit-hook", "stop-hook"}
+HOOK_ENABLE_FLAG = "--enable-compat-hook"
+NON_HOOK_COMMANDS = {
+    "prepare-active-run",
+    "attach-child-active-run",
+    "finish-child-active-run",
+    "reconcile-active-run",
+    "show-index",
+}
 HOOK_LOG_MAX_BYTES_ENV = "WAITED_DELIVERY_HOOK_LOG_MAX_BYTES"
 HOOK_LOG_UNCOMPRESSED_SLOTS_ENV = "WAITED_DELIVERY_HOOK_LOG_UNCOMPRESSED_SLOTS"
 HOOK_LOG_RETENTION_DAYS_ENV = "WAITED_DELIVERY_HOOK_LOG_RETENTION_DAYS"
@@ -1110,6 +1118,15 @@ def _show_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _raw_hook_command(argv: list[str]) -> str | None:
+    for token in argv:
+        if token in HOOK_COMMANDS:
+            return token
+        if token in NON_HOOK_COMMANDS:
+            return None
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1125,7 +1142,7 @@ def _build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     user_prompt.add_argument(
-        "--enable-compat-hook",
+        HOOK_ENABLE_FLAG,
         action="store_true",
         help="explicitly enable the historical compatibility hook",
     )
@@ -1136,7 +1153,7 @@ def _build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     stop.add_argument(
-        "--enable-compat-hook",
+        HOOK_ENABLE_FLAG,
         action="store_true",
         help="explicitly enable the historical compatibility hook",
     )
@@ -1197,12 +1214,20 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    raw_hook_command = _raw_hook_command(raw_argv)
+    if raw_hook_command is not None and HOOK_ENABLE_FLAG not in raw_argv:
+        return _success_hook_response()
+
     parser = _build_parser()
-    args = parser.parse_args()
     try:
-        if args.command in HOOK_COMMANDS and not args.enable_compat_hook:
+        args = parser.parse_args(raw_argv)
+    except SystemExit as error:
+        if raw_hook_command is not None and error.code not in (None, 0):
             return _success_hook_response()
+        raise
+    try:
         return args.func(args)
     except UserError as error:
         if args.command in HOOK_COMMANDS:
