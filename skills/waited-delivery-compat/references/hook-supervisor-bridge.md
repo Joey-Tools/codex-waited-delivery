@@ -1,11 +1,14 @@
-# Hook / Supervisor Bridge
+# Compatibility Hook / Supervisor Bridge
 
-Use this bridge when future experimental hooks, a local supervisor, or an app-side adapter needs to drive `waited-delivery` without hard-coding runner internals.
+Use this bridge only when an explicit compatibility experiment needs to drive historical `waited-delivery` state without hard-coding runner internals.
 
 ## Bridge Script
 
 - [waited_delivery_bridge.py](../scripts/waited_delivery_bridge.py)
-- If hooks are already available and you want repo-local session indexing plus a stop gate, prefer the higher-level adapter documented in [hook-adapter.md](hook-adapter.md).
+- If the user explicitly requests a compatibility hook experiment and hooks are
+  already available, use the higher-level adapter documented in
+  [hook-adapter.md](hook-adapter.md) with its required
+  `--enable-compat-hook` flag.
 
 ## Stable Env Contract
 

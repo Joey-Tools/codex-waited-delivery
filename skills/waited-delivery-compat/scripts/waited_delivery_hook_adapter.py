@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+"""Explicit-only hook compatibility for historical waited-delivery runs."""
+
 from __future__ import annotations
 
 import argparse
@@ -322,6 +324,10 @@ def _append_hook_log(entry: dict[str, object]) -> None:
 
 
 def _preview_text(value: object, *, limit: int = 240) -> str | None:
+    """Retain the legacy formatter for import compatibility.
+
+    Hook diagnostics intentionally no longer call this helper.
+    """
     if not isinstance(value, str):
         return None
     preview = value.replace("\n", "\\n")
@@ -346,8 +352,8 @@ def _hook_log_event(error: Exception) -> dict[str, object]:
         "transcript_path": payload.get("transcript_path"),
         "permission_mode": payload.get("permission_mode"),
         "stop_hook_active": payload.get("stop_hook_active"),
-        "prompt_preview": _preview_text(payload.get("prompt")),
-        "assistant_preview": _preview_text(payload.get("last_assistant_message")),
+        "prompt_preview": None,
+        "assistant_preview": None,
         "error_type": type(error).__name__,
         "error_message": str(error),
         "traceback_tail": traceback_text[-4000:] if traceback_text else None,
@@ -792,7 +798,7 @@ def _build_stop_emergency_prompt(
             )
             return "\n".join(lines)
         command = (
-            "python3 personal_codex/skills/waited-delivery/scripts/"
+            "python3 personal_codex/skills/waited-delivery-compat/scripts/"
             "waited_delivery_hook_adapter.py reconcile-active-run"
             f" --repo {shlex.quote(str(repo_root))}"
             f" --run-dir {shlex.quote(str(run_dir))}"
@@ -1106,14 +1112,27 @@ def _show_index(args: argparse.Namespace) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Waited-delivery outer adapter for Codex hooks and active-run control.",
+        description=(
+            "Explicit-only waited-delivery compatibility adapter for hooks and "
+            "active-run control."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     user_prompt = subparsers.add_parser("user-prompt-submit-hook")
+    user_prompt.add_argument(
+        "--enable-compat-hook",
+        action="store_true",
+        help="explicitly enable the historical compatibility hook",
+    )
     user_prompt.set_defaults(func=_user_prompt_submit_hook)
 
     stop = subparsers.add_parser("stop-hook")
+    stop.add_argument(
+        "--enable-compat-hook",
+        action="store_true",
+        help="explicitly enable the historical compatibility hook",
+    )
     stop.set_defaults(func=_stop_hook)
 
     prepare = subparsers.add_parser("prepare-active-run")
@@ -1175,6 +1194,8 @@ def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
     try:
+        if args.command in HOOK_COMMANDS and not args.enable_compat_hook:
+            return _success_hook_response()
         return args.func(args)
     except UserError as error:
         if args.command in HOOK_COMMANDS:

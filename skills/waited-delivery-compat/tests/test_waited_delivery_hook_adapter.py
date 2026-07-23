@@ -1,3 +1,5 @@
+"""Compatibility tests for the historical waited-delivery hook adapter."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -114,8 +116,14 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     env.pop(key, None)
                 else:
                     env[key] = value
+        adapter_args = list(args)
+        if adapter_args and adapter_args[0] in {
+            "user-prompt-submit-hook",
+            "stop-hook",
+        }:
+            adapter_args.insert(1, "--enable-compat-hook")
         return run(
-            [sys.executable, str(ADAPTER_PATH), *args],
+            [sys.executable, str(ADAPTER_PATH), *adapter_args],
             env=env,
             input_text=input_text,
         )
@@ -197,6 +205,45 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def test_hook_commands_are_inert_without_explicit_compatibility_flag(
+        self,
+    ) -> None:
+        fake_home = self.root / "home-default-inert"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        index_path = adapter_dir / "index.json"
+        index_path.write_text("{legacy invalid json\n", encoding="utf-8")
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+        env.pop("CODEX_THREAD_ID", None)
+
+        payloads = {
+            "user-prompt-submit-hook": self._session_payload(
+                prompt="sensitive compatibility prompt"
+            ),
+            "stop-hook": {
+                "session_id": "session-1",
+                "cwd": str(self.repo),
+                "last_assistant_message": "sensitive compatibility response",
+            },
+        }
+        for command, payload in payloads.items():
+            with self.subTest(command=command):
+                completed = run(
+                    [sys.executable, str(ADAPTER_PATH), command],
+                    env=env,
+                    input_text=json.dumps(payload),
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout.strip(), "{}")
+                self.assertEqual(completed.stderr, "")
+
+        self.assertEqual(
+            index_path.read_text(encoding="utf-8"),
+            "{legacy invalid json\n",
+        )
+        self.assertFalse((fake_home / ".codex" / "log").exists())
 
     def test_terminal_stop_prompts_refuse_missing_child_identity(self) -> None:
         module = self._load_adapter_module()
@@ -608,6 +655,12 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(entries[-1]["hook_command"], "stop-hook")
         self.assertEqual(entries[-1]["session_id"], "session-1")
         self.assertEqual(entries[-1]["error_type"], "JSONDecodeError")
+        self.assertIsNone(entries[-1]["prompt_preview"])
+        self.assertIsNone(entries[-1]["assistant_preview"])
+        self.assertNotIn(
+            "I am about to stop",
+            log_path.read_text(encoding="utf-8"),
+        )
 
     def test_user_prompt_submit_hook_fails_open_when_index_is_invalid(self) -> None:
         fake_home = self.root / "home-submit-invalid"
@@ -630,7 +683,12 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             for line in log_path.read_text(encoding="utf-8").splitlines()
         ]
         self.assertEqual(entries[-1]["hook_command"], "user-prompt-submit-hook")
-        self.assertEqual(entries[-1]["prompt_preview"], "Please use waited delivery")
+        self.assertIsNone(entries[-1]["prompt_preview"])
+        self.assertIsNone(entries[-1]["assistant_preview"])
+        self.assertNotIn(
+            "Please use waited delivery",
+            log_path.read_text(encoding="utf-8"),
+        )
 
     def test_stop_hook_debug_env_mirrors_fail_open_error_to_stderr(self) -> None:
         fake_home = self.root / "home-stop-debug"

@@ -19,7 +19,7 @@ jobs:
           python-version: "3.x"
       - name: Compile Python helpers
         run: |
-          python3 -m py_compile skills/waited-delivery/scripts/*.py
+          python3 -m py_compile skills/waited-delivery-compat/scripts/*.py
       - name: Run tests
         run: |
-          python3 -m unittest discover -s skills/waited-delivery/tests
+          python3 -m unittest discover -s skills/waited-delivery-compat/tests

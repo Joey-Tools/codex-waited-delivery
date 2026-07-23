@@ -1,4 +1,4 @@
-# Terminal Outcomes
+# Compatibility Terminal Outcomes
 
 Use these labels consistently when the delivery child returns control to the parent:
 

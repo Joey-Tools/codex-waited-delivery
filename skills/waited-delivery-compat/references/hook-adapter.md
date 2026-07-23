@@ -1,6 +1,9 @@
-# Hook Adapter
+# Compatibility Hook Adapter
 
-Use the hook adapter when `waited-delivery` needs to cooperate with verified Codex hook events instead of only with manual bridge commands.
+Use the hook adapter only for an explicitly requested waited-delivery
+compatibility experiment with verified Codex hook events. Do not install this
+skill into the active personal skill directory or register either hook by
+default.
 
 ## Adapter Script
 
@@ -8,11 +11,11 @@ Use the hook adapter when `waited-delivery` needs to cooperate with verified Cod
 
 ## Responsibilities
 
-The adapter adds one layer above the bridge:
+The adapter adds one explicitly enabled layer above the bridge:
 
-- `UserPromptSubmit` hook records the current session metadata in a repo-local session index
+- `UserPromptSubmit` hook records the current session metadata in a repo-local session index only when its command includes `--enable-compat-hook`
 - `prepare-active-run` resolves an unambiguous observed session and binds it to a new `run_dir`
-- `Stop` hook checks that session index and blocks premature finish while the run is still active
+- `Stop` hook checks that session index and blocks premature finish while the run is still active only when its command includes `--enable-compat-hook`
 - `finish-child-active-run` requires the exact attached child id, records the child's terminal status, and preserves the active-run association for parent-owned review
 - `reconcile-active-run` requires that same exact child id and clears the active-run association only when reconciliation finishes cleanly with the required `internal_review` phase and a nonblank attached child identity
 
@@ -40,12 +43,17 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
 
 ## Hook Commands
 
+- Both hook commands return `{}` without reading stdin when
+  `--enable-compat-hook` is absent. This keeps stale legacy registrations inert
+  until downstream removal metadata unlinks the old active installation.
 - `user-prompt-submit-hook`
+  - requires `--enable-compat-hook` to run the historical behavior
   - reads payload JSON from stdin
   - resolves the repo root from `cwd`
   - records the current session metadata into the adapter index
   - returns `{}` on success
 - `stop-hook`
+  - requires `--enable-compat-hook` to run the historical behavior
   - reads payload JSON from stdin
   - looks up the active `run_dir` for the current `session_id`
   - allows stop if no active run exists
@@ -74,18 +82,20 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   - if `zstd` is unavailable or compression fails, the archive is preserved uncompressed as:
     - `waited-delivery-hooks-<timestamp>-<unique>-<stem>.jsonl`
   - archives older than `7` days are pruned on the next due daily prune pass
-- Current diagnostic payload includes:
+- Diagnostic payload includes:
   - `hook_command`
   - `session_id`
   - `cwd`
   - `transcript_path`
   - `permission_mode`
-  - `prompt_preview`
-  - `assistant_preview`
+  - `prompt_preview`, retained as `null` for legacy schema compatibility
+  - `assistant_preview`, retained as `null` for legacy schema compatibility
   - `error_type`
   - `error_message`
   - `traceback_tail` for non-`UserError` exceptions
 - Set `WAITED_DELIVERY_HOOK_DEBUG=1` to also mirror fail-open hook errors to `stderr` during live debugging.
+- Prompt and assistant-message content is never written to hook diagnostics,
+  including when debug mode is enabled.
 
 ## Active-Run Commands
 
@@ -115,9 +125,13 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
 - `show-index`
   - prints the current adapter index for debugging
 
-## Example Hook Config
+## Explicit Compatibility Hook Config
 
-Replace `<expanded-home>` with the current user's absolute home path before installing this JSON if the hook runtime does not expand shell variables in command strings.
+Do not install this configuration as a default or persistent personal hook
+surface. Use it only for a bounded compatibility experiment, then remove it.
+Replace `<compat-skill-root>` with the absolute path to an explicit checkout of
+`skills/waited-delivery-compat` if the hook runtime does not expand shell
+variables in command strings.
 
 ```json
 {
@@ -127,7 +141,7 @@ Replace `<expanded-home>` with the current user's absolute home path before inst
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/python3 <expanded-home>/.codex/skills/waited-delivery/scripts/waited_delivery_hook_adapter.py user-prompt-submit-hook",
+            "command": "/usr/bin/python3 <compat-skill-root>/scripts/waited_delivery_hook_adapter.py user-prompt-submit-hook --enable-compat-hook",
             "timeoutSec": 10,
             "statusMessage": "tracking waited-delivery session metadata"
           }
@@ -139,7 +153,7 @@ Replace `<expanded-home>` with the current user's absolute home path before inst
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/bin/python3 <expanded-home>/.codex/skills/waited-delivery/scripts/waited_delivery_hook_adapter.py stop-hook",
+            "command": "/usr/bin/python3 <compat-skill-root>/scripts/waited_delivery_hook_adapter.py stop-hook --enable-compat-hook",
             "timeoutSec": 10,
             "statusMessage": "checking waited-delivery active run state"
           }

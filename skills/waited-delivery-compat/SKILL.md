@@ -1,25 +1,29 @@
 ---
-name: waited-delivery
-description: Historical and experimental child-and-wait delivery workflow. Use only when the user explicitly asks to test or use waited-delivery itself, to inspect its runner/hooks, or to recover prior waited-delivery runs; do not use as the default change delivery or PR readiness workflow.
+name: waited-delivery-compat
+description: Inspect or explicitly exercise historical waited-delivery child-and-wait artifacts. Use only when the user names waited-delivery compatibility, asks to recover a prior waited-delivery run, or requests a bounded experiment against its runner, bridge, or hooks; never use it for default change delivery, task supervision, or PR readiness.
 ---
 
-# Waited Delivery
+# Waited Delivery Compatibility
 
 ## Overview
 
-Use this skill when the user explicitly wants to test or use a delivery workflow where the main session stays blocked, spawns exactly one delivery child, and waits for that child to reach a terminal result before replying.
+Use this skill only when the user explicitly wants to inspect, recover, or test the historical workflow where the main session stays blocked, spawns exactly one delivery child, and waits for that child to reach a terminal result before replying.
 
-This skill is historical/experimental compatibility infrastructure.
+Treat this skill as reference-only historical compatibility infrastructure.
 
+- Do not install or link it into the active personal skill directory.
 - Do not silently replace `$change-delivery-workflow` with it.
 - Do not use it for PR readiness; use `$review-orchestration-playbook`.
 - Prefer `cbth` for new long-running task supervision and delivery experiments unless the user specifically asks to exercise waited-delivery.
+- Do not register its `UserPromptSubmit` or `Stop` hooks by default.
+- Require `--enable-compat-hook` on either historical hook command; without that flag the command returns `{}` without reading or persisting its payload.
+- Keep hook diagnostic `prompt_preview` and `assistant_preview` fields null. Never restore prompt or assistant-message content logging.
 
 ## Execution Layer
 
 Prefer the deterministic runner under `scripts/waited_delivery_runner.py` when setting up a real run.
 When thinking about future hooks or app-side adapters, also use the env-aware bridge under `scripts/waited_delivery_bridge.py`.
-When verified `UserPromptSubmit` / `Stop` hooks are available, prefer the outer adapter under `scripts/waited_delivery_hook_adapter.py` to bind a session to a run and to gate premature stop attempts.
+When the user explicitly requests a compatibility hook experiment and verified `UserPromptSubmit` / `Stop` hooks are available, use the outer adapter under `scripts/waited_delivery_hook_adapter.py` with `--enable-compat-hook` to bind a session to a run and to gate premature stop attempts.
 
 - `prepare`: create `.codex-tmp/waited-delivery/<run-id>/`, write `state.json`, `child-contract.md`, `child-prompt.md`, `parent-prompt.md`, and fallback-smoke artifacts. Any `--phase` override must retain the required `internal_review` phase. Use `--json` when a future supervisor or hook needs machine-readable artifact paths.
 - `prepare-live`: bridge command that wraps `prepare --json` and injects parent metadata from args or the bridge env contract.
@@ -27,8 +31,8 @@ When verified `UserPromptSubmit` / `Stop` hooks are available, prefer the outer 
 - `attach-child-live`: bridge command that wraps `attach-child` and also propagates parent metadata from args or env.
 - `finish-child-live`: bridge command that requires the attached child's exact nonblank `child_session_id` and records its matching terminal status after `wait` and before parent-owned review.
 - `reconcile-live`: bridge command that requires the same exact `child_session_id` and wraps `reconcile-parent --json`.
-- `user-prompt-submit-hook`: hook entrypoint that records the current session metadata into a repo-local adapter index.
-- `stop-hook`: hook entrypoint that checks whether a waited-delivery run is still active and, if so, blocks premature finish with a continuation prompt.
+- `user-prompt-submit-hook`: compatibility hook entrypoint that is inert unless passed `--enable-compat-hook`; when explicitly enabled, it records the current session metadata into a repo-local adapter index.
+- `stop-hook`: compatibility hook entrypoint that is inert unless passed `--enable-compat-hook`; when explicitly enabled, it checks whether a waited-delivery run is still active and, if so, blocks premature finish with a continuation prompt.
 - `prepare-active-run`: outer-adapter command that resolves an unambiguous observed session and binds it to a new `run_dir` through `prepare-live`; prefer `--session-id` when available, let host-injected `CODEX_THREAD_ID` act as the default explicit parent-session selector when present, and otherwise use `--transcript-path` or `--prompt-text` as explicit recovery selectors instead of trusting repo-global recency.
 - `attach-child-active-run`: outer-adapter command that wraps `attach-child-live` while preserving the recorded parent metadata; blank child ids are rejected before the run can enter `running`.
 - `finish-child-active-run`: outer-adapter command that wraps `finish-child-live` while requiring both the selected session to own the run and the caller-supplied child id to match the attachment, keeping that association for review and reconciliation.
@@ -43,8 +47,8 @@ When verified `UserPromptSubmit` / `Stop` hooks are available, prefer the outer 
 - `finalize`: derive an overall delivery status and write `summary.md`; every invocation revalidates any passed review against terminal-child, clean-worktree, and evidence guards and requires the `internal_review` phase, and any invocation that sees a terminal child requires its nonblank attached identity, while `--require-terminal` additionally requires the child and every phase to be terminal.
 
 Use the runner as the control plane even when the actual child work is still driven by a Codex subagent. The goal is to move run state, fallback smoke artifacts, and terminal accounting out of pure prompt memory.
-For future hooks / supervisor integration, prefer the repo-owned bridge env contract documented in [hook-supervisor-bridge.md](references/hook-supervisor-bridge.md) over guessing undocumented product env names inside the runner itself. The current bridge can already preserve `session_id`, `turn_id`, `transcript_path`, and `permission_mode` when an outer adapter has them, and it remains valid even when `turn_id` is temporarily unavailable.
-For actual verified hook integration on `codex-cli 0.116.0`, also see the repo-local adapter guidance in [hook-adapter.md](references/hook-adapter.md).
+For an explicit compatibility hook or supervisor experiment, prefer the repo-owned bridge env contract documented in [hook-supervisor-bridge.md](references/hook-supervisor-bridge.md) over guessing undocumented product env names inside the runner itself. The current bridge can already preserve `session_id`, `turn_id`, `transcript_path`, and `permission_mode` when an outer adapter has them, and it remains valid even when `turn_id` is temporarily unavailable.
+For an explicit verified hook experiment against the historical `codex-cli 0.116.0` contract, also see the repo-local adapter guidance in [hook-adapter.md](references/hook-adapter.md).
 
 ## Workflow
 
@@ -136,7 +140,10 @@ For actual verified hook integration on `codex-cli 0.116.0`, also see the repo-l
 
 ## Guardrails
 
-- This skill is experimental and opt-in only.
+- This skill is compatibility-only, reference-only, and opt-in only.
+- Do not add it to active personal installation manifests.
+- Do not enable either hook without `--enable-compat-hook`.
+- Do not record prompt or assistant-message previews in hook diagnostics.
 - Do not use it for tiny edits or pure discussion turns.
 - Do not spawn multiple concurrent delivery children for the same task unless the user explicitly asks for a different parallel experiment.
 - Do not let the parent end its turn before the child is terminal.

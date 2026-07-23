@@ -1,3 +1,5 @@
+"""Compatibility tests for the historical waited-delivery bridge."""
+
 from __future__ import annotations
 
 import json

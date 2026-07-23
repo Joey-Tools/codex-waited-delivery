@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+"""Compatibility bridge for historical waited-delivery runs."""
+
 from __future__ import annotations
 
 import argparse

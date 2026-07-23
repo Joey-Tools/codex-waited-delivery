@@ -1,3 +1,5 @@
+"""Compatibility tests for the historical waited-delivery runner."""
+
 from __future__ import annotations
 
 import json
