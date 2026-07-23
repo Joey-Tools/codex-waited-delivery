@@ -26,10 +26,28 @@ needed. Neither choice changes the internal reviewer identity or count.
 The private overlay may retain the compatibility source under the explicit
 `personal_codex/skills/waited-delivery-compat` reference-only distribution
 layout without this repository-level README or dependency document. It must not
-link that directory into the active personal skill installation. The legacy
-`skills/waited-delivery` target should instead be retired through downstream
-`removed_links` metadata with `skills/change-delivery-workflow` as its
-replacement.
+link that directory into the active personal skill installation.
+
+Legacy hook removal is a two-release migration:
+
+1. First map the repository asset
+   `legacy-hook-shims/waited-delivery/scripts/waited_delivery_hook_adapter.py`
+   onto every installed or aggregate
+   `skills/waited-delivery/scripts/waited_delivery_hook_adapter.py` path still
+   named by a hook registration. The source lives outside the skill discovery
+   root and has no `SKILL.md`; its adapter never parses argv, reads stdin, writes
+   state, or returns a blocking status.
+2. Remove every default `UserPromptSubmit` and `Stop` registration on each host,
+   then verify the effective hook configuration contains no legacy adapter path.
+3. Only after that proof, retire the legacy `skills/waited-delivery` target
+   through downstream `removed_links` metadata with
+   `skills/change-delivery-workflow` as its replacement.
+
+Do not remove the legacy link in the same transaction that merely requests hook
+configuration cleanup. A stale registration must continue to reach the inert
+shim until absence is independently verified. The compatibility implementation
+under `waited-delivery-compat` remains explicit-only and is never substituted at
+the legacy path.
 
 Distribution-profile contract tests keep validating a synced reference-only
 copy in that recognized layout, but skip only the canonical documentation
