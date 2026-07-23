@@ -245,6 +245,92 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         )
         self.assertFalse((fake_home / ".codex" / "log").exists())
 
+    def test_hook_commands_reject_abbreviated_compatibility_flag_without_effects(
+        self,
+    ) -> None:
+        fake_home = self.root / "home-abbreviated-flag"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        index_path = adapter_dir / "index.json"
+        sentinel = "{legacy invalid json\n"
+        index_path.write_text(sentinel, encoding="utf-8")
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+        env.pop("CODEX_THREAD_ID", None)
+
+        payloads = {
+            "user-prompt-submit-hook": self._session_payload(
+                prompt="abbreviated flag must not read this prompt"
+            ),
+            "stop-hook": {
+                "session_id": "session-abbreviated",
+                "cwd": str(self.repo),
+                "last_assistant_message": (
+                    "abbreviated flag must not read this response"
+                ),
+            },
+        }
+        for command, payload in payloads.items():
+            with self.subTest(command=command):
+                completed = run(
+                    [
+                        sys.executable,
+                        str(ADAPTER_PATH),
+                        command,
+                        "--enable",
+                    ],
+                    env=env,
+                    input_text=json.dumps(payload),
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+                self.assertIn("unrecognized arguments: --enable", completed.stderr)
+                self.assertNotIn("must not read", completed.stderr)
+
+        self.assertEqual(index_path.read_text(encoding="utf-8"), sentinel)
+        self.assertFalse((fake_home / ".codex" / "log").exists())
+
+    def test_exact_compatibility_flag_activates_hook_commands(self) -> None:
+        submit = run(
+            [
+                sys.executable,
+                str(ADAPTER_PATH),
+                "user-prompt-submit-hook",
+                "--enable-compat-hook",
+            ],
+            input_text=json.dumps(
+                self._session_payload(
+                    session_id="session-exact-flag",
+                    prompt="exact flag prompt",
+                )
+            ),
+        )
+        self.assertEqual(submit.returncode, 0, submit.stderr)
+        self.assertEqual(submit.stdout.strip(), "{}")
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertIn("session-exact-flag", index["sessions"])
+
+        fake_home = self.root / "home-exact-flag"
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+        stop = run(
+            [
+                sys.executable,
+                str(ADAPTER_PATH),
+                "stop-hook",
+                "--enable-compat-hook",
+            ],
+            env=env,
+            input_text="{invalid json\n",
+        )
+        self.assertEqual(stop.returncode, 0, stop.stderr)
+        self.assertEqual(stop.stdout.strip(), "{}")
+        log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
+        self.assertTrue(log_path.is_file())
+        entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(entry["hook_command"], "stop-hook")
+        self.assertEqual(entry["error_type"], "JSONDecodeError")
+
     def test_terminal_stop_prompts_refuse_missing_child_identity(self) -> None:
         module = self._load_adapter_module()
         run_dir = self.repo / ".codex-tmp" / "waited-delivery" / "damaged-run"

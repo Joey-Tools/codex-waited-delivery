@@ -1116,10 +1116,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "Explicit-only waited-delivery compatibility adapter for hooks and "
             "active-run control."
         ),
+        allow_abbrev=False,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    user_prompt = subparsers.add_parser("user-prompt-submit-hook")
+    user_prompt = subparsers.add_parser(
+        "user-prompt-submit-hook",
+        allow_abbrev=False,
+    )
     user_prompt.add_argument(
         "--enable-compat-hook",
         action="store_true",
@@ -1127,7 +1131,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     user_prompt.set_defaults(func=_user_prompt_submit_hook)
 
-    stop = subparsers.add_parser("stop-hook")
+    stop = subparsers.add_parser(
+        "stop-hook",
+        allow_abbrev=False,
+    )
     stop.add_argument(
         "--enable-compat-hook",
         action="store_true",
