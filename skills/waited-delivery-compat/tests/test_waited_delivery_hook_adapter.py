@@ -17,6 +17,8 @@ import zlib
 from collections.abc import Mapping
 from unittest import mock
 
+from _subprocess_test_support import run_before_stdin_eof
+
 
 ADAPTER_PATH = (
     pathlib.Path(__file__).resolve().parents[1]
@@ -243,6 +245,36 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             index_path.read_text(encoding="utf-8"),
             "{legacy invalid json\n",
         )
+        self.assertFalse((fake_home / ".codex" / "log").exists())
+
+    def test_hook_commands_without_exact_flag_exit_before_stdin_eof(self) -> None:
+        fake_home = self.root / "home-open-stdin"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        index_path = adapter_dir / "index.json"
+        sentinel = "{legacy invalid json\n"
+        index_path.write_text(sentinel, encoding="utf-8")
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env.pop("CODEX_THREAD_ID", None)
+
+        for command in ("user-prompt-submit-hook", "stop-hook"):
+            with self.subTest(command=command):
+                completed = run_before_stdin_eof(
+                    [sys.executable, str(ADAPTER_PATH), command],
+                    cwd=self.repo,
+                    env=env,
+                    input_text=(
+                        '{"session_id":"open-pipe","cwd":"'
+                        f'{self.repo}","sensitive":"must not read"}}'
+                    ),
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout, "{}\n")
+                self.assertEqual(completed.stderr, "")
+
+        self.assertEqual(index_path.read_text(encoding="utf-8"), sentinel)
         self.assertFalse((fake_home / ".codex" / "log").exists())
 
     def test_hook_commands_without_exact_flag_are_inert_before_argparse(
