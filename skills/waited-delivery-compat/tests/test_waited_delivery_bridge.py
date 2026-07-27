@@ -207,6 +207,31 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
             "/tmp/parent-env-2.jsonl",
         )
 
+    def test_refresh_prompts_live_uses_loaded_compatibility_runner(self) -> None:
+        run_dir = self._prepare_run_dir()
+        legacy_runner = pathlib.Path(
+            "/legacy/skills/waited-delivery/scripts/waited_delivery_runner.py"
+        )
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (run_dir / prompt_name).write_text(
+                f"`{sys.executable} {legacy_runner}`\n",
+                encoding="utf-8",
+            )
+
+        completed = self._run_bridge(
+            "refresh-prompts-live",
+            "--run-dir",
+            str(run_dir),
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["runner_path"], str(RUNNER_PATH))
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            prompt = (run_dir / prompt_name).read_text(encoding="utf-8")
+            self.assertIn(str(RUNNER_PATH), prompt)
+            self.assertNotIn(str(legacy_runner), prompt)
+
     def test_attach_child_live_propagates_env_parent_metadata(self) -> None:
         run_dir = self._prepare_run_dir()
         completed = self._run_bridge(

@@ -278,6 +278,48 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(payload["parent_prompt"], str(run_dir / "parent-prompt.md"))
         self.assertEqual(payload["child_prompt"], str(run_dir / "child-prompt.md"))
 
+    def test_refresh_prompts_replaces_legacy_runner_commands(self) -> None:
+        run_dir = self._prepare("--no-fallback-smoke")
+        legacy_runner = (
+            self.root
+            / "skills"
+            / "waited-delivery"
+            / "scripts"
+            / "waited_delivery_runner.py"
+        )
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (run_dir / prompt_name).write_text(
+                f"legacy sentinel\n`{sys.executable} {legacy_runner}`\n",
+                encoding="utf-8",
+            )
+
+        completed = self._run_runner(
+            "refresh-prompts",
+            "--run-dir",
+            str(run_dir),
+            "--json",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["runner_path"], str(SCRIPT_PATH))
+        self.assertEqual(payload["child_prompt"], str(run_dir / "child-prompt.md"))
+        self.assertEqual(payload["parent_prompt"], str(run_dir / "parent-prompt.md"))
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            state["artifacts"]["child_prompt"],
+            str(run_dir / "child-prompt.md"),
+        )
+        self.assertEqual(
+            state["artifacts"]["parent_prompt"],
+            str(run_dir / "parent-prompt.md"),
+        )
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            prompt = (run_dir / prompt_name).read_text(encoding="utf-8")
+            self.assertIn(str(SCRIPT_PATH), prompt)
+            self.assertNotIn(str(legacy_runner), prompt)
+            self.assertNotIn("legacy sentinel", prompt)
+
     def test_run_fallback_smoke_records_ready_sample(self) -> None:
         run_dir = self._prepare()
         completed = run(

@@ -98,6 +98,9 @@ class SkillContractTest(unittest.TestCase):
             skill,
         )
         self.assertIn("--enable-compat-hook", skill)
+        self.assertIn("`refresh-prompts`", skill)
+        self.assertIn("`refresh-prompts-live`", skill)
+        self.assertIn("currently loaded compatibility runner", skill)
         self.assertIn("allow_implicit_invocation: false", openai_yaml)
         self.assertIn("$waited-delivery-compat", openai_yaml)
         self.assertIn("<compat-skill-root>", hook_reference)
@@ -229,6 +232,19 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("downstream `removed_links` metadata", dependencies)
         self.assertIn(
             "`skills/change-delivery-workflow` as its replacement",
+            dependencies,
+        )
+        self.assertIn(
+            "Direct repository links use the byte-identical checked-in "
+            "historical target",
+            dependencies,
+        )
+        self.assertIn(
+            "Aggregate and private-overlay packaging must preserve the same bytes",
+            dependencies,
+        )
+        self.assertIn(
+            "`removed_links` may retire it only after the effective hook list is empty",
             dependencies,
         )
 

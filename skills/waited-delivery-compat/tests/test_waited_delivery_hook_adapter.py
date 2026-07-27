@@ -901,6 +901,136 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "{}")
 
+    def test_stop_hook_regenerates_legacy_prompts_before_spawning_child(self) -> None:
+        session_id = "session-legacy-pending"
+        transcript_path = "/tmp/transcript-legacy-pending.jsonl"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="Recover a legacy pending run",
+                transcript_path=transcript_path,
+            ),
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Recover a legacy pending run",
+            "--session-id",
+            session_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
+        legacy_runner = pathlib.Path(
+            "/legacy/skills/waited-delivery/scripts/waited_delivery_runner.py"
+        )
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (run_dir / prompt_name).write_text(
+                f"legacy prompt sentinel\n`{sys.executable} {legacy_runner}`\n",
+                encoding="utf-8",
+            )
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload={
+                "session_id": session_id,
+                "transcript_path": transcript_path,
+                "cwd": str(self.repo),
+                "hook_event_name": "Stop",
+                "model": "gpt-5.5",
+                "permission_mode": "acceptEdits",
+                "stop_hook_active": False,
+                "last_assistant_message": "recover pending run",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("regenerated", completed.stderr)
+        self.assertIn(str(run_dir / "parent-prompt.md"), completed.stderr)
+        self.assertIn(str(run_dir / "child-prompt.md"), completed.stderr)
+        self.assertNotIn("legacy prompt sentinel", completed.stderr)
+        self.assertNotIn(str(legacy_runner), completed.stderr)
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            prompt = (run_dir / prompt_name).read_text(encoding="utf-8")
+            self.assertIn(str(RUNNER_PATH), prompt)
+            self.assertNotIn(str(legacy_runner), prompt)
+            self.assertNotIn("legacy prompt sentinel", prompt)
+
+    def test_stop_hook_refreshes_prompt_for_active_legacy_child(self) -> None:
+        session_id = "session-legacy-active"
+        transcript_path = "/tmp/transcript-legacy-active.jsonl"
+        child_session_id = "child-legacy-active"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="Recover an active legacy child",
+                transcript_path=transcript_path,
+            ),
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Recover an active legacy child",
+            "--session-id",
+            session_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
+        attached = self._run_adapter(
+            "attach-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            str(run_dir),
+            "--child-session-id",
+            child_session_id,
+            "--session-id",
+            session_id,
+        )
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        legacy_runner = pathlib.Path(
+            "/legacy/skills/waited-delivery/scripts/waited_delivery_runner.py"
+        )
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (run_dir / prompt_name).write_text(
+                f"active legacy prompt\n`{sys.executable} {legacy_runner}`\n",
+                encoding="utf-8",
+            )
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload={
+                "session_id": session_id,
+                "transcript_path": transcript_path,
+                "cwd": str(self.repo),
+                "hook_event_name": "Stop",
+                "model": "gpt-5.5",
+                "permission_mode": "acceptEdits",
+                "stop_hook_active": False,
+                "last_assistant_message": "recover active child",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(child_session_id, completed.stderr)
+        self.assertIn("re-read the regenerated child prompt", completed.stderr)
+        self.assertNotIn(str(legacy_runner), completed.stderr)
+        child_prompt = (run_dir / "child-prompt.md").read_text(encoding="utf-8")
+        self.assertIn(str(RUNNER_PATH), child_prompt)
+        self.assertNotIn(str(legacy_runner), child_prompt)
+        self.assertNotIn("active legacy prompt", child_prompt)
+
     def test_stop_hook_fails_open_when_index_is_invalid(self) -> None:
         fake_home = self.root / "home-stop-invalid"
         adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"

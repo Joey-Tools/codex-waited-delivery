@@ -389,6 +389,25 @@ def _build_parent_prompt(run_dir: pathlib.Path, state: WaitedDeliveryState) -> s
     return "\n".join(lines) + "\n"
 
 
+def _write_current_prompts(
+    run_dir: pathlib.Path,
+    state: WaitedDeliveryState,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    child_prompt_path = run_dir / "child-prompt.md"
+    parent_prompt_path = run_dir / "parent-prompt.md"
+    state["artifacts"]["child_prompt"] = str(child_prompt_path)
+    state["artifacts"]["parent_prompt"] = str(parent_prompt_path)
+    child_prompt_path.write_text(
+        _build_child_prompt(run_dir, state),
+        encoding="utf-8",
+    )
+    parent_prompt_path.write_text(
+        _build_parent_prompt(run_dir, state),
+        encoding="utf-8",
+    )
+    return child_prompt_path, parent_prompt_path
+
+
 def _non_terminal_phase_names(state: WaitedDeliveryState) -> list[str]:
     return [
         phase_name
@@ -471,10 +490,7 @@ def _prepare(args: argparse.Namespace) -> int:
     }
     state["fallback_readiness_smoke"]["command"] = _smoke_command_argv(state)
     contract_path.write_text(_build_child_contract(state), encoding="utf-8")
-    child_prompt_path.write_text(_build_child_prompt(run_dir, state), encoding="utf-8")
-    parent_prompt_path.write_text(
-        _build_parent_prompt(run_dir, state), encoding="utf-8"
-    )
+    _write_current_prompts(run_dir, state)
     smoke_command_path.write_text(
         _shell_command(state["fallback_readiness_smoke"]["command"]) + "\n",
         encoding="utf-8",
@@ -526,6 +542,26 @@ def _load_state_from_run_dir(
 def _save_state(run_dir: pathlib.Path, state: WaitedDeliveryState) -> None:
     state["updated_at"] = _utc_now()
     _write_json(run_dir / "state.json", state)
+
+
+def _refresh_prompts(args: argparse.Namespace) -> int:
+    run_dir, state = _load_state_from_run_dir(args.run_dir)
+    child_prompt_path, parent_prompt_path = _write_current_prompts(run_dir, state)
+    _save_state(run_dir, state)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "run_dir": str(run_dir),
+                    "runner_path": str(pathlib.Path(__file__).resolve()),
+                    "child_prompt": str(child_prompt_path),
+                    "parent_prompt": str(parent_prompt_path),
+                }
+            )
+        )
+    else:
+        print(parent_prompt_path)
+    return 0
 
 
 def _attach_child(args: argparse.Namespace) -> int:
@@ -971,6 +1007,15 @@ def _build_parser() -> argparse.ArgumentParser:
     bind_parent.add_argument("--parent-transcript-path")
     bind_parent.add_argument("--permission-mode")
     bind_parent.set_defaults(func=_bind_parent)
+
+    refresh_prompts = subparsers.add_parser("refresh-prompts")
+    refresh_prompts.add_argument("--run-dir", required=True)
+    refresh_prompts.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the refreshed prompt and runner paths as JSON.",
+    )
+    refresh_prompts.set_defaults(func=_refresh_prompts)
 
     begin_phase = subparsers.add_parser("begin-phase")
     begin_phase.add_argument("--run-dir", required=True)

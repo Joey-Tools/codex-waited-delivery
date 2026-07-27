@@ -16,6 +16,7 @@ The adapter adds one explicitly enabled layer above the bridge:
 - `UserPromptSubmit` hook records the current session metadata in a repo-local session index only when its command includes `--enable-compat-hook`
 - `prepare-active-run` resolves an unambiguous observed session and binds it to a new `run_dir`
 - `Stop` hook checks that session index and blocks premature finish while the run is still active only when its command includes `--enable-compat-hook`
+- before rendering an active-run continuation, `Stop` calls `refresh-prompts-live` so both persisted prompts use the currently loaded compatibility runner instead of a removed historical absolute path
 - `finish-child-active-run` requires the exact attached child id, records the child's terminal status, and preserves the active-run association for parent-owned review
 - `reconcile-active-run` requires that same exact child id and clears the active-run association only when reconciliation finishes cleanly with the required `internal_review` phase and a nonblank attached child identity
 
@@ -58,6 +59,8 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   - looks up the active `run_dir` for the current `session_id`
   - allows stop if no active run exists
   - blocks stop with a continuation prompt when the run is still active or not yet reconciled
+  - regenerates `child-prompt.md` and `parent-prompt.md` through the loaded compatibility bridge before referring the parent back to either file
+  - tells a parent with an already active legacy child to have that same child re-read the regenerated child prompt before another runner command
   - uses `stop_hook_active` to avoid continuation loops
   - if continuation prompt rendering fails on an active run, it records diagnostics, falls back to a generic continuation prompt, and still blocks
   - every prompt variant preserves the current child terminal status and exact `child_session_id` when it suggests `reconcile-active-run`; an inconsistent terminal state with no nonblank child id produces recovery guidance instead of an unexecutable command

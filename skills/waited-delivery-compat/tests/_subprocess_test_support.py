@@ -7,19 +7,108 @@ import pathlib
 import selectors
 import signal
 import subprocess
+import sys
 import time
+from typing import Literal
 
 
 _DRAIN_CHUNK_BYTES = 64 * 1024
 _MAX_CAPTURE_BYTES = 256 * 1024
 _POLL_INTERVAL_SECONDS = 0.02
+_PROC_GROUP_SCAN_MAX_ENTRIES = 131_072
+_PROC_GROUP_SCAN_TIMEOUT_SECONDS = 0.25
+_LinuxProcessGroupState = Literal[
+    "live",
+    "zombie-only",
+    "no-members",
+    "unknown",
+]
 
 
 class _CaptureLimitExceeded(Exception):
     pass
 
 
-def _process_group_exists(pgid: int) -> bool:
+def _parse_linux_proc_stat(raw: str) -> tuple[str, int] | None:
+    closing_parenthesis = raw.rfind(")")
+    if closing_parenthesis <= 0:
+        return None
+    fields = raw[closing_parenthesis + 1 :].split()
+    if len(fields) < 3 or len(fields[0]) != 1:
+        return None
+    try:
+        process_group = int(fields[2])
+    except ValueError:
+        return None
+    return fields[0], process_group
+
+
+def _linux_process_group_state(
+    pgid: int,
+    *,
+    proc_root: pathlib.Path = pathlib.Path("/proc"),
+    deadline: float | None = None,
+    max_entries: int = _PROC_GROUP_SCAN_MAX_ENTRIES,
+) -> _LinuxProcessGroupState:
+    if deadline is None:
+        deadline = time.monotonic() + _PROC_GROUP_SCAN_TIMEOUT_SECONDS
+    if max_entries <= 0:
+        return "unknown"
+    saw_zombie = False
+    entry_count = 0
+    try:
+        entries = os.scandir(proc_root)
+    except OSError:
+        return "unknown"
+    with entries:
+        for entry in entries:
+            entry_count += 1
+            if entry_count > max_entries or time.monotonic() >= deadline:
+                return "unknown"
+            if not entry.name.isdecimal():
+                continue
+            try:
+                raw = (pathlib.Path(entry.path) / "stat").read_text(encoding="utf-8")
+            except FileNotFoundError:
+                # Process churn between scandir and read is not ambiguous.
+                continue
+            except OSError:
+                return "unknown"
+            parsed = _parse_linux_proc_stat(raw)
+            if parsed is None:
+                return "unknown"
+            state, process_group = parsed
+            if process_group != pgid:
+                continue
+            if state != "Z":
+                return "live"
+            saw_zombie = True
+    if saw_zombie:
+        return "zombie-only"
+    return "no-members"
+
+
+def _process_group_exists(
+    pgid: int,
+    *,
+    proc_root: pathlib.Path = pathlib.Path("/proc"),
+    platform: str = sys.platform,
+) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if not platform.startswith("linux"):
+        return True
+    state = _linux_process_group_state(pgid, proc_root=proc_root)
+    if state == "zombie-only":
+        return False
+    if state != "no-members":
+        return True
+    # The group may have disappeared during the scan. Only a second ESRCH proves
+    # absence; every other ambiguous result remains live and fails closed.
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:

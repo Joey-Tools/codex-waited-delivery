@@ -8,7 +8,9 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
+import _subprocess_test_support as support
 from _subprocess_test_support import run_before_stdin_eof
 
 
@@ -19,6 +21,130 @@ class SubprocessTestSupportTests(unittest.TestCase):
             "PATH": os.environ.get("PATH", ""),
             "PYTHONDONTWRITEBYTECODE": "1",
         }
+
+    def _write_proc_stat(
+        self,
+        proc_root: Path,
+        *,
+        pid: int,
+        state: str,
+        process_group: int,
+    ) -> None:
+        process_dir = proc_root / str(pid)
+        process_dir.mkdir(parents=True)
+        (process_dir / "stat").write_text(
+            f"{pid} (fixture ) name) {state} 1 {process_group} 1 0\n",
+            encoding="utf-8",
+        )
+
+    def test_linux_proc_scan_classifies_zombie_only_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_root = Path(temp_dir)
+            self._write_proc_stat(
+                proc_root,
+                pid=201,
+                state="Z",
+                process_group=77,
+            )
+            self._write_proc_stat(
+                proc_root,
+                pid=202,
+                state="Z",
+                process_group=77,
+            )
+            self._write_proc_stat(
+                proc_root,
+                pid=203,
+                state="S",
+                process_group=88,
+            )
+
+            self.assertEqual(
+                support._linux_process_group_state(77, proc_root=proc_root),
+                "zombie-only",
+            )
+            with mock.patch.object(support.os, "killpg", return_value=None):
+                self.assertFalse(
+                    support._process_group_exists(
+                        77,
+                        proc_root=proc_root,
+                        platform="linux",
+                    )
+                )
+
+    def test_linux_proc_scan_keeps_real_live_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_root = Path(temp_dir)
+            self._write_proc_stat(
+                proc_root,
+                pid=301,
+                state="Z",
+                process_group=91,
+            )
+            self._write_proc_stat(
+                proc_root,
+                pid=302,
+                state="S",
+                process_group=91,
+            )
+
+            self.assertEqual(
+                support._linux_process_group_state(91, proc_root=proc_root),
+                "live",
+            )
+            with mock.patch.object(support.os, "killpg", return_value=None):
+                self.assertTrue(
+                    support._process_group_exists(
+                        91,
+                        proc_root=proc_root,
+                        platform="linux",
+                    )
+                )
+
+    def test_linux_proc_scan_deadline_unreadable_and_ambiguity_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_root = Path(temp_dir)
+            self._write_proc_stat(
+                proc_root,
+                pid=401,
+                state="Z",
+                process_group=101,
+            )
+            self.assertEqual(
+                support._linux_process_group_state(
+                    101,
+                    proc_root=proc_root,
+                    deadline=time.monotonic() - 1,
+                ),
+                "unknown",
+            )
+
+            stat_path = proc_root / "401" / "stat"
+            stat_path.unlink()
+            stat_path.mkdir()
+            self.assertEqual(
+                support._linux_process_group_state(101, proc_root=proc_root),
+                "unknown",
+            )
+            stat_path.rmdir()
+            stat_path.write_text(
+                "ambiguous\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                support._linux_process_group_state(101, proc_root=proc_root),
+                "unknown",
+            )
+            with mock.patch.object(support.os, "killpg", return_value=None):
+                self.assertTrue(
+                    support._process_group_exists(
+                        101,
+                        proc_root=proc_root,
+                        platform="linux",
+                    )
+                )
 
     def test_empty_open_stdin_blocks_a_single_byte_read(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -113,15 +239,21 @@ class SubprocessTestSupportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             child_pid_path = root / "child.pid"
+            process_group_path = root / "process-group.pid"
             producer = root / "spawn-pipe-holder.py"
             producer.write_text(
                 textwrap.dedent(
                     """\
+                    import os
                     import pathlib
                     import subprocess
                     import sys
                     import time
 
+                    pathlib.Path(sys.argv[2]).write_text(
+                        str(os.getpgrp()),
+                        encoding="utf-8",
+                    )
                     child_code = '''
                     import os
                     import pathlib
@@ -150,21 +282,27 @@ class SubprocessTestSupportTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            started_at = time.monotonic()
             with self.assertRaisesRegex(
                 AssertionError,
                 "left a child in its process group",
             ):
                 run_before_stdin_eof(
-                    [sys.executable, str(producer), str(child_pid_path)],
+                    [
+                        sys.executable,
+                        str(producer),
+                        str(child_pid_path),
+                        str(process_group_path),
+                    ],
                     cwd=root,
                     env=self._environment(root),
                     input_text="",
                     timeout=3,
                 )
 
-            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child_pid, 0)
+            process_group = int(process_group_path.read_text(encoding="utf-8"))
+            self.assertFalse(support._process_group_exists(process_group))
+            self.assertLess(time.monotonic() - started_at, 3.5)
 
 
 if __name__ == "__main__":

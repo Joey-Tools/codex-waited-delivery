@@ -152,6 +152,15 @@ def _attach_child_live(args: argparse.Namespace) -> int:
     return _run_runner(*runner_args)
 
 
+def _refresh_prompts_live(args: argparse.Namespace) -> int:
+    return _run_runner(
+        "refresh-prompts",
+        "--run-dir",
+        args.run_dir,
+        "--json",
+    )
+
+
 def _finish_child_live(args: argparse.Namespace) -> int:
     runner_args = [
         "finish-child",
@@ -241,6 +250,10 @@ def _build_parser() -> argparse.ArgumentParser:
     attach_child_live.add_argument("--parent-transcript-path")
     attach_child_live.add_argument("--permission-mode")
     attach_child_live.set_defaults(func=_attach_child_live)
+
+    refresh_prompts_live = subparsers.add_parser("refresh-prompts-live")
+    refresh_prompts_live.add_argument("--run-dir", required=True)
+    refresh_prompts_live.set_defaults(func=_refresh_prompts_live)
 
     finish_child_live = subparsers.add_parser("finish-child-live")
     finish_child_live.add_argument("--run-dir", required=True)

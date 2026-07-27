@@ -29,10 +29,12 @@ When the user explicitly requests a compatibility hook experiment and verified `
 - `prepare-live`: bridge command that wraps `prepare --json` and injects parent metadata from args or the bridge env contract.
 - `bind-parent-live`: bridge command that patches parent metadata into an existing run after the ids become known.
 - `attach-child-live`: bridge command that wraps `attach-child` and also propagates parent metadata from args or env.
+- `refresh-prompts`: runner recovery command that rewrites `child-prompt.md` and `parent-prompt.md` with commands bound to the currently loaded compatibility runner and rebinds their canonical run-local artifact paths.
+- `refresh-prompts-live`: bridge command that wraps `refresh-prompts --json`; the explicitly enabled stop hook uses it before returning continuation guidance for an older active run.
 - `finish-child-live`: bridge command that requires the attached child's exact nonblank `child_session_id` and records its matching terminal status after `wait` and before parent-owned review.
 - `reconcile-live`: bridge command that requires the same exact `child_session_id` and wraps `reconcile-parent --json`.
 - `user-prompt-submit-hook`: compatibility hook entrypoint that is inert unless passed `--enable-compat-hook`; when explicitly enabled, it records the current session metadata into a repo-local adapter index.
-- `stop-hook`: compatibility hook entrypoint that is inert unless passed `--enable-compat-hook`; when explicitly enabled, it checks whether a waited-delivery run is still active and, if so, blocks premature finish with a continuation prompt.
+- `stop-hook`: compatibility hook entrypoint that is inert unless passed `--enable-compat-hook`; when explicitly enabled, it checks whether a waited-delivery run is still active, regenerates both persisted prompts through the loaded compatibility runner so historical absolute runner paths are not reused, and then blocks premature finish with a continuation prompt.
 - `prepare-active-run`: outer-adapter command that resolves an unambiguous observed session and binds it to a new `run_dir` through `prepare-live`; prefer `--session-id` when available, let host-injected `CODEX_THREAD_ID` act as the default explicit parent-session selector when present, and otherwise use `--transcript-path` or `--prompt-text` as explicit recovery selectors instead of trusting repo-global recency.
 - `attach-child-active-run`: outer-adapter command that wraps `attach-child-live` while preserving the recorded parent metadata; blank child ids are rejected before the run can enter `running`.
 - `finish-child-active-run`: outer-adapter command that wraps `finish-child-live` while requiring both the selected session to own the run and the caller-supplied child id to match the attachment, keeping that association for review and reconciliation.
@@ -68,6 +70,7 @@ For an explicit verified hook experiment against the historical `codex-cli 0.116
 - Prefer `scripts/waited_delivery_runner.py prepare ...` so the contract, run directory, and fallback-smoke prompt are written to disk before the child starts.
 - Prefer the generated `child-prompt.md` as the bounded handoff payload for the delivery child instead of rebuilding the control-plane instructions ad hoc.
 - Prefer the generated `parent-prompt.md` as the bounded handoff/checklist for the main session instead of relying on prompt memory for `attach-child`, `wait`, and reconciliation.
+- When recovering a run created before the compatibility rename, use `refresh-prompts` (or let the explicitly enabled stop hook call `refresh-prompts-live`) before following either persisted prompt. For an already active legacy child, have that same child re-read the regenerated child prompt before its next runner command.
 - Prefer forked context when the runtime naturally provides it through Codex subagent spawning, but still restate the delivery contract explicitly so the child does not rely only on implicit history.
 - Decide upfront which gates must end in a terminal result during this run.
 

@@ -30,24 +30,36 @@ link that directory into the active personal skill installation.
 
 Legacy hook removal is a two-release migration:
 
-1. First map the repository asset
+1. In the first release, replace the old active `kind: skill` link with an
+   inert `kind: directory` link backed by the repository asset
    `legacy-hook-shims/waited-delivery/scripts/waited_delivery_hook_adapter.py`
    onto every installed or aggregate
    `skills/waited-delivery/scripts/waited_delivery_hook_adapter.py` path still
-   named by a hook registration. The source lives outside the skill discovery
-   root and has no `SKILL.md`; its adapter never parses argv, reads stdin, writes
-   state, or returns a blocking status.
+   named by a hook registration. Direct repository links use the byte-identical
+   checked-in historical target at that path. Both source directories omit
+   `SKILL.md`; the adapter never parses argv, reads stdin, writes state, or
+   returns a blocking status. Aggregate and private-overlay packaging must
+   preserve the same bytes at the installed historical target. Record that
+   active-skill-to-inert-directory identity change with its own append-only
+   `removed_links` migration entry while keeping the target installed.
 2. Remove every default `UserPromptSubmit` and `Stop` registration on each host,
    then verify the effective hook configuration contains no legacy adapter path.
-3. Only after that proof, retire the legacy `skills/waited-delivery` target
-   through downstream `removed_links` metadata with
-   `skills/change-delivery-workflow` as its replacement.
+3. Only after that proof, retire the legacy `skills/waited-delivery` target by
+   removing the inert directory link in a later release and appending a second
+   entry to downstream `removed_links` metadata with
+   `skills/change-delivery-workflow` as its replacement. Preserve the first
+   migration entry as history.
 
 Do not remove the legacy link in the same transaction that merely requests hook
 configuration cleanup. A stale registration must continue to reach the inert
 shim until absence is independently verified. The compatibility implementation
 under `waited-delivery-compat` remains explicit-only and is never substituted at
 the legacy path.
+
+Contract tests exercise the direct repository link, aggregate and private
+overlay release layouts, and the two-phase order: the inert target remains
+callable while a registration exists, then `removed_links` may retire it only
+after the effective hook list is empty.
 
 Distribution-profile contract tests keep validating a synced reference-only
 copy in that recognized layout, but skip only the canonical documentation

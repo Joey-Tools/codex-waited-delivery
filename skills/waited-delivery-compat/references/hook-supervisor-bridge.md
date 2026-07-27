@@ -32,6 +32,8 @@ The current outer adapter already follows this rule: it may observe product-spec
   - patches parent metadata into an existing run when the ids or other outer-adapter metadata become known later
 - `attach-child-live`
   - wraps `attach-child`, rejects a blank child id before state mutation, and also propagates parent metadata from args or env
+- `refresh-prompts-live`
+  - wraps `refresh-prompts --json` and returns the exact current runner plus regenerated run-local child and parent prompt paths
 - `finish-child-live`
   - requires the exact attached `child_session_id` and wraps `finish-child` so the bridge can persist the child's matching terminal status after `wait` and before parent-owned review
 - `reconcile-live`

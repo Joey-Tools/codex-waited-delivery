@@ -20,6 +20,7 @@ from typing import TypedDict, cast
 
 
 BRIDGE_PATH = pathlib.Path(__file__).resolve().with_name("waited_delivery_bridge.py")
+RUNNER_PATH = BRIDGE_PATH.with_name("waited_delivery_runner.py")
 INDEX_SCHEMA_VERSION = 1
 CURRENT_THREAD_ENV = "CODEX_THREAD_ID"
 HOOK_DEBUG_ENV = "WAITED_DELIVERY_HOOK_DEBUG"
@@ -407,17 +408,37 @@ def _load_run_state(run_dir_str: str) -> dict[str, object] | None:
     return cast(dict[str, object], payload)
 
 
+def _refresh_recovery_prompts(
+    run_dir: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    payload = _run_bridge_json(
+        "refresh-prompts-live",
+        "--run-dir",
+        str(run_dir),
+    )
+    expected_paths = {
+        "runner_path": RUNNER_PATH,
+        "child_prompt": run_dir / "child-prompt.md",
+        "parent_prompt": run_dir / "parent-prompt.md",
+    }
+    for field, expected_path in expected_paths.items():
+        value = payload.get(field)
+        if not isinstance(value, str) or not value:
+            raise UserError(f"refresh-prompts-live did not return {field}")
+        if pathlib.Path(value).resolve() != expected_path.resolve():
+            raise UserError(
+                f"refresh-prompts-live returned unexpected {field}: {value}"
+            )
+    return (
+        expected_paths["child_prompt"],
+        expected_paths["parent_prompt"],
+    )
+
+
 def _state_orchestration(state: dict[str, object]) -> dict[str, object]:
     orchestration = state.get("orchestration")
     if isinstance(orchestration, dict):
         return cast(dict[str, object], orchestration)
-    return {}
-
-
-def _state_artifacts(state: dict[str, object]) -> dict[str, object]:
-    artifacts = state.get("artifacts")
-    if isinstance(artifacts, dict):
-        return cast(dict[str, object], artifacts)
     return {}
 
 
@@ -613,19 +634,22 @@ def _update_session_observation(
 
 
 def _build_stop_continuation_prompt(
-    repo_root: pathlib.Path, run_dir: pathlib.Path, state: dict[str, object]
+    repo_root: pathlib.Path,
+    run_dir: pathlib.Path,
+    state: dict[str, object],
+    *,
+    child_prompt: pathlib.Path | None = None,
+    parent_prompt: pathlib.Path | None = None,
 ) -> str:
     orchestration = _state_orchestration(state)
-    artifacts = _state_artifacts(state)
     child_status = orchestration.get("child_status")
     if not isinstance(child_status, str):
         child_status = "pending"
     child_session_id = orchestration.get("child_session_id")
     if not isinstance(child_session_id, str) or not child_session_id.strip():
         child_session_id = None
-    parent_prompt = artifacts.get("parent_prompt")
-    if not isinstance(parent_prompt, str) or not parent_prompt:
-        parent_prompt = str(run_dir / "parent-prompt.md")
+    child_prompt = child_prompt or run_dir / "child-prompt.md"
+    parent_prompt = parent_prompt or run_dir / "parent-prompt.md"
     if child_status in CHILD_TERMINAL_STATUSES:
         if child_session_id is None:
             return (
@@ -649,19 +673,23 @@ def _build_stop_continuation_prompt(
         ]
         return (
             "A waited-delivery run for this session is not reconciled yet. "
-            f"Do not finish. Read `{parent_prompt}` and reconcile the active run with "
+            f"Do not finish. Read the regenerated `{parent_prompt}` and reconcile "
+            "the active run with "
             f"`{_shell_command(reconcile_cmd)}` before replying."
         )
     if child_session_id:
         return (
             "A waited-delivery run for this session is still active. "
-            f"Do not finish. Read `{parent_prompt}` and keep waiting for delivery child "
-            f"`{child_session_id}` unless the user explicitly interrupts the run."
+            f"Do not finish. The compatibility runner regenerated `{parent_prompt}` "
+            f"and `{child_prompt}`. Ask delivery child `{child_session_id}` to re-read "
+            "the regenerated child prompt before its next runner command, then keep "
+            "waiting unless the user explicitly interrupts the run."
         )
     return (
         "A waited-delivery run for this session has started but no delivery child has been "
-        f"attached yet. Do not finish. Read `{parent_prompt}` and continue the required "
-        "spawn -> attach-child -> wait sequence."
+        f"attached yet. Do not finish. Read the regenerated `{parent_prompt}`, spawn "
+        f"exactly one child with regenerated `{child_prompt}`, and continue the required "
+        "attach-child -> wait sequence."
     )
 
 
@@ -907,10 +935,13 @@ def _stop_hook(_: argparse.Namespace) -> int:
         _save_index(index_path, index)
         run_dir = pathlib.Path(record["run_dir"]).resolve()
         try:
+            child_prompt, parent_prompt = _refresh_recovery_prompts(run_dir)
             prompt = _build_stop_continuation_prompt(
                 repo_root,
                 run_dir,
                 state,
+                child_prompt=child_prompt,
+                parent_prompt=parent_prompt,
             )
         except Exception as error:
             setattr(error, "hook_command", "stop-hook")
