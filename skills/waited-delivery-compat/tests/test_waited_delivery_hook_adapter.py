@@ -265,10 +265,8 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     [sys.executable, str(ADAPTER_PATH), command],
                     cwd=self.repo,
                     env=env,
-                    input_text=(
-                        '{"session_id":"open-pipe","cwd":"'
-                        f'{self.repo}","sensitive":"must not read"}}'
-                    ),
+                    # Keep the writer open with zero bytes so even read(1) blocks.
+                    input_text="",
                 )
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertEqual(completed.stdout, "{}\n")

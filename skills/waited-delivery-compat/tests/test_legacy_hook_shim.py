@@ -78,7 +78,8 @@ class LegacyHookShimTests(unittest.TestCase):
                 ],
                 cwd=root,
                 env=environment,
-                input_text="{not valid hook JSON and no EOF",
+                # Keep the writer open with zero bytes so even read(1) blocks.
+                input_text="",
             )
 
             self.assertEqual(completed.returncode, 0)
