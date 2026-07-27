@@ -26,7 +26,6 @@ superseded_by:
 ## Next Steps
 
 - Confirm the current patch in PR CI's Linux runner after branch publication; the local Apple container image store is incomplete and the installed Podman has no running machine.
-- Complete signed delivery and exact secret admission for the current PR range.
 - Propagate the inert shim and later `removed_links` retirement through aggregate and private-overlay releases in two distinct phases.
 
 ## Evidence
@@ -38,3 +37,5 @@ superseded_by:
 - Local full suite: `83` tests passed.
 - Linux-path focused suite: `6` tests passed with synthetic `/proc` states covering zombie-only, live, deadline, unreadable, ambiguous, and cleanup behavior.
 - Static gates: Ruff format/check, Python compile, skill validation, and project-journal validation passed.
+- Signed implementation commit: `28c972a62b8ea3df65d8cdfc46644c7968ad813e` (`Good signature`).
+- Exact-secret admission: clean for `2cc1f97efc86dfbcb582743e5f0eb46440f2f713..28c972a62b8ea3df65d8cdfc46644c7968ad813e`; temporary cleanup complete.
