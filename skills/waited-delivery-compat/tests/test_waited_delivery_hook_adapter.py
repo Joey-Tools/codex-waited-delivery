@@ -277,9 +277,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             ),
             (
                 ("user-prompt-submit-hook", "--repo"),
-                self._session_payload(
-                    prompt="missing value must not read this prompt"
-                ),
+                self._session_payload(prompt="missing value must not read this prompt"),
             ),
             (
                 ("stop-hook", "--enable-compat-hook=true"),
@@ -306,9 +304,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 {
                     "session_id": "session-help",
                     "cwd": str(self.repo),
-                    "last_assistant_message": (
-                        "help flag must not read this response"
-                    ),
+                    "last_assistant_message": ("help flag must not read this response"),
                 },
             ),
             (
@@ -1450,9 +1446,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 state_path = run_dir / "state.json"
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 state["orchestration"]["child_status"] = child_status
-                state["orchestration"]["child_session_id"] = (
-                    "child-terminal-fallback"
-                )
+                state["orchestration"]["child_session_id"] = "child-terminal-fallback"
                 state_path.write_text(
                     json.dumps(state, indent=2, sort_keys=True) + "\n"
                 )

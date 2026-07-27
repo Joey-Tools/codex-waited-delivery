@@ -125,9 +125,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         return completed
 
     def _commit_implementation(self) -> None:
-        self.assertEqual(
-            git(self.repo, "add", "tracked.txt", "notes.md").returncode, 0
-        )
+        self.assertEqual(git(self.repo, "add", "tracked.txt", "notes.md").returncode, 0)
         git_commit(self.repo, "freeze implementation")
 
     def _attach_child(self, run_dir: pathlib.Path, child_session_id: str) -> None:
@@ -140,9 +138,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def _finish_child(
-        self, run_dir: pathlib.Path, child_session_id: str
-    ) -> None:
+    def _finish_child(self, run_dir: pathlib.Path, child_session_id: str) -> None:
         completed = self._run_runner(
             "finish-child",
             "--run-dir",
@@ -189,9 +185,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertIn("Waited Delivery Child Contract", contract)
         self.assertIn("tracked.txt", contract)
         self.assertIn("the main session completes implementation", contract)
-        self.assertIn(
-            "the child owns tests, docs sync, and verification", contract
-        )
+        self.assertIn("the child owns tests, docs sync, and verification", contract)
         self.assertIn(
             "must not mark `internal_review` or `external_review` as passed", contract
         )
@@ -705,9 +699,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertIn("nonblank attached child session id", completed.stderr)
 
         state["phases"]["internal_review"]["status"] = "passed"
-        state["phases"]["internal_review"]["evidence"] = [
-            "reviewer terminal artifact"
-        ]
+        state["phases"]["internal_review"]["evidence"] = ["reviewer terminal artifact"]
         state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
         completed = self._run_runner(
             "finalize",

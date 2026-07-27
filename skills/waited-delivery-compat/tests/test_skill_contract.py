@@ -58,9 +58,7 @@ def require_canonical_documentation(
             "the private skill-only distribution"
         )
     if profile != "canonical":
-        test_case.fail(
-            f"unsupported waited-delivery compatibility profile: {profile}"
-        )
+        test_case.fail(f"unsupported waited-delivery compatibility profile: {profile}")
     missing_paths = tuple(path for path in documentation_paths if not path.exists())
     if missing_paths:
         test_case.fail(
@@ -82,9 +80,7 @@ class SkillContractTest(unittest.TestCase):
 
     def test_private_skill_layout_selects_private_profile(self) -> None:
         root = pathlib.Path("/example/repository")
-        skill_root = (
-            root / "personal_codex" / "skills" / "waited-delivery-compat"
-        )
+        skill_root = root / "personal_codex" / "skills" / "waited-delivery-compat"
         self.assertEqual(
             (root, "private"),
             distribution_contract_context(skill_root),
@@ -222,9 +218,7 @@ class SkillContractTest(unittest.TestCase):
 
     def test_documents_reference_only_downstream_retirement(self) -> None:
         require_canonical_documentation(self)
-        dependencies = " ".join(
-            DEPENDENCIES_PATH.read_text(encoding="utf-8").split()
-        )
+        dependencies = " ".join(DEPENDENCIES_PATH.read_text(encoding="utf-8").split())
 
         self.assertIn(
             "`personal_codex/skills/waited-delivery-compat` reference-only "

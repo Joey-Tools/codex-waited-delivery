@@ -591,9 +591,7 @@ def _begin_phase(args: argparse.Namespace) -> int:
     return 0
 
 
-def _validate_review_pass(
-    state: WaitedDeliveryState, evidence: list[str]
-) -> None:
+def _validate_review_pass(state: WaitedDeliveryState, evidence: list[str]) -> None:
     orchestration = state["orchestration"]
     if orchestration["child_status"] not in CHILD_TERMINAL_STATUSES:
         raise UserError("cannot record a passed review before the child is terminal")
@@ -618,7 +616,9 @@ def _validate_review_pass(
 
 def _validate_passed_reviews(state: WaitedDeliveryState) -> None:
     if "internal_review" not in state["phases"]:
-        raise UserError("waited-delivery state is missing the required internal_review phase")
+        raise UserError(
+            "waited-delivery state is missing the required internal_review phase"
+        )
     for phase_name in REVIEW_PHASES:
         phase = state["phases"].get(phase_name)
         if phase is not None and phase["status"] == "passed":
@@ -686,9 +686,13 @@ def _transition_child_terminal(
     orchestration = state["orchestration"]
     attached_id = orchestration["child_session_id"]
     if not attached_id:
-        raise UserError("cannot finish child before attach-child records its session id")
+        raise UserError(
+            "cannot finish child before attach-child records its session id"
+        )
     if not child_session_id or not child_session_id.strip():
-        raise UserError("child terminal transition requires a nonblank child session id")
+        raise UserError(
+            "child terminal transition requires a nonblank child session id"
+        )
     if child_session_id != attached_id:
         raise UserError(
             "child session id does not match the attached child: "
@@ -807,12 +811,8 @@ def _write_summary(
             f"{orchestration['child_status']}"
         )
     child_session_id = orchestration["child_session_id"]
-    if (
-        orchestration["child_status"] in CHILD_TERMINAL_STATUSES
-        and (
-            not isinstance(child_session_id, str)
-            or not child_session_id.strip()
-        )
+    if orchestration["child_status"] in CHILD_TERMINAL_STATUSES and (
+        not isinstance(child_session_id, str) or not child_session_id.strip()
     ):
         raise UserError(
             "cannot finalize a terminal run without a nonblank attached child session id"
