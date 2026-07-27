@@ -805,9 +805,10 @@ def _build_stop_emergency_prompt(
                 "missing or blank. Recover the exact attached child id before reconciliation."
             )
             return "\n".join(lines)
+        adapter_path = pathlib.Path(__file__).resolve()
         command = (
-            "python3 personal_codex/skills/waited-delivery-compat/scripts/"
-            "waited_delivery_hook_adapter.py reconcile-active-run"
+            f"{shlex.quote(sys.executable)} {shlex.quote(str(adapter_path))}"
+            " reconcile-active-run"
             f" --repo {shlex.quote(str(repo_root))}"
             f" --run-dir {shlex.quote(str(run_dir))}"
             f" --child-status {shlex.quote(child_status)}"

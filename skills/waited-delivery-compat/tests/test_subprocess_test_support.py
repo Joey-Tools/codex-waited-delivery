@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -49,6 +50,64 @@ class SubprocessTestSupportTests(unittest.TestCase):
                 )
 
             self.assertLess(time.monotonic() - started_at, 2.0)
+
+    def test_large_payload_cannot_block_before_child_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            child = root / "ignore-stdin.py"
+            child.write_text(
+                'print("child started")\n',
+                encoding="utf-8",
+            )
+            probe = root / "large-payload-probe.py"
+            support_dir = Path(__file__).resolve().parent
+            probe.write_text(
+                textwrap.dedent(
+                    f"""\
+                    import os
+                    from pathlib import Path
+                    import sys
+
+                    sys.path.insert(0, {str(support_dir)!r})
+                    from _subprocess_test_support import run_before_stdin_eof
+
+                    root = Path(sys.argv[1])
+                    completed = run_before_stdin_eof(
+                        [sys.executable, str(root / "ignore-stdin.py")],
+                        cwd=root,
+                        env={{
+                            **os.environ,
+                            "PYTHONDONTWRITEBYTECODE": "1",
+                        }},
+                        input_text="x" * (4 * 1024 * 1024),
+                        timeout=2,
+                    )
+                    if completed.returncode != 0:
+                        raise SystemExit(completed.returncode)
+                    print(completed.stdout, end="")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            started_at = time.monotonic()
+
+            completed = subprocess.run(
+                [sys.executable, str(probe), str(root)],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, "child started\n")
+            self.assertLess(time.monotonic() - started_at, 4.0)
 
     def test_descendant_held_pipes_are_killed_before_failure_returns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

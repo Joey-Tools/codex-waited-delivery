@@ -62,6 +62,7 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   - if continuation prompt rendering fails on an active run, it records diagnostics, falls back to a generic continuation prompt, and still blocks
   - every prompt variant preserves the current child terminal status and exact `child_session_id` when it suggests `reconcile-active-run`; an inconsistent terminal state with no nonblank child id produces recovery guidance instead of an unexecutable command
   - if even that fallback prompt builder fails, the hook still blocks with a last-resort prompt; if that builder also fails, it falls through to a static emergency prompt that still carries terminal reconcile instructions
+  - the emergency reconcile command uses the absolute path of the currently loaded adapter, so both canonical `skills/waited-delivery-compat` and private `personal_codex/skills/waited-delivery-compat` distributions remain executable
   - if writing that prompt to `stderr` fails, it falls back to the outer fail-open path instead of silently blocking with no message
   - outside the active-run blocking path, unexpected internal errors still record diagnostics and fail-open instead of breaking unrelated sessions
 

@@ -101,7 +101,9 @@ def run_before_stdin_eof(
 
     A command that tries any blocking stdin read will block when ``input_text``
     is empty, and a command that reads stdin to EOF will block for any payload.
-    A fresh process group makes timeout and descendant cleanup explicit.
+    The payload is written non-blockingly after the child starts so even an
+    oversized sentinel remains subject to the monitor deadline. A fresh process
+    group makes timeout and descendant cleanup explicit.
     """
 
     if timeout <= 0:
@@ -115,9 +117,6 @@ def run_before_stdin_eof(
     write_fd_open = True
     try:
         encoded = input_text.encode("utf-8")
-        written = os.write(write_fd, encoded)
-        if written != len(encoded):
-            raise RuntimeError("failed to seed the stdin sentinel pipe")
         process = subprocess.Popen(
             cmd,
             cwd=str(cwd),
@@ -140,6 +139,7 @@ def run_before_stdin_eof(
     selector = selectors.DefaultSelector()
     captures = {"stdout": bytearray(), "stderr": bytearray()}
     try:
+        os.set_blocking(write_fd, False)
         for name, stream in (
             ("stdout", process.stdout),
             ("stderr", process.stderr),
@@ -149,7 +149,19 @@ def run_before_stdin_eof(
 
         failure: str | None = None
         returncode: int | None = None
+        input_offset = 0
+        stdin_accepting_writes = True
         while time.monotonic() < monitor_deadline:
+            if stdin_accepting_writes and input_offset < len(encoded):
+                try:
+                    input_offset += os.write(
+                        write_fd,
+                        memoryview(encoded)[input_offset:],
+                    )
+                except BlockingIOError:
+                    pass
+                except BrokenPipeError:
+                    stdin_accepting_writes = False
             remaining = monitor_deadline - time.monotonic()
             try:
                 _drain_once(

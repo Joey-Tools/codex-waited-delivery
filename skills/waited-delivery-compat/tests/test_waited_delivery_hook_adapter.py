@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -198,9 +199,9 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
     def _home_log_dir(self, home: pathlib.Path) -> pathlib.Path:
         return home / ".codex" / "log"
 
-    def _load_adapter_module(self):
+    def _load_adapter_module(self, adapter_path: pathlib.Path = ADAPTER_PATH):
         spec = importlib.util.spec_from_file_location(
-            "waited_delivery_hook_adapter_test_module", ADAPTER_PATH
+            "waited_delivery_hook_adapter_test_module", adapter_path
         )
         if spec is None or spec.loader is None:
             raise RuntimeError("failed to load waited_delivery_hook_adapter module")
@@ -544,6 +545,37 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertTrue(module._run_is_terminal(terminal_state))
         del terminal_state["phases"]["internal_review"]
         self.assertFalse(module._run_is_terminal(terminal_state))
+
+    def test_emergency_prompt_uses_loaded_adapter_distribution_path(self) -> None:
+        layouts = (
+            pathlib.Path("skills/waited-delivery-compat"),
+            pathlib.Path("personal_codex/skills/waited-delivery-compat"),
+        )
+        for layout in layouts:
+            with self.subTest(layout=layout):
+                adapter_path = (
+                    self.root
+                    / "distribution"
+                    / layout
+                    / "scripts"
+                    / "waited_delivery_hook_adapter.py"
+                )
+                adapter_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ADAPTER_PATH, adapter_path)
+                module = self._load_adapter_module(adapter_path)
+
+                prompt = module._build_stop_emergency_prompt(
+                    self.repo,
+                    self.repo / ".codex-tmp" / "waited-delivery" / "active-run",
+                    child_status="failed",
+                    child_session_id="child-emergency",
+                )
+
+                command = prompt.split("Run this from the repo root:\n", 1)[1]
+                argv = shlex.split(command)
+                self.assertEqual(argv[0], sys.executable)
+                self.assertEqual(argv[1], str(adapter_path.resolve()))
+                self.assertEqual(argv[2], "reconcile-active-run")
 
     def test_user_prompt_submit_hook_records_session_metadata(self) -> None:
         completed = self._run_adapter(
