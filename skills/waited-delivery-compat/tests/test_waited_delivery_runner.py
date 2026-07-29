@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import argparse
+import fcntl
 import json
+import importlib.util
 import pathlib
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
+from unittest import mock
 
 
 SCRIPT_PATH = (
@@ -123,6 +128,17 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             ]
         )
         return completed
+
+    def _load_runner_module(self):
+        spec = importlib.util.spec_from_file_location(
+            "waited_delivery_runner_test_module",
+            SCRIPT_PATH,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("failed to load waited_delivery_runner module")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
 
     def _commit_implementation(self) -> None:
         self.assertEqual(git(self.repo, "add", "tracked.txt", "notes.md").returncode, 0)
@@ -292,6 +308,10 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 f"legacy sentinel\n`{sys.executable} {legacy_runner}`\n",
                 encoding="utf-8",
             )
+        before_inodes = {
+            name: (run_dir / name).stat().st_ino
+            for name in ("state.json", "child-prompt.md", "parent-prompt.md")
+        }
 
         completed = self._run_runner(
             "refresh-prompts",
@@ -319,6 +339,155 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             self.assertIn(str(SCRIPT_PATH), prompt)
             self.assertNotIn(str(legacy_runner), prompt)
             self.assertNotIn("legacy sentinel", prompt)
+        for name, old_inode in before_inodes.items():
+            self.assertNotEqual((run_dir / name).stat().st_ino, old_inode)
+
+    def test_refresh_prompts_rejects_symlinked_state_or_prompt_artifacts(self) -> None:
+        for target_name in ("state.json", "child-prompt.md", "parent-prompt.md"):
+            with self.subTest(target=target_name):
+                run_dir = self._prepare("--no-fallback-smoke")
+                artifact = run_dir / target_name
+                external_target = self.root / (
+                    f"external-{run_dir.name}-{target_name.replace('.', '-')}"
+                )
+                artifact.rename(external_target)
+                artifact.symlink_to(external_target)
+                sentinel = external_target.read_bytes()
+
+                completed = self._run_runner(
+                    "refresh-prompts",
+                    "--run-dir",
+                    str(run_dir),
+                    "--expected-repo-root",
+                    str(self.repo),
+                    "--json",
+                )
+
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(external_target.read_bytes(), sentinel)
+
+    def test_refresh_prompts_serializes_state_rmw_with_phase_and_child_updates(
+        self,
+    ) -> None:
+        for mutation in ("record-phase", "finish-child"):
+            with self.subTest(mutation=mutation):
+                module = self._load_runner_module()
+                run_dir = self._prepare("--no-fallback-smoke")
+                if mutation == "finish-child":
+                    self._attach_child(run_dir, "child-race")
+                for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                    (run_dir / prompt_name).write_text(
+                        "legacy prompt\n",
+                        encoding="utf-8",
+                    )
+
+                refresh_holds_lock = threading.Event()
+                release_refresh = threading.Event()
+                mutation_attempted_lock = threading.Event()
+                failures: list[BaseException] = []
+                real_write_prompts = module._write_current_prompts
+                real_flock = fcntl.flock
+
+                def instrumented_flock(fd: int, operation: int) -> None:
+                    if (
+                        threading.current_thread().name == mutation
+                        and operation == fcntl.LOCK_EX
+                    ):
+                        mutation_attempted_lock.set()
+                    real_flock(fd, operation)
+
+                def blocking_write_prompts(*args, **kwargs):
+                    if threading.current_thread().name == "refresh-prompts":
+                        refresh_holds_lock.set()
+                        if not release_refresh.wait(5):
+                            raise RuntimeError("timed out waiting to release refresh")
+                    return real_write_prompts(*args, **kwargs)
+
+                def run_refresh() -> None:
+                    try:
+                        module._refresh_prompts(
+                            argparse.Namespace(
+                                run_dir=str(run_dir),
+                                expected_repo_root=None,
+                                json=False,
+                            )
+                        )
+                    except BaseException as error:
+                        failures.append(error)
+
+                def run_mutation() -> None:
+                    try:
+                        if mutation == "record-phase":
+                            module._record_phase(
+                                argparse.Namespace(
+                                    run_dir=str(run_dir),
+                                    phase="tests",
+                                    status="passed",
+                                    summary="race preserved",
+                                    finding=[],
+                                    evidence=["deterministic interleaving"],
+                                )
+                            )
+                        else:
+                            module._finish_child(
+                                argparse.Namespace(
+                                    run_dir=str(run_dir),
+                                    child_status="completed",
+                                    child_session_id="child-race",
+                                )
+                            )
+                    except BaseException as error:
+                        failures.append(error)
+
+                with mock.patch.object(
+                    module.fcntl,
+                    "flock",
+                    side_effect=instrumented_flock,
+                ):
+                    with mock.patch.object(
+                        module,
+                        "_write_current_prompts",
+                        side_effect=blocking_write_prompts,
+                    ):
+                        refresh_thread = threading.Thread(
+                            target=run_refresh,
+                            name="refresh-prompts",
+                        )
+                        mutation_thread = threading.Thread(
+                            target=run_mutation,
+                            name=mutation,
+                        )
+                        refresh_thread.start()
+                        self.assertTrue(refresh_holds_lock.wait(5))
+                        mutation_thread.start()
+                        try:
+                            self.assertTrue(mutation_attempted_lock.wait(5))
+                        finally:
+                            release_refresh.set()
+                        refresh_thread.join(5)
+                        mutation_thread.join(5)
+
+                self.assertFalse(refresh_thread.is_alive())
+                self.assertFalse(mutation_thread.is_alive())
+                self.assertEqual(failures, [])
+                state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+                if mutation == "record-phase":
+                    self.assertEqual(state["phases"]["tests"]["status"], "passed")
+                    self.assertEqual(
+                        state["phases"]["tests"]["summary"],
+                        "race preserved",
+                    )
+                else:
+                    self.assertEqual(
+                        state["orchestration"]["child_status"],
+                        "completed",
+                    )
+                    self.assertIsNotNone(state["orchestration"]["child_finished_at"])
+                for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                    self.assertIn(
+                        str(SCRIPT_PATH),
+                        (run_dir / prompt_name).read_text(encoding="utf-8"),
+                    )
 
     def test_run_fallback_smoke_records_ready_sample(self) -> None:
         run_dir = self._prepare()

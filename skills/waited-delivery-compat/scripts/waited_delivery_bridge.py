@@ -153,12 +153,15 @@ def _attach_child_live(args: argparse.Namespace) -> int:
 
 
 def _refresh_prompts_live(args: argparse.Namespace) -> int:
-    return _run_runner(
+    runner_args = [
         "refresh-prompts",
         "--run-dir",
         args.run_dir,
         "--json",
-    )
+    ]
+    if args.expected_repo_root:
+        runner_args.extend(["--expected-repo-root", args.expected_repo_root])
+    return _run_runner(*runner_args)
 
 
 def _finish_child_live(args: argparse.Namespace) -> int:
@@ -253,6 +256,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     refresh_prompts_live = subparsers.add_parser("refresh-prompts-live")
     refresh_prompts_live.add_argument("--run-dir", required=True)
+    refresh_prompts_live.add_argument("--expected-repo-root")
     refresh_prompts_live.set_defaults(func=_refresh_prompts_live)
 
     finish_child_live = subparsers.add_parser("finish-child-live")

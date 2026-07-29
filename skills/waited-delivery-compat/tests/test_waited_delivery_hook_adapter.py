@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import io
 import json
@@ -195,6 +196,44 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
 
     def _index_path(self) -> pathlib.Path:
         return self.repo / ".codex-tmp" / "waited-delivery-hook-adapter" / "index.json"
+
+    def _prepare_indexed_run(self, session_id: str, run_id: str) -> pathlib.Path:
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                transcript_path=f"/tmp/{session_id}.jsonl",
+            ),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        prepared = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            f"Prepare {session_id}",
+            "--session-id",
+            session_id,
+            "--run-id",
+            run_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        return pathlib.Path(json.loads(prepared.stdout)["run_dir"])
+
+    def _stop_payload_for(self, session_id: str) -> dict[str, object]:
+        return {
+            "session_id": session_id,
+            "transcript_path": f"/tmp/{session_id}.jsonl",
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "unsafe run probe",
+        }
 
     def _home_log_dir(self, home: pathlib.Path) -> pathlib.Path:
         return home / ".codex" / "log"
@@ -1030,6 +1069,153 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertIn(str(RUNNER_PATH), child_prompt)
         self.assertNotIn(str(legacy_runner), child_prompt)
         self.assertNotIn("active legacy prompt", child_prompt)
+
+    def test_stop_hook_blocks_external_run_dir_without_writing_it(self) -> None:
+        session_id = "session-external-run"
+        run_dir = self._prepare_indexed_run(session_id, "external-source")
+        external_run = self.root / "external-run"
+        shutil.copytree(run_dir, external_run)
+        sentinel = "external prompt must remain unchanged\n"
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (external_run / prompt_name).write_text(sentinel, encoding="utf-8")
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        index["sessions"][session_id]["run_dir"] = str(external_run)
+        self._index_path().write_text(
+            json.dumps(index),
+            encoding="utf-8",
+        )
+        fake_home = self.root / "home-external-run"
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload=self._stop_payload_for(session_id),
+            env_overrides={"HOME": str(fake_home)},
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("failed repository/path safety validation", completed.stderr)
+        self.assertIn("Do not execute commands", completed.stderr)
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            self.assertEqual(
+                (external_run / prompt_name).read_text(encoding="utf-8"),
+                sentinel,
+            )
+
+    def test_stop_hook_blocks_repo_mismatch_before_prompt_refresh(self) -> None:
+        session_id = "session-repo-mismatch"
+        run_dir = self._prepare_indexed_run(session_id, "repo-mismatch")
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["repo_root"] = str(self.root / "different-repo")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        sentinel = "repo mismatch prompt\n"
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (run_dir / prompt_name).write_text(sentinel, encoding="utf-8")
+        fake_home = self.root / "home-repo-mismatch"
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload=self._stop_payload_for(session_id),
+            env_overrides={"HOME": str(fake_home)},
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("failed repository/path safety validation", completed.stderr)
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            self.assertEqual(
+                (run_dir / prompt_name).read_text(encoding="utf-8"),
+                sentinel,
+            )
+
+    def test_stop_hook_rejects_symlinked_run_components_and_artifacts(self) -> None:
+        cases = ("run-dir", "state.json", "child-prompt.md", "parent-prompt.md")
+        for index, target_name in enumerate(cases):
+            with self.subTest(target=target_name):
+                session_id = f"session-symlink-{index}"
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    f"symlink-{index}",
+                )
+                external_target = self.root / f"external-target-{index}"
+                if target_name == "run-dir":
+                    run_dir.rename(external_target)
+                    run_dir.symlink_to(external_target, target_is_directory=True)
+                    sentinel_paths = [
+                        external_target / "child-prompt.md",
+                        external_target / "parent-prompt.md",
+                    ]
+                else:
+                    artifact = run_dir / target_name
+                    artifact.rename(external_target)
+                    artifact.symlink_to(external_target)
+                    sentinel_paths = [external_target]
+                sentinel_values = {path: path.read_bytes() for path in sentinel_paths}
+                fake_home = self.root / f"home-symlink-{index}"
+
+                completed = self._run_adapter(
+                    "stop-hook",
+                    input_payload=self._stop_payload_for(session_id),
+                    env_overrides={"HOME": str(fake_home)},
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn(
+                    "failed repository/path safety validation",
+                    completed.stderr,
+                )
+                for path, content in sentinel_values.items():
+                    self.assertEqual(path.read_bytes(), content)
+
+    def test_stop_hook_fails_closed_on_prompt_link_replacement_after_preflight(
+        self,
+    ) -> None:
+        session_id = "session-link-replacement"
+        self._prepare_indexed_run(session_id, "link-replacement")
+        external_target = self.root / "link-replacement-target"
+        external_target.write_text(
+            "external replacement sentinel\n",
+            encoding="utf-8",
+        )
+        original_external = external_target.read_bytes()
+        module = self._load_adapter_module()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def replace_after_preflight(
+            current_run_dir: pathlib.Path,
+            _: pathlib.Path,
+        ) -> tuple[pathlib.Path, pathlib.Path]:
+            child_prompt = current_run_dir / "child-prompt.md"
+            child_prompt.unlink()
+            child_prompt.symlink_to(external_target)
+            raise module.UserError("simulated refresh interruption")
+
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.root / "home-link-replacement")},
+            clear=False,
+        ):
+            with mock.patch.object(
+                module,
+                "_refresh_recovery_prompts",
+                side_effect=replace_after_preflight,
+            ):
+                with mock.patch.object(
+                    module.sys,
+                    "stdin",
+                    io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                ):
+                    with mock.patch.object(module.sys, "stdout", stdout):
+                        with mock.patch.object(module.sys, "stderr", stderr):
+                            returncode = module._stop_hook(argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "failed repository/path safety validation",
+            stderr.getvalue(),
+        )
+        self.assertEqual(external_target.read_bytes(), original_external)
 
     def test_stop_hook_fails_open_when_index_is_invalid(self) -> None:
         fake_home = self.root / "home-stop-invalid"

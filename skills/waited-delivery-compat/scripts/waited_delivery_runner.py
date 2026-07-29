@@ -5,13 +5,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
+import os
 import pathlib
 import shlex
+import stat
 import subprocess
 import sys
 import uuid
+from collections.abc import Iterator
 from typing import TypedDict, cast
 
 
@@ -49,6 +54,12 @@ Output contract:
 - If the lane is usable and can answer, reply exactly: READY
 - If the lane is blocked or unavailable, reply with a single short line starting with: BLOCKED:
 """
+RUN_LOCK_NAME = ".state.lock"
+STATE_FILE_NAME = "state.json"
+RUNS_DIR_NAME = "waited-delivery"
+STATE_MAX_BYTES = 4 * 1024 * 1024
+FILE_MODE = 0o600
+DIRECTORY_MODE = 0o700
 
 
 class UserError(RuntimeError):
@@ -190,15 +201,388 @@ def _ensure_relative_paths(paths: list[str]) -> list[str]:
     return result
 
 
-def _write_json(path: pathlib.Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
     )
 
 
-def _load_json(path: pathlib.Path) -> object:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _regular_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _lexical_absolute(path_arg: str | pathlib.Path) -> pathlib.Path:
+    return pathlib.Path(os.path.abspath(os.fspath(path_arg)))
+
+
+def _validate_component_name(name: str, *, label: str) -> None:
+    if not name or name in {".", ".."} or pathlib.PurePath(name).name != name:
+        raise UserError(f"{label} must be one path component: {name!r}")
+
+
+def _open_absolute_directory(path: pathlib.Path) -> int:
+    if not path.is_absolute():
+        raise UserError(f"directory path must be absolute: {path}")
+    current_fd = os.open("/", _directory_open_flags())
+    try:
+        for component in path.parts[1:]:
+            next_fd = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _open_directory_at(parent_fd: int, name: str) -> int:
+    _validate_component_name(name, label="directory name")
+    return os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+
+
+def _ensure_directory_at(parent_fd: int, name: str) -> int:
+    _validate_component_name(name, label="directory name")
+    try:
+        os.mkdir(name, DIRECTORY_MODE, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    return _open_directory_at(parent_fd, name)
+
+
+def _run_layout(
+    run_dir_arg: str | pathlib.Path,
+    *,
+    expected_repo_root: str | pathlib.Path | None = None,
+) -> tuple[pathlib.Path, pathlib.Path, str]:
+    run_dir = _lexical_absolute(run_dir_arg)
+    if (
+        run_dir.parent.name != RUNS_DIR_NAME
+        or run_dir.parent.parent.name != ".codex-tmp"
+    ):
+        raise UserError(
+            "run directory must be a direct child of <repo>/.codex-tmp/waited-delivery"
+        )
+    run_name = run_dir.name
+    _validate_component_name(run_name, label="run id")
+    repo_root = run_dir.parents[2]
+    if expected_repo_root is not None:
+        expected = _lexical_absolute(expected_repo_root)
+        if repo_root != expected:
+            raise UserError(
+                "run directory is outside the expected repository waited-delivery root"
+            )
+    return run_dir, repo_root, run_name
+
+
+def _open_run_directory_path(repo_root: pathlib.Path, run_name: str) -> int:
+    repo_fd = _open_absolute_directory(repo_root)
+    codex_tmp_fd: int | None = None
+    runs_fd: int | None = None
+    try:
+        codex_tmp_fd = _open_directory_at(repo_fd, ".codex-tmp")
+        runs_fd = _open_directory_at(codex_tmp_fd, RUNS_DIR_NAME)
+        return _open_directory_at(runs_fd, run_name)
+    finally:
+        if runs_fd is not None:
+            os.close(runs_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        os.close(repo_fd)
+
+
+def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _verify_run_directory_identity(
+    run_dir: pathlib.Path,
+    repo_root: pathlib.Path,
+    run_fd: int,
+) -> None:
+    current_fd = _open_run_directory_path(repo_root, run_dir.name)
+    try:
+        current = os.fstat(current_fd)
+        pinned = os.fstat(run_fd)
+        if not stat.S_ISDIR(current.st_mode) or not _same_object(current, pinned):
+            raise UserError(f"run directory identity changed: {run_dir}")
+    finally:
+        os.close(current_fd)
+
+
+def _open_run_directory(
+    run_dir_arg: str | pathlib.Path,
+    *,
+    expected_repo_root: str | pathlib.Path | None = None,
+) -> tuple[pathlib.Path, pathlib.Path, int]:
+    run_dir, repo_root, run_name = _run_layout(
+        run_dir_arg,
+        expected_repo_root=expected_repo_root,
+    )
+    try:
+        run_fd = _open_run_directory_path(repo_root, run_name)
+    except OSError as error:
+        raise UserError(f"unsafe or unavailable run directory: {run_dir}") from error
+    try:
+        _verify_run_directory_identity(run_dir, repo_root, run_fd)
+    except Exception:
+        os.close(run_fd)
+        raise
+    return run_dir, repo_root, run_fd
+
+
+def _create_run_directory(
+    repo_root: pathlib.Path,
+    run_id: str,
+) -> tuple[pathlib.Path, int]:
+    _validate_component_name(run_id, label="run id")
+    repo_fd = _open_absolute_directory(repo_root)
+    codex_tmp_fd: int | None = None
+    runs_fd: int | None = None
+    try:
+        codex_tmp_fd = _ensure_directory_at(repo_fd, ".codex-tmp")
+        runs_fd = _ensure_directory_at(codex_tmp_fd, RUNS_DIR_NAME)
+        try:
+            os.mkdir(run_id, DIRECTORY_MODE, dir_fd=runs_fd)
+        except FileExistsError as error:
+            raise UserError(
+                f"run directory already exists for run id: {run_id}"
+            ) from error
+        run_fd = _open_directory_at(runs_fd, run_id)
+    finally:
+        if runs_fd is not None:
+            os.close(runs_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        os.close(repo_fd)
+    run_dir = repo_root / ".codex-tmp" / RUNS_DIR_NAME / run_id
+    try:
+        _verify_run_directory_identity(run_dir, repo_root, run_fd)
+    except Exception:
+        os.close(run_fd)
+        raise
+    return run_dir, run_fd
+
+
+def _regular_file_stat(
+    run_fd: int,
+    name: str,
+    *,
+    required: bool,
+) -> os.stat_result | None:
+    _validate_component_name(name, label="artifact name")
+    try:
+        file_stat = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if required:
+            raise UserError(f"required run artifact is missing: {name}")
+        return None
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise UserError(f"run artifact must be a regular file: {name}")
+    return file_stat
+
+
+def _read_regular_bytes(run_fd: int, name: str, *, max_bytes: int) -> bytes:
+    try:
+        file_fd = os.open(name, _regular_open_flags(), dir_fd=run_fd)
+    except OSError as error:
+        raise UserError(
+            f"cannot open run artifact without following links: {name}"
+        ) from error
+    try:
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise UserError(f"run artifact must be a regular file: {name}")
+        if before.st_size > max_bytes:
+            raise UserError(f"run artifact exceeds byte limit: {name}")
+        chunks: list[bytes] = []
+        retained = 0
+        while True:
+            chunk = os.read(file_fd, min(65536, max_bytes + 1 - retained))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            retained += len(chunk)
+            if retained > max_bytes:
+                raise UserError(f"run artifact exceeds byte limit: {name}")
+        after = os.fstat(file_fd)
+        if (
+            not _same_object(before, after)
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+        ):
+            raise UserError(f"run artifact changed while it was read: {name}")
+        return b"".join(chunks)
+    finally:
+        os.close(file_fd)
+
+
+def _atomic_write_regular(
+    run_fd: int,
+    name: str,
+    content: str,
+    *,
+    require_existing: bool,
+) -> None:
+    expected = _regular_file_stat(run_fd, name, required=require_existing)
+    temp_name = f".{name}.{uuid.uuid4().hex}.tmp"
+    temp_fd: int | None = None
+    try:
+        temp_fd = os.open(
+            temp_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            FILE_MODE,
+            dir_fd=run_fd,
+        )
+        encoded = content.encode("utf-8")
+        offset = 0
+        while offset < len(encoded):
+            written_bytes = os.write(temp_fd, encoded[offset:])
+            if written_bytes <= 0:
+                raise UserError(f"failed to write temporary run artifact: {name}")
+            offset += written_bytes
+        os.fsync(temp_fd)
+        os.close(temp_fd)
+        temp_fd = None
+        current = _regular_file_stat(run_fd, name, required=require_existing)
+        if expected is not None and (
+            current is None or not _same_object(expected, current)
+        ):
+            raise UserError(f"run artifact was replaced before update: {name}")
+        os.replace(
+            temp_name,
+            name,
+            src_dir_fd=run_fd,
+            dst_dir_fd=run_fd,
+        )
+        written = _regular_file_stat(run_fd, name, required=True)
+        assert written is not None
+        os.fsync(run_fd)
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        try:
+            os.unlink(temp_name, dir_fd=run_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _load_state_from_fd(
+    run_dir: pathlib.Path,
+    repo_root: pathlib.Path,
+    run_fd: int,
+) -> WaitedDeliveryState:
+    try:
+        payload = json.loads(
+            _read_regular_bytes(
+                run_fd,
+                STATE_FILE_NAME,
+                max_bytes=STATE_MAX_BYTES,
+            ).decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise UserError(
+            f"invalid state payload: {run_dir / STATE_FILE_NAME}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise UserError(f"invalid state payload: {run_dir / STATE_FILE_NAME}")
+    state = cast(WaitedDeliveryState, payload)
+    if state.get("repo_root") != str(repo_root):
+        raise UserError(
+            "state repo_root does not exactly match the run directory repository"
+        )
+    orchestration = state["orchestration"]
+    orchestration.setdefault("parent_session_id", None)
+    orchestration.setdefault("parent_turn_id", None)
+    orchestration.setdefault("parent_transcript_path", None)
+    orchestration.setdefault("permission_mode", None)
+    return state
+
+
+def _save_state(
+    run_dir: pathlib.Path,
+    repo_root: pathlib.Path,
+    run_fd: int,
+    state: WaitedDeliveryState,
+) -> None:
+    _verify_run_directory_identity(run_dir, repo_root, run_fd)
+    state["updated_at"] = _utc_now()
+    _atomic_write_regular(
+        run_fd,
+        STATE_FILE_NAME,
+        json.dumps(state, indent=2, sort_keys=True) + "\n",
+        require_existing=True,
+    )
+    _verify_run_directory_identity(run_dir, repo_root, run_fd)
+
+
+@contextlib.contextmanager
+def _run_lock(run_fd: int) -> Iterator[None]:
+    try:
+        lock_fd = os.open(
+            RUN_LOCK_NAME,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            FILE_MODE,
+            dir_fd=run_fd,
+        )
+    except OSError as error:
+        raise UserError("cannot open run lock without following links") from error
+    try:
+        lock_stat = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_stat.st_mode):
+            raise UserError("run lock must be a regular file")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        named_lock = _regular_file_stat(run_fd, RUN_LOCK_NAME, required=True)
+        if named_lock is None or not _same_object(lock_stat, named_lock):
+            raise UserError("run lock was replaced before acquisition")
+        yield
+        named_lock = _regular_file_stat(run_fd, RUN_LOCK_NAME, required=True)
+        if named_lock is None or not _same_object(lock_stat, named_lock):
+            raise UserError("run lock was replaced while held")
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+@contextlib.contextmanager
+def _locked_run_state(
+    run_dir_arg: str | pathlib.Path,
+    *,
+    expected_repo_root: str | pathlib.Path | None = None,
+) -> Iterator[tuple[pathlib.Path, pathlib.Path, int, WaitedDeliveryState]]:
+    run_dir, repo_root, run_fd = _open_run_directory(
+        run_dir_arg,
+        expected_repo_root=expected_repo_root,
+    )
+    try:
+        with _run_lock(run_fd):
+            _verify_run_directory_identity(run_dir, repo_root, run_fd)
+            state = _load_state_from_fd(run_dir, repo_root, run_fd)
+            yield run_dir, repo_root, run_fd, state
+            _verify_run_directory_identity(run_dir, repo_root, run_fd)
+    finally:
+        os.close(run_fd)
 
 
 def _phase_template() -> PhaseState:
@@ -391,19 +775,36 @@ def _build_parent_prompt(run_dir: pathlib.Path, state: WaitedDeliveryState) -> s
 
 def _write_current_prompts(
     run_dir: pathlib.Path,
+    run_fd: int,
     state: WaitedDeliveryState,
+    *,
+    require_existing: bool,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     child_prompt_path = run_dir / "child-prompt.md"
     parent_prompt_path = run_dir / "parent-prompt.md"
     state["artifacts"]["child_prompt"] = str(child_prompt_path)
     state["artifacts"]["parent_prompt"] = str(parent_prompt_path)
-    child_prompt_path.write_text(
-        _build_child_prompt(run_dir, state),
-        encoding="utf-8",
+    _regular_file_stat(
+        run_fd,
+        child_prompt_path.name,
+        required=require_existing,
     )
-    parent_prompt_path.write_text(
+    _regular_file_stat(
+        run_fd,
+        parent_prompt_path.name,
+        required=require_existing,
+    )
+    _atomic_write_regular(
+        run_fd,
+        child_prompt_path.name,
+        _build_child_prompt(run_dir, state),
+        require_existing=require_existing,
+    )
+    _atomic_write_regular(
+        run_fd,
+        parent_prompt_path.name,
         _build_parent_prompt(run_dir, state),
-        encoding="utf-8",
+        require_existing=require_existing,
     )
     return child_prompt_path, parent_prompt_path
 
@@ -430,8 +831,7 @@ def _prepare(args: argparse.Namespace) -> int:
     phases_order = args.phase or list(DEFAULT_PHASES)
     if "internal_review" not in phases_order:
         raise UserError("phase order must include the required internal_review phase")
-    run_dir = repo_root / ".codex-tmp" / "waited-delivery" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir, run_fd = _create_run_directory(repo_root, run_id)
 
     state_path = run_dir / "state.json"
     contract_path = run_dir / "child-contract.md"
@@ -439,8 +839,6 @@ def _prepare(args: argparse.Namespace) -> int:
     parent_prompt_path = run_dir / "parent-prompt.md"
     smoke_prompt_path = run_dir / "fallback-smoke.prompt.md"
     smoke_command_path = run_dir / "fallback-smoke.command.txt"
-
-    smoke_prompt_path.write_text(FALLBACK_SMOKE_PROMPT, encoding="utf-8")
 
     state: WaitedDeliveryState = {
         "schema_version": 3,
@@ -489,13 +887,41 @@ def _prepare(args: argparse.Namespace) -> int:
         "overall_status": "pending",
     }
     state["fallback_readiness_smoke"]["command"] = _smoke_command_argv(state)
-    contract_path.write_text(_build_child_contract(state), encoding="utf-8")
-    _write_current_prompts(run_dir, state)
-    smoke_command_path.write_text(
-        _shell_command(state["fallback_readiness_smoke"]["command"]) + "\n",
-        encoding="utf-8",
-    )
-    _write_json(state_path, state)
+    try:
+        with _run_lock(run_fd):
+            _atomic_write_regular(
+                run_fd,
+                smoke_prompt_path.name,
+                FALLBACK_SMOKE_PROMPT,
+                require_existing=False,
+            )
+            _atomic_write_regular(
+                run_fd,
+                contract_path.name,
+                _build_child_contract(state),
+                require_existing=False,
+            )
+            _write_current_prompts(
+                run_dir,
+                run_fd,
+                state,
+                require_existing=False,
+            )
+            _atomic_write_regular(
+                run_fd,
+                smoke_command_path.name,
+                _shell_command(state["fallback_readiness_smoke"]["command"]) + "\n",
+                require_existing=False,
+            )
+            _atomic_write_regular(
+                run_fd,
+                state_path.name,
+                json.dumps(state, indent=2, sort_keys=True) + "\n",
+                require_existing=False,
+            )
+            _verify_run_directory_identity(run_dir, repo_root, run_fd)
+    finally:
+        os.close(run_fd)
 
     if args.json:
         print(
@@ -520,34 +946,18 @@ def _prepare(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_state_from_run_dir(
-    run_dir_arg: str,
-) -> tuple[pathlib.Path, WaitedDeliveryState]:
-    run_dir = pathlib.Path(run_dir_arg).resolve()
-    state_path = run_dir / "state.json"
-    if not state_path.is_file():
-        raise UserError(f"state file not found: {state_path}")
-    payload = _load_json(state_path)
-    if not isinstance(payload, dict):
-        raise UserError(f"invalid state payload: {state_path}")
-    state = cast(WaitedDeliveryState, payload)
-    orchestration = state["orchestration"]
-    orchestration.setdefault("parent_session_id", None)
-    orchestration.setdefault("parent_turn_id", None)
-    orchestration.setdefault("parent_transcript_path", None)
-    orchestration.setdefault("permission_mode", None)
-    return run_dir, state
-
-
-def _save_state(run_dir: pathlib.Path, state: WaitedDeliveryState) -> None:
-    state["updated_at"] = _utc_now()
-    _write_json(run_dir / "state.json", state)
-
-
 def _refresh_prompts(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    child_prompt_path, parent_prompt_path = _write_current_prompts(run_dir, state)
-    _save_state(run_dir, state)
+    with _locked_run_state(
+        args.run_dir,
+        expected_repo_root=args.expected_repo_root,
+    ) as (run_dir, repo_root, run_fd, state):
+        child_prompt_path, parent_prompt_path = _write_current_prompts(
+            run_dir,
+            run_fd,
+            state,
+            require_existing=True,
+        )
+        _save_state(run_dir, repo_root, run_fd, state)
     if args.json:
         print(
             json.dumps(
@@ -565,65 +975,83 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
 
 
 def _attach_child(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    if not args.child_session_id.strip():
-        raise UserError("attach-child requires a nonblank child session id")
-    orchestration = state["orchestration"]
-    if orchestration["child_status"] != "pending" or orchestration["child_session_id"]:
-        raise UserError(
-            "cannot attach child after child orchestration has already started"
-        )
-    orchestration["child_session_id"] = args.child_session_id
-    orchestration["child_status"] = "running"
-    orchestration["child_started_at"] = _utc_now()
-    orchestration["updated_at"] = _utc_now()
-    if args.parent_session_id:
-        orchestration["parent_session_id"] = args.parent_session_id
-    if args.parent_turn_id:
-        orchestration["parent_turn_id"] = args.parent_turn_id
-    if args.parent_transcript_path:
-        orchestration["parent_transcript_path"] = args.parent_transcript_path
-    if args.permission_mode:
-        orchestration["permission_mode"] = args.permission_mode
-    _save_state(run_dir, state)
+    with _locked_run_state(args.run_dir) as (
+        run_dir,
+        repo_root,
+        run_fd,
+        state,
+    ):
+        if not args.child_session_id.strip():
+            raise UserError("attach-child requires a nonblank child session id")
+        orchestration = state["orchestration"]
+        if (
+            orchestration["child_status"] != "pending"
+            or orchestration["child_session_id"]
+        ):
+            raise UserError(
+                "cannot attach child after child orchestration has already started"
+            )
+        orchestration["child_session_id"] = args.child_session_id
+        orchestration["child_status"] = "running"
+        orchestration["child_started_at"] = _utc_now()
+        orchestration["updated_at"] = _utc_now()
+        if args.parent_session_id:
+            orchestration["parent_session_id"] = args.parent_session_id
+        if args.parent_turn_id:
+            orchestration["parent_turn_id"] = args.parent_turn_id
+        if args.parent_transcript_path:
+            orchestration["parent_transcript_path"] = args.parent_transcript_path
+        if args.permission_mode:
+            orchestration["permission_mode"] = args.permission_mode
+        _save_state(run_dir, repo_root, run_fd, state)
     return 0
 
 
 def _bind_parent(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    if (
-        not args.parent_session_id
-        and not args.parent_turn_id
-        and not args.parent_transcript_path
-        and not args.permission_mode
+    with _locked_run_state(args.run_dir) as (
+        run_dir,
+        repo_root,
+        run_fd,
+        state,
     ):
-        raise UserError("bind-parent requires at least one parent metadata field")
-    orchestration = state["orchestration"]
-    if args.parent_session_id:
-        orchestration["parent_session_id"] = args.parent_session_id
-    if args.parent_turn_id:
-        orchestration["parent_turn_id"] = args.parent_turn_id
-    if args.parent_transcript_path:
-        orchestration["parent_transcript_path"] = args.parent_transcript_path
-    if args.permission_mode:
-        orchestration["permission_mode"] = args.permission_mode
-    orchestration["updated_at"] = _utc_now()
-    _save_state(run_dir, state)
+        if (
+            not args.parent_session_id
+            and not args.parent_turn_id
+            and not args.parent_transcript_path
+            and not args.permission_mode
+        ):
+            raise UserError("bind-parent requires at least one parent metadata field")
+        orchestration = state["orchestration"]
+        if args.parent_session_id:
+            orchestration["parent_session_id"] = args.parent_session_id
+        if args.parent_turn_id:
+            orchestration["parent_turn_id"] = args.parent_turn_id
+        if args.parent_transcript_path:
+            orchestration["parent_transcript_path"] = args.parent_transcript_path
+        if args.permission_mode:
+            orchestration["permission_mode"] = args.permission_mode
+        orchestration["updated_at"] = _utc_now()
+        _save_state(run_dir, repo_root, run_fd, state)
     return 0
 
 
 def _begin_phase(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    phases = state["phases"]
-    if args.phase not in phases:
-        raise UserError(f"unknown phase: {args.phase}")
-    phase = phases[args.phase]
-    phase["status"] = "running"
-    phase["summary"] = args.summary or ""
-    phase["findings"] = []
-    phase["evidence"] = []
-    phase["updated_at"] = _utc_now()
-    _save_state(run_dir, state)
+    with _locked_run_state(args.run_dir) as (
+        run_dir,
+        repo_root,
+        run_fd,
+        state,
+    ):
+        phases = state["phases"]
+        if args.phase not in phases:
+            raise UserError(f"unknown phase: {args.phase}")
+        phase = phases[args.phase]
+        phase["status"] = "running"
+        phase["summary"] = args.summary or ""
+        phase["findings"] = []
+        phase["evidence"] = []
+        phase["updated_at"] = _utc_now()
+        _save_state(run_dir, repo_root, run_fd, state)
     return 0
 
 
@@ -662,52 +1090,64 @@ def _validate_passed_reviews(state: WaitedDeliveryState) -> None:
 
 
 def _record_phase(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    phases = state["phases"]
-    if args.phase not in phases:
-        raise UserError(f"unknown phase: {args.phase}")
-    if args.status not in PHASE_STATUSES:
-        raise UserError(f"unsupported status: {args.status}")
-    if args.phase in REVIEW_PHASES and args.status == "passed":
-        _validate_review_pass(state, list(args.evidence))
-    phase = phases[args.phase]
-    phase["status"] = args.status
-    phase["summary"] = args.summary or ""
-    phase["findings"] = list(args.finding)
-    phase["evidence"] = list(args.evidence)
-    phase["updated_at"] = _utc_now()
-    _save_state(run_dir, state)
+    with _locked_run_state(args.run_dir) as (
+        run_dir,
+        repo_root,
+        run_fd,
+        state,
+    ):
+        phases = state["phases"]
+        if args.phase not in phases:
+            raise UserError(f"unknown phase: {args.phase}")
+        if args.status not in PHASE_STATUSES:
+            raise UserError(f"unsupported status: {args.status}")
+        if args.phase in REVIEW_PHASES and args.status == "passed":
+            _validate_review_pass(state, list(args.evidence))
+        phase = phases[args.phase]
+        phase["status"] = args.status
+        phase["summary"] = args.summary or ""
+        phase["findings"] = list(args.finding)
+        phase["evidence"] = list(args.evidence)
+        phase["updated_at"] = _utc_now()
+        _save_state(run_dir, repo_root, run_fd, state)
     return 0
 
 
 def _close_open_phases(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    if args.status not in TERMINAL_PHASE_STATUSES:
-        raise UserError(f"close-open-phases requires a terminal status: {args.status}")
-    findings = list(args.finding)
-    evidence = list(args.evidence)
-    if args.status == "passed" and any(
-        phase_name in REVIEW_PHASES
-        and state["phases"][phase_name]["status"] not in TERMINAL_PHASE_STATUSES
-        for phase_name in state["phases_order"]
+    with _locked_run_state(args.run_dir) as (
+        run_dir,
+        repo_root,
+        run_fd,
+        state,
     ):
-        raise UserError(
-            "close-open-phases cannot mark review phases passed; record each "
-            "review phase with its own terminal evidence"
-        )
-    updated = False
-    for phase_name in state["phases_order"]:
-        phase = state["phases"][phase_name]
-        if phase["status"] in TERMINAL_PHASE_STATUSES:
-            continue
-        phase["status"] = args.status
-        phase["summary"] = args.summary or ""
-        phase["findings"] = findings.copy()
-        phase["evidence"] = evidence.copy()
-        phase["updated_at"] = _utc_now()
-        updated = True
-    if updated:
-        _save_state(run_dir, state)
+        if args.status not in TERMINAL_PHASE_STATUSES:
+            raise UserError(
+                f"close-open-phases requires a terminal status: {args.status}"
+            )
+        findings = list(args.finding)
+        evidence = list(args.evidence)
+        if args.status == "passed" and any(
+            phase_name in REVIEW_PHASES
+            and state["phases"][phase_name]["status"] not in TERMINAL_PHASE_STATUSES
+            for phase_name in state["phases_order"]
+        ):
+            raise UserError(
+                "close-open-phases cannot mark review phases passed; record each "
+                "review phase with its own terminal evidence"
+            )
+        updated = False
+        for phase_name in state["phases_order"]:
+            phase = state["phases"][phase_name]
+            if phase["status"] in TERMINAL_PHASE_STATUSES:
+                continue
+            phase["status"] = args.status
+            phase["summary"] = args.summary or ""
+            phase["findings"] = findings.copy()
+            phase["evidence"] = evidence.copy()
+            phase["updated_at"] = _utc_now()
+            updated = True
+        if updated:
+            _save_state(run_dir, repo_root, run_fd, state)
     return 0
 
 
@@ -752,13 +1192,18 @@ def _transition_child_terminal(
 
 
 def _finish_child(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    _transition_child_terminal(
+    with _locked_run_state(args.run_dir) as (
+        run_dir,
+        repo_root,
+        run_fd,
         state,
-        child_status=args.child_status,
-        child_session_id=args.child_session_id,
-    )
-    _save_state(run_dir, state)
+    ):
+        _transition_child_terminal(
+            state,
+            child_status=args.child_status,
+            child_session_id=args.child_session_id,
+        )
+        _save_state(run_dir, repo_root, run_fd, state)
     return 0
 
 
@@ -781,31 +1226,36 @@ def _classify_smoke(
 
 
 def _run_fallback_smoke(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    smoke = state["fallback_readiness_smoke"]
-    if not smoke["enabled"]:
-        raise UserError("fallback readiness smoke is disabled for this run")
+    with _locked_run_state(args.run_dir) as (
+        run_dir,
+        repo_root,
+        run_fd,
+        state,
+    ):
+        smoke = state["fallback_readiness_smoke"]
+        if not smoke["enabled"]:
+            raise UserError("fallback readiness smoke is disabled for this run")
 
-    command = list(smoke["command"])
-    completed = subprocess.run(
-        command,
-        cwd=state["repo_root"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    status, sample = _classify_smoke(
-        stdout=completed.stdout,
-        stderr=completed.stderr,
-        returncode=completed.returncode,
-    )
-    smoke["status"] = status
-    smoke["sample"] = sample
-    smoke["stdout"] = completed.stdout
-    smoke["stderr"] = completed.stderr
-    smoke["returncode"] = completed.returncode
-    smoke["updated_at"] = _utc_now()
-    _save_state(run_dir, state)
+        command = list(smoke["command"])
+        completed = subprocess.run(
+            command,
+            cwd=state["repo_root"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        status, sample = _classify_smoke(
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            returncode=completed.returncode,
+        )
+        smoke["status"] = status
+        smoke["sample"] = sample
+        smoke["stdout"] = completed.stdout
+        smoke["stderr"] = completed.stderr
+        smoke["returncode"] = completed.returncode
+        smoke["updated_at"] = _utc_now()
+        _save_state(run_dir, repo_root, run_fd, state)
     if sample:
         print(sample)
     return 0 if status == "passed" else 1
@@ -829,7 +1279,11 @@ def _overall_status(phases: dict[str, PhaseState]) -> str:
 
 
 def _write_summary(
-    run_dir: pathlib.Path, state: WaitedDeliveryState, *, require_terminal: bool
+    run_dir: pathlib.Path,
+    run_fd: int,
+    state: WaitedDeliveryState,
+    *,
+    require_terminal: bool,
 ) -> pathlib.Path:
     non_terminal = _non_terminal_phase_names(state)
     if require_terminal and non_terminal:
@@ -892,29 +1346,53 @@ def _write_summary(
     if smoke["sample"]:
         lines.append(f"- Sample: `{smoke['sample']}`")
     summary_path = run_dir / "summary.md"
-    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    _save_state(run_dir, state)
+    _atomic_write_regular(
+        run_fd,
+        summary_path.name,
+        "\n".join(lines) + "\n",
+        require_existing=False,
+    )
     return summary_path
 
 
 def _finalize(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    summary_path = _write_summary(
-        run_dir, state, require_terminal=args.require_terminal
-    )
+    with _locked_run_state(args.run_dir) as (
+        run_dir,
+        repo_root,
+        run_fd,
+        state,
+    ):
+        summary_path = _write_summary(
+            run_dir,
+            run_fd,
+            state,
+            require_terminal=args.require_terminal,
+        )
+        _save_state(run_dir, repo_root, run_fd, state)
     print(summary_path)
     return 0
 
 
 def _reconcile_parent(args: argparse.Namespace) -> int:
-    run_dir, state = _load_state_from_run_dir(args.run_dir)
-    _transition_child_terminal(
+    with _locked_run_state(args.run_dir) as (
+        run_dir,
+        repo_root,
+        run_fd,
         state,
-        child_status=args.child_status,
-        child_session_id=args.child_session_id,
-    )
-    orchestration = state["orchestration"]
-    summary_path = _write_summary(run_dir, state, require_terminal=True)
+    ):
+        _transition_child_terminal(
+            state,
+            child_status=args.child_status,
+            child_session_id=args.child_session_id,
+        )
+        orchestration = state["orchestration"]
+        summary_path = _write_summary(
+            run_dir,
+            run_fd,
+            state,
+            require_terminal=True,
+        )
+        _save_state(run_dir, repo_root, run_fd, state)
     if args.json:
         print(
             json.dumps(
@@ -1010,6 +1488,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     refresh_prompts = subparsers.add_parser("refresh-prompts")
     refresh_prompts.add_argument("--run-dir", required=True)
+    refresh_prompts.add_argument(
+        "--expected-repo-root",
+        help=(
+            "Require the run to be a direct no-symlink descendant of this exact "
+            "repository root."
+        ),
+    )
     refresh_prompts.add_argument(
         "--json",
         action="store_true",

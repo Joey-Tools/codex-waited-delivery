@@ -34,6 +34,7 @@ The current outer adapter already follows this rule: it may observe product-spec
   - wraps `attach-child`, rejects a blank child id before state mutation, and also propagates parent metadata from args or env
 - `refresh-prompts-live`
   - wraps `refresh-prompts --json` and returns the exact current runner plus regenerated run-local child and parent prompt paths
+  - accepts `--expected-repo-root` from the outer adapter so the runner can enforce exact repo containment again under the run-level state lock
 - `finish-child-live`
   - requires the exact attached `child_session_id` and wraps `finish-child` so the bridge can persist the child's matching terminal status after `wait` and before parent-owned review
 - `reconcile-live`
