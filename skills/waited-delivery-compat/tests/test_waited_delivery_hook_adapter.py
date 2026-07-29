@@ -1487,6 +1487,184 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     stderr.getvalue(),
                 )
 
+    def test_stop_hook_binds_refreshed_prompt_identity_access_and_content(
+        self,
+    ) -> None:
+        expected_errors = {
+            "replacement": "was replaced after prompt refresh",
+            "content": "content changed after prompt refresh",
+            "access": "access policy changed after prompt refresh",
+        }
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            for mutation in (*expected_errors, "timestamps"):
+                with self.subTest(prompt=prompt_name, mutation=mutation):
+                    session_id = (
+                        f"session-prompt-{prompt_name.removesuffix('.md')}-{mutation}"
+                    )
+                    self._prepare_indexed_run(
+                        session_id,
+                        f"prompt-{prompt_name.removesuffix('.md')}-{mutation}",
+                    )
+                    module = self._load_adapter_module()
+                    real_refresh = module._refresh_recovery_prompts
+                    displaced_prompt = self.root / (
+                        f"displaced-{prompt_name}-{mutation}"
+                    )
+                    fake_home = self.root / (
+                        f"home-prompt-{prompt_name.removesuffix('.md')}-{mutation}"
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+
+                    def mutate_after_refresh(
+                        current_run_dir: pathlib.Path,
+                        repo_root: pathlib.Path,
+                        run_identity,
+                    ):
+                        refreshed = real_refresh(
+                            current_run_dir,
+                            repo_root,
+                            run_identity,
+                        )
+                        prompt_path = current_run_dir / prompt_name
+                        original_stat = prompt_path.stat()
+                        original_content = prompt_path.read_bytes()
+                        if mutation == "replacement":
+                            prompt_path.rename(displaced_prompt)
+                            prompt_path.write_bytes(original_content)
+                            prompt_path.chmod(original_stat.st_mode & 0o7777)
+                        elif mutation == "content":
+                            replacement = bytearray(original_content)
+                            replacement[0] ^= 1
+                            prompt_path.write_bytes(replacement)
+                        elif mutation == "access":
+                            prompt_path.chmod(0o640)
+                        else:
+                            os.utime(
+                                prompt_path,
+                                ns=(
+                                    original_stat.st_atime_ns,
+                                    original_stat.st_mtime_ns + 1_000_000_000,
+                                ),
+                            )
+                        return refreshed
+
+                    with mock.patch.dict(
+                        os.environ,
+                        {"HOME": str(fake_home)},
+                        clear=False,
+                    ):
+                        with mock.patch.object(
+                            module,
+                            "_refresh_recovery_prompts",
+                            side_effect=mutate_after_refresh,
+                        ):
+                            with mock.patch.object(
+                                module.sys,
+                                "stdin",
+                                io.StringIO(
+                                    json.dumps(self._stop_payload_for(session_id))
+                                ),
+                            ):
+                                with mock.patch.object(module.sys, "stdout", stdout):
+                                    with mock.patch.object(
+                                        module.sys,
+                                        "stderr",
+                                        stderr,
+                                    ):
+                                        returncode = module._stop_hook(
+                                            argparse.Namespace()
+                                        )
+
+                    self.assertEqual(returncode, 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    if mutation == "timestamps":
+                        self.assertIn("regenerated", stderr.getvalue())
+                        self.assertNotIn(
+                            "failed repository/path safety validation",
+                            stderr.getvalue(),
+                        )
+                    else:
+                        self.assertIn(
+                            "failed repository/path safety validation",
+                            stderr.getvalue(),
+                        )
+                        log_path = (
+                            self._home_log_dir(fake_home)
+                            / "waited-delivery-hooks.jsonl"
+                        )
+                        entry = json.loads(
+                            log_path.read_text(encoding="utf-8").splitlines()[-1]
+                        )
+                        self.assertEqual(entry["error_type"], "RunSafetyError")
+                        self.assertIn(
+                            expected_errors[mutation],
+                            entry["error_message"],
+                        )
+
+    def test_stop_hook_binds_runner_version_returned_through_bridge(self) -> None:
+        mutations = {
+            "replacement": ("inode", "was replaced after prompt refresh"),
+            "access": ("mode", "access policy changed after prompt refresh"),
+            "content": ("sha256", "content changed after prompt refresh"),
+        }
+        for mutation, (field, expected_error) in mutations.items():
+            with self.subTest(mutation=mutation):
+                session_id = f"session-runner-{mutation}-mismatch"
+                self._prepare_indexed_run(
+                    session_id,
+                    f"runner-{mutation}-mismatch",
+                )
+                module = self._load_adapter_module()
+                real_run_bridge_json = module._run_bridge_json
+                fake_home = self.root / f"home-runner-{mutation}-mismatch"
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                def corrupt_runner_version(*args: str) -> dict[str, object]:
+                    payload = real_run_bridge_json(*args)
+                    runner_version = payload["runner_version"]
+                    assert isinstance(runner_version, dict)
+                    current = runner_version[field]
+                    if field == "sha256":
+                        runner_version[field] = "0" * 64
+                    else:
+                        assert isinstance(current, int)
+                        runner_version[field] = current ^ 0o040
+                    return payload
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(fake_home)},
+                    clear=False,
+                ):
+                    with mock.patch.object(
+                        module,
+                        "_run_bridge_json",
+                        side_effect=corrupt_runner_version,
+                    ):
+                        with mock.patch.object(
+                            module.sys,
+                            "stdin",
+                            io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                        ):
+                            with mock.patch.object(module.sys, "stdout", stdout):
+                                with mock.patch.object(module.sys, "stderr", stderr):
+                                    returncode = module._stop_hook(argparse.Namespace())
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(
+                    "failed repository/path safety validation",
+                    stderr.getvalue(),
+                )
+                log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
+                entry = json.loads(
+                    log_path.read_text(encoding="utf-8").splitlines()[-1]
+                )
+                self.assertEqual(entry["error_type"], "RunSafetyError")
+                self.assertIn(expected_error, entry["error_message"])
+
     def test_stop_hook_fails_open_when_index_is_invalid(self) -> None:
         fake_home = self.root / "home-stop-invalid"
         adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"

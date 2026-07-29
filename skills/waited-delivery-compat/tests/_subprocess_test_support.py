@@ -201,7 +201,12 @@ def run_before_stdin_eof(
     deadline = started_at + timeout
     cleanup_reserve = min(1.0, timeout / 2)
     monitor_deadline = deadline - cleanup_reserve
-    read_fd, write_fd = os.pipe()
+    selector = selectors.DefaultSelector()
+    try:
+        read_fd, write_fd = os.pipe()
+    except BaseException:
+        selector.close()
+        raise
     process: subprocess.Popen[bytes] | None = None
     write_fd_open = True
     try:
@@ -221,11 +226,11 @@ def run_before_stdin_eof(
         if process is None:
             os.close(write_fd)
             write_fd_open = False
+            selector.close()
 
     assert process is not None
     assert process.stdout is not None
     assert process.stderr is not None
-    selector = selectors.DefaultSelector()
     captures = {"stdout": bytearray(), "stderr": bytearray()}
     try:
         os.set_blocking(write_fd, False)

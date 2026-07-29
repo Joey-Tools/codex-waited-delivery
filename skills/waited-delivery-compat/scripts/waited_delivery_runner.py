@@ -72,11 +72,15 @@ PROCESS_DRAIN_CHUNK_BYTES = 64 * 1024
 PROCESS_POLL_INTERVAL_SECONDS = 0.02
 PROC_GROUP_SCAN_MAX_ENTRIES = 131_072
 PROC_GROUP_SCAN_TIMEOUT_SECONDS = 0.25
+PROMPT_REFRESH_SCHEMA_VERSION = 1
 
 
 class FileVersion(NamedTuple):
     device: int
     inode: int
+    uid: int
+    gid: int
+    mode: int
     size: int
     sha256: str
 
@@ -523,33 +527,78 @@ def _read_regular_artifact(
         ) from error
     try:
         before = os.fstat(file_fd)
-        if not stat.S_ISREG(before.st_mode):
+        try:
+            named_before = os.stat(
+                name,
+                dir_fd=run_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise ArtifactUnreadableError(
+                f"cannot restat run artifact without following links: {name}"
+            ) from error
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(named_before.st_mode)
+            or not _same_object(before, named_before)
+        ):
             raise ArtifactUnreadableError(
                 f"run artifact must be a regular file: {name}"
             )
         if before.st_size > max_bytes:
             raise ArtifactUnreadableError(f"run artifact exceeds byte limit: {name}")
+        expected_access = (
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+        )
         first_content = _read_fd_bounded(file_fd, name, max_bytes=max_bytes)
         middle = os.fstat(file_fd)
         os.lseek(file_fd, 0, os.SEEK_SET)
         second_content = _read_fd_bounded(file_fd, name, max_bytes=max_bytes)
         after = os.fstat(file_fd)
+        try:
+            named_after = os.stat(
+                name,
+                dir_fd=run_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise ArtifactUnreadableError(
+                f"cannot restat run artifact without following links: {name}"
+            ) from error
+        stable_stats = (before, named_before, middle, after, named_after)
         if (
-            not _same_object(before, after)
-            or not _same_object(before, middle)
-            or before.st_size != middle.st_size
-            or before.st_size != after.st_size
+            any(not stat.S_ISREG(value.st_mode) for value in stable_stats)
+            or any(not _same_object(before, value) for value in stable_stats[1:])
+            or any(value.st_size != before.st_size for value in stable_stats[1:])
+            or any(
+                (
+                    value.st_uid,
+                    value.st_gid,
+                    stat.S_IMODE(value.st_mode),
+                )
+                != expected_access
+                for value in stable_stats[1:]
+            )
             or len(first_content) != before.st_size
+            or len(second_content) != before.st_size
+            or hashlib.sha256(first_content).digest()
+            != hashlib.sha256(second_content).digest()
             or first_content != second_content
         ):
             raise ArtifactChangedError(
-                f"run artifact content changed while it was read: {name}"
+                f"run artifact identity, access, size, or content changed "
+                f"while it was read: {name}"
             )
         return ArtifactRead(
             content=second_content,
             version=FileVersion(
                 device=after.st_dev,
                 inode=after.st_ino,
+                uid=after.st_uid,
+                gid=after.st_gid,
+                mode=stat.S_IMODE(after.st_mode),
                 size=after.st_size,
                 sha256=hashlib.sha256(second_content).hexdigest(),
             ),
@@ -610,11 +659,70 @@ def _validate_expected_artifact(
         expected_version.inode,
     ):
         raise UserError(f"run artifact was replaced before update: {name}")
+    if (current.uid, current.gid, current.mode) != (
+        expected_version.uid,
+        expected_version.gid,
+        expected_version.mode,
+    ):
+        raise UserError(f"run artifact access changed before update: {name}")
     if (
         current.size != expected_version.size
         or current.sha256 != expected_version.sha256
     ):
         raise UserError(f"run artifact content changed before update: {name}")
+
+
+def _file_version_payload(version: FileVersion) -> dict[str, object]:
+    return {
+        "device": version.device,
+        "inode": version.inode,
+        "uid": version.uid,
+        "gid": version.gid,
+        "mode": version.mode,
+        "size": version.size,
+        "sha256": version.sha256,
+    }
+
+
+def _validate_file_version(
+    actual: FileVersion,
+    expected: FileVersion,
+    *,
+    label: str,
+) -> None:
+    if (actual.device, actual.inode) != (expected.device, expected.inode):
+        raise UserError(f"{label} was replaced")
+    if (actual.uid, actual.gid, actual.mode) != (
+        expected.uid,
+        expected.gid,
+        expected.mode,
+    ):
+        raise UserError(f"{label} access policy changed")
+    if actual.size != expected.size or actual.sha256 != expected.sha256:
+        raise UserError(f"{label} content changed")
+
+
+def _read_absolute_regular_artifact(
+    path: pathlib.Path,
+    *,
+    max_bytes: int,
+) -> ArtifactRead:
+    if not path.is_absolute() or not path.name:
+        raise ArtifactUnreadableError("absolute artifact path is required")
+    try:
+        parent_fd = _open_absolute_directory(path.parent)
+    except OSError as error:
+        raise ArtifactUnreadableError(
+            f"cannot open absolute artifact parent without following links: {path}"
+        ) from error
+    try:
+        return _read_regular_artifact(
+            parent_fd,
+            path.name,
+            max_bytes=max_bytes,
+        )
+    finally:
+        os.close(parent_fd)
 
 
 def _atomic_write_regular(
@@ -683,11 +791,28 @@ def _atomic_write_regular(
             name,
             max_bytes=max(len(encoded), 1),
         )
-        if written.content != encoded or (
-            written.version.device,
-            written.version.inode,
-        ) != (temp_identity.device, temp_identity.inode):
-            raise UserError(f"run artifact content mismatch after update: {name}")
+        if (
+            written.content != encoded
+            or (
+                written.version.device,
+                written.version.inode,
+            )
+            != (temp_identity.device, temp_identity.inode)
+            or (
+                written.version.uid,
+                written.version.gid,
+                written.version.mode,
+            )
+            != (
+                temp_identity.uid,
+                temp_identity.gid,
+                temp_identity.mode,
+            )
+        ):
+            raise UserError(
+                f"run artifact publication identity or content mismatch "
+                f"after update: {name}"
+            )
         return written.version
     finally:
         if temp_fd is not None:
@@ -1047,7 +1172,7 @@ def _write_current_prompts(
     state: WaitedDeliveryState,
     *,
     require_existing: bool,
-) -> tuple[pathlib.Path, pathlib.Path]:
+) -> tuple[pathlib.Path, FileVersion, pathlib.Path, FileVersion]:
     child_prompt_path = run_dir / "child-prompt.md"
     parent_prompt_path = run_dir / "parent-prompt.md"
     state["artifacts"]["child_prompt"] = str(child_prompt_path)
@@ -1062,19 +1187,24 @@ def _write_current_prompts(
         parent_prompt_path.name,
         required=require_existing,
     )
-    _atomic_write_regular(
+    child_published_version = _atomic_write_regular(
         run_fd,
         child_prompt_path.name,
         _build_child_prompt(run_dir, state),
         expected_version=child_prompt_version,
     )
-    _atomic_write_regular(
+    parent_published_version = _atomic_write_regular(
         run_fd,
         parent_prompt_path.name,
         _build_parent_prompt(run_dir, state),
         expected_version=parent_prompt_version,
     )
-    return child_prompt_path, parent_prompt_path
+    return (
+        child_prompt_path,
+        child_published_version,
+        parent_prompt_path,
+        parent_published_version,
+    )
 
 
 def _non_terminal_phase_names(state: WaitedDeliveryState) -> list[str]:
@@ -1237,13 +1367,82 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
             gid=cast(int, expected_identity_values[3]),
             mode=cast(int, expected_identity_values[4]),
         )
+    expected_runner_values = (
+        getattr(args, "expected_runner_dev", None),
+        getattr(args, "expected_runner_ino", None),
+        getattr(args, "expected_runner_uid", None),
+        getattr(args, "expected_runner_gid", None),
+        getattr(args, "expected_runner_mode", None),
+        getattr(args, "expected_runner_size", None),
+        getattr(args, "expected_runner_sha256", None),
+    )
+    if any(value is not None for value in expected_runner_values) and not all(
+        value is not None for value in expected_runner_values
+    ):
+        raise UserError(
+            "expected runner device, inode, uid, gid, mode, size, and sha256 "
+            "must be supplied together"
+        )
+    expected_runner_version = None
+    if all(value is not None for value in expected_runner_values):
+        integer_values = expected_runner_values[:-1]
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in integer_values
+        ):
+            raise UserError("expected runner identity fields must be nonnegative")
+        expected_runner_sha256 = expected_runner_values[-1]
+        if (
+            not isinstance(expected_runner_sha256, str)
+            or len(expected_runner_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_runner_sha256
+            )
+        ):
+            raise UserError("expected runner sha256 must be lowercase hexadecimal")
+        expected_runner_version = FileVersion(
+            device=cast(int, integer_values[0]),
+            inode=cast(int, integer_values[1]),
+            uid=cast(int, integer_values[2]),
+            gid=cast(int, integer_values[3]),
+            mode=cast(int, integer_values[4]),
+            size=cast(int, integer_values[5]),
+            sha256=expected_runner_sha256,
+        )
+    runner_path = pathlib.Path(__file__).resolve()
+    runner_version = _read_absolute_regular_artifact(
+        runner_path,
+        max_bytes=STATE_MAX_BYTES,
+    ).version
+    if expected_runner_version is not None:
+        _validate_file_version(
+            runner_version,
+            expected_runner_version,
+            label="compatibility runner",
+        )
     with _locked_run_state(
         args.run_dir,
         expected_repo_root=args.expected_repo_root,
         expected_run_identity=expected_run_identity,
     ) as (run_dir, repo_root, run_fd, state, state_version):
         run_identity = _directory_identity(os.fstat(run_fd))
-        child_prompt_path, parent_prompt_path = _write_current_prompts(
+        runner_version = _read_absolute_regular_artifact(
+            runner_path,
+            max_bytes=STATE_MAX_BYTES,
+        ).version
+        if expected_runner_version is not None:
+            _validate_file_version(
+                runner_version,
+                expected_runner_version,
+                label="compatibility runner",
+            )
+        (
+            child_prompt_path,
+            child_prompt_version,
+            parent_prompt_path,
+            parent_prompt_version,
+        ) = _write_current_prompts(
             run_dir,
             run_fd,
             state,
@@ -1256,14 +1455,30 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
             state,
             state_version,
         )
+        runner_version = _read_absolute_regular_artifact(
+            runner_path,
+            max_bytes=STATE_MAX_BYTES,
+        ).version
+        if expected_runner_version is not None:
+            _validate_file_version(
+                runner_version,
+                expected_runner_version,
+                label="compatibility runner",
+            )
     if args.json:
         print(
             json.dumps(
                 {
+                    "refresh_schema_version": PROMPT_REFRESH_SCHEMA_VERSION,
                     "run_dir": str(run_dir),
-                    "runner_path": str(pathlib.Path(__file__).resolve()),
+                    "runner_path": str(runner_path),
+                    "runner_version": _file_version_payload(runner_version),
                     "child_prompt": str(child_prompt_path),
+                    "child_prompt_version": _file_version_payload(child_prompt_version),
                     "parent_prompt": str(parent_prompt_path),
+                    "parent_prompt_version": _file_version_payload(
+                        parent_prompt_version
+                    ),
                     "run_dev": run_identity.device,
                     "run_ino": run_identity.inode,
                     "run_uid": run_identity.uid,
@@ -2391,6 +2606,13 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Require the run directory to have this exact POSIX mode.",
     )
+    refresh_prompts.add_argument("--expected-runner-dev", type=int)
+    refresh_prompts.add_argument("--expected-runner-ino", type=int)
+    refresh_prompts.add_argument("--expected-runner-uid", type=int)
+    refresh_prompts.add_argument("--expected-runner-gid", type=int)
+    refresh_prompts.add_argument("--expected-runner-mode", type=int)
+    refresh_prompts.add_argument("--expected-runner-size", type=int)
+    refresh_prompts.add_argument("--expected-runner-sha256")
     refresh_prompts.add_argument(
         "--json",
         action="store_true",

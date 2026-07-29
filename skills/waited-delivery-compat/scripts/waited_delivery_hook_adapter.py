@@ -53,6 +53,7 @@ TERMINAL_PHASE_STATUSES = {
 CHILD_TERMINAL_STATUSES = {"completed", "failed", "interrupted"}
 RUNS_DIR_NAME = "waited-delivery"
 STATE_MAX_BYTES = 4 * 1024 * 1024
+PROMPT_REFRESH_SCHEMA_VERSION = 1
 
 
 class UserError(RuntimeError):
@@ -69,6 +70,28 @@ class RunDirectoryIdentity(NamedTuple):
     uid: int
     gid: int
     mode: int
+
+
+class StopArtifactVersion(NamedTuple):
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    mode: int
+    size: int
+    sha256: str
+
+
+class StopArtifactRead(NamedTuple):
+    content: bytes
+    version: StopArtifactVersion
+
+
+class RefreshedPrompts(NamedTuple):
+    child_prompt: pathlib.Path
+    child_version: StopArtifactVersion
+    parent_prompt: pathlib.Path
+    parent_version: StopArtifactVersion
 
 
 class SessionRecord(TypedDict):
@@ -494,12 +517,12 @@ def _open_stop_run_directory(repo_root: pathlib.Path, run_name: str) -> int:
         os.close(repo_fd)
 
 
-def _read_stop_regular_file(
+def _read_stop_regular_artifact(
     run_fd: int,
     name: str,
     *,
     max_bytes: int,
-) -> bytes:
+) -> StopArtifactRead:
     try:
         file_fd = os.open(name, _regular_open_flags(), dir_fd=run_fd)
     except OSError as error:
@@ -586,23 +609,120 @@ def _read_stop_regular_file(
                 f"active run artifact identity, access, size, or content changed "
                 f"while read: {name}"
             )
-        return second_content
-    finally:
-        os.close(file_fd)
-
-
-def _validate_stop_regular_file(run_fd: int, name: str) -> None:
-    try:
-        file_fd = os.open(name, _regular_open_flags(), dir_fd=run_fd)
+        return StopArtifactRead(
+            content=second_content,
+            version=StopArtifactVersion(
+                device=after.st_dev,
+                inode=after.st_ino,
+                uid=after.st_uid,
+                gid=after.st_gid,
+                mode=stat.S_IMODE(after.st_mode),
+                size=after.st_size,
+                sha256=hashlib.sha256(second_content).hexdigest(),
+            ),
+        )
+    except RunSafetyError:
+        raise
     except OSError as error:
         raise RunSafetyError(
-            f"active run artifact cannot be opened without following links: {name}"
+            f"active run artifact cannot be read stably: {name}"
         ) from error
-    try:
-        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
-            raise RunSafetyError(f"active run artifact must be a regular file: {name}")
     finally:
         os.close(file_fd)
+
+
+def _read_stop_regular_file(
+    run_fd: int,
+    name: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    return _read_stop_regular_artifact(
+        run_fd,
+        name,
+        max_bytes=max_bytes,
+    ).content
+
+
+def _read_stop_absolute_regular_artifact(
+    path: pathlib.Path,
+    *,
+    max_bytes: int,
+) -> StopArtifactRead:
+    if not path.is_absolute() or not path.name:
+        raise RunSafetyError("absolute artifact path is required")
+    try:
+        parent_fd = _open_absolute_directory(path.parent)
+    except OSError as error:
+        raise RunSafetyError(
+            f"absolute artifact parent cannot be opened without following links: {path}"
+        ) from error
+    try:
+        return _read_stop_regular_artifact(
+            parent_fd,
+            path.name,
+            max_bytes=max_bytes,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def _stop_artifact_version_from_payload(
+    payload: dict[str, object],
+    field: str,
+) -> StopArtifactVersion:
+    raw_version = payload.get(field)
+    if not isinstance(raw_version, dict):
+        raise RunSafetyError(f"refresh-prompts-live did not return {field}")
+    version = cast(dict[str, object], raw_version)
+    integer_fields = ("device", "inode", "uid", "gid", "mode", "size")
+    integer_values = tuple(version.get(name) for name in integer_fields)
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in integer_values
+    ):
+        raise RunSafetyError(
+            f"refresh-prompts-live returned an invalid {field} identity"
+        )
+    sha256 = version.get("sha256")
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+    ):
+        raise RunSafetyError(f"refresh-prompts-live returned an invalid {field} digest")
+    return StopArtifactVersion(
+        device=cast(int, integer_values[0]),
+        inode=cast(int, integer_values[1]),
+        uid=cast(int, integer_values[2]),
+        gid=cast(int, integer_values[3]),
+        mode=cast(int, integer_values[4]),
+        size=cast(int, integer_values[5]),
+        sha256=sha256,
+    )
+
+
+def _validate_expected_stop_artifact(
+    name: str,
+    actual: StopArtifactVersion,
+    expected: StopArtifactVersion,
+) -> None:
+    if (actual.device, actual.inode) != (expected.device, expected.inode):
+        raise RunSafetyError(
+            f"active run artifact was replaced after prompt refresh: {name}"
+        )
+    if (actual.uid, actual.gid, actual.mode) != (
+        expected.uid,
+        expected.gid,
+        expected.mode,
+    ):
+        raise RunSafetyError(
+            f"active run artifact access policy changed after prompt refresh: {name}"
+        )
+    if actual.size != expected.size or actual.sha256 != expected.sha256:
+        raise RunSafetyError(
+            f"active run artifact content changed after prompt refresh: {name}"
+        )
 
 
 def _validate_stop_run_state_descriptor(
@@ -611,6 +731,7 @@ def _validate_stop_run_state_descriptor(
     run_fd: int,
     *,
     expected_identity: RunDirectoryIdentity | None = None,
+    expected_prompt_versions: dict[str, StopArtifactVersion] | None = None,
 ) -> tuple[dict[str, object], RunDirectoryIdentity]:
     pinned = os.fstat(run_fd)
     if not stat.S_ISDIR(pinned.st_mode):
@@ -651,8 +772,25 @@ def _validate_stop_run_state_descriptor(
         raise RunSafetyError(
             "active run state repo_root does not exactly match the current repository"
         )
-    _validate_stop_regular_file(run_fd, "child-prompt.md")
-    _validate_stop_regular_file(run_fd, "parent-prompt.md")
+    prompt_names = ("child-prompt.md", "parent-prompt.md")
+    if expected_prompt_versions is not None and set(expected_prompt_versions) != set(
+        prompt_names
+    ):
+        raise RunSafetyError(
+            "prompt refresh did not return complete child and parent versions"
+        )
+    for prompt_name in prompt_names:
+        prompt = _read_stop_regular_artifact(
+            run_fd,
+            prompt_name,
+            max_bytes=STATE_MAX_BYTES,
+        )
+        if expected_prompt_versions is not None:
+            _validate_expected_stop_artifact(
+                prompt_name,
+                prompt.version,
+                expected_prompt_versions[prompt_name],
+            )
     current_fd = _open_stop_run_directory(repo_root, run_dir.name)
     try:
         current = os.fstat(current_fd)
@@ -716,7 +854,11 @@ def _refresh_recovery_prompts(
     run_dir: pathlib.Path,
     repo_root: pathlib.Path,
     run_identity: RunDirectoryIdentity,
-) -> tuple[pathlib.Path, pathlib.Path]:
+) -> RefreshedPrompts:
+    expected_runner = _read_stop_absolute_regular_artifact(
+        RUNNER_PATH,
+        max_bytes=STATE_MAX_BYTES,
+    ).version
     payload = _run_bridge_json(
         "refresh-prompts-live",
         "--run-dir",
@@ -733,7 +875,25 @@ def _refresh_recovery_prompts(
         str(run_identity.gid),
         "--expected-run-mode",
         str(run_identity.mode),
+        "--expected-runner-dev",
+        str(expected_runner.device),
+        "--expected-runner-ino",
+        str(expected_runner.inode),
+        "--expected-runner-uid",
+        str(expected_runner.uid),
+        "--expected-runner-gid",
+        str(expected_runner.gid),
+        "--expected-runner-mode",
+        str(expected_runner.mode),
+        "--expected-runner-size",
+        str(expected_runner.size),
+        "--expected-runner-sha256",
+        expected_runner.sha256,
     )
+    if payload.get("refresh_schema_version") != PROMPT_REFRESH_SCHEMA_VERSION:
+        raise RunSafetyError(
+            "refresh-prompts-live returned an unsupported refresh schema"
+        )
     expected_paths = {
         "runner_path": RUNNER_PATH,
         "child_prompt": run_dir / "child-prompt.md",
@@ -742,11 +902,34 @@ def _refresh_recovery_prompts(
     for field, expected_path in expected_paths.items():
         value = payload.get(field)
         if not isinstance(value, str) or not value:
-            raise UserError(f"refresh-prompts-live did not return {field}")
+            raise RunSafetyError(f"refresh-prompts-live did not return {field}")
         if pathlib.Path(value) != expected_path:
-            raise UserError(
+            raise RunSafetyError(
                 f"refresh-prompts-live returned unexpected {field}: {value}"
             )
+    runner_version = _stop_artifact_version_from_payload(payload, "runner_version")
+    child_version = _stop_artifact_version_from_payload(
+        payload,
+        "child_prompt_version",
+    )
+    parent_version = _stop_artifact_version_from_payload(
+        payload,
+        "parent_prompt_version",
+    )
+    actual_runner = _read_stop_absolute_regular_artifact(
+        RUNNER_PATH,
+        max_bytes=STATE_MAX_BYTES,
+    ).version
+    _validate_expected_stop_artifact(
+        "waited_delivery_runner.py",
+        runner_version,
+        expected_runner,
+    )
+    _validate_expected_stop_artifact(
+        "waited_delivery_runner.py",
+        actual_runner,
+        runner_version,
+    )
     returned_identity_values = (
         payload.get("run_dev"),
         payload.get("run_ino"),
@@ -758,7 +941,7 @@ def _refresh_recovery_prompts(
         isinstance(value, int) and not isinstance(value, bool)
         for value in returned_identity_values
     ):
-        raise UserError(
+        raise RunSafetyError(
             "refresh-prompts-live did not return a complete run access identity"
         )
     returned_identity = RunDirectoryIdentity(
@@ -772,9 +955,11 @@ def _refresh_recovery_prompts(
         raise RunSafetyError(
             "refresh-prompts-live returned an unexpected run directory identity"
         )
-    return (
-        expected_paths["child_prompt"],
-        expected_paths["parent_prompt"],
+    return RefreshedPrompts(
+        child_prompt=expected_paths["child_prompt"],
+        child_version=child_version,
+        parent_prompt=expected_paths["parent_prompt"],
+        parent_version=parent_version,
     )
 
 
@@ -1283,7 +1468,7 @@ def _handle_pinned_stop_run(
     record["updated_at"] = _utc_now()
     _save_index(index_path, index)
     try:
-        child_prompt, parent_prompt = _refresh_recovery_prompts(
+        refreshed_prompts = _refresh_recovery_prompts(
             run_dir,
             repo_root,
             run_identity,
@@ -1293,6 +1478,10 @@ def _handle_pinned_stop_run(
             run_dir,
             run_fd,
             expected_identity=run_identity,
+            expected_prompt_versions={
+                "child-prompt.md": refreshed_prompts.child_version,
+                "parent-prompt.md": refreshed_prompts.parent_version,
+            },
         )
         if refreshed_identity != run_identity:
             raise RunSafetyError("active run directory changed during prompt refresh")
@@ -1300,8 +1489,8 @@ def _handle_pinned_stop_run(
             repo_root,
             run_dir,
             state,
-            child_prompt=child_prompt,
-            parent_prompt=parent_prompt,
+            child_prompt=refreshed_prompts.child_prompt,
+            parent_prompt=refreshed_prompts.parent_prompt,
         )
     except RunSafetyError as error:
         return _block_unsafe_stop(error, payload)

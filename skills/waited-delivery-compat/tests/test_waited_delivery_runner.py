@@ -110,6 +110,27 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def _assert_file_version_payload(
+        self,
+        payload: object,
+        path: pathlib.Path,
+    ) -> None:
+        self.assertIsInstance(payload, dict)
+        version = payload
+        assert isinstance(version, dict)
+        file_stat = path.stat()
+        content = path.read_bytes()
+        self.assertEqual(version["device"], file_stat.st_dev)
+        self.assertEqual(version["inode"], file_stat.st_ino)
+        self.assertEqual(version["uid"], file_stat.st_uid)
+        self.assertEqual(version["gid"], file_stat.st_gid)
+        self.assertEqual(version["mode"], file_stat.st_mode & 0o7777)
+        self.assertEqual(version["size"], len(content))
+        self.assertEqual(
+            version["sha256"],
+            hashlib.sha256(content).hexdigest(),
+        )
+
     def _prepare(self, *extra_args: str) -> pathlib.Path:
         completed = self._run_runner(
             "prepare",
@@ -327,9 +348,19 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
+        self.assertEqual(payload["refresh_schema_version"], 1)
         self.assertEqual(payload["runner_path"], str(SCRIPT_PATH))
         self.assertEqual(payload["child_prompt"], str(run_dir / "child-prompt.md"))
         self.assertEqual(payload["parent_prompt"], str(run_dir / "parent-prompt.md"))
+        self._assert_file_version_payload(payload["runner_version"], SCRIPT_PATH)
+        self._assert_file_version_payload(
+            payload["child_prompt_version"],
+            run_dir / "child-prompt.md",
+        )
+        self._assert_file_version_payload(
+            payload["parent_prompt_version"],
+            run_dir / "parent-prompt.md",
+        )
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(
             state["artifacts"]["child_prompt"],
@@ -346,6 +377,44 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             self.assertNotIn("legacy sentinel", prompt)
         for name, old_inode in before_inodes.items():
             self.assertNotEqual((run_dir / name).stat().st_ino, old_inode)
+
+    def test_refresh_prompts_rejects_runner_mismatch_before_writes(self) -> None:
+        run_dir = self._prepare("--no-fallback-smoke")
+        watched_paths = tuple(
+            run_dir / name
+            for name in ("state.json", "child-prompt.md", "parent-prompt.md")
+        )
+        before = {
+            path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
+        }
+        runner_stat = SCRIPT_PATH.stat()
+
+        completed = self._run_runner(
+            "refresh-prompts",
+            "--run-dir",
+            str(run_dir),
+            "--expected-runner-dev",
+            str(runner_stat.st_dev),
+            "--expected-runner-ino",
+            str(runner_stat.st_ino),
+            "--expected-runner-uid",
+            str(runner_stat.st_uid),
+            "--expected-runner-gid",
+            str(runner_stat.st_gid),
+            "--expected-runner-mode",
+            str(runner_stat.st_mode & 0o7777),
+            "--expected-runner-size",
+            str(runner_stat.st_size),
+            "--expected-runner-sha256",
+            "0" * 64,
+            "--json",
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("compatibility runner content changed", completed.stderr)
+        for path, (expected_inode, expected_content) in before.items():
+            self.assertEqual(path.stat().st_ino, expected_inode)
+            self.assertEqual(path.read_bytes(), expected_content)
 
     def test_refresh_prompts_rejects_symlinked_state_or_prompt_artifacts(self) -> None:
         for target_name in ("state.json", "child-prompt.md", "parent-prompt.md"):
@@ -412,6 +481,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         mutations = {
             "missing": "is missing before update",
             "replaced": "was replaced before update",
+            "access-changed": "access changed before update",
             "content-changed": "content changed before update",
             "unreadable": "is unreadable before update",
         }
@@ -449,6 +519,8 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                                 b"[" if original_content[:1] != b"[" else b"{"
                             )
                             state_file.flush()
+                    elif mutation == "access-changed":
+                        state_path.chmod(0o640)
                     else:
                         state_path.unlink()
                         state_path.mkdir()
@@ -523,6 +595,51 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                     )
         finally:
             module.os.close(run_fd)
+
+    def test_atomic_write_binds_published_temp_file_access_policy(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        opened_run_dir, _repo_root, run_fd = module._open_run_directory(run_dir)
+        artifact_name = "child-prompt.md"
+        artifact_path = opened_run_dir / artifact_name
+        expected_version = module._expected_artifact_version(
+            run_fd,
+            artifact_name,
+            required=True,
+        )
+        self.assertIsNotNone(expected_version)
+        real_regular_file_stat = module._regular_file_stat
+        access_changed = False
+
+        def stat_then_change_access(*args, **kwargs):
+            nonlocal access_changed
+            published_stat = real_regular_file_stat(*args, **kwargs)
+            if not access_changed:
+                access_changed = True
+                artifact_path.chmod(0o640)
+            return published_stat
+
+        try:
+            with mock.patch.object(
+                module,
+                "_regular_file_stat",
+                side_effect=stat_then_change_access,
+            ):
+                with self.assertRaisesRegex(
+                    module.UserError,
+                    "publication identity or content mismatch",
+                ):
+                    module._atomic_write_regular(
+                        run_fd,
+                        artifact_name,
+                        "intended publication\n",
+                        expected_version=expected_version,
+                    )
+        finally:
+            module.os.close(run_fd)
+
+        self.assertTrue(access_changed)
+        self.assertEqual(artifact_path.stat().st_mode & 0o7777, 0o640)
 
     def test_refresh_prompts_serializes_state_rmw_with_phase_and_child_updates(
         self,

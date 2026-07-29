@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -90,6 +91,27 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def _assert_file_version_payload(
+        self,
+        payload: object,
+        path: pathlib.Path,
+    ) -> None:
+        self.assertIsInstance(payload, dict)
+        version = payload
+        assert isinstance(version, dict)
+        file_stat = path.stat()
+        content = path.read_bytes()
+        self.assertEqual(version["device"], file_stat.st_dev)
+        self.assertEqual(version["inode"], file_stat.st_ino)
+        self.assertEqual(version["uid"], file_stat.st_uid)
+        self.assertEqual(version["gid"], file_stat.st_gid)
+        self.assertEqual(version["mode"], file_stat.st_mode & 0o7777)
+        self.assertEqual(version["size"], len(content))
+        self.assertEqual(
+            version["sha256"],
+            hashlib.sha256(content).hexdigest(),
+        )
 
     def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
         return run([sys.executable, str(RUNNER_PATH), *args])
@@ -218,6 +240,8 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
                 encoding="utf-8",
             )
         run_identity = run_dir.stat()
+        runner_identity = RUNNER_PATH.stat()
+        runner_sha256 = hashlib.sha256(RUNNER_PATH.read_bytes()).hexdigest()
 
         completed = self._run_bridge(
             "refresh-prompts-live",
@@ -233,11 +257,35 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
             str(run_identity.st_gid),
             "--expected-run-mode",
             str(run_identity.st_mode & 0o7777),
+            "--expected-runner-dev",
+            str(runner_identity.st_dev),
+            "--expected-runner-ino",
+            str(runner_identity.st_ino),
+            "--expected-runner-uid",
+            str(runner_identity.st_uid),
+            "--expected-runner-gid",
+            str(runner_identity.st_gid),
+            "--expected-runner-mode",
+            str(runner_identity.st_mode & 0o7777),
+            "--expected-runner-size",
+            str(runner_identity.st_size),
+            "--expected-runner-sha256",
+            runner_sha256,
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
+        self.assertEqual(payload["refresh_schema_version"], 1)
         self.assertEqual(payload["runner_path"], str(RUNNER_PATH))
+        self._assert_file_version_payload(payload["runner_version"], RUNNER_PATH)
+        self._assert_file_version_payload(
+            payload["child_prompt_version"],
+            run_dir / "child-prompt.md",
+        )
+        self._assert_file_version_payload(
+            payload["parent_prompt_version"],
+            run_dir / "parent-prompt.md",
+        )
         self.assertEqual(payload["run_dev"], run_identity.st_dev)
         self.assertEqual(payload["run_ino"], run_identity.st_ino)
         self.assertEqual(payload["run_uid"], run_identity.st_uid)
@@ -247,6 +295,43 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
             prompt = (run_dir / prompt_name).read_text(encoding="utf-8")
             self.assertIn(str(RUNNER_PATH), prompt)
             self.assertNotIn(str(legacy_runner), prompt)
+
+    def test_refresh_prompts_live_rejects_runner_mismatch_before_writes(self) -> None:
+        run_dir = self._prepare_run_dir()
+        watched_paths = tuple(
+            run_dir / name
+            for name in ("state.json", "child-prompt.md", "parent-prompt.md")
+        )
+        before = {
+            path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
+        }
+        runner_identity = RUNNER_PATH.stat()
+
+        completed = self._run_bridge(
+            "refresh-prompts-live",
+            "--run-dir",
+            str(run_dir),
+            "--expected-runner-dev",
+            str(runner_identity.st_dev),
+            "--expected-runner-ino",
+            str(runner_identity.st_ino),
+            "--expected-runner-uid",
+            str(runner_identity.st_uid),
+            "--expected-runner-gid",
+            str(runner_identity.st_gid),
+            "--expected-runner-mode",
+            str(runner_identity.st_mode & 0o7777),
+            "--expected-runner-size",
+            str(runner_identity.st_size),
+            "--expected-runner-sha256",
+            "0" * 64,
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("compatibility runner content changed", completed.stderr)
+        for path, (expected_inode, expected_content) in before.items():
+            self.assertEqual(path.stat().st_ino, expected_inode)
+            self.assertEqual(path.read_bytes(), expected_content)
 
     def test_attach_child_live_propagates_env_parent_metadata(self) -> None:
         run_dir = self._prepare_run_dir()

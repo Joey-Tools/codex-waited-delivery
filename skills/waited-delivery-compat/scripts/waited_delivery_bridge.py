@@ -166,6 +166,22 @@ def _refresh_prompts_live(args: argparse.Namespace) -> int:
         raise UserError(
             "expected run device, inode, uid, gid, and mode must be supplied together"
         )
+    expected_runner_args = (
+        ("--expected-runner-dev", args.expected_runner_dev),
+        ("--expected-runner-ino", args.expected_runner_ino),
+        ("--expected-runner-uid", args.expected_runner_uid),
+        ("--expected-runner-gid", args.expected_runner_gid),
+        ("--expected-runner-mode", args.expected_runner_mode),
+        ("--expected-runner-size", args.expected_runner_size),
+        ("--expected-runner-sha256", args.expected_runner_sha256),
+    )
+    if any(value is not None for _name, value in expected_runner_args) and not all(
+        value is not None for _name, value in expected_runner_args
+    ):
+        raise UserError(
+            "expected runner device, inode, uid, gid, mode, size, and sha256 "
+            "must be supplied together"
+        )
     runner_args = [
         "refresh-prompts",
         "--run-dir",
@@ -175,6 +191,9 @@ def _refresh_prompts_live(args: argparse.Namespace) -> int:
     if args.expected_repo_root:
         runner_args.extend(["--expected-repo-root", args.expected_repo_root])
     for name, value in expected_identity_args:
+        if value is not None:
+            runner_args.extend([name, str(value)])
+    for name, value in expected_runner_args:
         if value is not None:
             runner_args.extend([name, str(value)])
     return _run_runner(*runner_args)
@@ -278,6 +297,13 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_prompts_live.add_argument("--expected-run-uid", type=int)
     refresh_prompts_live.add_argument("--expected-run-gid", type=int)
     refresh_prompts_live.add_argument("--expected-run-mode", type=int)
+    refresh_prompts_live.add_argument("--expected-runner-dev", type=int)
+    refresh_prompts_live.add_argument("--expected-runner-ino", type=int)
+    refresh_prompts_live.add_argument("--expected-runner-uid", type=int)
+    refresh_prompts_live.add_argument("--expected-runner-gid", type=int)
+    refresh_prompts_live.add_argument("--expected-runner-mode", type=int)
+    refresh_prompts_live.add_argument("--expected-runner-size", type=int)
+    refresh_prompts_live.add_argument("--expected-runner-sha256")
     refresh_prompts_live.set_defaults(func=_refresh_prompts_live)
 
     finish_child_live = subparsers.add_parser("finish-child-live")

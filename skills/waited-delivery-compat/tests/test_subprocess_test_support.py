@@ -146,6 +146,40 @@ class SubprocessTestSupportTests(unittest.TestCase):
                     )
                 )
 
+    def test_selector_initialization_failure_precedes_pipe_and_process_launch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with mock.patch.object(
+                support.selectors,
+                "DefaultSelector",
+                side_effect=OSError("selector unavailable"),
+            ):
+                with mock.patch.object(
+                    support.os,
+                    "pipe",
+                    wraps=support.os.pipe,
+                ) as pipe:
+                    with mock.patch.object(
+                        support.subprocess,
+                        "Popen",
+                        wraps=support.subprocess.Popen,
+                    ) as popen:
+                        with self.assertRaisesRegex(
+                            OSError,
+                            "selector unavailable",
+                        ):
+                            run_before_stdin_eof(
+                                [sys.executable, "-c", "raise SystemExit(0)"],
+                                cwd=root,
+                                env=self._environment(root),
+                                input_text="",
+                            )
+
+            pipe.assert_not_called()
+            popen.assert_not_called()
+
     def test_empty_open_stdin_blocks_a_single_byte_read(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
