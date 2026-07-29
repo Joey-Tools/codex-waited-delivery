@@ -72,7 +72,7 @@ PROCESS_DRAIN_CHUNK_BYTES = 64 * 1024
 PROCESS_POLL_INTERVAL_SECONDS = 0.02
 PROC_GROUP_SCAN_MAX_ENTRIES = 131_072
 PROC_GROUP_SCAN_TIMEOUT_SECONDS = 0.25
-PROMPT_REFRESH_SCHEMA_VERSION = 1
+PROMPT_REFRESH_SCHEMA_VERSION = 2
 
 
 class FileVersion(NamedTuple):
@@ -702,6 +702,41 @@ def _validate_file_version(
         raise UserError(f"{label} content changed")
 
 
+def _expected_file_version(
+    args: argparse.Namespace,
+    prefix: str,
+) -> FileVersion:
+    values = tuple(
+        getattr(args, f"expected_{prefix}_{field}")
+        for field in ("dev", "ino", "uid", "gid", "mode", "size", "sha256")
+    )
+    integer_values = values[:-1]
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in integer_values
+    ):
+        raise UserError(
+            f"expected {prefix} identity fields must be supplied as nonnegative "
+            f"integers"
+        )
+    sha256 = values[-1]
+    if (
+        not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+    ):
+        raise UserError(f"expected {prefix} sha256 must be lowercase hexadecimal")
+    return FileVersion(
+        device=cast(int, integer_values[0]),
+        inode=cast(int, integer_values[1]),
+        uid=cast(int, integer_values[2]),
+        gid=cast(int, integer_values[3]),
+        mode=cast(int, integer_values[4]),
+        size=cast(int, integer_values[5]),
+        sha256=sha256,
+    )
+
+
 def _read_absolute_regular_artifact(
     path: pathlib.Path,
     *,
@@ -723,6 +758,161 @@ def _read_absolute_regular_artifact(
         )
     finally:
         os.close(parent_fd)
+
+
+def _read_inherited_regular_artifact(
+    file_fd: int,
+    name: str,
+    *,
+    max_bytes: int,
+) -> ArtifactRead:
+    def read_bounded() -> bytes:
+        chunks: list[bytes] = []
+        offset = 0
+        while True:
+            chunk = os.pread(
+                file_fd,
+                min(65536, max_bytes + 1 - offset),
+                offset,
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+            if offset > max_bytes:
+                raise ArtifactUnreadableError(
+                    f"descriptor-bound compatibility artifact exceeds byte "
+                    f"limit: {name}"
+                )
+        return b"".join(chunks)
+
+    try:
+        access_mode = fcntl.fcntl(file_fd, fcntl.F_GETFL) & os.O_ACCMODE
+        if access_mode != os.O_RDONLY:
+            raise ArtifactUnreadableError(
+                f"descriptor-bound compatibility artifact must be opened "
+                f"read-only: {name}"
+            )
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ArtifactUnreadableError(
+                f"descriptor-bound compatibility artifact must be a regular "
+                f"file: {name}"
+            )
+        if before.st_size > max_bytes:
+            raise ArtifactUnreadableError(
+                f"descriptor-bound compatibility artifact exceeds byte limit: {name}"
+            )
+        expected_access = (
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+        )
+        first_content = read_bounded()
+        middle = os.fstat(file_fd)
+        second_content = read_bounded()
+        after = os.fstat(file_fd)
+        stable_stats = (before, middle, after)
+        if (
+            any(not stat.S_ISREG(value.st_mode) for value in stable_stats)
+            or any(not _same_object(before, value) for value in stable_stats[1:])
+            or any(value.st_size != before.st_size for value in stable_stats[1:])
+            or any(
+                (
+                    value.st_uid,
+                    value.st_gid,
+                    stat.S_IMODE(value.st_mode),
+                )
+                != expected_access
+                for value in stable_stats[1:]
+            )
+            or len(first_content) != before.st_size
+            or len(second_content) != before.st_size
+            or first_content != second_content
+        ):
+            raise ArtifactChangedError(
+                f"descriptor-bound compatibility artifact identity, access, size, "
+                f"or content changed while read: {name}"
+            )
+        return ArtifactRead(
+            content=second_content,
+            version=FileVersion(
+                device=after.st_dev,
+                inode=after.st_ino,
+                uid=after.st_uid,
+                gid=after.st_gid,
+                mode=stat.S_IMODE(after.st_mode),
+                size=after.st_size,
+                sha256=hashlib.sha256(second_content).hexdigest(),
+            ),
+        )
+    except (ArtifactUnreadableError, ArtifactChangedError):
+        raise
+    except OSError as error:
+        raise ArtifactUnreadableError(
+            f"cannot read descriptor-bound compatibility artifact: {name}"
+        ) from error
+
+
+def _fd_execution_path(file_fd: int, name: str) -> pathlib.Path:
+    try:
+        descriptor_stat = os.fstat(file_fd)
+    except OSError as error:
+        raise UserError(
+            f"cannot inspect descriptor-bound compatibility artifact: {name}"
+        ) from error
+    for root in (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")):
+        candidate = root / str(file_fd)
+        probe_fd: int | None = None
+        try:
+            probe_fd = os.open(
+                candidate,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+            candidate_stat = os.fstat(probe_fd)
+        except OSError:
+            continue
+        finally:
+            if probe_fd is not None:
+                os.close(probe_fd)
+        if _same_object(descriptor_stat, candidate_stat):
+            return candidate
+    raise UserError(f"cannot expose descriptor-bound compatibility artifact: {name}")
+
+
+def _validate_runner_loaded_from_descriptor(file_fd: int) -> pathlib.Path:
+    execution_path = _fd_execution_path(file_fd, "waited_delivery_runner.py")
+    loaded_path = pathlib.Path(os.path.abspath(__file__))
+    if loaded_path != execution_path:
+        raise UserError(
+            "compatibility runner refresh must be launched through its inherited "
+            "descriptor path"
+        )
+    loaded_fd: int | None = None
+    try:
+        loaded_fd = os.open(
+            loaded_path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        loaded_stat = os.fstat(loaded_fd)
+        descriptor_stat = os.fstat(file_fd)
+    except OSError as error:
+        raise UserError(
+            "cannot bind loaded compatibility runner to inherited descriptor"
+        ) from error
+    finally:
+        if loaded_fd is not None:
+            os.close(loaded_fd)
+    if not _same_object(loaded_stat, descriptor_stat):
+        raise UserError(
+            "loaded compatibility runner does not match inherited descriptor"
+        )
+    return execution_path
+
+
+def _require_isolated_python() -> None:
+    if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
+        raise UserError("refresh-prompts requires Python -I -B -S isolation")
 
 
 def _atomic_write_regular(
@@ -1075,10 +1265,12 @@ def _shell_command(args: list[str]) -> str:
     return " ".join(shlex.quote(arg) for arg in args)
 
 
-def _runner_command(*args: str) -> str:
-    return _shell_command(
-        [sys.executable, str(pathlib.Path(__file__).resolve()), *args]
-    )
+def _runner_command(
+    *args: str,
+    runner_path: pathlib.Path | None = None,
+) -> str:
+    published_path = runner_path or pathlib.Path(__file__).resolve()
+    return _shell_command([sys.executable, str(published_path), *args])
 
 
 def _smoke_command_argv(state: WaitedDeliveryState) -> list[str]:
@@ -1099,7 +1291,12 @@ def _smoke_command_argv(state: WaitedDeliveryState) -> list[str]:
     ]
 
 
-def _build_child_prompt(run_dir: pathlib.Path, state: WaitedDeliveryState) -> str:
+def _build_child_prompt(
+    run_dir: pathlib.Path,
+    state: WaitedDeliveryState,
+    *,
+    runner_path: pathlib.Path | None = None,
+) -> str:
     smoke = state["fallback_readiness_smoke"]
     lines = [
         "# Waited Delivery Child Prompt",
@@ -1118,19 +1315,19 @@ def _build_child_prompt(run_dir: pathlib.Path, state: WaitedDeliveryState) -> st
             "2. If an early fallback-lane readiness probe is useful, run this narrow smoke first:"
         )
         lines.append(
-            f"   `{_runner_command('run-fallback-smoke', '--run-dir', str(run_dir))}`"
+            f"   `{_runner_command('run-fallback-smoke', '--run-dir', str(run_dir), runner_path=runner_path)}`"
         )
     else:
         lines.append("2. Fallback readiness smoke is disabled for this run.")
     lines.extend(
         [
             "3. For each child-owned delivery phase, mark it `running` before work begins:",
-            f"   `{_runner_command('begin-phase', '--run-dir', str(run_dir), '--phase', '<phase>')}`",
+            f"   `{_runner_command('begin-phase', '--run-dir', str(run_dir), '--phase', '<phase>', runner_path=runner_path)}`",
             "4. As soon as a phase reaches a terminal result, persist it with `record-phase`:",
-            f"   `{_runner_command('record-phase', '--run-dir', str(run_dir), '--phase', '<phase>', '--status', 'passed', '--summary', '<summary>')}`",
+            f"   `{_runner_command('record-phase', '--run-dir', str(run_dir), '--phase', '<phase>', '--status', 'passed', '--summary', '<summary>', runner_path=runner_path)}`",
             "5. Do not mark `internal_review` or `external_review` as passed. The parent owns review after you return.",
             "6. If you stop early after a decisive failure or decision point, close untouched downstream phases before returning:",
-            f"   `{_runner_command('close-open-phases', '--run-dir', str(run_dir), '--status', 'blocked', '--summary', '<why downstream phases were not run>')}`",
+            f"   `{_runner_command('close-open-phases', '--run-dir', str(run_dir), '--status', 'blocked', '--summary', '<why downstream phases were not run>', runner_path=runner_path)}`",
             "7. Do not call `finalize` from the child. The parent owns review and reconciliation after `wait` returns.",
             "8. Return a concise terminal summary for the parent that matches the persisted child-owned phase states.",
         ]
@@ -1138,7 +1335,12 @@ def _build_child_prompt(run_dir: pathlib.Path, state: WaitedDeliveryState) -> st
     return "\n".join(lines) + "\n"
 
 
-def _build_parent_prompt(run_dir: pathlib.Path, state: WaitedDeliveryState) -> str:
+def _build_parent_prompt(
+    run_dir: pathlib.Path,
+    state: WaitedDeliveryState,
+    *,
+    runner_path: pathlib.Path | None = None,
+) -> str:
     lines = [
         "# Waited Delivery Parent Prompt",
         "",
@@ -1146,16 +1348,16 @@ def _build_parent_prompt(run_dir: pathlib.Path, state: WaitedDeliveryState) -> s
         "",
         "Required sequence:",
         f"1. Spawn exactly one delivery child for this run and give it `{state['artifacts']['child_prompt']}` as the bounded handoff payload.",
-        f"2. As soon as the child session ID is known, persist it with: `{_runner_command('attach-child', '--run-dir', str(run_dir), '--child-session-id', '<child_session_id>')}`",
+        f"2. As soon as the child session ID is known, persist it with: `{_runner_command('attach-child', '--run-dir', str(run_dir), '--child-session-id', '<child_session_id>', runner_path=runner_path)}`",
         "3. Immediately wait for that child. Do not summarize early and do not continue unrelated work while the child is active.",
         "4. When `wait` returns, inspect the child result and persist its terminal status before starting review:",
-        f"   `{_runner_command('finish-child', '--run-dir', str(run_dir), '--child-status', '<completed|failed|interrupted>', '--child-session-id', '<child_session_id>')}`",
+        f"   `{_runner_command('finish-child', '--run-dir', str(run_dir), '--child-status', '<completed|failed|interrupted>', '--child-session-id', '<child_session_id>', runner_path=runner_path)}`",
         "5. Do not claim review coverage while implementation changes remain dirty or untracked. When authorized, form a committed clean/frozen `base_sha..head_sha`; otherwise record `blocked` or `decision_point`.",
         "6. Named internal single review means directly launching exactly one fresh/clear-context Codex `reviewer` agent. Require it to load `$review-orchestration-playbook` plus applicable `AGENTS.md` and repository guidance.",
         "7. Give the reviewer only the goal, workspace path, immutable refs, focus, evidence budget, and output contract. Do not precompute or paste a full diff; the reviewer discovers the fixed diff and nearby context with tools inside the clean/frozen workspace.",
         "8. `isolated_review` is low-level compatibility/diagnostic tooling only. It cannot start, satisfy, substitute for, or count as the named internal single review; its lifecycle does not add a reviewer.",
         "9. Persist the named Codex artifact only as `internal_review`. Run `external_review` separately only when required, and never reuse the internal artifact for it. A fallback-readiness smoke is availability evidence only and never review coverage.",
-        f"10. Reconcile the run with: `{_runner_command('reconcile-parent', '--run-dir', str(run_dir), '--child-status', '<completed|failed|interrupted>', '--child-session-id', '<child_session_id>')}`",
+        f"10. Reconcile the run with: `{_runner_command('reconcile-parent', '--run-dir', str(run_dir), '--child-status', '<completed|failed|interrupted>', '--child-session-id', '<child_session_id>', runner_path=runner_path)}`",
         "11. Read the resulting `summary.md` and only then give the user the consolidated finish-line result.",
         "",
         "Guardrails:",
@@ -1172,6 +1374,7 @@ def _write_current_prompts(
     state: WaitedDeliveryState,
     *,
     require_existing: bool,
+    runner_path: pathlib.Path | None = None,
 ) -> tuple[pathlib.Path, FileVersion, pathlib.Path, FileVersion]:
     child_prompt_path = run_dir / "child-prompt.md"
     parent_prompt_path = run_dir / "parent-prompt.md"
@@ -1190,13 +1393,21 @@ def _write_current_prompts(
     child_published_version = _atomic_write_regular(
         run_fd,
         child_prompt_path.name,
-        _build_child_prompt(run_dir, state),
+        _build_child_prompt(
+            run_dir,
+            state,
+            runner_path=runner_path,
+        ),
         expected_version=child_prompt_version,
     )
     parent_published_version = _atomic_write_regular(
         run_fd,
         parent_prompt_path.name,
-        _build_parent_prompt(run_dir, state),
+        _build_parent_prompt(
+            run_dir,
+            state,
+            runner_path=runner_path,
+        ),
         expected_version=parent_prompt_version,
     )
     return (
@@ -1345,6 +1556,7 @@ def _prepare(args: argparse.Namespace) -> int:
 
 
 def _refresh_prompts(args: argparse.Namespace) -> int:
+    _require_isolated_python()
     expected_identity_values = (
         getattr(args, "expected_run_dev", None),
         getattr(args, "expected_run_ino", None),
@@ -1367,76 +1579,68 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
             gid=cast(int, expected_identity_values[3]),
             mode=cast(int, expected_identity_values[4]),
         )
-    expected_runner_values = (
-        getattr(args, "expected_runner_dev", None),
-        getattr(args, "expected_runner_ino", None),
-        getattr(args, "expected_runner_uid", None),
-        getattr(args, "expected_runner_gid", None),
-        getattr(args, "expected_runner_mode", None),
-        getattr(args, "expected_runner_size", None),
-        getattr(args, "expected_runner_sha256", None),
+    expected_bridge_version = _expected_file_version(args, "bridge")
+    expected_runner_version = _expected_file_version(args, "runner")
+    runner_execution_path = _validate_runner_loaded_from_descriptor(
+        args.executed_runner_fd
     )
-    if any(value is not None for value in expected_runner_values) and not all(
-        value is not None for value in expected_runner_values
+    bridge_execution_path = _fd_execution_path(
+        args.executed_bridge_fd,
+        "waited_delivery_bridge.py",
+    )
+    runner_path = pathlib.Path(args.published_runner_path)
+    if (
+        not runner_path.is_absolute()
+        or not runner_path.name
+        or pathlib.PurePath(runner_path.name).name != runner_path.name
     ):
-        raise UserError(
-            "expected runner device, inode, uid, gid, mode, size, and sha256 "
-            "must be supplied together"
-        )
-    expected_runner_version = None
-    if all(value is not None for value in expected_runner_values):
-        integer_values = expected_runner_values[:-1]
-        if not all(
-            isinstance(value, int) and not isinstance(value, bool) and value >= 0
-            for value in integer_values
-        ):
-            raise UserError("expected runner identity fields must be nonnegative")
-        expected_runner_sha256 = expected_runner_values[-1]
-        if (
-            not isinstance(expected_runner_sha256, str)
-            or len(expected_runner_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in expected_runner_sha256
-            )
-        ):
-            raise UserError("expected runner sha256 must be lowercase hexadecimal")
-        expected_runner_version = FileVersion(
-            device=cast(int, integer_values[0]),
-            inode=cast(int, integer_values[1]),
-            uid=cast(int, integer_values[2]),
-            gid=cast(int, integer_values[3]),
-            mode=cast(int, integer_values[4]),
-            size=cast(int, integer_values[5]),
-            sha256=expected_runner_sha256,
-        )
-    runner_path = pathlib.Path(__file__).resolve()
-    runner_version = _read_absolute_regular_artifact(
-        runner_path,
+        raise UserError("published runner path must be an absolute file path")
+    bridge_version = _read_inherited_regular_artifact(
+        args.executed_bridge_fd,
+        "waited_delivery_bridge.py",
         max_bytes=STATE_MAX_BYTES,
     ).version
-    if expected_runner_version is not None:
-        _validate_file_version(
-            runner_version,
-            expected_runner_version,
-            label="compatibility runner",
-        )
+    _validate_file_version(
+        bridge_version,
+        expected_bridge_version,
+        label="compatibility bridge",
+    )
+    runner_version = _read_inherited_regular_artifact(
+        args.executed_runner_fd,
+        "waited_delivery_runner.py",
+        max_bytes=STATE_MAX_BYTES,
+    ).version
+    _validate_file_version(
+        runner_version,
+        expected_runner_version,
+        label="compatibility runner",
+    )
     with _locked_run_state(
         args.run_dir,
         expected_repo_root=args.expected_repo_root,
         expected_run_identity=expected_run_identity,
     ) as (run_dir, repo_root, run_fd, state, state_version):
         run_identity = _directory_identity(os.fstat(run_fd))
-        runner_version = _read_absolute_regular_artifact(
-            runner_path,
+        bridge_version = _read_inherited_regular_artifact(
+            args.executed_bridge_fd,
+            "waited_delivery_bridge.py",
             max_bytes=STATE_MAX_BYTES,
         ).version
-        if expected_runner_version is not None:
-            _validate_file_version(
-                runner_version,
-                expected_runner_version,
-                label="compatibility runner",
-            )
+        _validate_file_version(
+            bridge_version,
+            expected_bridge_version,
+            label="compatibility bridge",
+        )
+        runner_version = _read_inherited_regular_artifact(
+            args.executed_runner_fd,
+            "waited_delivery_runner.py",
+            max_bytes=STATE_MAX_BYTES,
+        ).version
+        _validate_file_version(
+            runner_version,
+            expected_runner_version,
+            label="compatibility runner",
+        )
         (
             child_prompt_path,
             child_prompt_version,
@@ -1447,6 +1651,7 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
             run_fd,
             state,
             require_existing=True,
+            runner_path=runner_path,
         )
         _save_state(
             run_dir,
@@ -1455,23 +1660,19 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
             state,
             state_version,
         )
-        runner_version = _read_absolute_regular_artifact(
-            runner_path,
-            max_bytes=STATE_MAX_BYTES,
-        ).version
-        if expected_runner_version is not None:
-            _validate_file_version(
-                runner_version,
-                expected_runner_version,
-                label="compatibility runner",
-            )
     if args.json:
         print(
             json.dumps(
                 {
                     "refresh_schema_version": PROMPT_REFRESH_SCHEMA_VERSION,
+                    "python_isolated": True,
+                    "bridge_fd_access": "read-only",
+                    "runner_fd_access": "read-only",
                     "run_dir": str(run_dir),
                     "runner_path": str(runner_path),
+                    "executed_bridge_path": str(bridge_execution_path),
+                    "bridge_version": _file_version_payload(bridge_version),
+                    "executed_runner_path": str(runner_execution_path),
                     "runner_version": _file_version_payload(runner_version),
                     "child_prompt": str(child_prompt_path),
                     "child_prompt_version": _file_version_payload(child_prompt_version),
@@ -2575,6 +2776,23 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_prompts = subparsers.add_parser("refresh-prompts")
     refresh_prompts.add_argument("--run-dir", required=True)
     refresh_prompts.add_argument(
+        "--executed-bridge-fd",
+        type=int,
+        required=True,
+        help="Inherited read-only descriptor for the launching bridge snapshot.",
+    )
+    refresh_prompts.add_argument(
+        "--executed-runner-fd",
+        type=int,
+        required=True,
+        help="Inherited read-only descriptor used to execute this runner snapshot.",
+    )
+    refresh_prompts.add_argument(
+        "--published-runner-path",
+        required=True,
+        help="Canonical runner path to publish in regenerated prompts.",
+    )
+    refresh_prompts.add_argument(
         "--expected-repo-root",
         help=(
             "Require the run to be a direct no-symlink descendant of this exact "
@@ -2606,13 +2824,68 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Require the run directory to have this exact POSIX mode.",
     )
-    refresh_prompts.add_argument("--expected-runner-dev", type=int)
-    refresh_prompts.add_argument("--expected-runner-ino", type=int)
-    refresh_prompts.add_argument("--expected-runner-uid", type=int)
-    refresh_prompts.add_argument("--expected-runner-gid", type=int)
-    refresh_prompts.add_argument("--expected-runner-mode", type=int)
-    refresh_prompts.add_argument("--expected-runner-size", type=int)
-    refresh_prompts.add_argument("--expected-runner-sha256")
+    refresh_prompts.add_argument(
+        "--expected-bridge-dev",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-bridge-ino",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-bridge-uid",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-bridge-gid",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-bridge-mode",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-bridge-size",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument("--expected-bridge-sha256", required=True)
+    refresh_prompts.add_argument(
+        "--expected-runner-dev",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-runner-ino",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-runner-uid",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-runner-gid",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-runner-mode",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument(
+        "--expected-runner-size",
+        type=int,
+        required=True,
+    )
+    refresh_prompts.add_argument("--expected-runner-sha256", required=True)
     refresh_prompts.add_argument(
         "--json",
         action="store_true",

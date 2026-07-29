@@ -30,6 +30,7 @@ def run(
     *,
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
@@ -38,6 +39,7 @@ def run(
         text=True,
         capture_output=True,
         check=False,
+        pass_fds=pass_fds,
     )
 
 
@@ -123,6 +125,75 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
         if env:
             bridge_env.update(env)
         return run([sys.executable, str(BRIDGE_PATH), *args], env=bridge_env)
+
+    def _version_args(
+        self,
+        prefix: str,
+        file_fd: int,
+        path: pathlib.Path,
+        *,
+        sha256: str | None = None,
+    ) -> list[str]:
+        file_stat = os.fstat(file_fd)
+        return [
+            f"--expected-{prefix}-dev",
+            str(file_stat.st_dev),
+            f"--expected-{prefix}-ino",
+            str(file_stat.st_ino),
+            f"--expected-{prefix}-uid",
+            str(file_stat.st_uid),
+            f"--expected-{prefix}-gid",
+            str(file_stat.st_gid),
+            f"--expected-{prefix}-mode",
+            str(file_stat.st_mode & 0o7777),
+            f"--expected-{prefix}-size",
+            str(file_stat.st_size),
+            f"--expected-{prefix}-sha256",
+            sha256 or hashlib.sha256(path.read_bytes()).hexdigest(),
+        ]
+
+    def _run_refresh_bridge(
+        self,
+        *args: str,
+        runner_sha256: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
+        runner_fd = os.open(RUNNER_PATH, os.O_RDONLY)
+        try:
+            return run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    f"/dev/fd/{bridge_fd}",
+                    "refresh-prompts-live",
+                    "--executed-bridge-fd",
+                    str(bridge_fd),
+                    "--executed-runner-fd",
+                    str(runner_fd),
+                    "--published-runner-path",
+                    str(RUNNER_PATH),
+                    *self._version_args(
+                        "bridge",
+                        bridge_fd,
+                        BRIDGE_PATH,
+                    ),
+                    *self._version_args(
+                        "runner",
+                        runner_fd,
+                        RUNNER_PATH,
+                        sha256=runner_sha256,
+                    ),
+                    *args,
+                ],
+                env=env,
+                pass_fds=(bridge_fd, runner_fd),
+            )
+        finally:
+            os.close(runner_fd)
+            os.close(bridge_fd)
 
     def _prepare_run_dir(self) -> pathlib.Path:
         completed = self._run_runner(
@@ -240,11 +311,8 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
                 encoding="utf-8",
             )
         run_identity = run_dir.stat()
-        runner_identity = RUNNER_PATH.stat()
-        runner_sha256 = hashlib.sha256(RUNNER_PATH.read_bytes()).hexdigest()
 
-        completed = self._run_bridge(
-            "refresh-prompts-live",
+        completed = self._run_refresh_bridge(
             "--run-dir",
             str(run_dir),
             "--expected-run-dev",
@@ -257,26 +325,24 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
             str(run_identity.st_gid),
             "--expected-run-mode",
             str(run_identity.st_mode & 0o7777),
-            "--expected-runner-dev",
-            str(runner_identity.st_dev),
-            "--expected-runner-ino",
-            str(runner_identity.st_ino),
-            "--expected-runner-uid",
-            str(runner_identity.st_uid),
-            "--expected-runner-gid",
-            str(runner_identity.st_gid),
-            "--expected-runner-mode",
-            str(runner_identity.st_mode & 0o7777),
-            "--expected-runner-size",
-            str(runner_identity.st_size),
-            "--expected-runner-sha256",
-            runner_sha256,
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
-        self.assertEqual(payload["refresh_schema_version"], 1)
+        self.assertEqual(payload["refresh_schema_version"], 2)
+        self.assertIs(payload["python_isolated"], True)
+        self.assertEqual(payload["bridge_fd_access"], "read-only")
+        self.assertEqual(payload["runner_fd_access"], "read-only")
         self.assertEqual(payload["runner_path"], str(RUNNER_PATH))
+        self.assertIn(
+            pathlib.Path(payload["executed_bridge_path"]).parent,
+            (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")),
+        )
+        self.assertIn(
+            pathlib.Path(payload["executed_runner_path"]).parent,
+            (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")),
+        )
+        self._assert_file_version_payload(payload["bridge_version"], BRIDGE_PATH)
         self._assert_file_version_payload(payload["runner_version"], RUNNER_PATH)
         self._assert_file_version_payload(
             payload["child_prompt_version"],
@@ -305,26 +371,10 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
         before = {
             path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
         }
-        runner_identity = RUNNER_PATH.stat()
-
-        completed = self._run_bridge(
-            "refresh-prompts-live",
+        completed = self._run_refresh_bridge(
             "--run-dir",
             str(run_dir),
-            "--expected-runner-dev",
-            str(runner_identity.st_dev),
-            "--expected-runner-ino",
-            str(runner_identity.st_ino),
-            "--expected-runner-uid",
-            str(runner_identity.st_uid),
-            "--expected-runner-gid",
-            str(runner_identity.st_gid),
-            "--expected-runner-mode",
-            str(runner_identity.st_mode & 0o7777),
-            "--expected-runner-size",
-            str(runner_identity.st_size),
-            "--expected-runner-sha256",
-            "0" * 64,
+            runner_sha256="0" * 64,
         )
 
         self.assertEqual(completed.returncode, 1)
@@ -332,6 +382,224 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
         for path, (expected_inode, expected_content) in before.items():
             self.assertEqual(path.stat().st_ino, expected_inode)
             self.assertEqual(path.read_bytes(), expected_content)
+
+    def test_refresh_prompts_live_rejects_source_path_bridge_launch_before_writes(
+        self,
+    ) -> None:
+        run_dir = self._prepare_run_dir()
+        watched_paths = tuple(
+            run_dir / name
+            for name in ("state.json", "child-prompt.md", "parent-prompt.md")
+        )
+        before = {
+            path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
+        }
+        bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
+        runner_fd = os.open(RUNNER_PATH, os.O_RDONLY)
+        try:
+            completed = run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    str(BRIDGE_PATH),
+                    "refresh-prompts-live",
+                    "--run-dir",
+                    str(run_dir),
+                    "--executed-bridge-fd",
+                    str(bridge_fd),
+                    "--executed-runner-fd",
+                    str(runner_fd),
+                    "--published-runner-path",
+                    str(RUNNER_PATH),
+                    *self._version_args(
+                        "bridge",
+                        bridge_fd,
+                        BRIDGE_PATH,
+                    ),
+                    *self._version_args(
+                        "runner",
+                        runner_fd,
+                        RUNNER_PATH,
+                    ),
+                ],
+                pass_fds=(bridge_fd, runner_fd),
+            )
+        finally:
+            os.close(runner_fd)
+            os.close(bridge_fd)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "must be launched through its inherited descriptor path",
+            completed.stderr,
+        )
+        for path, (expected_inode, expected_content) in before.items():
+            self.assertEqual(path.stat().st_ino, expected_inode)
+            self.assertEqual(path.read_bytes(), expected_content)
+
+    def test_refresh_prompts_live_rejects_writable_bridge_fd_before_writes(
+        self,
+    ) -> None:
+        run_dir = self._prepare_run_dir()
+        watched_paths = tuple(
+            run_dir / name
+            for name in ("state.json", "child-prompt.md", "parent-prompt.md")
+        )
+        before = {
+            path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
+        }
+        bridge_fd = os.open(BRIDGE_PATH, os.O_RDWR)
+        runner_fd = os.open(RUNNER_PATH, os.O_RDONLY)
+        try:
+            completed = run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    f"/dev/fd/{bridge_fd}",
+                    "refresh-prompts-live",
+                    "--run-dir",
+                    str(run_dir),
+                    "--executed-bridge-fd",
+                    str(bridge_fd),
+                    "--executed-runner-fd",
+                    str(runner_fd),
+                    "--published-runner-path",
+                    str(RUNNER_PATH),
+                    *self._version_args(
+                        "bridge",
+                        bridge_fd,
+                        BRIDGE_PATH,
+                    ),
+                    *self._version_args(
+                        "runner",
+                        runner_fd,
+                        RUNNER_PATH,
+                    ),
+                ],
+                pass_fds=(bridge_fd, runner_fd),
+            )
+        finally:
+            os.close(runner_fd)
+            os.close(bridge_fd)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "must be opened read-only: waited_delivery_bridge.py",
+            completed.stderr,
+        )
+        for path, (expected_inode, expected_content) in before.items():
+            self.assertEqual(path.stat().st_ino, expected_inode)
+            self.assertEqual(path.read_bytes(), expected_content)
+
+    def test_refresh_prompts_live_blocks_pythonpath_site_injection(self) -> None:
+        run_dir = self._prepare_run_dir()
+        injection_dir = self.root / "pythonpath-injection"
+        injection_dir.mkdir()
+        marker = self.root / "unexpected-sitecustomize.txt"
+        (injection_dir / "sitecustomize.py").write_text(
+            "import pathlib\n"
+            f"pathlib.Path({str(marker)!r}).write_text("
+            "'unexpected site import\\n', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        injected_env = os.environ.copy()
+        injected_env["PYTHONPATH"] = str(injection_dir)
+        injected_env["PYTHONINSPECT"] = "1"
+
+        completed = self._run_refresh_bridge(
+            "--run-dir",
+            str(run_dir),
+            env=injected_env,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse(marker.exists())
+        payload = json.loads(completed.stdout)
+        self.assertIs(payload["python_isolated"], True)
+        self.assertEqual(payload["bridge_fd_access"], "read-only")
+        self.assertEqual(payload["runner_fd_access"], "read-only")
+
+    def test_refresh_prompts_live_executes_bound_fds_across_source_aba(
+        self,
+    ) -> None:
+        for artifact_name in ("bridge", "runner"):
+            with self.subTest(artifact=artifact_name):
+                run_dir = self._prepare_run_dir()
+                launch_dir = self.root / f"launch-aba-{artifact_name}"
+                launch_dir.mkdir()
+                bridge_path = launch_dir / BRIDGE_PATH.name
+                runner_path = launch_dir / RUNNER_PATH.name
+                bridge_path.write_bytes(BRIDGE_PATH.read_bytes())
+                runner_path.write_bytes(RUNNER_PATH.read_bytes())
+                bridge_path.chmod(BRIDGE_PATH.stat().st_mode & 0o7777)
+                runner_path.chmod(RUNNER_PATH.stat().st_mode & 0o7777)
+                source_path = bridge_path if artifact_name == "bridge" else runner_path
+                source_stat = source_path.stat()
+                displaced = launch_dir / f"{artifact_name}-original.py"
+                marker = self.root / f"unexpected-{artifact_name}-execution.txt"
+                malicious = (
+                    "#!/usr/bin/env python3\n"
+                    "import pathlib\n"
+                    f"pathlib.Path({str(marker)!r}).write_text("
+                    "'unexpected path execution\\n', encoding='utf-8')\n"
+                    "raise SystemExit(93)\n"
+                )
+                bridge_fd = os.open(bridge_path, os.O_RDONLY)
+                runner_fd = os.open(runner_path, os.O_RDONLY)
+                command = [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    f"/dev/fd/{bridge_fd}",
+                    "refresh-prompts-live",
+                    "--run-dir",
+                    str(run_dir),
+                    "--executed-bridge-fd",
+                    str(bridge_fd),
+                    "--executed-runner-fd",
+                    str(runner_fd),
+                    "--published-runner-path",
+                    str(runner_path),
+                    *self._version_args(
+                        "bridge",
+                        bridge_fd,
+                        bridge_path,
+                    ),
+                    *self._version_args(
+                        "runner",
+                        runner_fd,
+                        runner_path,
+                    ),
+                ]
+                source_path.rename(displaced)
+                source_path.write_text(malicious, encoding="utf-8")
+                source_path.chmod(source_stat.st_mode & 0o7777)
+                try:
+                    completed = run(
+                        command,
+                        pass_fds=(bridge_fd, runner_fd),
+                    )
+                finally:
+                    os.close(runner_fd)
+                    os.close(bridge_fd)
+                    source_path.unlink()
+                    displaced.rename(source_path)
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertFalse(marker.exists())
+                self.assertEqual(source_path.stat().st_ino, source_stat.st_ino)
+                payload = json.loads(completed.stdout)
+                self.assertEqual(payload["refresh_schema_version"], 2)
+                for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                    self.assertIn(
+                        str(runner_path),
+                        (run_dir / prompt_name).read_text(encoding="utf-8"),
+                    )
 
     def test_attach_child_live_propagates_env_parent_metadata(self) -> None:
         run_dir = self._prepare_run_dir()

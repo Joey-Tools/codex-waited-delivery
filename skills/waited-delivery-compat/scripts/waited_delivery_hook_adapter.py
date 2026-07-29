@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
@@ -16,8 +17,10 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import traceback
 import uuid
+from collections.abc import Iterator
 from typing import NamedTuple, TypedDict, cast
 
 
@@ -53,7 +56,9 @@ TERMINAL_PHASE_STATUSES = {
 CHILD_TERMINAL_STATUSES = {"completed", "failed", "interrupted"}
 RUNS_DIR_NAME = "waited-delivery"
 STATE_MAX_BYTES = 4 * 1024 * 1024
-PROMPT_REFRESH_SCHEMA_VERSION = 1
+PROMPT_REFRESH_SCHEMA_VERSION = 2
+LAUNCH_SNAPSHOT_DIRECTORY_MODE = 0o700
+LAUNCH_SNAPSHOT_FILE_MODE = 0o600
 
 
 class UserError(RuntimeError):
@@ -94,6 +99,19 @@ class RefreshedPrompts(NamedTuple):
     parent_version: StopArtifactVersion
 
 
+class LaunchArtifactSnapshot(NamedTuple):
+    source_path: pathlib.Path
+    source_version: StopArtifactVersion
+    snapshot_fd: int
+    snapshot_version: StopArtifactVersion
+    execution_path: pathlib.Path
+
+
+class RefreshLaunchSnapshots(NamedTuple):
+    bridge: LaunchArtifactSnapshot
+    runner: LaunchArtifactSnapshot
+
+
 class SessionRecord(TypedDict):
     session_id: str
     cwd: str
@@ -121,14 +139,20 @@ def _shell_command(args: list[str]) -> str:
 
 
 def _run(
-    cmd: list[str], *, cwd: pathlib.Path | None = None
+    cmd: list[str],
+    *,
+    cwd: pathlib.Path | None = None,
+    pass_fds: tuple[int, ...] = (),
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
+        env=env,
         text=True,
         capture_output=True,
         check=False,
+        pass_fds=pass_fds,
     )
 
 
@@ -136,8 +160,9 @@ def _bridge_command(*args: str) -> list[str]:
     return [sys.executable, str(BRIDGE_PATH), *args]
 
 
-def _run_bridge_json(*args: str) -> dict[str, object]:
-    completed = _run(_bridge_command(*args))
+def _bridge_json_payload(
+    completed: subprocess.CompletedProcess[str],
+) -> dict[str, object]:
     if completed.returncode != 0:
         stderr = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
         raise UserError(stderr)
@@ -151,6 +176,10 @@ def _run_bridge_json(*args: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise UserError("bridge JSON output must be an object")
     return cast(dict[str, object], payload)
+
+
+def _run_bridge_json(*args: str) -> dict[str, object]:
+    return _bridge_json_payload(_run(_bridge_command(*args)))
 
 
 def _run_bridge_passthrough(*args: str) -> int:
@@ -667,6 +696,398 @@ def _read_stop_absolute_regular_artifact(
         os.close(parent_fd)
 
 
+def _read_stop_fd_regular_artifact(
+    file_fd: int,
+    name: str,
+    *,
+    max_bytes: int,
+) -> StopArtifactRead:
+    def read_bounded() -> bytes:
+        chunks: list[bytes] = []
+        offset = 0
+        while True:
+            chunk = os.pread(
+                file_fd,
+                min(65536, max_bytes + 1 - offset),
+                offset,
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+            if offset > max_bytes:
+                raise RunSafetyError(
+                    f"compatibility launch snapshot exceeds byte limit: {name}"
+                )
+        return b"".join(chunks)
+
+    try:
+        access_mode = fcntl.fcntl(file_fd, fcntl.F_GETFL) & os.O_ACCMODE
+        if access_mode != os.O_RDONLY:
+            raise RunSafetyError(
+                f"compatibility launch snapshot must be opened read-only: {name}"
+            )
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RunSafetyError(
+                f"compatibility launch snapshot must be a regular file: {name}"
+            )
+        if before.st_size > max_bytes:
+            raise RunSafetyError(
+                f"compatibility launch snapshot exceeds byte limit: {name}"
+            )
+        expected_access = (
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+        )
+        first_content = read_bounded()
+        middle = os.fstat(file_fd)
+        second_content = read_bounded()
+        after = os.fstat(file_fd)
+        stable_stats = (before, middle, after)
+        if (
+            any(not stat.S_ISREG(value.st_mode) for value in stable_stats)
+            or any(not _same_object(before, value) for value in stable_stats[1:])
+            or any(value.st_size != before.st_size for value in stable_stats[1:])
+            or any(
+                (
+                    value.st_uid,
+                    value.st_gid,
+                    stat.S_IMODE(value.st_mode),
+                )
+                != expected_access
+                for value in stable_stats[1:]
+            )
+            or len(first_content) != before.st_size
+            or len(second_content) != before.st_size
+            or first_content != second_content
+        ):
+            raise RunSafetyError(
+                f"compatibility launch snapshot identity, access, size, or content "
+                f"changed while read: {name}"
+            )
+        return StopArtifactRead(
+            content=second_content,
+            version=StopArtifactVersion(
+                device=after.st_dev,
+                inode=after.st_ino,
+                uid=after.st_uid,
+                gid=after.st_gid,
+                mode=stat.S_IMODE(after.st_mode),
+                size=after.st_size,
+                sha256=hashlib.sha256(second_content).hexdigest(),
+            ),
+        )
+    except RunSafetyError:
+        raise
+    except OSError as error:
+        raise RunSafetyError(
+            f"compatibility launch snapshot cannot be read stably: {name}"
+        ) from error
+
+
+def _fd_execution_path(file_fd: int, name: str) -> pathlib.Path:
+    descriptor_stat = os.fstat(file_fd)
+    for root in (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")):
+        candidate = root / str(file_fd)
+        probe_fd: int | None = None
+        try:
+            probe_fd = os.open(
+                candidate,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+            candidate_stat = os.fstat(probe_fd)
+        except OSError:
+            continue
+        finally:
+            if probe_fd is not None:
+                os.close(probe_fd)
+        if _same_object(descriptor_stat, candidate_stat):
+            return candidate
+    raise RunSafetyError(
+        f"cannot expose descriptor-bound compatibility snapshot for execution: {name}"
+    )
+
+
+def _write_launch_snapshot(
+    snapshot_dir_fd: int,
+    name: str,
+    source_path: pathlib.Path,
+    source: StopArtifactRead,
+) -> LaunchArtifactSnapshot:
+    write_fd: int | None = None
+    snapshot_fd: int | None = None
+    keep_snapshot_fd = False
+    try:
+        write_fd = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            LAUNCH_SNAPSHOT_FILE_MODE,
+            dir_fd=snapshot_dir_fd,
+        )
+        os.fchmod(write_fd, LAUNCH_SNAPSHOT_FILE_MODE)
+        offset = 0
+        while offset < len(source.content):
+            written = os.write(write_fd, source.content[offset:])
+            if written <= 0:
+                raise RunSafetyError(
+                    f"cannot write compatibility launch snapshot: {name}"
+                )
+            offset += written
+        os.fsync(write_fd)
+        os.close(write_fd)
+        write_fd = None
+
+        snapshot_fd = os.open(
+            name,
+            _regular_open_flags(),
+            dir_fd=snapshot_dir_fd,
+        )
+        descriptor_stat = os.fstat(snapshot_fd)
+        named_stat = os.stat(
+            name,
+            dir_fd=snapshot_dir_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(descriptor_stat.st_mode)
+            or not stat.S_ISREG(named_stat.st_mode)
+            or not _same_object(descriptor_stat, named_stat)
+            or descriptor_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(descriptor_stat.st_mode) != LAUNCH_SNAPSHOT_FILE_MODE
+        ):
+            raise RunSafetyError(
+                f"compatibility launch snapshot is not owner-private: {name}"
+            )
+        snapshot = _read_stop_fd_regular_artifact(
+            snapshot_fd,
+            name,
+            max_bytes=STATE_MAX_BYTES,
+        )
+        if (
+            snapshot.content != source.content
+            or snapshot.version.size != source.version.size
+            or snapshot.version.sha256 != source.version.sha256
+        ):
+            raise RunSafetyError(
+                f"compatibility launch snapshot does not match bound source: {name}"
+            )
+        os.unlink(name, dir_fd=snapshot_dir_fd)
+        execution_path = _fd_execution_path(snapshot_fd, name)
+        keep_snapshot_fd = True
+        return LaunchArtifactSnapshot(
+            source_path=source_path,
+            source_version=source.version,
+            snapshot_fd=snapshot_fd,
+            snapshot_version=snapshot.version,
+            execution_path=execution_path,
+        )
+    except RunSafetyError:
+        raise
+    except OSError as error:
+        raise RunSafetyError(
+            f"cannot create descriptor-bound compatibility launch snapshot: {name}"
+        ) from error
+    finally:
+        if write_fd is not None:
+            os.close(write_fd)
+        if snapshot_fd is not None and not keep_snapshot_fd:
+            os.close(snapshot_fd)
+        if snapshot_fd is not None:
+            try:
+                os.stat(
+                    name,
+                    dir_fd=snapshot_dir_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                os.unlink(name, dir_fd=snapshot_dir_fd)
+
+
+@contextlib.contextmanager
+def _verified_refresh_launch_snapshots() -> Iterator[RefreshLaunchSnapshots]:
+    with tempfile.TemporaryDirectory(
+        prefix="waited-delivery-refresh-launch-"
+    ) as snapshot_dir_str:
+        snapshot_dir = pathlib.Path(snapshot_dir_str)
+        snapshot_dir_fd: int | None = None
+        snapshots: list[LaunchArtifactSnapshot] = []
+        try:
+            named_directory = os.lstat(snapshot_dir)
+            snapshot_dir_fd = os.open(
+                snapshot_dir,
+                _directory_open_flags(),
+            )
+            opened_directory = os.fstat(snapshot_dir_fd)
+            if (
+                not stat.S_ISDIR(named_directory.st_mode)
+                or not stat.S_ISDIR(opened_directory.st_mode)
+                or not _same_object(named_directory, opened_directory)
+                or opened_directory.st_uid != os.geteuid()
+                or stat.S_IMODE(opened_directory.st_mode)
+                != LAUNCH_SNAPSHOT_DIRECTORY_MODE
+            ):
+                raise RunSafetyError(
+                    "compatibility launch snapshot directory is not owner-private"
+                )
+            bound_bridge = _read_stop_absolute_regular_artifact(
+                BRIDGE_PATH,
+                max_bytes=STATE_MAX_BYTES,
+            )
+            bound_runner = _read_stop_absolute_regular_artifact(
+                RUNNER_PATH,
+                max_bytes=STATE_MAX_BYTES,
+            )
+            bridge = _write_launch_snapshot(
+                snapshot_dir_fd,
+                "waited_delivery_bridge.py",
+                BRIDGE_PATH,
+                bound_bridge,
+            )
+            snapshots.append(bridge)
+            runner = _write_launch_snapshot(
+                snapshot_dir_fd,
+                "waited_delivery_runner.py",
+                RUNNER_PATH,
+                bound_runner,
+            )
+            snapshots.append(runner)
+            yield RefreshLaunchSnapshots(bridge=bridge, runner=runner)
+        finally:
+            for snapshot in reversed(snapshots):
+                os.close(snapshot.snapshot_fd)
+            if snapshot_dir_fd is not None:
+                os.close(snapshot_dir_fd)
+
+
+def _validate_launch_artifact_version(
+    name: str,
+    actual: StopArtifactVersion,
+    expected: StopArtifactVersion,
+) -> None:
+    if (actual.device, actual.inode) != (expected.device, expected.inode):
+        raise RunSafetyError(
+            f"compatibility launch source was replaced before process start: {name}"
+        )
+    if (actual.uid, actual.gid, actual.mode) != (
+        expected.uid,
+        expected.gid,
+        expected.mode,
+    ):
+        raise RunSafetyError(
+            f"compatibility launch source access policy changed before process "
+            f"start: {name}"
+        )
+    if actual.size != expected.size or actual.sha256 != expected.sha256:
+        raise RunSafetyError(
+            f"compatibility launch source content changed before process start: {name}"
+        )
+
+
+def _revalidate_refresh_launch_snapshots(
+    snapshots: RefreshLaunchSnapshots,
+) -> None:
+    for name, snapshot in (
+        ("waited_delivery_bridge.py", snapshots.bridge),
+        ("waited_delivery_runner.py", snapshots.runner),
+    ):
+        source = _read_stop_absolute_regular_artifact(
+            snapshot.source_path,
+            max_bytes=STATE_MAX_BYTES,
+        )
+        _validate_launch_artifact_version(
+            name,
+            source.version,
+            snapshot.source_version,
+        )
+        executed = _read_stop_fd_regular_artifact(
+            snapshot.snapshot_fd,
+            name,
+            max_bytes=STATE_MAX_BYTES,
+        )
+        _validate_launch_artifact_version(
+            name,
+            executed.version,
+            snapshot.snapshot_version,
+        )
+
+
+def _isolated_python_environment() -> dict[str, str]:
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("PYTHON") and name != "__PYVENV_LAUNCHER__"
+    }
+
+
+def _expected_version_args(
+    prefix: str,
+    version: StopArtifactVersion,
+) -> list[str]:
+    return [
+        f"--expected-{prefix}-dev",
+        str(version.device),
+        f"--expected-{prefix}-ino",
+        str(version.inode),
+        f"--expected-{prefix}-uid",
+        str(version.uid),
+        f"--expected-{prefix}-gid",
+        str(version.gid),
+        f"--expected-{prefix}-mode",
+        str(version.mode),
+        f"--expected-{prefix}-size",
+        str(version.size),
+        f"--expected-{prefix}-sha256",
+        version.sha256,
+    ]
+
+
+def _run_refresh_bridge_json(
+    snapshots: RefreshLaunchSnapshots,
+    *args: str,
+) -> dict[str, object]:
+    _revalidate_refresh_launch_snapshots(snapshots)
+    command = [
+        sys.executable,
+        "-I",
+        "-B",
+        "-S",
+        str(snapshots.bridge.execution_path),
+        "refresh-prompts-live",
+        "--executed-bridge-fd",
+        str(snapshots.bridge.snapshot_fd),
+        "--executed-runner-fd",
+        str(snapshots.runner.snapshot_fd),
+        "--published-runner-path",
+        str(RUNNER_PATH),
+        *_expected_version_args(
+            "bridge",
+            snapshots.bridge.snapshot_version,
+        ),
+        *_expected_version_args(
+            "runner",
+            snapshots.runner.snapshot_version,
+        ),
+        *args,
+    ]
+    completed = _run(
+        command,
+        pass_fds=(
+            snapshots.bridge.snapshot_fd,
+            snapshots.runner.snapshot_fd,
+        ),
+        env=_isolated_python_environment(),
+    )
+    return _bridge_json_payload(completed)
+
+
 def _stop_artifact_version_from_payload(
     payload: dict[str, object],
     field: str,
@@ -855,112 +1276,109 @@ def _refresh_recovery_prompts(
     repo_root: pathlib.Path,
     run_identity: RunDirectoryIdentity,
 ) -> RefreshedPrompts:
-    expected_runner = _read_stop_absolute_regular_artifact(
-        RUNNER_PATH,
-        max_bytes=STATE_MAX_BYTES,
-    ).version
-    payload = _run_bridge_json(
-        "refresh-prompts-live",
-        "--run-dir",
-        str(run_dir),
-        "--expected-repo-root",
-        str(repo_root),
-        "--expected-run-dev",
-        str(run_identity.device),
-        "--expected-run-ino",
-        str(run_identity.inode),
-        "--expected-run-uid",
-        str(run_identity.uid),
-        "--expected-run-gid",
-        str(run_identity.gid),
-        "--expected-run-mode",
-        str(run_identity.mode),
-        "--expected-runner-dev",
-        str(expected_runner.device),
-        "--expected-runner-ino",
-        str(expected_runner.inode),
-        "--expected-runner-uid",
-        str(expected_runner.uid),
-        "--expected-runner-gid",
-        str(expected_runner.gid),
-        "--expected-runner-mode",
-        str(expected_runner.mode),
-        "--expected-runner-size",
-        str(expected_runner.size),
-        "--expected-runner-sha256",
-        expected_runner.sha256,
-    )
-    if payload.get("refresh_schema_version") != PROMPT_REFRESH_SCHEMA_VERSION:
-        raise RunSafetyError(
-            "refresh-prompts-live returned an unsupported refresh schema"
+    with _verified_refresh_launch_snapshots() as snapshots:
+        payload = _run_refresh_bridge_json(
+            snapshots,
+            "--run-dir",
+            str(run_dir),
+            "--expected-repo-root",
+            str(repo_root),
+            "--expected-run-dev",
+            str(run_identity.device),
+            "--expected-run-ino",
+            str(run_identity.inode),
+            "--expected-run-uid",
+            str(run_identity.uid),
+            "--expected-run-gid",
+            str(run_identity.gid),
+            "--expected-run-mode",
+            str(run_identity.mode),
         )
-    expected_paths = {
-        "runner_path": RUNNER_PATH,
-        "child_prompt": run_dir / "child-prompt.md",
-        "parent_prompt": run_dir / "parent-prompt.md",
-    }
-    for field, expected_path in expected_paths.items():
-        value = payload.get(field)
-        if not isinstance(value, str) or not value:
-            raise RunSafetyError(f"refresh-prompts-live did not return {field}")
-        if pathlib.Path(value) != expected_path:
+        if payload.get("refresh_schema_version") != PROMPT_REFRESH_SCHEMA_VERSION:
             raise RunSafetyError(
-                f"refresh-prompts-live returned unexpected {field}: {value}"
+                "refresh-prompts-live returned an unsupported refresh schema"
             )
-    runner_version = _stop_artifact_version_from_payload(payload, "runner_version")
-    child_version = _stop_artifact_version_from_payload(
-        payload,
-        "child_prompt_version",
-    )
-    parent_version = _stop_artifact_version_from_payload(
-        payload,
-        "parent_prompt_version",
-    )
-    actual_runner = _read_stop_absolute_regular_artifact(
-        RUNNER_PATH,
-        max_bytes=STATE_MAX_BYTES,
-    ).version
-    _validate_expected_stop_artifact(
-        "waited_delivery_runner.py",
-        runner_version,
-        expected_runner,
-    )
-    _validate_expected_stop_artifact(
-        "waited_delivery_runner.py",
-        actual_runner,
-        runner_version,
-    )
-    returned_identity_values = (
-        payload.get("run_dev"),
-        payload.get("run_ino"),
-        payload.get("run_uid"),
-        payload.get("run_gid"),
-        payload.get("run_mode"),
-    )
-    if not all(
-        isinstance(value, int) and not isinstance(value, bool)
-        for value in returned_identity_values
-    ):
-        raise RunSafetyError(
-            "refresh-prompts-live did not return a complete run access identity"
+        if payload.get("python_isolated") is not True:
+            raise RunSafetyError(
+                "refresh-prompts-live did not attest isolated Python execution"
+            )
+        for field in ("bridge_fd_access", "runner_fd_access"):
+            if payload.get(field) != "read-only":
+                raise RunSafetyError(
+                    f"refresh-prompts-live did not attest read-only {field}"
+                )
+        expected_paths = {
+            "runner_path": RUNNER_PATH,
+            "executed_bridge_path": snapshots.bridge.execution_path,
+            "executed_runner_path": snapshots.runner.execution_path,
+            "child_prompt": run_dir / "child-prompt.md",
+            "parent_prompt": run_dir / "parent-prompt.md",
+        }
+        for field, expected_path in expected_paths.items():
+            value = payload.get(field)
+            if not isinstance(value, str) or not value:
+                raise RunSafetyError(f"refresh-prompts-live did not return {field}")
+            if pathlib.Path(value) != expected_path:
+                raise RunSafetyError(
+                    f"refresh-prompts-live returned unexpected {field}: {value}"
+                )
+        bridge_version = _stop_artifact_version_from_payload(
+            payload,
+            "bridge_version",
         )
-    returned_identity = RunDirectoryIdentity(
-        device=cast(int, returned_identity_values[0]),
-        inode=cast(int, returned_identity_values[1]),
-        uid=cast(int, returned_identity_values[2]),
-        gid=cast(int, returned_identity_values[3]),
-        mode=cast(int, returned_identity_values[4]),
-    )
-    if returned_identity != run_identity:
-        raise RunSafetyError(
-            "refresh-prompts-live returned an unexpected run directory identity"
+        runner_version = _stop_artifact_version_from_payload(
+            payload,
+            "runner_version",
         )
-    return RefreshedPrompts(
-        child_prompt=expected_paths["child_prompt"],
-        child_version=child_version,
-        parent_prompt=expected_paths["parent_prompt"],
-        parent_version=parent_version,
-    )
+        child_version = _stop_artifact_version_from_payload(
+            payload,
+            "child_prompt_version",
+        )
+        parent_version = _stop_artifact_version_from_payload(
+            payload,
+            "parent_prompt_version",
+        )
+        _validate_launch_artifact_version(
+            "waited_delivery_bridge.py executed snapshot",
+            bridge_version,
+            snapshots.bridge.snapshot_version,
+        )
+        _validate_launch_artifact_version(
+            "waited_delivery_runner.py executed snapshot",
+            runner_version,
+            snapshots.runner.snapshot_version,
+        )
+        returned_identity_values = (
+            payload.get("run_dev"),
+            payload.get("run_ino"),
+            payload.get("run_uid"),
+            payload.get("run_gid"),
+            payload.get("run_mode"),
+        )
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in returned_identity_values
+        ):
+            raise RunSafetyError(
+                "refresh-prompts-live did not return a complete run access identity"
+            )
+        returned_identity = RunDirectoryIdentity(
+            device=cast(int, returned_identity_values[0]),
+            inode=cast(int, returned_identity_values[1]),
+            uid=cast(int, returned_identity_values[2]),
+            gid=cast(int, returned_identity_values[3]),
+            mode=cast(int, returned_identity_values[4]),
+        )
+        if returned_identity != run_identity:
+            raise RunSafetyError(
+                "refresh-prompts-live returned an unexpected run directory identity"
+            )
+        return RefreshedPrompts(
+            child_prompt=expected_paths["child_prompt"],
+            child_version=child_version,
+            parent_prompt=expected_paths["parent_prompt"],
+            parent_version=parent_version,
+        )
 
 
 def _state_orchestration(state: dict[str, object]) -> dict[str, object]:

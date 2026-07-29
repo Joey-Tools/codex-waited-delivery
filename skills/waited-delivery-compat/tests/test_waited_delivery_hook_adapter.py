@@ -27,6 +27,11 @@ ADAPTER_PATH = (
     / "scripts"
     / "waited_delivery_hook_adapter.py"
 )
+BRIDGE_PATH = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "waited_delivery_bridge.py"
+)
 RUNNER_PATH = (
     pathlib.Path(__file__).resolve().parents[1]
     / "scripts"
@@ -247,6 +252,28 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    def _private_launch_sources(
+        self,
+        label: str,
+    ) -> tuple[pathlib.Path, pathlib.Path]:
+        source_dir = self.root / f"launch-sources-{label}"
+        source_dir.mkdir()
+        bridge_path = source_dir / BRIDGE_PATH.name
+        runner_path = source_dir / RUNNER_PATH.name
+        shutil.copy2(BRIDGE_PATH, bridge_path)
+        shutil.copy2(RUNNER_PATH, runner_path)
+        return bridge_path.resolve(), runner_path.resolve()
+
+    def _run_identity(self, module, run_dir: pathlib.Path):
+        run_stat = run_dir.stat()
+        return module.RunDirectoryIdentity(
+            device=run_stat.st_dev,
+            inode=run_stat.st_ino,
+            uid=run_stat.st_uid,
+            gid=run_stat.st_gid,
+            mode=run_stat.st_mode & 0o7777,
+        )
 
     def test_hook_commands_are_inert_without_explicit_compatibility_flag(
         self,
@@ -1604,9 +1631,9 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
 
     def test_stop_hook_binds_runner_version_returned_through_bridge(self) -> None:
         mutations = {
-            "replacement": ("inode", "was replaced after prompt refresh"),
-            "access": ("mode", "access policy changed after prompt refresh"),
-            "content": ("sha256", "content changed after prompt refresh"),
+            "replacement": ("inode", "was replaced before process start"),
+            "access": ("mode", "access policy changed before process start"),
+            "content": ("sha256", "content changed before process start"),
         }
         for mutation, (field, expected_error) in mutations.items():
             with self.subTest(mutation=mutation):
@@ -1616,13 +1643,16 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     f"runner-{mutation}-mismatch",
                 )
                 module = self._load_adapter_module()
-                real_run_bridge_json = module._run_bridge_json
+                real_run_bridge_json = module._run_refresh_bridge_json
                 fake_home = self.root / f"home-runner-{mutation}-mismatch"
                 stdout = io.StringIO()
                 stderr = io.StringIO()
 
-                def corrupt_runner_version(*args: str) -> dict[str, object]:
-                    payload = real_run_bridge_json(*args)
+                def corrupt_runner_version(
+                    snapshots,
+                    *args: str,
+                ) -> dict[str, object]:
+                    payload = real_run_bridge_json(snapshots, *args)
                     runner_version = payload["runner_version"]
                     assert isinstance(runner_version, dict)
                     current = runner_version[field]
@@ -1640,7 +1670,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 ):
                     with mock.patch.object(
                         module,
-                        "_run_bridge_json",
+                        "_run_refresh_bridge_json",
                         side_effect=corrupt_runner_version,
                     ):
                         with mock.patch.object(
@@ -1664,6 +1694,274 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 )
                 self.assertEqual(entry["error_type"], "RunSafetyError")
                 self.assertIn(expected_error, entry["error_message"])
+
+    def test_launch_snapshot_closes_fd_when_execution_path_resolution_fails(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        source = module._read_stop_absolute_regular_artifact(
+            BRIDGE_PATH,
+            max_bytes=module.STATE_MAX_BYTES,
+        )
+        snapshot_dir = self.root / "snapshot-resolution-failure"
+        snapshot_dir.mkdir(mode=0o700)
+        snapshot_dir_fd = os.open(snapshot_dir, os.O_RDONLY)
+        captured_fds: list[int] = []
+
+        def fail_execution_path(file_fd: int, name: str) -> pathlib.Path:
+            captured_fds.append(file_fd)
+            raise module.RunSafetyError(
+                f"cannot expose descriptor-bound compatibility snapshot: {name}"
+            )
+
+        try:
+            with mock.patch.object(
+                module,
+                "_fd_execution_path",
+                side_effect=fail_execution_path,
+            ):
+                with self.assertRaisesRegex(
+                    module.RunSafetyError,
+                    "cannot expose descriptor-bound compatibility snapshot",
+                ):
+                    module._write_launch_snapshot(
+                        snapshot_dir_fd,
+                        "waited_delivery_bridge.py",
+                        BRIDGE_PATH,
+                        source,
+                    )
+        finally:
+            os.close(snapshot_dir_fd)
+
+        self.assertEqual(len(captured_fds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(captured_fds[0])
+        self.assertFalse((snapshot_dir / "waited_delivery_bridge.py").exists())
+
+    def test_refresh_launch_revalidates_bridge_and_runner_before_process(
+        self,
+    ) -> None:
+        expected_errors = {
+            "replacement": "was replaced before process start",
+            "content": "content changed before process start",
+            "access": "access policy changed before process start",
+        }
+        for artifact_name in ("bridge", "runner"):
+            for mutation in (*expected_errors, "timestamps"):
+                with self.subTest(artifact=artifact_name, mutation=mutation):
+                    module = self._load_adapter_module()
+                    bridge_path, runner_path = self._private_launch_sources(
+                        f"{artifact_name}-{mutation}"
+                    )
+                    source_path = (
+                        bridge_path if artifact_name == "bridge" else runner_path
+                    )
+                    run_dir = self._prepare_indexed_run(
+                        f"session-launch-{artifact_name}-{mutation}",
+                        f"launch-{artifact_name}-{mutation}",
+                    )
+                    watched_paths = tuple(
+                        run_dir / name
+                        for name in (
+                            "state.json",
+                            "child-prompt.md",
+                            "parent-prompt.md",
+                        )
+                    )
+                    before = {
+                        path: (path.stat().st_ino, path.read_bytes())
+                        for path in watched_paths
+                    }
+                    run_identity = self._run_identity(module, run_dir)
+                    real_revalidate = module._revalidate_refresh_launch_snapshots
+                    displaced = self.root / (
+                        f"displaced-launch-{artifact_name}-{mutation}.py"
+                    )
+
+                    def mutate_before_revalidation(snapshots) -> None:
+                        original_stat = source_path.stat()
+                        original_content = source_path.read_bytes()
+                        if mutation == "replacement":
+                            source_path.rename(displaced)
+                            source_path.write_bytes(original_content)
+                            source_path.chmod(original_stat.st_mode & 0o7777)
+                        elif mutation == "content":
+                            changed = bytearray(original_content)
+                            changed[0] ^= 1
+                            source_path.write_bytes(changed)
+                        elif mutation == "access":
+                            source_path.chmod((original_stat.st_mode & 0o7777) ^ 0o040)
+                        else:
+                            os.utime(
+                                source_path,
+                                ns=(
+                                    original_stat.st_atime_ns,
+                                    original_stat.st_mtime_ns + 1_000_000_000,
+                                ),
+                            )
+                        real_revalidate(snapshots)
+
+                    launch_glob = "waited-delivery-refresh-launch-*"
+                    before_launch_dirs = set(self.root.glob(launch_glob))
+                    patches = (
+                        mock.patch.object(module, "BRIDGE_PATH", bridge_path),
+                        mock.patch.object(module, "RUNNER_PATH", runner_path),
+                        mock.patch.object(
+                            module,
+                            "_revalidate_refresh_launch_snapshots",
+                            side_effect=mutate_before_revalidation,
+                        ),
+                        mock.patch.object(module.tempfile, "tempdir", str(self.root)),
+                    )
+                    with patches[0], patches[1], patches[2], patches[3]:
+                        if mutation == "timestamps":
+                            refreshed = module._refresh_recovery_prompts(
+                                run_dir,
+                                self.repo.resolve(),
+                                run_identity,
+                            )
+                            self.assertEqual(
+                                refreshed.child_prompt,
+                                run_dir / "child-prompt.md",
+                            )
+                        else:
+                            with mock.patch.object(module, "_run") as process_run:
+                                with self.assertRaisesRegex(
+                                    module.RunSafetyError,
+                                    expected_errors[mutation],
+                                ):
+                                    module._refresh_recovery_prompts(
+                                        run_dir,
+                                        self.repo.resolve(),
+                                        run_identity,
+                                    )
+                                process_run.assert_not_called()
+                            for path, (
+                                expected_inode,
+                                expected_content,
+                            ) in before.items():
+                                self.assertEqual(path.stat().st_ino, expected_inode)
+                                self.assertEqual(path.read_bytes(), expected_content)
+                    self.assertEqual(
+                        set(self.root.glob(launch_glob)),
+                        before_launch_dirs,
+                    )
+
+    def test_refresh_launch_executes_private_snapshots_across_source_aba(
+        self,
+    ) -> None:
+        for artifact_name in ("bridge", "runner"):
+            with self.subTest(artifact=artifact_name):
+                module = self._load_adapter_module()
+                bridge_path, runner_path = self._private_launch_sources(
+                    f"aba-{artifact_name}"
+                )
+                source_path = bridge_path if artifact_name == "bridge" else runner_path
+                source_identity = source_path.stat()
+                run_dir = self._prepare_indexed_run(
+                    f"session-launch-aba-{artifact_name}",
+                    f"launch-aba-{artifact_name}",
+                )
+                for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                    (run_dir / prompt_name).write_text(
+                        "legacy launch-window prompt\n",
+                        encoding="utf-8",
+                    )
+                run_identity = self._run_identity(module, run_dir)
+                displaced = self.root / f"aba-original-{artifact_name}.py"
+                marker = self.root / f"aba-executed-{artifact_name}.txt"
+                malicious = (
+                    "#!/usr/bin/env python3\n"
+                    "import pathlib\n"
+                    f"pathlib.Path({str(marker)!r}).write_text("
+                    "'unexpected path execution\\n', encoding='utf-8')\n"
+                    "raise SystemExit(93)\n"
+                )
+                real_run = module._run
+                process_commands: list[list[str]] = []
+                process_environments: list[dict[str, str] | None] = []
+
+                def run_during_source_aba(
+                    cmd: list[str],
+                    *,
+                    cwd: pathlib.Path | None = None,
+                    pass_fds: tuple[int, ...] = (),
+                    env: dict[str, str] | None = None,
+                ) -> subprocess.CompletedProcess[str]:
+                    process_commands.append(cmd)
+                    process_environments.append(env)
+                    source_path.rename(displaced)
+                    source_path.write_text(malicious, encoding="utf-8")
+                    source_path.chmod(source_identity.st_mode & 0o7777)
+                    try:
+                        return real_run(
+                            cmd,
+                            cwd=cwd,
+                            pass_fds=pass_fds,
+                            env=env,
+                        )
+                    finally:
+                        source_path.unlink()
+                        displaced.rename(source_path)
+
+                launch_glob = "waited-delivery-refresh-launch-*"
+                before_launch_dirs = set(self.root.glob(launch_glob))
+                with (
+                    mock.patch.object(
+                        module,
+                        "BRIDGE_PATH",
+                        bridge_path,
+                    ),
+                    mock.patch.object(
+                        module,
+                        "RUNNER_PATH",
+                        runner_path,
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_run",
+                        side_effect=run_during_source_aba,
+                    ),
+                    mock.patch.object(
+                        module.tempfile,
+                        "tempdir",
+                        str(self.root),
+                    ),
+                ):
+                    refreshed = module._refresh_recovery_prompts(
+                        run_dir,
+                        self.repo.resolve(),
+                        run_identity,
+                    )
+
+                self.assertEqual(len(process_commands), 1)
+                self.assertEqual(
+                    process_commands[0][1:4],
+                    ["-I", "-B", "-S"],
+                )
+                self.assertNotEqual(process_commands[0][4], str(source_path))
+                self.assertIsNotNone(process_environments[0])
+                assert process_environments[0] is not None
+                self.assertFalse(
+                    any(
+                        name.startswith("PYTHON") or name == "__PYVENV_LAUNCHER__"
+                        for name in process_environments[0]
+                    )
+                )
+                self.assertFalse(marker.exists())
+                self.assertEqual(source_path.stat().st_ino, source_identity.st_ino)
+                self.assertEqual(
+                    refreshed.parent_prompt,
+                    run_dir / "parent-prompt.md",
+                )
+                for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                    prompt = (run_dir / prompt_name).read_text(encoding="utf-8")
+                    self.assertIn(str(runner_path), prompt)
+                    self.assertNotIn("legacy launch-window prompt", prompt)
+                self.assertEqual(
+                    set(self.root.glob(launch_glob)),
+                    before_launch_dirs,
+                )
 
     def test_stop_hook_fails_open_when_index_is_invalid(self) -> None:
         fake_home = self.root / "home-stop-invalid"

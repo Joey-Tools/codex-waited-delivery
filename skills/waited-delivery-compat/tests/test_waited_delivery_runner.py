@@ -26,6 +26,7 @@ SCRIPT_PATH = (
     / "scripts"
     / "waited_delivery_runner.py"
 )
+BRIDGE_PATH = SCRIPT_PATH.with_name("waited_delivery_bridge.py")
 
 
 def run(
@@ -33,6 +34,7 @@ def run(
     *,
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
@@ -41,6 +43,7 @@ def run(
         text=True,
         capture_output=True,
         check=False,
+        pass_fds=pass_fds,
     )
 
 
@@ -154,6 +157,97 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             ]
         )
         return completed
+
+    def _runner_version(self, runner_fd: int) -> dict[str, int | str]:
+        file_stat = os.fstat(runner_fd)
+        content = SCRIPT_PATH.read_bytes()
+        return {
+            "device": file_stat.st_dev,
+            "inode": file_stat.st_ino,
+            "uid": file_stat.st_uid,
+            "gid": file_stat.st_gid,
+            "mode": file_stat.st_mode & 0o7777,
+            "size": file_stat.st_size,
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+
+    def _runner_version_args(
+        self,
+        runner_fd: int,
+        *,
+        sha256: str | None = None,
+    ) -> list[str]:
+        version = self._runner_version(runner_fd)
+        return [
+            "--expected-runner-dev",
+            str(version["device"]),
+            "--expected-runner-ino",
+            str(version["inode"]),
+            "--expected-runner-uid",
+            str(version["uid"]),
+            "--expected-runner-gid",
+            str(version["gid"]),
+            "--expected-runner-mode",
+            str(version["mode"]),
+            "--expected-runner-size",
+            str(version["size"]),
+            "--expected-runner-sha256",
+            sha256 or str(version["sha256"]),
+        ]
+
+    def _bridge_version_args(self, bridge_fd: int) -> list[str]:
+        file_stat = os.fstat(bridge_fd)
+        return [
+            "--expected-bridge-dev",
+            str(file_stat.st_dev),
+            "--expected-bridge-ino",
+            str(file_stat.st_ino),
+            "--expected-bridge-uid",
+            str(file_stat.st_uid),
+            "--expected-bridge-gid",
+            str(file_stat.st_gid),
+            "--expected-bridge-mode",
+            str(file_stat.st_mode & 0o7777),
+            "--expected-bridge-size",
+            str(file_stat.st_size),
+            "--expected-bridge-sha256",
+            hashlib.sha256(BRIDGE_PATH.read_bytes()).hexdigest(),
+        ]
+
+    def _run_refresh_runner(
+        self,
+        *args: str,
+        expected_sha256: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
+        runner_fd = os.open(SCRIPT_PATH, os.O_RDONLY)
+        try:
+            return run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    f"/dev/fd/{runner_fd}",
+                    "refresh-prompts",
+                    "--executed-bridge-fd",
+                    str(bridge_fd),
+                    "--executed-runner-fd",
+                    str(runner_fd),
+                    "--published-runner-path",
+                    str(SCRIPT_PATH),
+                    *self._bridge_version_args(bridge_fd),
+                    *self._runner_version_args(
+                        runner_fd,
+                        sha256=expected_sha256,
+                    ),
+                    *args,
+                ],
+                pass_fds=(bridge_fd, runner_fd),
+            )
+        finally:
+            os.close(runner_fd)
+            os.close(bridge_fd)
 
     def _load_runner_module(self):
         spec = importlib.util.spec_from_file_location(
@@ -339,8 +433,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             for name in ("state.json", "child-prompt.md", "parent-prompt.md")
         }
 
-        completed = self._run_runner(
-            "refresh-prompts",
+        completed = self._run_refresh_runner(
             "--run-dir",
             str(run_dir),
             "--json",
@@ -348,10 +441,22 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
-        self.assertEqual(payload["refresh_schema_version"], 1)
+        self.assertEqual(payload["refresh_schema_version"], 2)
+        self.assertIs(payload["python_isolated"], True)
+        self.assertEqual(payload["bridge_fd_access"], "read-only")
+        self.assertEqual(payload["runner_fd_access"], "read-only")
         self.assertEqual(payload["runner_path"], str(SCRIPT_PATH))
+        self.assertIn(
+            pathlib.Path(payload["executed_bridge_path"]).parent,
+            (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")),
+        )
+        self.assertIn(
+            pathlib.Path(payload["executed_runner_path"]).parent,
+            (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")),
+        )
         self.assertEqual(payload["child_prompt"], str(run_dir / "child-prompt.md"))
         self.assertEqual(payload["parent_prompt"], str(run_dir / "parent-prompt.md"))
+        self._assert_file_version_payload(payload["bridge_version"], BRIDGE_PATH)
         self._assert_file_version_payload(payload["runner_version"], SCRIPT_PATH)
         self._assert_file_version_payload(
             payload["child_prompt_version"],
@@ -387,27 +492,11 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         before = {
             path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
         }
-        runner_stat = SCRIPT_PATH.stat()
-
-        completed = self._run_runner(
-            "refresh-prompts",
+        completed = self._run_refresh_runner(
             "--run-dir",
             str(run_dir),
-            "--expected-runner-dev",
-            str(runner_stat.st_dev),
-            "--expected-runner-ino",
-            str(runner_stat.st_ino),
-            "--expected-runner-uid",
-            str(runner_stat.st_uid),
-            "--expected-runner-gid",
-            str(runner_stat.st_gid),
-            "--expected-runner-mode",
-            str(runner_stat.st_mode & 0o7777),
-            "--expected-runner-size",
-            str(runner_stat.st_size),
-            "--expected-runner-sha256",
-            "0" * 64,
             "--json",
+            expected_sha256="0" * 64,
         )
 
         self.assertEqual(completed.returncode, 1)
@@ -415,6 +504,192 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         for path, (expected_inode, expected_content) in before.items():
             self.assertEqual(path.stat().st_ino, expected_inode)
             self.assertEqual(path.read_bytes(), expected_content)
+
+    def test_refresh_prompts_rejects_source_path_launch_before_writes(self) -> None:
+        run_dir = self._prepare("--no-fallback-smoke")
+        watched_paths = tuple(
+            run_dir / name
+            for name in ("state.json", "child-prompt.md", "parent-prompt.md")
+        )
+        before = {
+            path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
+        }
+        bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
+        runner_fd = os.open(SCRIPT_PATH, os.O_RDONLY)
+        try:
+            completed = run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    str(SCRIPT_PATH),
+                    "refresh-prompts",
+                    "--run-dir",
+                    str(run_dir),
+                    "--executed-bridge-fd",
+                    str(bridge_fd),
+                    "--executed-runner-fd",
+                    str(runner_fd),
+                    "--published-runner-path",
+                    str(SCRIPT_PATH),
+                    *self._bridge_version_args(bridge_fd),
+                    *self._runner_version_args(runner_fd),
+                    "--json",
+                ],
+                pass_fds=(bridge_fd, runner_fd),
+            )
+        finally:
+            os.close(runner_fd)
+            os.close(bridge_fd)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "must be launched through its inherited descriptor path",
+            completed.stderr,
+        )
+        for path, (expected_inode, expected_content) in before.items():
+            self.assertEqual(path.stat().st_ino, expected_inode)
+            self.assertEqual(path.read_bytes(), expected_content)
+
+    def test_refresh_prompts_rejects_writable_runner_fd_before_writes(self) -> None:
+        run_dir = self._prepare("--no-fallback-smoke")
+        watched_paths = tuple(
+            run_dir / name
+            for name in ("state.json", "child-prompt.md", "parent-prompt.md")
+        )
+        before = {
+            path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
+        }
+        bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
+        runner_fd = os.open(SCRIPT_PATH, os.O_RDWR)
+        try:
+            completed = run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    f"/dev/fd/{runner_fd}",
+                    "refresh-prompts",
+                    "--run-dir",
+                    str(run_dir),
+                    "--executed-bridge-fd",
+                    str(bridge_fd),
+                    "--executed-runner-fd",
+                    str(runner_fd),
+                    "--published-runner-path",
+                    str(SCRIPT_PATH),
+                    *self._bridge_version_args(bridge_fd),
+                    *self._runner_version_args(runner_fd),
+                    "--json",
+                ],
+                pass_fds=(bridge_fd, runner_fd),
+            )
+        finally:
+            os.close(runner_fd)
+            os.close(bridge_fd)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "must be opened read-only: waited_delivery_runner.py",
+            completed.stderr,
+        )
+        for path, (expected_inode, expected_content) in before.items():
+            self.assertEqual(path.stat().st_ino, expected_inode)
+            self.assertEqual(path.read_bytes(), expected_content)
+
+    def test_refresh_prompts_revalidates_both_snapshots_before_writes(self) -> None:
+        for artifact_name in ("bridge", "runner"):
+            with self.subTest(artifact=artifact_name):
+                run_dir = self._prepare("--no-fallback-smoke")
+                watched_paths = tuple(
+                    run_dir / name
+                    for name in ("state.json", "child-prompt.md", "parent-prompt.md")
+                )
+                before = {
+                    path: (path.stat().st_ino, path.read_bytes())
+                    for path in watched_paths
+                }
+                module = self._load_runner_module()
+                bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
+                runner_fd = os.open(SCRIPT_PATH, os.O_RDONLY)
+                bridge_stat = os.fstat(bridge_fd)
+                runner_stat = os.fstat(runner_fd)
+                args = argparse.Namespace(
+                    run_dir=str(run_dir),
+                    expected_repo_root=None,
+                    expected_run_dev=None,
+                    expected_run_ino=None,
+                    expected_run_uid=None,
+                    expected_run_gid=None,
+                    expected_run_mode=None,
+                    executed_bridge_fd=bridge_fd,
+                    executed_runner_fd=runner_fd,
+                    published_runner_path=str(SCRIPT_PATH),
+                    expected_bridge_dev=bridge_stat.st_dev,
+                    expected_bridge_ino=bridge_stat.st_ino,
+                    expected_bridge_uid=bridge_stat.st_uid,
+                    expected_bridge_gid=bridge_stat.st_gid,
+                    expected_bridge_mode=bridge_stat.st_mode & 0o7777,
+                    expected_bridge_size=bridge_stat.st_size,
+                    expected_bridge_sha256=hashlib.sha256(
+                        BRIDGE_PATH.read_bytes()
+                    ).hexdigest(),
+                    expected_runner_dev=runner_stat.st_dev,
+                    expected_runner_ino=runner_stat.st_ino,
+                    expected_runner_uid=runner_stat.st_uid,
+                    expected_runner_gid=runner_stat.st_gid,
+                    expected_runner_mode=runner_stat.st_mode & 0o7777,
+                    expected_runner_size=runner_stat.st_size,
+                    expected_runner_sha256=hashlib.sha256(
+                        SCRIPT_PATH.read_bytes()
+                    ).hexdigest(),
+                    json=True,
+                )
+                real_read = module._read_inherited_regular_artifact
+                read_counts = {"bridge": 0, "runner": 0}
+
+                def drift_on_final_read(file_fd, name, *, max_bytes):
+                    artifact = real_read(file_fd, name, max_bytes=max_bytes)
+                    label = (
+                        "bridge" if name == "waited_delivery_bridge.py" else "runner"
+                    )
+                    read_counts[label] += 1
+                    if label == artifact_name and read_counts[label] == 2:
+                        artifact = module.ArtifactRead(
+                            content=artifact.content,
+                            version=artifact.version._replace(sha256="0" * 64),
+                        )
+                    return artifact
+
+                try:
+                    with (
+                        mock.patch.object(module, "_require_isolated_python"),
+                        mock.patch.object(
+                            module,
+                            "_validate_runner_loaded_from_descriptor",
+                            return_value=pathlib.Path(f"/dev/fd/{runner_fd}"),
+                        ),
+                        mock.patch.object(
+                            module,
+                            "_read_inherited_regular_artifact",
+                            side_effect=drift_on_final_read,
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            module.UserError,
+                            f"compatibility {artifact_name} content changed",
+                        ):
+                            module._refresh_prompts(args)
+                finally:
+                    os.close(runner_fd)
+                    os.close(bridge_fd)
+
+                self.assertEqual(read_counts[artifact_name], 2)
+                for path, (expected_inode, expected_content) in before.items():
+                    self.assertEqual(path.stat().st_ino, expected_inode)
+                    self.assertEqual(path.read_bytes(), expected_content)
 
     def test_refresh_prompts_rejects_symlinked_state_or_prompt_artifacts(self) -> None:
         for target_name in ("state.json", "child-prompt.md", "parent-prompt.md"):
@@ -428,8 +703,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 artifact.symlink_to(external_target)
                 sentinel = external_target.read_bytes()
 
-                completed = self._run_runner(
-                    "refresh-prompts",
+                completed = self._run_refresh_runner(
                     "--run-dir",
                     str(run_dir),
                     "--expected-repo-root",
@@ -450,8 +724,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         for prompt_name in ("child-prompt.md", "parent-prompt.md"):
             (run_dir / prompt_name).write_text(sentinel, encoding="utf-8")
 
-        completed = self._run_runner(
-            "refresh-prompts",
+        completed = self._run_refresh_runner(
             "--run-dir",
             str(run_dir),
             "--expected-repo-root",
@@ -660,6 +933,14 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 release_refresh = threading.Event()
                 mutation_attempted_lock = threading.Event()
                 failures: list[BaseException] = []
+                bridge_handle = BRIDGE_PATH.open("rb")
+                self.addCleanup(bridge_handle.close)
+                bridge_fd = bridge_handle.fileno()
+                bridge_stat = os.fstat(bridge_fd)
+                runner_handle = SCRIPT_PATH.open("rb")
+                self.addCleanup(runner_handle.close)
+                runner_fd = runner_handle.fileno()
+                runner_version = self._runner_version(runner_fd)
                 real_write_prompts = module._write_current_prompts
                 real_flock = fcntl.flock
 
@@ -684,6 +965,25 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                             argparse.Namespace(
                                 run_dir=str(run_dir),
                                 expected_repo_root=None,
+                                executed_bridge_fd=bridge_fd,
+                                executed_runner_fd=runner_fd,
+                                published_runner_path=str(SCRIPT_PATH),
+                                expected_bridge_dev=bridge_stat.st_dev,
+                                expected_bridge_ino=bridge_stat.st_ino,
+                                expected_bridge_uid=bridge_stat.st_uid,
+                                expected_bridge_gid=bridge_stat.st_gid,
+                                expected_bridge_mode=bridge_stat.st_mode & 0o7777,
+                                expected_bridge_size=bridge_stat.st_size,
+                                expected_bridge_sha256=hashlib.sha256(
+                                    BRIDGE_PATH.read_bytes()
+                                ).hexdigest(),
+                                expected_runner_dev=runner_version["device"],
+                                expected_runner_ino=runner_version["inode"],
+                                expected_runner_uid=runner_version["uid"],
+                                expected_runner_gid=runner_version["gid"],
+                                expected_runner_mode=runner_version["mode"],
+                                expected_runner_size=runner_version["size"],
+                                expected_runner_sha256=runner_version["sha256"],
                                 json=False,
                             )
                         )
@@ -714,10 +1014,18 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                     except BaseException as error:
                         failures.append(error)
 
-                with mock.patch.object(
-                    module.fcntl,
-                    "flock",
-                    side_effect=instrumented_flock,
+                with (
+                    mock.patch.object(module, "_require_isolated_python"),
+                    mock.patch.object(
+                        module,
+                        "_validate_runner_loaded_from_descriptor",
+                        return_value=SCRIPT_PATH,
+                    ),
+                    mock.patch.object(
+                        module.fcntl,
+                        "flock",
+                        side_effect=instrumented_flock,
+                    ),
                 ):
                     with mock.patch.object(
                         module,
