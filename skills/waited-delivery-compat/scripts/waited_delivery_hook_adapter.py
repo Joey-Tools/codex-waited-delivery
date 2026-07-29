@@ -12,12 +12,15 @@ import hashlib
 import json
 import os
 import pathlib
+import selectors
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import uuid
 from collections.abc import Iterator
@@ -27,6 +30,11 @@ from typing import NamedTuple, TypedDict, cast
 BRIDGE_PATH = pathlib.Path(__file__).resolve().with_name("waited_delivery_bridge.py")
 RUNNER_PATH = BRIDGE_PATH.with_name("waited_delivery_runner.py")
 INDEX_SCHEMA_VERSION = 1
+INDEX_FILE_NAME = "index.json"
+INDEX_LOCK_FILE_NAME = "index.lock"
+INDEX_MAX_BYTES = 4 * 1024 * 1024
+INDEX_DIRECTORY_MODE = 0o700
+INDEX_FILE_MODE = 0o600
 CURRENT_THREAD_ENV = "CODEX_THREAD_ID"
 HOOK_DEBUG_ENV = "WAITED_DELIVERY_HOOK_DEBUG"
 HOOK_COMMANDS = {"user-prompt-submit-hook", "stop-hook"}
@@ -59,6 +67,11 @@ STATE_MAX_BYTES = 4 * 1024 * 1024
 PROMPT_REFRESH_SCHEMA_VERSION = 2
 LAUNCH_SNAPSHOT_DIRECTORY_MODE = 0o700
 LAUNCH_SNAPSHOT_FILE_MODE = 0o600
+REFRESH_TIMEOUT_SECONDS = 7.0
+REFRESH_CLEANUP_TIMEOUT_SECONDS = 2.0
+REFRESH_CAPTURE_MAX_BYTES = 256 * 1024
+REFRESH_DRAIN_CHUNK_BYTES = 64 * 1024
+REFRESH_POLL_INTERVAL_SECONDS = 0.02
 
 
 class UserError(RuntimeError):
@@ -78,6 +91,16 @@ class RunDirectoryIdentity(NamedTuple):
 
 
 class StopArtifactVersion(NamedTuple):
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    mode: int
+    size: int
+    sha256: str
+
+
+class IndexFileVersion(NamedTuple):
     device: int
     inode: int
     uid: int
@@ -156,6 +179,435 @@ def _run(
     )
 
 
+class _RefreshCaptureLimitExceeded(Exception):
+    pass
+
+
+class _DeferredRefreshTermination(BaseException):
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+class _RefreshSignalTransaction:
+    """Defer one terminal signal until the refresh process group is gone."""
+
+    def __init__(self) -> None:
+        self._entry_mask: set[int] = set()
+        self._managed_signals: tuple[int, ...] = ()
+        self._previous_handlers: dict[int, object] = {}
+        self._pending_signal: int | None = None
+        self._raised = False
+
+    def _record(self, signum: int, _frame: object) -> None:
+        if self._pending_signal is None:
+            self._pending_signal = signum
+
+    @staticmethod
+    def _signal_runtime() -> tuple[object, object, object]:
+        pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+        sigpending = getattr(signal, "sigpending", None)
+        sigwait = getattr(signal, "sigwait", None)
+        if (
+            os.name != "posix"
+            or not callable(pthread_sigmask)
+            or not callable(sigpending)
+            or not callable(sigwait)
+        ):
+            raise UserError(
+                "prompt refresh signal supervision requires POSIX "
+                "pthread_sigmask, sigpending, and sigwait"
+            )
+        return pthread_sigmask, sigpending, sigwait
+
+    @staticmethod
+    def _candidate_signals() -> tuple[int, ...]:
+        return tuple(
+            int(signum)
+            for signum in (
+                signal.SIGHUP,
+                signal.SIGTERM,
+                signal.SIGQUIT,
+            )
+        )
+
+    def __enter__(self) -> _RefreshSignalTransaction:
+        pthread_sigmask, _sigpending, _sigwait = self._signal_runtime()
+        candidates = self._candidate_signals()
+        try:
+            self._entry_mask = {
+                int(value)
+                for value in pthread_sigmask(signal.SIG_BLOCK, set(candidates))
+            }
+        except (OSError, ValueError) as error:
+            raise UserError(
+                f"cannot block prompt refresh supervision signals: {error}"
+            ) from error
+        try:
+            for signum in candidates:
+                previous = signal.getsignal(signum)
+                if previous == signal.SIG_IGN or signum in self._entry_mask:
+                    continue
+                self._previous_handlers[signum] = previous
+                signal.signal(signum, self._record)
+            self._managed_signals = tuple(self._previous_handlers)
+        except BaseException:
+            for signum, previous in reversed(tuple(self._previous_handlers.items())):
+                signal.signal(signum, previous)
+            pthread_sigmask(signal.SIG_SETMASK, self._entry_mask)
+            raise
+        try:
+            pthread_sigmask(signal.SIG_SETMASK, self._entry_mask)
+        except (OSError, ValueError) as error:
+            for signum, previous in reversed(tuple(self._previous_handlers.items())):
+                signal.signal(signum, previous)
+            raise UserError(
+                f"cannot restore prompt refresh entry signal mask: {error}"
+            ) from error
+        return self
+
+    def raise_if_pending(self) -> None:
+        if self._pending_signal is None or self._raised:
+            return
+        self._raised = True
+        raise _DeferredRefreshTermination(self._pending_signal)
+
+    @property
+    def pending_signal(self) -> int | None:
+        return self._pending_signal
+
+    def _capture_pending_masked(
+        self,
+        sigpending: object,
+        sigwait: object,
+    ) -> None:
+        assert callable(sigpending)
+        assert callable(sigwait)
+        managed = set(self._managed_signals)
+        while True:
+            try:
+                pending = {int(value) for value in sigpending()} & managed
+            except OSError as error:
+                raise UserError(
+                    f"cannot inspect pending prompt refresh signals: {error}"
+                ) from error
+            if not pending:
+                return
+            try:
+                signum = int(sigwait(pending))
+            except (OSError, ValueError) as error:
+                raise UserError(
+                    f"cannot consume pending prompt refresh signal: {error}"
+                ) from error
+            if signum not in pending:
+                raise UserError("prompt refresh sigwait returned an unrequested signal")
+            self._record(signum, None)
+
+    def __exit__(
+        self,
+        _exc_type: object,
+        exc: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        pthread_sigmask, sigpending, sigwait = self._signal_runtime()
+        try:
+            terminal_mask = {
+                int(value)
+                for value in pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    set(self._managed_signals),
+                )
+            }
+        except (OSError, ValueError) as error:
+            raise UserError(
+                f"cannot block prompt refresh signals during cleanup: {error}"
+            ) from error
+        try:
+            self._capture_pending_masked(sigpending, sigwait)
+            for signum, previous in reversed(tuple(self._previous_handlers.items())):
+                signal.signal(signum, previous)
+            self._previous_handlers.clear()
+            self._capture_pending_masked(sigpending, sigwait)
+            signum = self._pending_signal
+            if signum is not None:
+                if exc is not None and not isinstance(
+                    exc,
+                    _DeferredRefreshTermination,
+                ):
+                    print(
+                        "note: prompt refresh cleanup raised "
+                        f"{type(exc).__name__}: {exc}; propagating "
+                        f"{signal.Signals(signum).name}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                signal.raise_signal(signum)
+        finally:
+            try:
+                pthread_sigmask(signal.SIG_SETMASK, terminal_mask)
+            except (OSError, ValueError) as error:
+                raise UserError(
+                    f"cannot restore prompt refresh terminal signal mask: {error}"
+                ) from error
+        return isinstance(exc, _DeferredRefreshTermination)
+
+
+def _refresh_process_group_is_addressable(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_refresh_process_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _drain_refresh_output_once(
+    selector: selectors.BaseSelector,
+    captures: dict[str, bytearray],
+    *,
+    timeout: float,
+    capture: bool,
+    max_capture_bytes: int,
+) -> None:
+    for key, _mask in selector.select(timeout):
+        try:
+            chunk = os.read(key.fd, REFRESH_DRAIN_CHUNK_BYTES)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            selector.unregister(key.fd)
+            continue
+        if not capture:
+            continue
+        retained = sum(len(value) for value in captures.values())
+        if retained + len(chunk) > max_capture_bytes:
+            raise _RefreshCaptureLimitExceeded
+        captures[cast(str, key.data)].extend(chunk)
+
+
+def _cleanup_refresh_process(
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector,
+    captures: dict[str, bytearray],
+    *,
+    cleanup_timeout: float,
+    max_capture_bytes: int,
+) -> None:
+    _kill_refresh_process_group(process.pid)
+    deadline = time.monotonic() + cleanup_timeout
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        _drain_refresh_output_once(
+            selector,
+            captures,
+            timeout=min(REFRESH_POLL_INTERVAL_SECONDS, max(0.0, remaining)),
+            capture=False,
+            max_capture_bytes=max_capture_bytes,
+        )
+        returncode = process.poll()
+        if (
+            returncode is not None
+            and not _refresh_process_group_is_addressable(process.pid)
+            and not selector.get_map()
+        ):
+            return
+    reasons: list[str] = []
+    if process.poll() is None:
+        reasons.append("failed to reap prompt refresh process")
+    if _refresh_process_group_is_addressable(process.pid):
+        reasons.append("failed to prove prompt refresh process-group disappearance")
+    if selector.get_map():
+        reasons.append("failed to drain prompt refresh process pipes")
+    raise UserError("; ".join(reasons) or "prompt refresh cleanup timed out")
+
+
+def _run_bounded_refresh_process(
+    command: list[str],
+    *,
+    pass_fds: tuple[int, ...],
+    env: dict[str, str],
+    timeout: float = REFRESH_TIMEOUT_SECONDS,
+    cleanup_timeout: float = REFRESH_CLEANUP_TIMEOUT_SECONDS,
+    max_capture_bytes: int = REFRESH_CAPTURE_MAX_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    if not command or not all(isinstance(argument, str) for argument in command):
+        raise UserError("prompt refresh command must be a nonempty argv")
+    if any(not isinstance(file_fd, int) or file_fd < 0 for file_fd in pass_fds):
+        raise UserError("prompt refresh pass_fds must be nonnegative integers")
+    if timeout <= 0 or cleanup_timeout <= 0 or max_capture_bytes <= 0:
+        raise UserError("prompt refresh process bounds must be positive")
+    signal_transaction = _RefreshSignalTransaction()
+    completed: subprocess.CompletedProcess[str] | None = None
+    with signal_transaction:
+        completed = _run_bounded_refresh_process_supervised(
+            command,
+            pass_fds=pass_fds,
+            env=env,
+            timeout=timeout,
+            cleanup_timeout=cleanup_timeout,
+            max_capture_bytes=max_capture_bytes,
+            signal_transaction=signal_transaction,
+        )
+    if signal_transaction.pending_signal is not None:
+        signum = signal_transaction.pending_signal
+        return subprocess.CompletedProcess(
+            command,
+            128 + signum,
+            stdout="" if completed is None else completed.stdout,
+            stderr=(
+                "BLOCKED: prompt refresh interrupted by "
+                f"{signal.Signals(signum).name} after process-group cleanup\n"
+            ),
+        )
+    if completed is None:
+        raise UserError("prompt refresh process completed without a result")
+    return completed
+
+
+def _run_bounded_refresh_process_supervised(
+    command: list[str],
+    *,
+    pass_fds: tuple[int, ...],
+    env: dict[str, str],
+    timeout: float,
+    cleanup_timeout: float,
+    max_capture_bytes: int,
+    signal_transaction: _RefreshSignalTransaction,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        selector = selectors.DefaultSelector()
+    except OSError as error:
+        raise UserError(
+            f"cannot initialize prompt refresh selector: {error}"
+        ) from error
+    captures = {"stdout": bytearray(), "stderr": bytearray()}
+    failure: tuple[int, str] | None = None
+    cleanup_complete = False
+    try:
+        signal_transaction.raise_if_pending()
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                pass_fds=pass_fds,
+                env=env,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise UserError(f"cannot start prompt refresh: {error}") from error
+        try:
+            if process.stdout is None or process.stderr is None:
+                raise UserError("prompt refresh process pipes were not created")
+            for name, stream in (
+                ("stdout", process.stdout),
+                ("stderr", process.stderr),
+            ):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream.fileno(), selectors.EVENT_READ, name)
+            signal_transaction.raise_if_pending()
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                signal_transaction.raise_if_pending()
+                remaining = deadline - time.monotonic()
+                try:
+                    _drain_refresh_output_once(
+                        selector,
+                        captures,
+                        timeout=min(
+                            REFRESH_POLL_INTERVAL_SECONDS,
+                            max(0.0, remaining),
+                        ),
+                        capture=True,
+                        max_capture_bytes=max_capture_bytes,
+                    )
+                except _RefreshCaptureLimitExceeded:
+                    failure = (
+                        125,
+                        "BLOCKED: prompt refresh output exceeded "
+                        f"{max_capture_bytes} bytes",
+                    )
+                    break
+                signal_transaction.raise_if_pending()
+                returncode = process.poll()
+                if returncode is None:
+                    continue
+                if _refresh_process_group_is_addressable(process.pid):
+                    failure = (
+                        126,
+                        "BLOCKED: prompt refresh left a live descendant in its "
+                        "process group",
+                    )
+                    break
+                if not selector.get_map():
+                    break
+            else:
+                failure = (
+                    124,
+                    f"BLOCKED: prompt refresh exceeded {timeout:g} second hard timeout",
+                )
+
+            if failure is not None:
+                _cleanup_refresh_process(
+                    process,
+                    selector,
+                    captures,
+                    cleanup_timeout=cleanup_timeout,
+                    max_capture_bytes=max_capture_bytes,
+                )
+                cleanup_complete = True
+                returncode, reason = failure
+                stderr = captures["stderr"].decode("utf-8", errors="replace")
+                if stderr and not stderr.endswith("\n"):
+                    stderr += "\n"
+                stderr += reason + "\n"
+                return subprocess.CompletedProcess(
+                    command,
+                    returncode,
+                    stdout=captures["stdout"].decode("utf-8", errors="replace"),
+                    stderr=stderr,
+                )
+
+            returncode = process.poll()
+            if returncode is None:
+                raise UserError(
+                    "prompt refresh process reached an impossible terminal state"
+                )
+            return subprocess.CompletedProcess(
+                command,
+                returncode,
+                stdout=captures["stdout"].decode("utf-8", errors="replace"),
+                stderr=captures["stderr"].decode("utf-8", errors="replace"),
+            )
+        except BaseException:
+            if not cleanup_complete:
+                _cleanup_refresh_process(
+                    process,
+                    selector,
+                    captures,
+                    cleanup_timeout=cleanup_timeout,
+                    max_capture_bytes=max_capture_bytes,
+                )
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+    finally:
+        selector.close()
+
+
 def _bridge_command(*args: str) -> list[str]:
     return [sys.executable, str(BRIDGE_PATH), *args]
 
@@ -209,7 +661,7 @@ def _adapter_dir(repo_root: pathlib.Path) -> pathlib.Path:
 
 
 def _index_path(repo_root: pathlib.Path) -> pathlib.Path:
-    return _adapter_dir(repo_root) / "index.json"
+    return _adapter_dir(repo_root) / INDEX_FILE_NAME
 
 
 def _index_template() -> AdapterIndex:
@@ -221,11 +673,12 @@ def _index_template() -> AdapterIndex:
     }
 
 
-def _load_index(repo_root: pathlib.Path) -> tuple[pathlib.Path, AdapterIndex]:
-    path = _index_path(repo_root)
-    if not path.is_file():
-        return path, _index_template()
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def _decode_index(content: bytes, path: pathlib.Path) -> AdapterIndex:
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise UserError(f"invalid adapter index: {path}: {error}") from error
+    payload = json.loads(decoded)
     if not isinstance(payload, dict):
         raise UserError(f"invalid adapter index: {path}")
     payload.setdefault("schema_version", INDEX_SCHEMA_VERSION)
@@ -246,15 +699,448 @@ def _load_index(repo_root: pathlib.Path) -> tuple[pathlib.Path, AdapterIndex]:
         raw_record.setdefault("run_dir", None)
         raw_record.setdefault("status", "observed")
         raw_record.setdefault("updated_at", None)
-    return path, cast(AdapterIndex, payload)
+    return cast(AdapterIndex, payload)
 
 
-def _save_index(path: pathlib.Path, index: AdapterIndex) -> None:
-    index["updated_at"] = _utc_now()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+def _canonical_index_snapshot(index: AdapterIndex) -> str:
+    return json.dumps(index, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _open_or_create_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    mode: int,
+    owner_private: bool,
+) -> int:
+    created = False
+    previous_umask = os.umask(0)
+    try:
+        try:
+            os.mkdir(name, mode, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
+    finally:
+        os.umask(previous_umask)
+    try:
+        directory_fd = _open_directory_at(parent_fd, name)
+    except OSError as error:
+        raise RunSafetyError(
+            f"adapter index directory cannot be opened without following links: {name}"
+        ) from error
+    try:
+        descriptor_stat = os.fstat(directory_fd)
+        named_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(descriptor_stat.st_mode)
+            or not stat.S_ISDIR(named_stat.st_mode)
+            or not _same_object(descriptor_stat, named_stat)
+        ):
+            raise RunSafetyError(f"adapter index directory identity mismatch: {name}")
+        if owner_private:
+            if descriptor_stat.st_uid != os.geteuid():
+                raise RunSafetyError(
+                    f"adapter index directory is not owned by the current user: {name}"
+                )
+            if created or stat.S_IMODE(descriptor_stat.st_mode) != mode:
+                os.fchmod(directory_fd, mode)
+            descriptor_after = os.fstat(directory_fd)
+            named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(descriptor_after.st_mode)
+                or not stat.S_ISDIR(named_after.st_mode)
+                or not _same_object(descriptor_stat, descriptor_after)
+                or not _same_object(descriptor_after, named_after)
+                or descriptor_after.st_uid != os.geteuid()
+                or stat.S_IMODE(descriptor_after.st_mode) != mode
+            ):
+                raise RunSafetyError(
+                    f"adapter index directory is not owner-private: {name}"
+                )
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def _open_index_directories(
+    repo_root: pathlib.Path,
+) -> tuple[int, int, int]:
+    repo_fd: int | None = None
+    codex_tmp_fd: int | None = None
+    adapter_fd: int | None = None
+    try:
+        repo_fd = _open_absolute_directory(repo_root)
+        codex_tmp_fd = _open_or_create_directory_at(
+            repo_fd,
+            ".codex-tmp",
+            mode=INDEX_DIRECTORY_MODE,
+            owner_private=False,
+        )
+        adapter_fd = _open_or_create_directory_at(
+            codex_tmp_fd,
+            "waited-delivery-hook-adapter",
+            mode=INDEX_DIRECTORY_MODE,
+            owner_private=True,
+        )
+        return repo_fd, codex_tmp_fd, adapter_fd
+    except Exception:
+        if adapter_fd is not None:
+            os.close(adapter_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        if repo_fd is not None:
+            os.close(repo_fd)
+        raise
+
+
+def _revalidate_index_directories(
+    repo_fd: int,
+    codex_tmp_fd: int,
+    adapter_fd: int,
+) -> None:
+    codex_tmp_stat = os.fstat(codex_tmp_fd)
+    named_codex_tmp = os.stat(
+        ".codex-tmp",
+        dir_fd=repo_fd,
+        follow_symlinks=False,
     )
+    adapter_stat = os.fstat(adapter_fd)
+    named_adapter = os.stat(
+        "waited-delivery-hook-adapter",
+        dir_fd=codex_tmp_fd,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISDIR(codex_tmp_stat.st_mode)
+        or not stat.S_ISDIR(named_codex_tmp.st_mode)
+        or not _same_object(codex_tmp_stat, named_codex_tmp)
+        or not stat.S_ISDIR(adapter_stat.st_mode)
+        or not stat.S_ISDIR(named_adapter.st_mode)
+        or not _same_object(adapter_stat, named_adapter)
+        or adapter_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(adapter_stat.st_mode) != INDEX_DIRECTORY_MODE
+    ):
+        raise RunSafetyError(
+            "adapter index directory identity or access policy changed"
+        )
+
+
+def _open_index_lock(adapter_fd: int) -> int:
+    created = False
+    create_flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        lock_fd = os.open(
+            INDEX_LOCK_FILE_NAME,
+            create_flags,
+            INDEX_FILE_MODE,
+            dir_fd=adapter_fd,
+        )
+        created = True
+    except FileExistsError:
+        try:
+            lock_fd = os.open(
+                INDEX_LOCK_FILE_NAME,
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=adapter_fd,
+            )
+        except OSError as error:
+            raise RunSafetyError(
+                "adapter index lock cannot be opened without following links"
+            ) from error
+    except OSError as error:
+        raise RunSafetyError("adapter index lock cannot be created safely") from error
+    try:
+        if created:
+            os.fchmod(lock_fd, INDEX_FILE_MODE)
+        _revalidate_index_lock(adapter_fd, lock_fd)
+        return lock_fd
+    except Exception:
+        os.close(lock_fd)
+        raise
+
+
+def _revalidate_index_lock(adapter_fd: int, lock_fd: int) -> None:
+    descriptor_stat = os.fstat(lock_fd)
+    named_stat = os.stat(
+        INDEX_LOCK_FILE_NAME,
+        dir_fd=adapter_fd,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or not stat.S_ISREG(named_stat.st_mode)
+        or not _same_object(descriptor_stat, named_stat)
+        or descriptor_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(descriptor_stat.st_mode) != INDEX_FILE_MODE
+    ):
+        raise RunSafetyError("adapter index lock identity or access policy mismatch")
+
+
+def _pread_index_bytes(file_fd: int) -> bytes:
+    chunks: list[bytes] = []
+    offset = 0
+    while True:
+        chunk = os.pread(
+            file_fd,
+            min(65536, INDEX_MAX_BYTES + 1 - offset),
+            offset,
+        )
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+        if offset > INDEX_MAX_BYTES:
+            raise RunSafetyError("adapter index exceeds byte limit")
+    return b"".join(chunks)
+
+
+def _read_index_bytes_at(
+    adapter_fd: int,
+) -> tuple[bytes, IndexFileVersion] | None:
+    try:
+        file_fd = os.open(
+            INDEX_FILE_NAME,
+            _regular_open_flags(),
+            dir_fd=adapter_fd,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RunSafetyError(
+            "adapter index cannot be opened without following links"
+        ) from error
+    try:
+        before = os.fstat(file_fd)
+        named_before = os.stat(
+            INDEX_FILE_NAME,
+            dir_fd=adapter_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(named_before.st_mode)
+            or not _same_object(before, named_before)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_size > INDEX_MAX_BYTES
+        ):
+            raise RunSafetyError(
+                "adapter index must be an owned, non-writable-by-others regular file"
+            )
+        first_content = _pread_index_bytes(file_fd)
+        middle = os.fstat(file_fd)
+        second_content = _pread_index_bytes(file_fd)
+        after = os.fstat(file_fd)
+        named_after = os.stat(
+            INDEX_FILE_NAME,
+            dir_fd=adapter_fd,
+            follow_symlinks=False,
+        )
+        expected_access = (
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+        )
+        observed_stats = (before, named_before, middle, after, named_after)
+        if (
+            any(not stat.S_ISREG(value.st_mode) for value in observed_stats)
+            or any(not _same_object(before, value) for value in observed_stats[1:])
+            or any(value.st_size != before.st_size for value in observed_stats[1:])
+            or any(
+                (
+                    value.st_uid,
+                    value.st_gid,
+                    stat.S_IMODE(value.st_mode),
+                )
+                != expected_access
+                for value in observed_stats[1:]
+            )
+            or len(first_content) != before.st_size
+            or first_content != second_content
+        ):
+            raise RunSafetyError(
+                "adapter index identity, access policy, size, or content changed "
+                "while read"
+            )
+        return (
+            second_content,
+            IndexFileVersion(
+                device=after.st_dev,
+                inode=after.st_ino,
+                uid=after.st_uid,
+                gid=after.st_gid,
+                mode=stat.S_IMODE(after.st_mode),
+                size=after.st_size,
+                sha256=hashlib.sha256(second_content).hexdigest(),
+            ),
+        )
+    except RunSafetyError:
+        raise
+    except OSError as error:
+        raise RunSafetyError("adapter index cannot be read stably") from error
+    finally:
+        os.close(file_fd)
+
+
+def _write_all(file_fd: int, content: bytes) -> None:
+    offset = 0
+    while offset < len(content):
+        written = os.write(file_fd, content[offset:])
+        if written <= 0:
+            raise RunSafetyError("adapter index temporary file write made no progress")
+        offset += written
+
+
+def _atomic_save_index_at(
+    adapter_fd: int,
+    index: AdapterIndex,
+    expected_version: IndexFileVersion | None,
+) -> IndexFileVersion:
+    current = _read_index_bytes_at(adapter_fd)
+    current_version = None if current is None else current[1]
+    if current_version != expected_version:
+        raise RunSafetyError("adapter index changed outside the locked transaction")
+    index["updated_at"] = _utc_now()
+    content = (
+        json.dumps(index, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(content) > INDEX_MAX_BYTES:
+        raise RunSafetyError("adapter index exceeds byte limit")
+    temporary_name = f".{INDEX_FILE_NAME}.{uuid.uuid4().hex}.tmp"
+    temporary_fd: int | None = None
+    temporary_visible = False
+    replaced = False
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            INDEX_FILE_MODE,
+            dir_fd=adapter_fd,
+        )
+        temporary_visible = True
+        os.fchmod(temporary_fd, INDEX_FILE_MODE)
+        _write_all(temporary_fd, content)
+        os.fsync(temporary_fd)
+        temporary_stat = os.fstat(temporary_fd)
+        named_temporary = os.stat(
+            temporary_name,
+            dir_fd=adapter_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(temporary_stat.st_mode)
+            or not stat.S_ISREG(named_temporary.st_mode)
+            or not _same_object(temporary_stat, named_temporary)
+            or temporary_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(temporary_stat.st_mode) != INDEX_FILE_MODE
+            or temporary_stat.st_size != len(content)
+            or _pread_index_bytes(temporary_fd) != content
+        ):
+            raise RunSafetyError(
+                "adapter index temporary file failed identity, access, or "
+                "content validation"
+            )
+        current = _read_index_bytes_at(adapter_fd)
+        current_version = None if current is None else current[1]
+        if current_version != expected_version:
+            raise RunSafetyError("adapter index changed before atomic replacement")
+        os.replace(
+            temporary_name,
+            INDEX_FILE_NAME,
+            src_dir_fd=adapter_fd,
+            dst_dir_fd=adapter_fd,
+        )
+        temporary_visible = False
+        replaced = True
+        os.fsync(adapter_fd)
+        saved = _read_index_bytes_at(adapter_fd)
+        if (
+            saved is None
+            or saved[0] != content
+            or saved[1].uid != os.geteuid()
+            or saved[1].mode != INDEX_FILE_MODE
+        ):
+            raise RunSafetyError(
+                "adapter index atomic replacement could not be verified"
+            )
+        return saved[1]
+    except RunSafetyError:
+        raise
+    except OSError as error:
+        operation = "commit" if replaced else "prepare"
+        raise RunSafetyError(
+            f"adapter index atomic {operation} failed: {error}"
+        ) from error
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if temporary_visible:
+            try:
+                os.unlink(temporary_name, dir_fd=adapter_fd)
+            except FileNotFoundError:
+                pass
+
+
+@contextlib.contextmanager
+def _index_transaction(
+    repo_root: pathlib.Path,
+    *,
+    write: bool,
+) -> Iterator[AdapterIndex]:
+    repo_fd: int | None = None
+    codex_tmp_fd: int | None = None
+    adapter_fd: int | None = None
+    lock_fd: int | None = None
+    locked = False
+    try:
+        repo_fd, codex_tmp_fd, adapter_fd = _open_index_directories(repo_root)
+        lock_fd = _open_index_lock(adapter_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
+        locked = True
+        _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+        _revalidate_index_lock(adapter_fd, lock_fd)
+        loaded = _read_index_bytes_at(adapter_fd)
+        if loaded is None:
+            index = _index_template()
+            expected_version = None
+        else:
+            content, expected_version = loaded
+            index = _decode_index(content, _index_path(repo_root))
+        original_snapshot = _canonical_index_snapshot(index)
+        yield index
+        if write and _canonical_index_snapshot(index) != original_snapshot:
+            _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+            _revalidate_index_lock(adapter_fd, lock_fd)
+            _atomic_save_index_at(adapter_fd, index, expected_version)
+            _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+            _revalidate_index_lock(adapter_fd, lock_fd)
+    finally:
+        if lock_fd is not None:
+            if locked:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        if adapter_fd is not None:
+            os.close(adapter_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        if repo_fd is not None:
+            os.close(repo_fd)
 
 
 def _success_hook_response() -> int:
@@ -1077,7 +1963,7 @@ def _run_refresh_bridge_json(
         ),
         *args,
     ]
-    completed = _run(
+    completed = _run_bounded_refresh_process(
         command,
         pass_fds=(
             snapshots.bridge.snapshot_fd,
@@ -1823,23 +2709,22 @@ def _user_prompt_submit_hook(_: argparse.Namespace) -> int:
         repo_root = _resolve_repo_root(cwd, strict=False)
         if repo_root is None:
             return _success_hook_response()
-        index_path, index = _load_index(repo_root)
         prompt = payload.get("prompt")
         transcript_value = payload.get("transcript_path")
         permission_value = payload.get("permission_mode")
-        _update_session_observation(
-            index,
-            session_id=session_id,
-            cwd=cwd,
-            transcript_path=transcript_value
-            if isinstance(transcript_value, str)
-            else None,
-            permission_mode=permission_value
-            if isinstance(permission_value, str)
-            else None,
-            prompt=prompt if isinstance(prompt, str) else None,
-        )
-        _save_index(index_path, index)
+        with _index_transaction(repo_root, write=True) as index:
+            _update_session_observation(
+                index,
+                session_id=session_id,
+                cwd=cwd,
+                transcript_path=transcript_value
+                if isinstance(transcript_value, str)
+                else None,
+                permission_mode=permission_value
+                if isinstance(permission_value, str)
+                else None,
+                prompt=prompt if isinstance(prompt, str) else None,
+            )
         return _success_hook_response()
     except Exception as error:
         setattr(error, "hook_command", "user-prompt-submit-hook")
@@ -1867,8 +2752,6 @@ def _handle_pinned_stop_run(
     *,
     payload: dict[str, object],
     repo_root: pathlib.Path,
-    index_path: pathlib.Path,
-    index: AdapterIndex,
     record: SessionRecord,
     run_dir: pathlib.Path,
     state: dict[str, object],
@@ -1879,12 +2762,10 @@ def _handle_pinned_stop_run(
         record["run_dir"] = None
         record["status"] = "completed"
         record["updated_at"] = _utc_now()
-        _save_index(index_path, index)
-        return _success_hook_response()
+        return 0
     if payload.get("stop_hook_active"):
-        return _success_hook_response()
+        return 0
     record["updated_at"] = _utc_now()
-    _save_index(index_path, index)
     try:
         refreshed_prompts = _refresh_recovery_prompts(
             run_dir,
@@ -1963,6 +2844,7 @@ def _handle_pinned_stop_run(
 
 def _stop_hook(_: argparse.Namespace) -> int:
     payload: dict[str, object] = {}
+    stop_result: int | None = None
     try:
         payload = json.load(sys.stdin)
         cwd = payload.get("cwd")
@@ -1972,91 +2854,99 @@ def _stop_hook(_: argparse.Namespace) -> int:
         repo_root = _resolve_repo_root(cwd, strict=False)
         if repo_root is None:
             return _success_hook_response()
-        index_path, index = _load_index(repo_root)
-        record = index["sessions"].get(session_id)
-        if record is None or not record["run_dir"]:
+        with _index_transaction(repo_root, write=True) as index:
+            record = index["sessions"].get(session_id)
+            if record is None or not record["run_dir"]:
+                stop_result = 0
+            else:
+                try:
+                    run_dir, state, run_identity, run_fd = _load_stop_run_state(
+                        repo_root,
+                        record["run_dir"],
+                    )
+                except RunSafetyError as error:
+                    stop_result = _block_unsafe_stop(error, payload)
+                else:
+                    try:
+                        stop_result = _handle_pinned_stop_run(
+                            payload=payload,
+                            repo_root=repo_root,
+                            record=record,
+                            run_dir=run_dir,
+                            state=state,
+                            run_identity=run_identity,
+                            run_fd=run_fd,
+                        )
+                    finally:
+                        os.close(run_fd)
+        if stop_result == 0:
             return _success_hook_response()
-        try:
-            run_dir, state, run_identity, run_fd = _load_stop_run_state(
-                repo_root,
-                record["run_dir"],
-            )
-        except RunSafetyError as error:
-            return _block_unsafe_stop(error, payload)
-        try:
-            return _handle_pinned_stop_run(
-                payload=payload,
-                repo_root=repo_root,
-                index_path=index_path,
-                index=index,
-                record=record,
-                run_dir=run_dir,
-                state=state,
-                run_identity=run_identity,
-                run_fd=run_fd,
-            )
-        finally:
-            os.close(run_fd)
+        if stop_result == 2:
+            return 2
+        raise UserError("stop hook completed without a result")
     except Exception as error:
         setattr(error, "hook_command", "stop-hook")
         setattr(error, "hook_payload", payload)
+        if stop_result == 2:
+            _record_hook_failure(error)
+            return 2
         return _fail_open_hook_response(error)
 
 
 def _prepare_active_run(args: argparse.Namespace) -> int:
     repo_root = _resolve_repo_root(args.repo, strict=True)
     assert repo_root is not None
-    index_path, index = _load_index(repo_root)
-    record = _resolve_session_record(
-        index,
-        repo_root=repo_root,
-        session_id=args.session_id,
-        transcript_path=args.transcript_path,
-        prompt_text=args.prompt_text,
-        host_session_id=_current_thread_session_id(),
-    )
-    if record["run_dir"]:
-        state = _load_run_state(record["run_dir"])
-        if state is not None and not _run_is_terminal(state):
-            raise UserError(
-                f"session {record['session_id']} already has an active waited-delivery run: {record['run_dir']}"
-            )
-    bridge_args = [
-        "prepare-live",
-        "--repo",
-        str(repo_root),
-        "--goal",
-        args.goal,
-        "--parent-session-id",
-        record["session_id"],
-    ]
-    if record["transcript_path"]:
-        bridge_args.extend(["--parent-transcript-path", record["transcript_path"]])
-    if record["permission_mode"]:
-        bridge_args.extend(["--permission-mode", record["permission_mode"]])
-    if args.run_id:
-        bridge_args.extend(["--run-id", args.run_id])
-    for phase in args.phase:
-        bridge_args.extend(["--phase", phase])
-    for changed_file in args.changed_file:
-        bridge_args.extend(["--changed-file", changed_file])
-    for blocker in args.known_blocker:
-        bridge_args.extend(["--known-blocker", blocker])
-    bridge_args.extend(["--external-lane", args.external_lane])
-    bridge_args.extend(["--fallback-lane", args.fallback_lane])
-    bridge_args.extend(["--fallback-entrypoint", args.fallback_entrypoint])
-    bridge_args.extend(["--external-helper", args.external_helper])
-    if args.no_fallback_smoke:
-        bridge_args.append("--no-fallback-smoke")
-    payload = _run_bridge_json(*bridge_args)
-    run_dir = payload.get("run_dir")
-    if not isinstance(run_dir, str) or not run_dir:
-        raise UserError("prepare-live did not return run_dir")
-    record["run_dir"] = run_dir
-    record["status"] = "active"
-    record["updated_at"] = _utc_now()
-    index["latest_session_id"] = record["session_id"]
-    _save_index(index_path, index)
+    with _index_transaction(repo_root, write=True) as index:
+        record = _resolve_session_record(
+            index,
+            repo_root=repo_root,
+            session_id=args.session_id,
+            transcript_path=args.transcript_path,
+            prompt_text=args.prompt_text,
+            host_session_id=_current_thread_session_id(),
+        )
+        if record["run_dir"]:
+            state = _load_run_state(record["run_dir"])
+            if state is not None and not _run_is_terminal(state):
+                raise UserError(
+                    f"session {record['session_id']} already has an active "
+                    f"waited-delivery run: {record['run_dir']}"
+                )
+        bridge_args = [
+            "prepare-live",
+            "--repo",
+            str(repo_root),
+            "--goal",
+            args.goal,
+            "--parent-session-id",
+            record["session_id"],
+        ]
+        if record["transcript_path"]:
+            bridge_args.extend(["--parent-transcript-path", record["transcript_path"]])
+        if record["permission_mode"]:
+            bridge_args.extend(["--permission-mode", record["permission_mode"]])
+        if args.run_id:
+            bridge_args.extend(["--run-id", args.run_id])
+        for phase in args.phase:
+            bridge_args.extend(["--phase", phase])
+        for changed_file in args.changed_file:
+            bridge_args.extend(["--changed-file", changed_file])
+        for blocker in args.known_blocker:
+            bridge_args.extend(["--known-blocker", blocker])
+        bridge_args.extend(["--external-lane", args.external_lane])
+        bridge_args.extend(["--fallback-lane", args.fallback_lane])
+        bridge_args.extend(["--fallback-entrypoint", args.fallback_entrypoint])
+        bridge_args.extend(["--external-helper", args.external_helper])
+        if args.no_fallback_smoke:
+            bridge_args.append("--no-fallback-smoke")
+        payload = _run_bridge_json(*bridge_args)
+        run_dir = payload.get("run_dir")
+        if not isinstance(run_dir, str) or not run_dir:
+            raise UserError("prepare-live did not return run_dir")
+        record["run_dir"] = run_dir
+        record["status"] = "active"
+        record["updated_at"] = _utc_now()
+        index["latest_session_id"] = record["session_id"]
     print(json.dumps(payload))
     return 0
 
@@ -2064,100 +2954,97 @@ def _prepare_active_run(args: argparse.Namespace) -> int:
 def _attach_child_active_run(args: argparse.Namespace) -> int:
     repo_root = _resolve_repo_root(args.repo, strict=True)
     assert repo_root is not None
-    index_path, index = _load_index(repo_root)
-    record = _resolve_session_record(
-        index,
-        repo_root=repo_root,
-        session_id=args.session_id,
-        run_dir=args.run_dir,
-    )
-    exit_code = _run_bridge_passthrough(
-        "attach-child-live",
-        "--run-dir",
-        args.run_dir,
-        "--child-session-id",
-        args.child_session_id,
-        "--parent-session-id",
-        record["session_id"],
-        *(
-            ["--parent-transcript-path", record["transcript_path"]]
-            if record["transcript_path"]
-            else []
-        ),
-        *(
-            ["--permission-mode", record["permission_mode"]]
-            if record["permission_mode"]
-            else []
-        ),
-    )
-    if exit_code == 0:
-        record["run_dir"] = args.run_dir
-        record["status"] = "active"
-        record["updated_at"] = _utc_now()
-        index["latest_session_id"] = record["session_id"]
-        _save_index(index_path, index)
+    with _index_transaction(repo_root, write=True) as index:
+        record = _resolve_session_record(
+            index,
+            repo_root=repo_root,
+            session_id=args.session_id,
+            run_dir=args.run_dir,
+        )
+        exit_code = _run_bridge_passthrough(
+            "attach-child-live",
+            "--run-dir",
+            args.run_dir,
+            "--child-session-id",
+            args.child_session_id,
+            "--parent-session-id",
+            record["session_id"],
+            *(
+                ["--parent-transcript-path", record["transcript_path"]]
+                if record["transcript_path"]
+                else []
+            ),
+            *(
+                ["--permission-mode", record["permission_mode"]]
+                if record["permission_mode"]
+                else []
+            ),
+        )
+        if exit_code == 0:
+            record["run_dir"] = args.run_dir
+            record["status"] = "active"
+            record["updated_at"] = _utc_now()
+            index["latest_session_id"] = record["session_id"]
     return exit_code
 
 
 def _finish_child_active_run(args: argparse.Namespace) -> int:
     repo_root = _resolve_repo_root(args.repo, strict=True)
     assert repo_root is not None
-    index_path, index = _load_index(repo_root)
-    record = _resolve_session_record(
-        index,
-        repo_root=repo_root,
-        session_id=args.session_id,
-        run_dir=args.run_dir,
-    )
-    bridge_args = [
-        "finish-child-live",
-        "--run-dir",
-        args.run_dir,
-        "--child-status",
-        args.child_status,
-        "--child-session-id",
-        args.child_session_id,
-    ]
-    exit_code = _run_bridge_passthrough(*bridge_args)
-    if exit_code == 0:
-        record["run_dir"] = args.run_dir
-        record["status"] = "active"
-        record["updated_at"] = _utc_now()
-        index["latest_session_id"] = record["session_id"]
-        _save_index(index_path, index)
+    with _index_transaction(repo_root, write=True) as index:
+        record = _resolve_session_record(
+            index,
+            repo_root=repo_root,
+            session_id=args.session_id,
+            run_dir=args.run_dir,
+        )
+        bridge_args = [
+            "finish-child-live",
+            "--run-dir",
+            args.run_dir,
+            "--child-status",
+            args.child_status,
+            "--child-session-id",
+            args.child_session_id,
+        ]
+        exit_code = _run_bridge_passthrough(*bridge_args)
+        if exit_code == 0:
+            record["run_dir"] = args.run_dir
+            record["status"] = "active"
+            record["updated_at"] = _utc_now()
+            index["latest_session_id"] = record["session_id"]
     return exit_code
 
 
 def _reconcile_active_run(args: argparse.Namespace) -> int:
     repo_root = _resolve_repo_root(args.repo, strict=True)
     assert repo_root is not None
-    index_path, index = _load_index(repo_root)
-    record = _resolve_session_record(
-        index,
-        repo_root=repo_root,
-        session_id=args.session_id,
-        run_dir=args.run_dir,
-    )
-    bridge_args = [
-        "reconcile-live",
-        "--run-dir",
-        args.run_dir,
-        "--child-status",
-        args.child_status,
-        "--child-session-id",
-        args.child_session_id,
-    ]
-    payload = _run_bridge_json(*bridge_args)
-    state = _load_run_state(args.run_dir)
-    if state is not None and _run_is_terminal(state):
-        record["run_dir"] = None
-        record["status"] = "completed"
-    else:
-        record["run_dir"] = args.run_dir
-        record["status"] = "active"
-    record["updated_at"] = _utc_now()
-    index["latest_session_id"] = record["session_id"]
-    _save_index(index_path, index)
+    with _index_transaction(repo_root, write=True) as index:
+        record = _resolve_session_record(
+            index,
+            repo_root=repo_root,
+            session_id=args.session_id,
+            run_dir=args.run_dir,
+        )
+        bridge_args = [
+            "reconcile-live",
+            "--run-dir",
+            args.run_dir,
+            "--child-status",
+            args.child_status,
+            "--child-session-id",
+            args.child_session_id,
+        ]
+        payload = _run_bridge_json(*bridge_args)
+        state = _load_run_state(args.run_dir)
+        if state is not None and _run_is_terminal(state):
+            record["run_dir"] = None
+            record["status"] = "completed"
+        else:
+            record["run_dir"] = args.run_dir
+            record["status"] = "active"
+        record["updated_at"] = _utc_now()
+        index["latest_session_id"] = record["session_id"]
     print(json.dumps(payload))
     return 0
 
@@ -2165,8 +3052,9 @@ def _reconcile_active_run(args: argparse.Namespace) -> int:
 def _show_index(args: argparse.Namespace) -> int:
     repo_root = _resolve_repo_root(args.repo, strict=True)
     assert repo_root is not None
-    _, index = _load_index(repo_root)
-    print(json.dumps(index, indent=2, sort_keys=True))
+    with _index_transaction(repo_root, write=False) as index:
+        rendered = json.dumps(index, indent=2, sort_keys=True)
+    print(rendered)
     return 0
 
 

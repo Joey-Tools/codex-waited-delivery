@@ -14,11 +14,12 @@ default.
 The adapter adds one explicitly enabled layer above the bridge:
 
 - `UserPromptSubmit` hook records the current session metadata in a repo-local session index only when its command includes `--enable-compat-hook`
+- every session-index command takes one descriptor-bound repo-local transaction lock before loading the index and holds it through selection, bridge/state work, mutation, and atomic commit, so concurrent hook and active-run commands cannot overwrite one another from stale snapshots
 - `prepare-active-run` resolves an unambiguous observed session and binds it to a new `run_dir`
 - `Stop` hook checks that session index and blocks premature finish while the run is still active only when its command includes `--enable-compat-hook`
 - before rendering an active-run continuation, `Stop` calls `refresh-prompts-live` so both persisted prompts use the currently loaded compatibility runner instead of a removed historical absolute path
 - before that refresh, `Stop` opens the repo/run path component-by-component without following links, requires the indexed `run_dir` to be a direct child of the current repo's `.codex-tmp/waited-delivery`, requires exact `state.repo_root` equality, requires regular no-follow state and prompt files, requires the current user plus mode `0700`, and records the opened run directory's exact device/inode and POSIX uid/gid/mode
-- `Stop` keeps that run descriptor open while refresh runs. It stable-reads both bridge and runner sources, binding each named entry, object identity, uid/gid/mode, size, and two bounded byte reads plus SHA-256 digest. It copies those exact bytes into a current-user `0700` temporary directory as `0600` files, opens and verifies both snapshots as `O_RDONLY`, immediately unlinks their names, revalidates both source paths, and launches the bridge only through its inherited snapshot FD. The adapter invokes Python with `-I -B -S` and removes Python environment-injection variables; the bridge preserves that isolation when it launches the runner through the inherited runner FD and forwards both inherited descriptors. Neither layer falls back to a source path or sibling lookup. Under the run lock, the runner performs the final bridge/runner descriptor revalidation immediately before the first prompt/state write. Refresh schema `2` returns exact executed bridge/runner paths and versions, both read-only FD attestations, isolated-execution attestation, and each newly published prompt version. The adapter compares those receipts to the still-open snapshot descriptors and rereads state/prompts through the pinned run descriptor before rendering guidance. Timestamp-only churn is deliberately excluded because it changes none of the protected properties. A source replacement, owner/group drift, mode change, or content change observed before launch fails before any prompt/state write, while a source-path A→B→A change after binding cannot execute the intermediate object.
+- `Stop` keeps that run descriptor open while refresh runs. It stable-reads both bridge and runner sources, binding each named entry, object identity, uid/gid/mode, size, and two bounded byte reads plus SHA-256 digest. It copies those exact bytes into a current-user `0700` temporary directory as `0600` files, opens and verifies both snapshots as `O_RDONLY`, immediately unlinks their names, revalidates both source paths, and launches the bridge only through its inherited snapshot FD. The adapter invokes Python with `-I -B -S` and removes Python environment-injection variables; the bridge preserves that isolation when it launches the runner through the inherited runner FD and forwards both inherited descriptors. Neither layer falls back to a source path or sibling lookup. The outer refresh process runs in a new session with a seven-second hard deadline, a captured-byte ceiling, and bounded whole-process-group kill/drain/reap. One deferred `SIGHUP`/`SIGTERM`/`SIGQUIT` transaction keeps the snapshot descriptors open until cleanup finishes and only then restores and redelivers the first terminal signal. Under the run lock, the runner performs the final bridge/runner descriptor revalidation immediately before the first prompt/state write. Refresh schema `2` returns exact executed bridge/runner paths and versions, both read-only FD attestations, isolated-execution attestation, and each newly published prompt version. The adapter compares those receipts to the still-open snapshot descriptors and rereads state/prompts through the pinned run descriptor before rendering guidance. Timestamp-only churn is deliberately excluded because it changes none of the protected properties. A source replacement, owner/group drift, mode change, or content change observed before launch fails before any prompt/state write, while a source-path A→B→A change after binding cannot execute the intermediate object.
 - `finish-child-active-run` requires the exact attached child id, records the child's terminal status, and preserves the active-run association for parent-owned review
 - `reconcile-active-run` requires that same exact child id and clears the active-run association only when reconciliation finishes cleanly with the required `internal_review` phase and a nonblank attached child identity
 
@@ -29,6 +30,18 @@ This keeps hooks product-facing and lets the bridge remain product-agnostic.
 The adapter stores repo-local state under:
 
 - `.codex-tmp/waited-delivery-hook-adapter/index.json`
+- `.codex-tmp/waited-delivery-hook-adapter/index.lock`
+
+The adapter directory is owner-only `0700`; each newly committed index snapshot
+and the transaction lock are `0600`. Both files are opened descriptor-relative
+with no-follow semantics. Index reads bind the named entry, regular-file object
+identity, owner/access policy, size, and two bounded byte reads. A changed index
+is written completely to a verified `0600` sibling temporary file, fsynced,
+atomically replaced, and directory-fsynced. Deliberate inode replacement at
+commit is expected; following or overwriting an object outside the adapter
+directory, exposing a newly persisted prompt through the umask, partial JSON
+visibility, and lost cooperative read-modify-write updates are the protected
+properties.
 
 Current records are keyed by `session_id` and include:
 
@@ -64,12 +77,14 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   - regenerates `child-prompt.md` and `parent-prompt.md` through descriptor-bound, unlinked bridge and runner snapshots before referring the parent back to either file
   - refuses to launch when either named source changes object identity, access policy, size, or content between its initial stable read and final prelaunch revalidation; timestamp-only changes remain benign
   - executes no bridge or runner source path after binding, uses Python `-I -B -S` with Python injection variables removed, requires both inherited FDs to remain `O_RDONLY`, binds schema `2` receipts to both exact executed snapshots/access modes, and cleans the private snapshot directory on success or failure
+  - supervises that descriptor-bound refresh in a new session with a seven-second hard timeout, a `256 KiB` combined capture ceiling, and bounded process-group kill/drain/reap; terminal `SIGHUP`, `SIGTERM`, and `SIGQUIT` are deferred until descendants are gone and snapshot FDs can be closed
   - has the runner revalidate both snapshots under the run lock immediately before the first prompt/state write, so a descriptor drift failure leaves those persistent artifacts unchanged
   - passes the exact current repo root plus the preflight run-directory device/inode, uid/gid, and mode through the bridge to the runner; the runner revalidates them under its run-level lock and atomically replaces prompt/state files through a pinned run-directory descriptor
   - fails closed without following record-provided prompt paths when the run points outside the repo, any run component or state/prompt file is a symlink/non-regular file, `state.repo_root` mismatches, or the pinned run object/access identity changes through a link, ordinary directory replacement, ownership drift, or mode change
   - tells a parent with an already active legacy child to have that same child re-read the regenerated child prompt before another runner command
   - uses `stop_hook_active` to avoid continuation loops
   - if continuation prompt rendering fails on an active run, it records diagnostics, falls back to a generic continuation prompt, and still blocks
+  - once an active nonterminal path has successfully rendered a blocking prompt, an index commit or final revalidation failure is recorded but cannot downgrade the hook result from exit `2` to fail-open exit `0`
   - every prompt variant preserves the current child terminal status and exact `child_session_id` when it suggests `reconcile-active-run`; an inconsistent terminal state with no nonblank child id produces recovery guidance instead of an unexecutable command
   - if even that fallback prompt builder fails, the hook still blocks with a last-resort prompt; if that builder also fails, it falls through to a static emergency prompt that still carries terminal reconcile instructions
   - the emergency reconcile command uses the absolute path of the currently loaded adapter, so both canonical `skills/waited-delivery-compat` and private `personal_codex/skills/waited-delivery-compat` distributions remain executable
@@ -109,6 +124,11 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   including when debug mode is enabled.
 
 ## Active-Run Commands
+
+All index-backed commands below use the same exclusive load-through-commit
+transaction as the prompt and Stop hooks. Bridge work stays inside that
+transaction so a concurrent hook cannot load a stale association and later
+replace another command's update.
 
 - `prepare-active-run`
   - resolves the target session from the adapter index

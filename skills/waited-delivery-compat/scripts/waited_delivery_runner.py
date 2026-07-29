@@ -218,12 +218,6 @@ def _resolve_repo_root(repo_arg: str) -> pathlib.Path:
     return pathlib.Path(stdout.strip()).resolve()
 
 
-def _parse_status_path(raw_path: str) -> str:
-    if " -> " in raw_path:
-        return raw_path.split(" -> ", 1)[1]
-    return raw_path
-
-
 def _collect_changed_files(repo_root: pathlib.Path) -> list[str]:
     stdout = _run_json(
         [
@@ -232,20 +226,32 @@ def _collect_changed_files(repo_root: pathlib.Path) -> list[str]:
             str(repo_root),
             "status",
             "--porcelain=v1",
+            "-z",
             "--untracked-files=all",
         ]
     )
     changed: list[str] = []
     seen: set[str] = set()
-    for line in stdout.splitlines():
-        if len(line) < 4:
+    records = stdout.split("\0")
+    record_index = 0
+    while record_index < len(records):
+        record = records[record_index]
+        record_index += 1
+        if len(record) < 4:
             continue
-        path = _parse_status_path(line[3:])
-        if path == ".codex-tmp" or path.startswith(".codex-tmp/"):
-            continue
-        if path not in seen:
-            changed.append(path)
-            seen.add(path)
+        status = record[:2]
+        paths = [record[3:]]
+        if "R" in status or "C" in status:
+            if record_index >= len(records) or not records[record_index]:
+                raise UserError("git status returned an incomplete rename record")
+            paths.append(records[record_index])
+            record_index += 1
+        for path in paths:
+            if path == ".codex-tmp" or path.startswith(".codex-tmp/"):
+                continue
+            if path not in seen:
+                changed.append(path)
+                seen.add(path)
     return changed
 
 

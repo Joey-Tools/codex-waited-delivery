@@ -377,6 +377,24 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertIn("reconcile-parent", parent_prompt)
         self.assertTrue((run_dir / "fallback-smoke.command.txt").is_file())
 
+    def test_changed_files_keep_rename_source_when_target_is_ignored(self) -> None:
+        module = self._load_runner_module()
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self.assertEqual(
+            git(
+                self.repo,
+                "mv",
+                "tracked.txt",
+                ".codex-tmp/tracked.txt",
+            ).returncode,
+            0,
+        )
+
+        changed_files = module._collect_changed_files(self.repo)
+
+        self.assertIn("tracked.txt", changed_files)
+        self.assertNotIn(".codex-tmp/tracked.txt", changed_files)
+
     def test_prepare_requires_internal_review_phase(self) -> None:
         run_id = "missing-internal-review"
         completed = self._run_runner(

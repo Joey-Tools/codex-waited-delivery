@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import importlib.util
 import io
 import json
@@ -10,10 +11,13 @@ import os
 import pathlib
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 import zlib
 from collections.abc import Mapping
@@ -658,6 +662,304 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(record["status"], "observed")
         self.assertIsNone(record["run_dir"])
 
+    def test_user_prompt_submit_hook_does_not_follow_index_symlink(self) -> None:
+        adapter_dir = self._index_path().parent
+        adapter_dir.mkdir(parents=True, mode=0o700)
+        external_index = self.root / "external-index.json"
+        sentinel = json.dumps(
+            {
+                "schema_version": 1,
+                "latest_session_id": None,
+                "updated_at": None,
+                "sessions": {},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        external_index.write_text(sentinel, encoding="utf-8")
+        self._index_path().symlink_to(external_index)
+
+        completed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                prompt="must not be written through the index symlink"
+            ),
+            env_overrides={"HOME": str(self.root / "home-index-symlink")},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "{}")
+        self.assertEqual(external_index.read_text(encoding="utf-8"), sentinel)
+        self.assertTrue(self._index_path().is_symlink())
+
+    def test_index_storage_is_owner_private_under_open_umask(self) -> None:
+        previous_umask = os.umask(0)
+        try:
+            completed = self._run_adapter(
+                "user-prompt-submit-hook",
+                input_payload=self._session_payload(
+                    session_id="session-private-index",
+                    prompt="owner-private prompt",
+                ),
+            )
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        adapter_dir = self._index_path().parent
+        lock_path = adapter_dir / "index.lock"
+        self.assertEqual(adapter_dir.stat().st_mode & 0o7777, 0o700)
+        self.assertEqual(self._index_path().stat().st_mode & 0o7777, 0o600)
+        self.assertEqual(lock_path.stat().st_mode & 0o7777, 0o600)
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            index["sessions"]["session-private-index"]["last_prompt"],
+            "owner-private prompt",
+        )
+
+    def test_index_directory_creation_survives_restrictive_umask(self) -> None:
+        previous_umask = os.umask(0o777)
+        try:
+            completed = self._run_adapter(
+                "user-prompt-submit-hook",
+                input_payload=self._session_payload(
+                    session_id="session-restrictive-umask",
+                    prompt="persist through restrictive umask",
+                ),
+            )
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        adapter_dir = self._index_path().parent
+        self.assertEqual(
+            (self.repo / ".codex-tmp").stat().st_mode & 0o7777,
+            0o700,
+        )
+        self.assertEqual(adapter_dir.stat().st_mode & 0o7777, 0o700)
+        self.assertEqual(self._index_path().stat().st_mode & 0o7777, 0o600)
+        self.assertEqual(
+            (adapter_dir / "index.lock").stat().st_mode & 0o7777,
+            0o600,
+        )
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            index["sessions"]["session-restrictive-umask"]["last_prompt"],
+            "persist through restrictive umask",
+        )
+
+    def test_index_transaction_serializes_load_modify_save(self) -> None:
+        seeded = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-seed"),
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        lock_path = self._index_path().parent / "index.lock"
+        lock_fd = os.open(lock_path, os.O_RDWR)
+        processes: list[subprocess.Popen[str]] = []
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            for session_id in ("session-race-a", "session-race-b"):
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(ADAPTER_PATH),
+                        "user-prompt-submit-hook",
+                        "--enable-compat-hook",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                assert process.stdin is not None
+                process.stdin.write(
+                    json.dumps(self._session_payload(session_id=session_id))
+                )
+                process.stdin.close()
+                process.stdin = None
+                processes.append(process)
+            time.sleep(0.2)
+            self.assertTrue(all(process.poll() is None for process in processes))
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(stdout.strip(), "{}")
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(index["sessions"]),
+            {"session-seed", "session-race-a", "session-race-b"},
+        )
+
+    def test_index_atomic_save_failure_preserves_previous_snapshot(self) -> None:
+        seeded = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-before-failure"),
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        before = self._index_path().read_bytes()
+        module = self._load_adapter_module()
+
+        with (
+            mock.patch.object(
+                module.os,
+                "replace",
+                side_effect=OSError("injected replace failure"),
+            ),
+            self.assertRaises(module.RunSafetyError),
+        ):
+            with module._index_transaction(self.repo.resolve(), write=True) as index:
+                module._update_session_observation(
+                    index,
+                    session_id="session-after-failure",
+                    cwd=str(self.repo),
+                    transcript_path=None,
+                    permission_mode=None,
+                    prompt="must not become visible",
+                )
+
+        self.assertEqual(self._index_path().read_bytes(), before)
+        self.assertEqual(
+            list(self._index_path().parent.glob(".index.json.*.tmp")),
+            [],
+        )
+
+    def test_refresh_timeout_kills_descendants_and_closes_passed_fds(self) -> None:
+        module = self._load_adapter_module()
+        script = self.root / "refresh-timeout-tree.py"
+        pid_path = self.root / "refresh-timeout.pid"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                inherited_fd = int(sys.argv[1])
+                pathlib.Path(sys.argv[2]).write_text(
+                    str(os.getpid()),
+                    encoding="utf-8",
+                )
+                os.set_inheritable(inherited_fd, True)
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    pass_fds=(inherited_fd,),
+                )
+                time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+        read_fd, write_fd = os.pipe()
+        try:
+            completed = module._run_bounded_refresh_process(
+                [
+                    sys.executable,
+                    str(script),
+                    str(write_fd),
+                    str(pid_path),
+                ],
+                pass_fds=(write_fd,),
+                env=os.environ.copy(),
+                timeout=0.3,
+                cleanup_timeout=3.0,
+                max_capture_bytes=64 * 1024,
+            )
+        finally:
+            os.close(write_fd)
+            if pid_path.exists():
+                try:
+                    os.killpg(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        try:
+            self.assertEqual(completed.returncode, 124, completed.stderr)
+            self.assertIn("hard timeout", completed.stderr)
+            os.set_blocking(read_fd, False)
+            self.assertEqual(os.read(read_fd, 1), b"")
+        finally:
+            os.close(read_fd)
+
+    def test_refresh_signal_cleans_process_group_before_redelivery(self) -> None:
+        module = self._load_adapter_module()
+        script = self.root / "refresh-signal-tree.py"
+        pid_path = self.root / "refresh-signal.pid"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                inherited_fd = int(sys.argv[1])
+                pathlib.Path(sys.argv[2]).write_text(
+                    str(os.getpid()),
+                    encoding="utf-8",
+                )
+                os.set_inheritable(inherited_fd, True)
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    pass_fds=(inherited_fd,),
+                )
+                time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+        read_fd, write_fd = os.pipe()
+        received_signals: list[int] = []
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        signal.signal(
+            signal.SIGTERM,
+            lambda signum, _frame: received_signals.append(signum),
+        )
+        sender = threading.Thread(
+            target=lambda: (
+                time.sleep(0.3),
+                os.kill(os.getpid(), signal.SIGTERM),
+            ),
+            daemon=True,
+        )
+        sender.start()
+        try:
+            completed = module._run_bounded_refresh_process(
+                [
+                    sys.executable,
+                    str(script),
+                    str(write_fd),
+                    str(pid_path),
+                ],
+                pass_fds=(write_fd,),
+                env=os.environ.copy(),
+                timeout=5.0,
+                cleanup_timeout=3.0,
+                max_capture_bytes=64 * 1024,
+            )
+        finally:
+            sender.join(timeout=2)
+            signal.signal(signal.SIGTERM, previous_handler)
+            os.close(write_fd)
+            if pid_path.exists():
+                try:
+                    os.killpg(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        try:
+            self.assertEqual(completed.returncode, 128 + signal.SIGTERM)
+            self.assertEqual(received_signals, [signal.SIGTERM])
+            os.set_blocking(read_fd, False)
+            self.assertEqual(os.read(read_fd, 1), b"")
+        finally:
+            os.close(read_fd)
+
     def test_prepare_active_run_registers_run_dir_for_single_observed_session(
         self,
     ) -> None:
@@ -966,6 +1268,41 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         completed = self._run_adapter("stop-hook", input_payload=stop_payload)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "{}")
+
+    def test_stop_hook_keeps_blocking_when_index_commit_fails(self) -> None:
+        session_id = "session-index-commit-failure"
+        self._prepare_indexed_run(session_id, "index-commit-failure")
+        module = self._load_adapter_module()
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        commit_error = module.RunSafetyError("injected index commit failure")
+
+        with (
+            mock.patch.object(
+                module.sys,
+                "stdin",
+                io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+            ),
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+            mock.patch.object(module.sys, "stderr", captured_stderr),
+            mock.patch.object(
+                module,
+                "_utc_now",
+                return_value="2999-01-01T00:00:00+00:00",
+            ),
+            mock.patch.object(
+                module,
+                "_atomic_save_index_at",
+                side_effect=commit_error,
+            ),
+            mock.patch.object(module, "_record_hook_failure") as record_failure,
+        ):
+            returncode = module._stop_hook(argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertIn("Do not finish", captured_stderr.getvalue())
+        record_failure.assert_called_once_with(commit_error)
 
     def test_stop_hook_regenerates_legacy_prompts_before_spawning_child(self) -> None:
         session_id = "session-legacy-pending"
@@ -1877,16 +2214,16 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     "'unexpected path execution\\n', encoding='utf-8')\n"
                     "raise SystemExit(93)\n"
                 )
-                real_run = module._run
+                real_run = module._run_bounded_refresh_process
                 process_commands: list[list[str]] = []
                 process_environments: list[dict[str, str] | None] = []
 
                 def run_during_source_aba(
                     cmd: list[str],
                     *,
-                    cwd: pathlib.Path | None = None,
-                    pass_fds: tuple[int, ...] = (),
-                    env: dict[str, str] | None = None,
+                    pass_fds: tuple[int, ...],
+                    env: dict[str, str],
+                    **bounds: object,
                 ) -> subprocess.CompletedProcess[str]:
                     process_commands.append(cmd)
                     process_environments.append(env)
@@ -1896,9 +2233,9 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     try:
                         return real_run(
                             cmd,
-                            cwd=cwd,
                             pass_fds=pass_fds,
                             env=env,
+                            **bounds,
                         )
                     finally:
                         source_path.unlink()
@@ -1919,7 +2256,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     ),
                     mock.patch.object(
                         module,
-                        "_run",
+                        "_run_bounded_refresh_process",
                         side_effect=run_during_source_aba,
                     ),
                     mock.patch.object(
