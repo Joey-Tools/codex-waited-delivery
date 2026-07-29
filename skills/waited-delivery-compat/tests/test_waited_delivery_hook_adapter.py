@@ -1166,6 +1166,106 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 for path, content in sentinel_values.items():
                     self.assertEqual(path.read_bytes(), content)
 
+    def test_stop_artifact_read_allows_metadata_only_churn(self) -> None:
+        session_id = "session-read-metadata-churn"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "read-metadata-churn",
+        )
+        module = self._load_adapter_module()
+        run_fd = module._open_stop_run_directory(
+            self.repo.resolve(),
+            run_dir.name,
+        )
+        state_path = run_dir / "state.json"
+        expected = state_path.read_bytes()
+        original = state_path.stat()
+        real_read = module.os.read
+        changed = False
+
+        def read_then_touch(file_fd: int, size: int) -> bytes:
+            nonlocal changed
+            chunk = real_read(file_fd, size)
+            if chunk and not changed:
+                changed = True
+                os.utime(
+                    state_path,
+                    ns=(
+                        original.st_atime_ns,
+                        original.st_mtime_ns + 1_000_000,
+                    ),
+                )
+            return chunk
+
+        try:
+            with mock.patch.object(
+                module.os,
+                "read",
+                side_effect=read_then_touch,
+            ):
+                actual = module._read_stop_regular_file(
+                    run_fd,
+                    "state.json",
+                    max_bytes=module.STATE_MAX_BYTES,
+                )
+        finally:
+            module.os.close(run_fd)
+
+        self.assertTrue(changed)
+        self.assertEqual(actual, expected)
+        self.assertNotEqual(state_path.stat().st_mtime_ns, original.st_mtime_ns)
+
+    def test_stop_artifact_read_rejects_content_or_access_change(self) -> None:
+        for mutation in ("content", "access"):
+            with self.subTest(mutation=mutation):
+                session_id = f"session-read-{mutation}-change"
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    f"read-{mutation}-change",
+                )
+                module = self._load_adapter_module()
+                run_fd = module._open_stop_run_directory(
+                    self.repo.resolve(),
+                    run_dir.name,
+                )
+                state_path = run_dir / "state.json"
+                original_content = state_path.read_bytes()
+                replacement = (
+                    b"[" if original_content[:1] != b"[" else b"{"
+                ) + original_content[1:]
+                real_read = module.os.read
+                changed = False
+
+                def read_then_mutate(file_fd: int, size: int) -> bytes:
+                    nonlocal changed
+                    chunk = real_read(file_fd, size)
+                    if chunk and not changed:
+                        changed = True
+                        if mutation == "content":
+                            state_path.write_bytes(replacement)
+                        else:
+                            state_path.chmod(0o640)
+                    return chunk
+
+                try:
+                    with mock.patch.object(
+                        module.os,
+                        "read",
+                        side_effect=read_then_mutate,
+                    ):
+                        with self.assertRaisesRegex(
+                            module.RunSafetyError,
+                            "identity, access, size, or content changed",
+                        ):
+                            module._read_stop_regular_file(
+                                run_fd,
+                                "state.json",
+                                max_bytes=module.STATE_MAX_BYTES,
+                            )
+                finally:
+                    module.os.close(run_fd)
+                self.assertTrue(changed)
+
     def test_stop_hook_fails_closed_on_prompt_link_replacement_after_preflight(
         self,
     ) -> None:

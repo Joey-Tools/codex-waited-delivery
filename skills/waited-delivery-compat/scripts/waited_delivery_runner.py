@@ -1520,6 +1520,177 @@ class _CaptureLimitExceeded(Exception):
     pass
 
 
+class _DeferredSmokeTermination(BaseException):
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+class _SmokeSignalTransaction:
+    """Defer one terminal signal until the launched process group is gone."""
+
+    def __init__(self) -> None:
+        self._entry_mask: set[int] = set()
+        self._managed_signals: tuple[int, ...] = ()
+        self._previous_handlers: dict[int, object] = {}
+        self._pending_signal: int | None = None
+        self._raised = False
+
+    def _record(self, signum: int, _frame: object) -> None:
+        if self._pending_signal is None:
+            self._pending_signal = signum
+
+    @staticmethod
+    def _signal_runtime() -> tuple[object, object, object]:
+        pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+        sigpending = getattr(signal, "sigpending", None)
+        sigwait = getattr(signal, "sigwait", None)
+        if (
+            os.name != "posix"
+            or not callable(pthread_sigmask)
+            or not callable(sigpending)
+            or not callable(sigwait)
+        ):
+            raise UserError(
+                "fallback readiness smoke signal supervision requires POSIX "
+                "pthread_sigmask, sigpending, and sigwait"
+            )
+        return pthread_sigmask, sigpending, sigwait
+
+    @staticmethod
+    def _candidate_signals() -> tuple[int, ...]:
+        return tuple(
+            int(signum)
+            for signum in (
+                signal.SIGHUP,
+                signal.SIGTERM,
+                signal.SIGQUIT,
+            )
+        )
+
+    def __enter__(self) -> _SmokeSignalTransaction:
+        pthread_sigmask, _sigpending, _sigwait = self._signal_runtime()
+        candidates = self._candidate_signals()
+        try:
+            self._entry_mask = {
+                int(value)
+                for value in pthread_sigmask(signal.SIG_BLOCK, set(candidates))
+            }
+        except (OSError, ValueError) as error:
+            raise UserError(
+                f"cannot block smoke supervision signals before launch: {error}"
+            ) from error
+        try:
+            for signum in candidates:
+                previous = signal.getsignal(signum)
+                if previous == signal.SIG_IGN or signum in self._entry_mask:
+                    continue
+                self._previous_handlers[signum] = previous
+                signal.signal(signum, self._record)
+            self._managed_signals = tuple(self._previous_handlers)
+        except BaseException:
+            for signum, previous in reversed(tuple(self._previous_handlers.items())):
+                signal.signal(signum, previous)
+            pthread_sigmask(signal.SIG_SETMASK, self._entry_mask)
+            raise
+        try:
+            pthread_sigmask(signal.SIG_SETMASK, self._entry_mask)
+        except (OSError, ValueError) as error:
+            for signum, previous in reversed(tuple(self._previous_handlers.items())):
+                signal.signal(signum, previous)
+            raise UserError(
+                f"cannot restore smoke supervision entry signal mask: {error}"
+            ) from error
+        return self
+
+    def raise_if_pending(self) -> None:
+        if self._pending_signal is None or self._raised:
+            return
+        self._raised = True
+        raise _DeferredSmokeTermination(self._pending_signal)
+
+    def _capture_pending_masked(
+        self,
+        sigpending: object,
+        sigwait: object,
+    ) -> None:
+        assert callable(sigpending)
+        assert callable(sigwait)
+        managed = set(self._managed_signals)
+        while True:
+            try:
+                pending = {int(value) for value in sigpending()} & managed
+            except OSError as error:
+                raise UserError(
+                    f"cannot inspect pending smoke supervision signals: {error}"
+                ) from error
+            if not pending:
+                return
+            try:
+                signum = int(sigwait(pending))
+            except (OSError, ValueError) as error:
+                raise UserError(
+                    f"cannot consume pending smoke supervision signal: {error}"
+                ) from error
+            if signum not in pending:
+                raise UserError(
+                    "smoke supervision sigwait returned an unrequested signal"
+                )
+            self._record(signum, None)
+
+    def __exit__(
+        self,
+        _exc_type: object,
+        exc: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        pthread_sigmask, sigpending, sigwait = self._signal_runtime()
+        try:
+            terminal_mask = {
+                int(value)
+                for value in pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    set(self._managed_signals),
+                )
+            }
+        except (OSError, ValueError) as error:
+            raise UserError(
+                f"cannot block smoke supervision signals during cleanup: {error}"
+            ) from error
+
+        try:
+            self._capture_pending_masked(sigpending, sigwait)
+            for signum, previous in reversed(tuple(self._previous_handlers.items())):
+                signal.signal(signum, previous)
+            self._previous_handlers.clear()
+            self._capture_pending_masked(sigpending, sigwait)
+            signum = self._pending_signal
+            if signum is not None:
+                if exc is not None and not isinstance(
+                    exc,
+                    _DeferredSmokeTermination,
+                ):
+                    print(
+                        "note: smoke cleanup raised "
+                        f"{type(exc).__name__}: {exc}; propagating "
+                        f"{signal.Signals(signum).name}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                signal.raise_signal(signum)
+        finally:
+            try:
+                pthread_sigmask(signal.SIG_SETMASK, terminal_mask)
+            except (OSError, ValueError) as error:
+                raise UserError(
+                    f"cannot restore smoke supervision terminal signal mask: {error}"
+                ) from error
+
+        if self._pending_signal is not None:
+            raise SystemExit(128 + self._pending_signal)
+        return False
+
+
 def _parse_linux_proc_stat(raw: str) -> tuple[str, int] | None:
     closing_parenthesis = raw.rfind(")")
     if closing_parenthesis <= 0:
@@ -1685,6 +1856,27 @@ def _run_bounded_smoke_process(
         raise UserError("fallback readiness smoke command must be a nonempty argv")
     if timeout <= 0 or cleanup_timeout <= 0 or max_capture_bytes <= 0:
         raise UserError("fallback readiness smoke bounds must be positive")
+    with _SmokeSignalTransaction() as signal_transaction:
+        return _run_bounded_smoke_process_supervised(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+            cleanup_timeout=cleanup_timeout,
+            max_capture_bytes=max_capture_bytes,
+            signal_transaction=signal_transaction,
+        )
+
+
+def _run_bounded_smoke_process_supervised(
+    command: list[str],
+    *,
+    cwd: pathlib.Path,
+    timeout: float,
+    cleanup_timeout: float,
+    max_capture_bytes: int,
+    signal_transaction: _SmokeSignalTransaction,
+) -> subprocess.CompletedProcess[str]:
+    signal_transaction.raise_if_pending()
     try:
         process = subprocess.Popen(
             command,
@@ -1710,8 +1902,10 @@ def _run_bounded_smoke_process(
         ):
             os.set_blocking(stream.fileno(), False)
             selector.register(stream.fileno(), selectors.EVENT_READ, name)
+        signal_transaction.raise_if_pending()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            signal_transaction.raise_if_pending()
             remaining = deadline - time.monotonic()
             try:
                 _drain_process_output_once(
@@ -1730,6 +1924,7 @@ def _run_bounded_smoke_process(
                     f"BLOCKED: smoke output exceeded {max_capture_bytes} bytes",
                 )
                 break
+            signal_transaction.raise_if_pending()
             returncode = process.poll()
             if returncode is None:
                 continue
@@ -1797,18 +1992,21 @@ def _classify_smoke(
     stdout: str, stderr: str, returncode: int
 ) -> tuple[str, str | None]:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if returncode != 0:
+        err_lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+        if err_lines:
+            return "blocked", err_lines[-1]
+        blocked = next((line for line in lines if line.startswith("BLOCKED:")), None)
+        if blocked:
+            return "blocked", blocked
+        return "blocked", f"process exited with code {returncode}"
     if lines and lines[-1] == "READY":
         return "passed", "READY"
     blocked = next((line for line in lines if line.startswith("BLOCKED:")), None)
     if blocked:
         return "blocked", blocked
-    if returncode == 0:
-        sample = lines[-1] if lines else None
-        return "decision_point", sample
-    err_lines = [line.strip() for line in stderr.splitlines() if line.strip()]
-    if err_lines:
-        return "blocked", err_lines[-1]
-    return "blocked", f"process exited with code {returncode}"
+    sample = lines[-1] if lines else None
+    return "decision_point", sample
 
 
 def _run_fallback_smoke(args: argparse.Namespace) -> int:

@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
@@ -507,28 +508,85 @@ def _read_stop_regular_file(
         ) from error
     try:
         before = os.fstat(file_fd)
-        if not stat.S_ISREG(before.st_mode):
+        try:
+            named_before = os.stat(
+                name,
+                dir_fd=run_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise RunSafetyError(
+                f"active run artifact cannot be restated without following links: {name}"
+            ) from error
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(named_before.st_mode)
+            or not _same_object(before, named_before)
+        ):
             raise RunSafetyError(f"active run artifact must be a regular file: {name}")
         if before.st_size > max_bytes:
             raise RunSafetyError(f"active run artifact exceeds byte limit: {name}")
-        chunks: list[bytes] = []
-        retained = 0
-        while True:
-            chunk = os.read(file_fd, min(65536, max_bytes + 1 - retained))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            retained += len(chunk)
-            if retained > max_bytes:
-                raise RunSafetyError(f"active run artifact exceeds byte limit: {name}")
+        expected_access = (
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+        )
+
+        def read_bounded() -> bytes:
+            chunks: list[bytes] = []
+            retained = 0
+            while True:
+                chunk = os.read(file_fd, min(65536, max_bytes + 1 - retained))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                retained += len(chunk)
+                if retained > max_bytes:
+                    raise RunSafetyError(
+                        f"active run artifact exceeds byte limit: {name}"
+                    )
+            return b"".join(chunks)
+
+        first_content = read_bounded()
+        middle = os.fstat(file_fd)
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        second_content = read_bounded()
         after = os.fstat(file_fd)
+        try:
+            named_after = os.stat(
+                name,
+                dir_fd=run_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise RunSafetyError(
+                f"active run artifact cannot be restated without following links: {name}"
+            ) from error
+        stable_stats = (before, named_before, middle, after, named_after)
         if (
-            not _same_object(before, after)
-            or before.st_size != after.st_size
-            or before.st_mtime_ns != after.st_mtime_ns
+            any(not stat.S_ISREG(value.st_mode) for value in stable_stats)
+            or any(not _same_object(before, value) for value in stable_stats[1:])
+            or any(value.st_size != before.st_size for value in stable_stats[1:])
+            or any(
+                (
+                    value.st_uid,
+                    value.st_gid,
+                    stat.S_IMODE(value.st_mode),
+                )
+                != expected_access
+                for value in stable_stats[1:]
+            )
+            or len(first_content) != before.st_size
+            or len(second_content) != before.st_size
+            or hashlib.sha256(first_content).digest()
+            != hashlib.sha256(second_content).digest()
+            or first_content != second_content
         ):
-            raise RunSafetyError(f"active run artifact changed while read: {name}")
-        return b"".join(chunks)
+            raise RunSafetyError(
+                f"active run artifact identity, access, size, or content changed "
+                f"while read: {name}"
+            )
+        return second_content
     finally:
         os.close(file_fd)
 

@@ -7,13 +7,16 @@ import fcntl
 import hashlib
 import json
 import importlib.util
+import os
 import pathlib
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -873,6 +876,225 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         )
         process_group = int(process_group_path.read_text(encoding="utf-8"))
         self.assertFalse(module._process_group_exists(process_group))
+
+    def test_smoke_nonzero_status_overrides_ready_output(self) -> None:
+        module = self._load_runner_module()
+        for returncode in (1, 7, 124, 125, 126, -signal.SIGKILL):
+            with self.subTest(returncode=returncode):
+                status, sample = module._classify_smoke(
+                    "READY\n",
+                    "",
+                    returncode,
+                )
+                self.assertEqual(status, "blocked")
+                self.assertNotEqual(sample, "READY")
+
+    def test_ready_output_does_not_override_bounded_process_failures(self) -> None:
+        module = self._load_runner_module()
+        helper = self.root / "ready-then-failure.py"
+        process_group_path = self.root / "ready-then-failure-pgid.txt"
+        helper.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                mode = sys.argv[1]
+                pathlib.Path(sys.argv[2]).write_text(
+                    str(os.getpgrp()),
+                    encoding="utf-8",
+                )
+                print("READY", flush=True)
+                time.sleep(0.1)
+                if mode == "output":
+                    sys.stdout.write("x" * (1024 * 1024))
+                    sys.stdout.flush()
+                    time.sleep(60)
+                elif mode == "residual":
+                    subprocess.Popen(
+                        [sys.executable, "-c", "import time; time.sleep(60)"]
+                    )
+                else:
+                    time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+        scenarios = {
+            "timeout": {
+                "returncode": 124,
+                "timeout": 0.4,
+                "max_capture_bytes": 4096,
+            },
+            "output": {
+                "returncode": 125,
+                "timeout": 5,
+                "max_capture_bytes": 1024,
+            },
+            "residual": {
+                "returncode": 126,
+                "timeout": 5,
+                "max_capture_bytes": 4096,
+            },
+        }
+
+        for mode, expected in scenarios.items():
+            with self.subTest(mode=mode):
+                process_group_path.unlink(missing_ok=True)
+                completed = module._run_bounded_smoke_process(
+                    [
+                        sys.executable,
+                        str(helper),
+                        mode,
+                        str(process_group_path),
+                    ],
+                    cwd=self.repo,
+                    timeout=expected["timeout"],
+                    cleanup_timeout=3,
+                    max_capture_bytes=expected["max_capture_bytes"],
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    expected["returncode"],
+                    completed.stderr,
+                )
+                self.assertIn("READY", completed.stdout)
+                status, sample = module._classify_smoke(
+                    completed.stdout,
+                    completed.stderr,
+                    completed.returncode,
+                )
+                self.assertEqual(status, "blocked")
+                self.assertNotEqual(sample, "READY")
+                process_group = int(process_group_path.read_text(encoding="utf-8"))
+                self.assertFalse(module._process_group_exists(process_group))
+
+    def test_smoke_defers_terminal_signals_until_process_group_cleanup(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        helper = self.root / "signal-resistant-smoke.py"
+        harness = self.root / "smoke-signal-harness.py"
+        process_group_path = self.root / "signal-resistant-smoke-pgid.txt"
+        helper.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import signal
+                import subprocess
+                import sys
+                import time
+
+                for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
+                    signal.signal(signum, signal.SIG_IGN)
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import signal,time;"
+                            "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
+                            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                            "signal.signal(signal.SIGQUIT,signal.SIG_IGN);"
+                            "time.sleep(60)"
+                        ),
+                    ]
+                )
+                pathlib.Path(sys.argv[1]).write_text(
+                    str(os.getpgrp()),
+                    encoding="utf-8",
+                )
+                print("READY", flush=True)
+                time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+        harness.write_text(
+            textwrap.dedent(
+                f"""\
+                import importlib.util
+                import pathlib
+                import sys
+
+                spec = importlib.util.spec_from_file_location(
+                    "waited_delivery_runner_signal_harness",
+                    {str(SCRIPT_PATH)!r},
+                )
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("cannot load waited-delivery runner")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                module._run_bounded_smoke_process(
+                    [
+                        sys.executable,
+                        {str(helper)!r},
+                        sys.argv[1],
+                    ],
+                    cwd=pathlib.Path({str(self.repo)!r}),
+                    timeout=60,
+                    cleanup_timeout=3,
+                )
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
+            with self.subTest(signum=signal.Signals(signum).name):
+                process_group_path.unlink(missing_ok=True)
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(harness),
+                        str(process_group_path),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                process_group: int | None = None
+                try:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if process_group_path.is_file():
+                            process_group = int(
+                                process_group_path.read_text(encoding="utf-8")
+                            )
+                            break
+                        if process.poll() is not None:
+                            break
+                        time.sleep(0.02)
+                    self.assertIsNotNone(
+                        process_group,
+                        "smoke helper did not publish its process group",
+                    )
+                    os.kill(process.pid, signum)
+                    stdout, stderr = process.communicate(timeout=10)
+                    self.assertEqual(
+                        process.returncode,
+                        -signum,
+                        f"stdout={stdout!r}\nstderr={stderr!r}",
+                    )
+                    assert process_group is not None
+                    self.assertFalse(
+                        module._process_group_exists(process_group),
+                        f"process group {process_group} survived "
+                        f"{signal.Signals(signum).name}",
+                    )
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=5)
+                    if process_group is not None and module._process_group_exists(
+                        process_group
+                    ):
+                        os.killpg(process_group, signal.SIGKILL)
 
     def test_rejects_passed_review_for_dirty_or_unproven_state(self) -> None:
         run_dir = self._prepare()
