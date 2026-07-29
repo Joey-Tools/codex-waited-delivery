@@ -17,7 +17,7 @@ import subprocess
 import sys
 import traceback
 import uuid
-from typing import TypedDict, cast
+from typing import NamedTuple, TypedDict, cast
 
 
 BRIDGE_PATH = pathlib.Path(__file__).resolve().with_name("waited_delivery_bridge.py")
@@ -60,6 +60,14 @@ class UserError(RuntimeError):
 
 class RunSafetyError(UserError):
     pass
+
+
+class RunDirectoryIdentity(NamedTuple):
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    mode: int
 
 
 class SessionRecord(TypedDict):
@@ -450,6 +458,16 @@ def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
+def _run_directory_identity(file_stat: os.stat_result) -> RunDirectoryIdentity:
+    return RunDirectoryIdentity(
+        device=file_stat.st_dev,
+        inode=file_stat.st_ino,
+        uid=file_stat.st_uid,
+        gid=file_stat.st_gid,
+        mode=stat.S_IMODE(file_stat.st_mode),
+    )
+
+
 def _open_stop_run_directory(repo_root: pathlib.Path, run_name: str) -> int:
     try:
         repo_fd = _open_absolute_directory(repo_root)
@@ -529,10 +547,77 @@ def _validate_stop_regular_file(run_fd: int, name: str) -> None:
         os.close(file_fd)
 
 
+def _validate_stop_run_state_descriptor(
+    repo_root: pathlib.Path,
+    run_dir: pathlib.Path,
+    run_fd: int,
+    *,
+    expected_identity: RunDirectoryIdentity | None = None,
+) -> tuple[dict[str, object], RunDirectoryIdentity]:
+    pinned = os.fstat(run_fd)
+    if not stat.S_ISDIR(pinned.st_mode):
+        raise RunSafetyError("active run path must end in a directory")
+    pinned_identity = _run_directory_identity(pinned)
+    if expected_identity is not None:
+        if (
+            pinned_identity.device,
+            pinned_identity.inode,
+        ) != (
+            expected_identity.device,
+            expected_identity.inode,
+        ):
+            raise RunSafetyError(
+                "active run directory object changed during validation"
+            )
+        if pinned_identity != expected_identity:
+            raise RunSafetyError(
+                "active run directory access identity changed during validation"
+            )
+    if pinned_identity.uid != os.geteuid() or pinned_identity.mode != 0o700:
+        raise RunSafetyError(
+            "active run directory must be owned by the current user with mode 0700"
+        )
+    try:
+        payload = json.loads(
+            _read_stop_regular_file(
+                run_fd,
+                "state.json",
+                max_bytes=STATE_MAX_BYTES,
+            ).decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RunSafetyError("active run state.json is invalid") from error
+    if not isinstance(payload, dict):
+        raise RunSafetyError("active run state.json must contain an object")
+    if payload.get("repo_root") != str(repo_root):
+        raise RunSafetyError(
+            "active run state repo_root does not exactly match the current repository"
+        )
+    _validate_stop_regular_file(run_fd, "child-prompt.md")
+    _validate_stop_regular_file(run_fd, "parent-prompt.md")
+    current_fd = _open_stop_run_directory(repo_root, run_dir.name)
+    try:
+        current = os.fstat(current_fd)
+        current_identity = _run_directory_identity(current)
+        if not stat.S_ISDIR(current.st_mode) or current_identity != pinned_identity:
+            raise RunSafetyError(
+                "active run directory was replaced or its access identity "
+                "changed during validation"
+            )
+    finally:
+        os.close(current_fd)
+    return cast(dict[str, object], payload), pinned_identity
+
+
 def _load_stop_run_state(
     repo_root: pathlib.Path,
     run_dir_str: str,
-) -> tuple[pathlib.Path, dict[str, object]]:
+) -> tuple[
+    pathlib.Path,
+    dict[str, object],
+    RunDirectoryIdentity,
+    int,
+]:
     run_dir = pathlib.Path(run_dir_str)
     if not run_dir.is_absolute():
         raise RunSafetyError("active run_dir must be absolute")
@@ -548,38 +633,15 @@ def _load_stop_run_state(
         )
     run_fd = _open_stop_run_directory(repo_root, run_dir.name)
     try:
-        pinned = os.fstat(run_fd)
-        if not stat.S_ISDIR(pinned.st_mode):
-            raise RunSafetyError("active run path must end in a directory")
-        try:
-            payload = json.loads(
-                _read_stop_regular_file(
-                    run_fd,
-                    "state.json",
-                    max_bytes=STATE_MAX_BYTES,
-                ).decode("utf-8")
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise RunSafetyError("active run state.json is invalid") from error
-        if not isinstance(payload, dict):
-            raise RunSafetyError("active run state.json must contain an object")
-        if payload.get("repo_root") != str(repo_root):
-            raise RunSafetyError(
-                "active run state repo_root does not exactly match the current repository"
-            )
-        _validate_stop_regular_file(run_fd, "child-prompt.md")
-        _validate_stop_regular_file(run_fd, "parent-prompt.md")
-        current_fd = _open_stop_run_directory(repo_root, run_dir.name)
-        try:
-            if not _same_object(pinned, os.fstat(current_fd)):
-                raise RunSafetyError(
-                    "active run directory was replaced during validation"
-                )
-        finally:
-            os.close(current_fd)
-        return run_dir, cast(dict[str, object], payload)
-    finally:
+        state, run_identity = _validate_stop_run_state_descriptor(
+            repo_root,
+            run_dir,
+            run_fd,
+        )
+    except Exception:
         os.close(run_fd)
+        raise
+    return run_dir, state, run_identity, run_fd
 
 
 def _load_run_state(run_dir_str: str) -> dict[str, object] | None:
@@ -595,6 +657,7 @@ def _load_run_state(run_dir_str: str) -> dict[str, object] | None:
 def _refresh_recovery_prompts(
     run_dir: pathlib.Path,
     repo_root: pathlib.Path,
+    run_identity: RunDirectoryIdentity,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     payload = _run_bridge_json(
         "refresh-prompts-live",
@@ -602,6 +665,16 @@ def _refresh_recovery_prompts(
         str(run_dir),
         "--expected-repo-root",
         str(repo_root),
+        "--expected-run-dev",
+        str(run_identity.device),
+        "--expected-run-ino",
+        str(run_identity.inode),
+        "--expected-run-uid",
+        str(run_identity.uid),
+        "--expected-run-gid",
+        str(run_identity.gid),
+        "--expected-run-mode",
+        str(run_identity.mode),
     )
     expected_paths = {
         "runner_path": RUNNER_PATH,
@@ -616,6 +689,31 @@ def _refresh_recovery_prompts(
             raise UserError(
                 f"refresh-prompts-live returned unexpected {field}: {value}"
             )
+    returned_identity_values = (
+        payload.get("run_dev"),
+        payload.get("run_ino"),
+        payload.get("run_uid"),
+        payload.get("run_gid"),
+        payload.get("run_mode"),
+    )
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in returned_identity_values
+    ):
+        raise UserError(
+            "refresh-prompts-live did not return a complete run access identity"
+        )
+    returned_identity = RunDirectoryIdentity(
+        device=cast(int, returned_identity_values[0]),
+        inode=cast(int, returned_identity_values[1]),
+        uid=cast(int, returned_identity_values[2]),
+        gid=cast(int, returned_identity_values[3]),
+        mode=cast(int, returned_identity_values[4]),
+    )
+    if returned_identity != run_identity:
+        raise RunSafetyError(
+            "refresh-prompts-live returned an unexpected run directory identity"
+        )
     return (
         expected_paths["child_prompt"],
         expected_paths["parent_prompt"],
@@ -1104,6 +1202,100 @@ def _block_unsafe_stop(error: RunSafetyError, payload: dict[str, object]) -> int
     return 2
 
 
+def _handle_pinned_stop_run(
+    *,
+    payload: dict[str, object],
+    repo_root: pathlib.Path,
+    index_path: pathlib.Path,
+    index: AdapterIndex,
+    record: SessionRecord,
+    run_dir: pathlib.Path,
+    state: dict[str, object],
+    run_identity: RunDirectoryIdentity,
+    run_fd: int,
+) -> int:
+    if _run_is_terminal(state):
+        record["run_dir"] = None
+        record["status"] = "completed"
+        record["updated_at"] = _utc_now()
+        _save_index(index_path, index)
+        return _success_hook_response()
+    if payload.get("stop_hook_active"):
+        return _success_hook_response()
+    record["updated_at"] = _utc_now()
+    _save_index(index_path, index)
+    try:
+        child_prompt, parent_prompt = _refresh_recovery_prompts(
+            run_dir,
+            repo_root,
+            run_identity,
+        )
+        state, refreshed_identity = _validate_stop_run_state_descriptor(
+            repo_root,
+            run_dir,
+            run_fd,
+            expected_identity=run_identity,
+        )
+        if refreshed_identity != run_identity:
+            raise RunSafetyError("active run directory changed during prompt refresh")
+        prompt = _build_stop_continuation_prompt(
+            repo_root,
+            run_dir,
+            state,
+            child_prompt=child_prompt,
+            parent_prompt=parent_prompt,
+        )
+    except RunSafetyError as error:
+        return _block_unsafe_stop(error, payload)
+    except Exception as error:
+        setattr(error, "hook_command", "stop-hook")
+        setattr(error, "hook_payload", payload)
+        _record_hook_failure(error)
+        try:
+            state, fallback_identity = _validate_stop_run_state_descriptor(
+                repo_root,
+                run_dir,
+                run_fd,
+                expected_identity=run_identity,
+            )
+            if fallback_identity != run_identity:
+                raise RunSafetyError(
+                    "active run directory changed during failed prompt refresh"
+                )
+        except RunSafetyError as safety_error:
+            return _block_unsafe_stop(safety_error, payload)
+        try:
+            prompt = _build_stop_fallback_prompt(repo_root, run_dir, state)
+        except Exception as fallback_error:
+            setattr(fallback_error, "hook_command", "stop-hook")
+            setattr(fallback_error, "hook_payload", payload)
+            _record_hook_failure(fallback_error)
+            try:
+                prompt = _build_stop_last_resort_prompt(
+                    repo_root,
+                    run_dir,
+                    child_status=_state_child_status_hint(state),
+                    child_session_id=_state_child_session_id_hint(state),
+                )
+            except Exception as emergency_error:
+                setattr(emergency_error, "hook_command", "stop-hook")
+                setattr(emergency_error, "hook_payload", payload)
+                _record_hook_failure(emergency_error)
+                prompt = _build_stop_emergency_prompt(
+                    repo_root,
+                    run_dir,
+                    child_status=_state_child_status_hint(state),
+                    child_session_id=_state_child_session_id_hint(state),
+                )
+    try:
+        print(prompt, file=sys.stderr)
+    except Exception as error:
+        setattr(error, "hook_command", "stop-hook")
+        setattr(error, "hook_payload", payload)
+        raise
+    return 2
+
+
 def _stop_hook(_: argparse.Namespace) -> int:
     payload: dict[str, object] = {}
     try:
@@ -1120,79 +1312,26 @@ def _stop_hook(_: argparse.Namespace) -> int:
         if record is None or not record["run_dir"]:
             return _success_hook_response()
         try:
-            run_dir, state = _load_stop_run_state(repo_root, record["run_dir"])
-        except RunSafetyError as error:
-            return _block_unsafe_stop(error, payload)
-        if _run_is_terminal(state):
-            record["run_dir"] = None
-            record["status"] = "completed"
-            record["updated_at"] = _utc_now()
-            _save_index(index_path, index)
-            return _success_hook_response()
-        if payload.get("stop_hook_active"):
-            return _success_hook_response()
-        record["updated_at"] = _utc_now()
-        _save_index(index_path, index)
-        try:
-            child_prompt, parent_prompt = _refresh_recovery_prompts(
-                run_dir,
+            run_dir, state, run_identity, run_fd = _load_stop_run_state(
                 repo_root,
-            )
-            refreshed_run_dir, state = _load_stop_run_state(
-                repo_root,
-                str(run_dir),
-            )
-            if refreshed_run_dir != run_dir:
-                raise RunSafetyError(
-                    "active run directory changed during prompt refresh"
-                )
-            prompt = _build_stop_continuation_prompt(
-                repo_root,
-                run_dir,
-                state,
-                child_prompt=child_prompt,
-                parent_prompt=parent_prompt,
+                record["run_dir"],
             )
         except RunSafetyError as error:
             return _block_unsafe_stop(error, payload)
-        except Exception as error:
-            setattr(error, "hook_command", "stop-hook")
-            setattr(error, "hook_payload", payload)
-            _record_hook_failure(error)
-            try:
-                _load_stop_run_state(repo_root, str(run_dir))
-            except RunSafetyError as safety_error:
-                return _block_unsafe_stop(safety_error, payload)
-            try:
-                prompt = _build_stop_fallback_prompt(repo_root, run_dir, state)
-            except Exception as fallback_error:
-                setattr(fallback_error, "hook_command", "stop-hook")
-                setattr(fallback_error, "hook_payload", payload)
-                _record_hook_failure(fallback_error)
-                try:
-                    prompt = _build_stop_last_resort_prompt(
-                        repo_root,
-                        run_dir,
-                        child_status=_state_child_status_hint(state),
-                        child_session_id=_state_child_session_id_hint(state),
-                    )
-                except Exception as emergency_error:
-                    setattr(emergency_error, "hook_command", "stop-hook")
-                    setattr(emergency_error, "hook_payload", payload)
-                    _record_hook_failure(emergency_error)
-                    prompt = _build_stop_emergency_prompt(
-                        repo_root,
-                        run_dir,
-                        child_status=_state_child_status_hint(state),
-                        child_session_id=_state_child_session_id_hint(state),
-                    )
         try:
-            print(prompt, file=sys.stderr)
-        except Exception as error:
-            setattr(error, "hook_command", "stop-hook")
-            setattr(error, "hook_payload", payload)
-            raise
-        return 2
+            return _handle_pinned_stop_run(
+                payload=payload,
+                repo_root=repo_root,
+                index_path=index_path,
+                index=index,
+                record=record,
+                run_dir=run_dir,
+                state=state,
+                run_identity=run_identity,
+                run_fd=run_fd,
+            )
+        finally:
+            os.close(run_fd)
     except Exception as error:
         setattr(error, "hook_command", "stop-hook")
         setattr(error, "hook_payload", payload)

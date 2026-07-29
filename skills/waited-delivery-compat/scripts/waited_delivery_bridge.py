@@ -153,6 +153,19 @@ def _attach_child_live(args: argparse.Namespace) -> int:
 
 
 def _refresh_prompts_live(args: argparse.Namespace) -> int:
+    expected_identity_args = (
+        ("--expected-run-dev", args.expected_run_dev),
+        ("--expected-run-ino", args.expected_run_ino),
+        ("--expected-run-uid", args.expected_run_uid),
+        ("--expected-run-gid", args.expected_run_gid),
+        ("--expected-run-mode", args.expected_run_mode),
+    )
+    if any(value is not None for _name, value in expected_identity_args) and not all(
+        value is not None for _name, value in expected_identity_args
+    ):
+        raise UserError(
+            "expected run device, inode, uid, gid, and mode must be supplied together"
+        )
     runner_args = [
         "refresh-prompts",
         "--run-dir",
@@ -161,6 +174,9 @@ def _refresh_prompts_live(args: argparse.Namespace) -> int:
     ]
     if args.expected_repo_root:
         runner_args.extend(["--expected-repo-root", args.expected_repo_root])
+    for name, value in expected_identity_args:
+        if value is not None:
+            runner_args.extend([name, str(value)])
     return _run_runner(*runner_args)
 
 
@@ -257,6 +273,11 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_prompts_live = subparsers.add_parser("refresh-prompts-live")
     refresh_prompts_live.add_argument("--run-dir", required=True)
     refresh_prompts_live.add_argument("--expected-repo-root")
+    refresh_prompts_live.add_argument("--expected-run-dev", type=int)
+    refresh_prompts_live.add_argument("--expected-run-ino", type=int)
+    refresh_prompts_live.add_argument("--expected-run-uid", type=int)
+    refresh_prompts_live.add_argument("--expected-run-gid", type=int)
+    refresh_prompts_live.add_argument("--expected-run-mode", type=int)
     refresh_prompts_live.set_defaults(func=_refresh_prompts_live)
 
     finish_child_live = subparsers.add_parser("finish-child-live")

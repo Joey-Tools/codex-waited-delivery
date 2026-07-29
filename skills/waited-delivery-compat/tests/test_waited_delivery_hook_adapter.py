@@ -1184,6 +1184,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         def replace_after_preflight(
             current_run_dir: pathlib.Path,
             _: pathlib.Path,
+            __: tuple[int, int],
         ) -> tuple[pathlib.Path, pathlib.Path]:
             child_prompt = current_run_dir / "child-prompt.md"
             child_prompt.unlink()
@@ -1216,6 +1217,175 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             stderr.getvalue(),
         )
         self.assertEqual(external_target.read_bytes(), original_external)
+
+    def test_stop_hook_fails_closed_on_run_directory_replacement_after_preflight(
+        self,
+    ) -> None:
+        session_id = "session-directory-replacement"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "directory-replacement",
+        )
+        module = self._load_adapter_module()
+        real_refresh = module._refresh_recovery_prompts
+        original_dir = self.root / "original-run-directory"
+        sentinel = "replacement directory prompt must remain unchanged\n"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def replace_after_preflight(
+            current_run_dir: pathlib.Path,
+            repo_root: pathlib.Path,
+            run_identity: tuple[int, int],
+        ) -> tuple[pathlib.Path, pathlib.Path]:
+            current_run_dir.rename(original_dir)
+            shutil.copytree(original_dir, current_run_dir)
+            for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                (current_run_dir / prompt_name).write_text(
+                    sentinel,
+                    encoding="utf-8",
+                )
+            return real_refresh(current_run_dir, repo_root, run_identity)
+
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.root / "home-directory-replacement")},
+            clear=False,
+        ):
+            with mock.patch.object(
+                module,
+                "_refresh_recovery_prompts",
+                side_effect=replace_after_preflight,
+            ):
+                with mock.patch.object(
+                    module.sys,
+                    "stdin",
+                    io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                ):
+                    with mock.patch.object(module.sys, "stdout", stdout):
+                        with mock.patch.object(module.sys, "stderr", stderr):
+                            returncode = module._stop_hook(argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "failed repository/path safety validation",
+            stderr.getvalue(),
+        )
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            self.assertEqual(
+                (run_dir / prompt_name).read_text(encoding="utf-8"),
+                sentinel,
+            )
+
+    def test_stop_hook_fails_closed_on_run_access_change_after_preflight(
+        self,
+    ) -> None:
+        session_id = "session-access-change"
+        run_dir = self._prepare_indexed_run(session_id, "access-change")
+        module = self._load_adapter_module()
+        real_refresh = module._refresh_recovery_prompts
+        sentinel = {
+            prompt_name: (run_dir / prompt_name).read_bytes()
+            for prompt_name in ("child-prompt.md", "parent-prompt.md")
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def change_access_after_preflight(
+            current_run_dir: pathlib.Path,
+            repo_root: pathlib.Path,
+            run_identity,
+        ) -> tuple[pathlib.Path, pathlib.Path]:
+            current_run_dir.chmod(0o755)
+            return real_refresh(current_run_dir, repo_root, run_identity)
+
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.root / "home-access-change")},
+            clear=False,
+        ):
+            with mock.patch.object(
+                module,
+                "_refresh_recovery_prompts",
+                side_effect=change_access_after_preflight,
+            ):
+                with mock.patch.object(
+                    module.sys,
+                    "stdin",
+                    io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                ):
+                    with mock.patch.object(module.sys, "stdout", stdout):
+                        with mock.patch.object(module.sys, "stderr", stderr):
+                            returncode = module._stop_hook(argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "failed repository/path safety validation",
+            stderr.getvalue(),
+        )
+        for prompt_name, original in sentinel.items():
+            self.assertEqual((run_dir / prompt_name).read_bytes(), original)
+
+    def test_stop_hook_revalidates_run_identity_after_prompt_refresh(
+        self,
+    ) -> None:
+        for mutation in ("replacement", "access"):
+            with self.subTest(mutation=mutation):
+                session_id = f"session-post-refresh-{mutation}"
+                self._prepare_indexed_run(
+                    session_id,
+                    f"post-refresh-{mutation}",
+                )
+                module = self._load_adapter_module()
+                real_refresh = module._refresh_recovery_prompts
+                original_dir = self.root / f"post-refresh-original-{mutation}"
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                def mutate_after_refresh(
+                    current_run_dir: pathlib.Path,
+                    repo_root: pathlib.Path,
+                    run_identity,
+                ) -> tuple[pathlib.Path, pathlib.Path]:
+                    result = real_refresh(
+                        current_run_dir,
+                        repo_root,
+                        run_identity,
+                    )
+                    if mutation == "replacement":
+                        current_run_dir.rename(original_dir)
+                        shutil.copytree(original_dir, current_run_dir)
+                    else:
+                        current_run_dir.chmod(0o755)
+                    return result
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(self.root / f"home-post-refresh-{mutation}")},
+                    clear=False,
+                ):
+                    with mock.patch.object(
+                        module,
+                        "_refresh_recovery_prompts",
+                        side_effect=mutate_after_refresh,
+                    ):
+                        with mock.patch.object(
+                            module.sys,
+                            "stdin",
+                            io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                        ):
+                            with mock.patch.object(module.sys, "stdout", stdout):
+                                with mock.patch.object(module.sys, "stderr", stderr):
+                                    returncode = module._stop_hook(argparse.Namespace())
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(
+                    "failed repository/path safety validation",
+                    stderr.getvalue(),
+                )
 
     def test_stop_hook_fails_open_when_index_is_invalid(self) -> None:
         fake_home = self.root / "home-stop-invalid"

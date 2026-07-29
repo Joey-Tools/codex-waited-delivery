@@ -217,16 +217,32 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
                 f"`{sys.executable} {legacy_runner}`\n",
                 encoding="utf-8",
             )
+        run_identity = run_dir.stat()
 
         completed = self._run_bridge(
             "refresh-prompts-live",
             "--run-dir",
             str(run_dir),
+            "--expected-run-dev",
+            str(run_identity.st_dev),
+            "--expected-run-ino",
+            str(run_identity.st_ino),
+            "--expected-run-uid",
+            str(run_identity.st_uid),
+            "--expected-run-gid",
+            str(run_identity.st_gid),
+            "--expected-run-mode",
+            str(run_identity.st_mode & 0o7777),
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
         self.assertEqual(payload["runner_path"], str(RUNNER_PATH))
+        self.assertEqual(payload["run_dev"], run_identity.st_dev)
+        self.assertEqual(payload["run_ino"], run_identity.st_ino)
+        self.assertEqual(payload["run_uid"], run_identity.st_uid)
+        self.assertEqual(payload["run_gid"], run_identity.st_gid)
+        self.assertEqual(payload["run_mode"], run_identity.st_mode & 0o7777)
         for prompt_name in ("child-prompt.md", "parent-prompt.md"):
             prompt = (run_dir / prompt_name).read_text(encoding="utf-8")
             self.assertIn(str(RUNNER_PATH), prompt)

@@ -35,6 +35,7 @@ The current outer adapter already follows this rule: it may observe product-spec
 - `refresh-prompts-live`
   - wraps `refresh-prompts --json` and returns the exact current runner plus regenerated run-local child and parent prompt paths
   - accepts `--expected-repo-root` from the outer adapter so the runner can enforce exact repo containment again under the run-level state lock
+  - accepts `--expected-run-dev`, `--expected-run-ino`, `--expected-run-uid`, `--expected-run-gid`, and `--expected-run-mode` only as one complete set, forwards them to the runner, and returns the refreshed identity so the outer adapter can bind one exact directory object and POSIX access identity across the bridge call
 - `finish-child-live`
   - requires the exact attached `child_session_id` and wraps `finish-child` so the bridge can persist the child's matching terminal status after `wait` and before parent-owned review
 - `reconcile-live`

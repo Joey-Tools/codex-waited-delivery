@@ -17,7 +17,8 @@ The adapter adds one explicitly enabled layer above the bridge:
 - `prepare-active-run` resolves an unambiguous observed session and binds it to a new `run_dir`
 - `Stop` hook checks that session index and blocks premature finish while the run is still active only when its command includes `--enable-compat-hook`
 - before rendering an active-run continuation, `Stop` calls `refresh-prompts-live` so both persisted prompts use the currently loaded compatibility runner instead of a removed historical absolute path
-- before that refresh, `Stop` opens the repo/run path component-by-component without following links, requires the indexed `run_dir` to be a direct child of the current repo's `.codex-tmp/waited-delivery`, requires exact `state.repo_root` equality, and requires regular no-follow state and prompt files
+- before that refresh, `Stop` opens the repo/run path component-by-component without following links, requires the indexed `run_dir` to be a direct child of the current repo's `.codex-tmp/waited-delivery`, requires exact `state.repo_root` equality, requires regular no-follow state and prompt files, requires the current user plus mode `0700`, and records the opened run directory's exact device/inode and POSIX uid/gid/mode
+- `Stop` keeps that descriptor open while the bridge runs, sends its full recorded identity through the bridge, and rereads state/prompts through the same descriptor before rendering guidance; a symlink, ordinary-directory replacement, owner/group drift, or mode change therefore fails closed
 - `finish-child-active-run` requires the exact attached child id, records the child's terminal status, and preserves the active-run association for parent-owned review
 - `reconcile-active-run` requires that same exact child id and clears the active-run association only when reconciliation finishes cleanly with the required `internal_review` phase and a nonblank attached child identity
 
@@ -61,8 +62,8 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   - allows stop if no active run exists
   - blocks stop with a continuation prompt when the run is still active or not yet reconciled
   - regenerates `child-prompt.md` and `parent-prompt.md` through the loaded compatibility bridge before referring the parent back to either file
-  - passes the exact current repo root through the bridge to the runner; the runner revalidates containment under its run-level lock and atomically replaces prompt/state files through a pinned run-directory descriptor
-  - fails closed without following record-provided prompt paths when the run points outside the repo, any run component or state/prompt file is a symlink/non-regular file, `state.repo_root` mismatches, or the pinned run identity changes
+  - passes the exact current repo root plus the preflight run-directory device/inode, uid/gid, and mode through the bridge to the runner; the runner revalidates them under its run-level lock and atomically replaces prompt/state files through a pinned run-directory descriptor
+  - fails closed without following record-provided prompt paths when the run points outside the repo, any run component or state/prompt file is a symlink/non-regular file, `state.repo_root` mismatches, or the pinned run object/access identity changes through a link, ordinary directory replacement, ownership drift, or mode change
   - tells a parent with an already active legacy child to have that same child re-read the regenerated child prompt before another runner command
   - uses `stop_hook_active` to avoid continuation loops
   - if continuation prompt rendering fails on an active run, it records diagnostics, falls back to a generic continuation prompt, and still blocks

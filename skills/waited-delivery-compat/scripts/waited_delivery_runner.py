@@ -5,19 +5,24 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
+import selectors
 import shlex
+import signal
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from collections.abc import Iterator
-from typing import TypedDict, cast
+from typing import Literal, NamedTuple, TypedDict, cast
 
 
 TERMINAL_PHASE_STATUSES = {
@@ -60,9 +65,56 @@ RUNS_DIR_NAME = "waited-delivery"
 STATE_MAX_BYTES = 4 * 1024 * 1024
 FILE_MODE = 0o600
 DIRECTORY_MODE = 0o700
+SMOKE_TIMEOUT_SECONDS = 30.0
+SMOKE_CLEANUP_TIMEOUT_SECONDS = 3.0
+SMOKE_CAPTURE_MAX_BYTES = 256 * 1024
+PROCESS_DRAIN_CHUNK_BYTES = 64 * 1024
+PROCESS_POLL_INTERVAL_SECONDS = 0.02
+PROC_GROUP_SCAN_MAX_ENTRIES = 131_072
+PROC_GROUP_SCAN_TIMEOUT_SECONDS = 0.25
+
+
+class FileVersion(NamedTuple):
+    device: int
+    inode: int
+    size: int
+    sha256: str
+
+
+class ArtifactRead(NamedTuple):
+    content: bytes
+    version: FileVersion
+
+
+class DirectoryIdentity(NamedTuple):
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    mode: int
+
+
+LinuxProcessGroupState = Literal[
+    "live",
+    "zombie-only",
+    "no-members",
+    "unknown",
+]
 
 
 class UserError(RuntimeError):
+    pass
+
+
+class ArtifactMissingError(UserError):
+    pass
+
+
+class ArtifactUnreadableError(UserError):
+    pass
+
+
+class ArtifactChangedError(UserError):
     pass
 
 
@@ -306,10 +358,22 @@ def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
+def _directory_identity(file_stat: os.stat_result) -> DirectoryIdentity:
+    return DirectoryIdentity(
+        device=file_stat.st_dev,
+        inode=file_stat.st_ino,
+        uid=file_stat.st_uid,
+        gid=file_stat.st_gid,
+        mode=stat.S_IMODE(file_stat.st_mode),
+    )
+
+
 def _verify_run_directory_identity(
     run_dir: pathlib.Path,
     repo_root: pathlib.Path,
     run_fd: int,
+    *,
+    expected_identity: DirectoryIdentity | None = None,
 ) -> None:
     current_fd = _open_run_directory_path(repo_root, run_dir.name)
     try:
@@ -317,6 +381,23 @@ def _verify_run_directory_identity(
         pinned = os.fstat(run_fd)
         if not stat.S_ISDIR(current.st_mode) or not _same_object(current, pinned):
             raise UserError(f"run directory identity changed: {run_dir}")
+        if expected_identity is not None:
+            pinned_identity = _directory_identity(pinned)
+            current_identity = _directory_identity(current)
+            if (
+                pinned_identity.device,
+                pinned_identity.inode,
+            ) != (
+                expected_identity.device,
+                expected_identity.inode,
+            ):
+                raise UserError(f"run directory identity changed: {run_dir}")
+            if pinned_identity != expected_identity:
+                raise UserError(f"run directory access identity changed: {run_dir}")
+            if current_identity != expected_identity:
+                raise UserError(
+                    f"named run directory access identity changed: {run_dir}"
+                )
     finally:
         os.close(current_fd)
 
@@ -325,6 +406,7 @@ def _open_run_directory(
     run_dir_arg: str | pathlib.Path,
     *,
     expected_repo_root: str | pathlib.Path | None = None,
+    expected_run_identity: DirectoryIdentity | None = None,
 ) -> tuple[pathlib.Path, pathlib.Path, int]:
     run_dir, repo_root, run_name = _run_layout(
         run_dir_arg,
@@ -336,6 +418,23 @@ def _open_run_directory(
         raise UserError(f"unsafe or unavailable run directory: {run_dir}") from error
     try:
         _verify_run_directory_identity(run_dir, repo_root, run_fd)
+        if expected_run_identity is not None:
+            actual_identity = _directory_identity(os.fstat(run_fd))
+            if (
+                actual_identity.device,
+                actual_identity.inode,
+            ) != (
+                expected_run_identity.device,
+                expected_run_identity.inode,
+            ):
+                raise UserError(
+                    "run directory identity does not match the expected bridge identity"
+                )
+            if actual_identity != expected_run_identity:
+                raise UserError(
+                    "run directory access identity does not match the expected "
+                    "bridge identity"
+                )
     except Exception:
         os.close(run_fd)
         raise
@@ -393,39 +492,129 @@ def _regular_file_stat(
     return file_stat
 
 
-def _read_regular_bytes(run_fd: int, name: str, *, max_bytes: int) -> bytes:
+def _read_fd_bounded(file_fd: int, name: str, *, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    retained = 0
+    while True:
+        chunk = os.read(file_fd, min(65536, max_bytes + 1 - retained))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        retained += len(chunk)
+        if retained > max_bytes:
+            raise ArtifactUnreadableError(f"run artifact exceeds byte limit: {name}")
+    return b"".join(chunks)
+
+
+def _read_regular_artifact(
+    run_fd: int,
+    name: str,
+    *,
+    max_bytes: int,
+) -> ArtifactRead:
+    _validate_component_name(name, label="artifact name")
     try:
         file_fd = os.open(name, _regular_open_flags(), dir_fd=run_fd)
+    except FileNotFoundError as error:
+        raise ArtifactMissingError(f"run artifact is missing: {name}") from error
     except OSError as error:
-        raise UserError(
+        raise ArtifactUnreadableError(
             f"cannot open run artifact without following links: {name}"
         ) from error
     try:
         before = os.fstat(file_fd)
         if not stat.S_ISREG(before.st_mode):
-            raise UserError(f"run artifact must be a regular file: {name}")
+            raise ArtifactUnreadableError(
+                f"run artifact must be a regular file: {name}"
+            )
         if before.st_size > max_bytes:
-            raise UserError(f"run artifact exceeds byte limit: {name}")
-        chunks: list[bytes] = []
-        retained = 0
-        while True:
-            chunk = os.read(file_fd, min(65536, max_bytes + 1 - retained))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            retained += len(chunk)
-            if retained > max_bytes:
-                raise UserError(f"run artifact exceeds byte limit: {name}")
+            raise ArtifactUnreadableError(f"run artifact exceeds byte limit: {name}")
+        first_content = _read_fd_bounded(file_fd, name, max_bytes=max_bytes)
+        middle = os.fstat(file_fd)
+        os.lseek(file_fd, 0, os.SEEK_SET)
+        second_content = _read_fd_bounded(file_fd, name, max_bytes=max_bytes)
         after = os.fstat(file_fd)
         if (
             not _same_object(before, after)
+            or not _same_object(before, middle)
+            or before.st_size != middle.st_size
             or before.st_size != after.st_size
-            or before.st_mtime_ns != after.st_mtime_ns
+            or len(first_content) != before.st_size
+            or first_content != second_content
         ):
-            raise UserError(f"run artifact changed while it was read: {name}")
-        return b"".join(chunks)
+            raise ArtifactChangedError(
+                f"run artifact content changed while it was read: {name}"
+            )
+        return ArtifactRead(
+            content=second_content,
+            version=FileVersion(
+                device=after.st_dev,
+                inode=after.st_ino,
+                size=after.st_size,
+                sha256=hashlib.sha256(second_content).hexdigest(),
+            ),
+        )
+    except OSError as error:
+        raise ArtifactUnreadableError(
+            f"cannot read stable run artifact content: {name}"
+        ) from error
     finally:
         os.close(file_fd)
+
+
+def _expected_artifact_version(
+    run_fd: int,
+    name: str,
+    *,
+    required: bool,
+    max_bytes: int = STATE_MAX_BYTES,
+) -> FileVersion | None:
+    try:
+        return _read_regular_artifact(
+            run_fd,
+            name,
+            max_bytes=max_bytes,
+        ).version
+    except ArtifactMissingError:
+        if required:
+            raise UserError(f"required run artifact is missing: {name}") from None
+        return None
+
+
+def _validate_expected_artifact(
+    run_fd: int,
+    name: str,
+    expected_version: FileVersion | None,
+    *,
+    max_bytes: int,
+) -> None:
+    try:
+        current = _read_regular_artifact(
+            run_fd,
+            name,
+            max_bytes=max_bytes,
+        ).version
+    except ArtifactMissingError:
+        if expected_version is None:
+            return
+        raise UserError(f"run artifact is missing before update: {name}") from None
+    except ArtifactChangedError:
+        raise UserError(f"run artifact content changed before update: {name}") from None
+    except ArtifactUnreadableError:
+        raise UserError(f"run artifact is unreadable before update: {name}") from None
+
+    if expected_version is None:
+        raise UserError(f"run artifact appeared before update: {name}")
+    if (current.device, current.inode) != (
+        expected_version.device,
+        expected_version.inode,
+    ):
+        raise UserError(f"run artifact was replaced before update: {name}")
+    if (
+        current.size != expected_version.size
+        or current.sha256 != expected_version.sha256
+    ):
+        raise UserError(f"run artifact content changed before update: {name}")
 
 
 def _atomic_write_regular(
@@ -433,11 +622,19 @@ def _atomic_write_regular(
     name: str,
     content: str,
     *,
-    require_existing: bool,
-) -> None:
-    expected = _regular_file_stat(run_fd, name, required=require_existing)
+    expected_version: FileVersion | None,
+) -> FileVersion:
+    encoded = content.encode("utf-8")
+    comparison_max_bytes = max(STATE_MAX_BYTES, len(encoded))
+    _validate_expected_artifact(
+        run_fd,
+        name,
+        expected_version,
+        max_bytes=comparison_max_bytes,
+    )
     temp_name = f".{name}.{uuid.uuid4().hex}.tmp"
     temp_fd: int | None = None
+    temp_identity: DirectoryIdentity | None = None
     try:
         temp_fd = os.open(
             temp_name,
@@ -449,7 +646,6 @@ def _atomic_write_regular(
             FILE_MODE,
             dir_fd=run_fd,
         )
-        encoded = content.encode("utf-8")
         offset = 0
         while offset < len(encoded):
             written_bytes = os.write(temp_fd, encoded[offset:])
@@ -457,22 +653,42 @@ def _atomic_write_regular(
                 raise UserError(f"failed to write temporary run artifact: {name}")
             offset += written_bytes
         os.fsync(temp_fd)
+        temp_identity = _directory_identity(os.fstat(temp_fd))
         os.close(temp_fd)
         temp_fd = None
-        current = _regular_file_stat(run_fd, name, required=require_existing)
-        if expected is not None and (
-            current is None or not _same_object(expected, current)
-        ):
-            raise UserError(f"run artifact was replaced before update: {name}")
+        _validate_expected_artifact(
+            run_fd,
+            name,
+            expected_version,
+            max_bytes=comparison_max_bytes,
+        )
         os.replace(
             temp_name,
             name,
             src_dir_fd=run_fd,
             dst_dir_fd=run_fd,
         )
-        written = _regular_file_stat(run_fd, name, required=True)
-        assert written is not None
         os.fsync(run_fd)
+        published_stat = _regular_file_stat(run_fd, name, required=True)
+        if (
+            published_stat is None
+            or temp_identity is None
+            or _directory_identity(published_stat) != temp_identity
+        ):
+            raise UserError(
+                f"run artifact publication identity mismatch after update: {name}"
+            )
+        written = _read_regular_artifact(
+            run_fd,
+            name,
+            max_bytes=max(len(encoded), 1),
+        )
+        if written.content != encoded or (
+            written.version.device,
+            written.version.inode,
+        ) != (temp_identity.device, temp_identity.inode):
+            raise UserError(f"run artifact content mismatch after update: {name}")
+        return written.version
     finally:
         if temp_fd is not None:
             os.close(temp_fd)
@@ -486,15 +702,14 @@ def _load_state_from_fd(
     run_dir: pathlib.Path,
     repo_root: pathlib.Path,
     run_fd: int,
-) -> WaitedDeliveryState:
+) -> tuple[WaitedDeliveryState, FileVersion]:
+    artifact = _read_regular_artifact(
+        run_fd,
+        STATE_FILE_NAME,
+        max_bytes=STATE_MAX_BYTES,
+    )
     try:
-        payload = json.loads(
-            _read_regular_bytes(
-                run_fd,
-                STATE_FILE_NAME,
-                max_bytes=STATE_MAX_BYTES,
-            ).decode("utf-8")
-        )
+        payload = json.loads(artifact.content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise UserError(
             f"invalid state payload: {run_dir / STATE_FILE_NAME}"
@@ -511,7 +726,7 @@ def _load_state_from_fd(
     orchestration.setdefault("parent_turn_id", None)
     orchestration.setdefault("parent_transcript_path", None)
     orchestration.setdefault("permission_mode", None)
-    return state
+    return state, artifact.version
 
 
 def _save_state(
@@ -519,20 +734,24 @@ def _save_state(
     repo_root: pathlib.Path,
     run_fd: int,
     state: WaitedDeliveryState,
-) -> None:
+    expected_state_version: FileVersion,
+) -> FileVersion:
     _verify_run_directory_identity(run_dir, repo_root, run_fd)
     state["updated_at"] = _utc_now()
-    _atomic_write_regular(
+    written_version = _atomic_write_regular(
         run_fd,
         STATE_FILE_NAME,
         json.dumps(state, indent=2, sort_keys=True) + "\n",
-        require_existing=True,
+        expected_version=expected_state_version,
     )
     _verify_run_directory_identity(run_dir, repo_root, run_fd)
+    return written_version
 
 
 @contextlib.contextmanager
-def _run_lock(run_fd: int) -> Iterator[None]:
+def _open_run_lock_descriptor(
+    run_fd: int,
+) -> Iterator[tuple[int, DirectoryIdentity]]:
     try:
         lock_fd = os.open(
             RUN_LOCK_NAME,
@@ -550,19 +769,51 @@ def _run_lock(run_fd: int) -> Iterator[None]:
         lock_stat = os.fstat(lock_fd)
         if not stat.S_ISREG(lock_stat.st_mode):
             raise UserError("run lock must be a regular file")
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield lock_fd, _directory_identity(lock_stat)
+    finally:
+        os.close(lock_fd)
+
+
+@contextlib.contextmanager
+def _acquired_run_lock(
+    run_fd: int,
+    lock_fd: int,
+    expected_lock_identity: DirectoryIdentity,
+) -> Iterator[None]:
+    current_lock = os.fstat(lock_fd)
+    if (
+        not stat.S_ISREG(current_lock.st_mode)
+        or _directory_identity(current_lock) != expected_lock_identity
+    ):
+        raise UserError("run lock descriptor identity changed before acquisition")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
         named_lock = _regular_file_stat(run_fd, RUN_LOCK_NAME, required=True)
-        if named_lock is None or not _same_object(lock_stat, named_lock):
+        if (
+            named_lock is None
+            or _directory_identity(named_lock) != expected_lock_identity
+        ):
             raise UserError("run lock was replaced before acquisition")
         yield
         named_lock = _regular_file_stat(run_fd, RUN_LOCK_NAME, required=True)
-        if named_lock is None or not _same_object(lock_stat, named_lock):
+        if (
+            named_lock is None
+            or _directory_identity(named_lock) != expected_lock_identity
+            or _directory_identity(os.fstat(lock_fd)) != expected_lock_identity
+        ):
             raise UserError("run lock was replaced while held")
     finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _run_lock(run_fd: int) -> Iterator[None]:
+    with _open_run_lock_descriptor(run_fd) as (
+        lock_fd,
+        lock_identity,
+    ):
+        with _acquired_run_lock(run_fd, lock_fd, lock_identity):
+            yield
 
 
 @contextlib.contextmanager
@@ -570,17 +821,34 @@ def _locked_run_state(
     run_dir_arg: str | pathlib.Path,
     *,
     expected_repo_root: str | pathlib.Path | None = None,
-) -> Iterator[tuple[pathlib.Path, pathlib.Path, int, WaitedDeliveryState]]:
+    expected_run_identity: DirectoryIdentity | None = None,
+) -> Iterator[tuple[pathlib.Path, pathlib.Path, int, WaitedDeliveryState, FileVersion]]:
     run_dir, repo_root, run_fd = _open_run_directory(
         run_dir_arg,
         expected_repo_root=expected_repo_root,
+        expected_run_identity=expected_run_identity,
     )
+    opened_run_identity = _directory_identity(os.fstat(run_fd))
     try:
         with _run_lock(run_fd):
-            _verify_run_directory_identity(run_dir, repo_root, run_fd)
-            state = _load_state_from_fd(run_dir, repo_root, run_fd)
-            yield run_dir, repo_root, run_fd, state
-            _verify_run_directory_identity(run_dir, repo_root, run_fd)
+            _verify_run_directory_identity(
+                run_dir,
+                repo_root,
+                run_fd,
+                expected_identity=opened_run_identity,
+            )
+            state, state_version = _load_state_from_fd(
+                run_dir,
+                repo_root,
+                run_fd,
+            )
+            yield run_dir, repo_root, run_fd, state, state_version
+            _verify_run_directory_identity(
+                run_dir,
+                repo_root,
+                run_fd,
+                expected_identity=opened_run_identity,
+            )
     finally:
         os.close(run_fd)
 
@@ -784,12 +1052,12 @@ def _write_current_prompts(
     parent_prompt_path = run_dir / "parent-prompt.md"
     state["artifacts"]["child_prompt"] = str(child_prompt_path)
     state["artifacts"]["parent_prompt"] = str(parent_prompt_path)
-    _regular_file_stat(
+    child_prompt_version = _expected_artifact_version(
         run_fd,
         child_prompt_path.name,
         required=require_existing,
     )
-    _regular_file_stat(
+    parent_prompt_version = _expected_artifact_version(
         run_fd,
         parent_prompt_path.name,
         required=require_existing,
@@ -798,13 +1066,13 @@ def _write_current_prompts(
         run_fd,
         child_prompt_path.name,
         _build_child_prompt(run_dir, state),
-        require_existing=require_existing,
+        expected_version=child_prompt_version,
     )
     _atomic_write_regular(
         run_fd,
         parent_prompt_path.name,
         _build_parent_prompt(run_dir, state),
-        require_existing=require_existing,
+        expected_version=parent_prompt_version,
     )
     return child_prompt_path, parent_prompt_path
 
@@ -893,13 +1161,13 @@ def _prepare(args: argparse.Namespace) -> int:
                 run_fd,
                 smoke_prompt_path.name,
                 FALLBACK_SMOKE_PROMPT,
-                require_existing=False,
+                expected_version=None,
             )
             _atomic_write_regular(
                 run_fd,
                 contract_path.name,
                 _build_child_contract(state),
-                require_existing=False,
+                expected_version=None,
             )
             _write_current_prompts(
                 run_dir,
@@ -911,13 +1179,13 @@ def _prepare(args: argparse.Namespace) -> int:
                 run_fd,
                 smoke_command_path.name,
                 _shell_command(state["fallback_readiness_smoke"]["command"]) + "\n",
-                require_existing=False,
+                expected_version=None,
             )
             _atomic_write_regular(
                 run_fd,
                 state_path.name,
                 json.dumps(state, indent=2, sort_keys=True) + "\n",
-                require_existing=False,
+                expected_version=None,
             )
             _verify_run_directory_identity(run_dir, repo_root, run_fd)
     finally:
@@ -947,17 +1215,47 @@ def _prepare(args: argparse.Namespace) -> int:
 
 
 def _refresh_prompts(args: argparse.Namespace) -> int:
+    expected_identity_values = (
+        getattr(args, "expected_run_dev", None),
+        getattr(args, "expected_run_ino", None),
+        getattr(args, "expected_run_uid", None),
+        getattr(args, "expected_run_gid", None),
+        getattr(args, "expected_run_mode", None),
+    )
+    if any(value is not None for value in expected_identity_values) and not all(
+        value is not None for value in expected_identity_values
+    ):
+        raise UserError(
+            "expected run device, inode, uid, gid, and mode must be supplied together"
+        )
+    expected_run_identity = None
+    if all(value is not None for value in expected_identity_values):
+        expected_run_identity = DirectoryIdentity(
+            device=cast(int, expected_identity_values[0]),
+            inode=cast(int, expected_identity_values[1]),
+            uid=cast(int, expected_identity_values[2]),
+            gid=cast(int, expected_identity_values[3]),
+            mode=cast(int, expected_identity_values[4]),
+        )
     with _locked_run_state(
         args.run_dir,
         expected_repo_root=args.expected_repo_root,
-    ) as (run_dir, repo_root, run_fd, state):
+        expected_run_identity=expected_run_identity,
+    ) as (run_dir, repo_root, run_fd, state, state_version):
+        run_identity = _directory_identity(os.fstat(run_fd))
         child_prompt_path, parent_prompt_path = _write_current_prompts(
             run_dir,
             run_fd,
             state,
             require_existing=True,
         )
-        _save_state(run_dir, repo_root, run_fd, state)
+        _save_state(
+            run_dir,
+            repo_root,
+            run_fd,
+            state,
+            state_version,
+        )
     if args.json:
         print(
             json.dumps(
@@ -966,6 +1264,11 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
                     "runner_path": str(pathlib.Path(__file__).resolve()),
                     "child_prompt": str(child_prompt_path),
                     "parent_prompt": str(parent_prompt_path),
+                    "run_dev": run_identity.device,
+                    "run_ino": run_identity.inode,
+                    "run_uid": run_identity.uid,
+                    "run_gid": run_identity.gid,
+                    "run_mode": run_identity.mode,
                 }
             )
         )
@@ -980,6 +1283,7 @@ def _attach_child(args: argparse.Namespace) -> int:
         repo_root,
         run_fd,
         state,
+        state_version,
     ):
         if not args.child_session_id.strip():
             raise UserError("attach-child requires a nonblank child session id")
@@ -1003,7 +1307,7 @@ def _attach_child(args: argparse.Namespace) -> int:
             orchestration["parent_transcript_path"] = args.parent_transcript_path
         if args.permission_mode:
             orchestration["permission_mode"] = args.permission_mode
-        _save_state(run_dir, repo_root, run_fd, state)
+        _save_state(run_dir, repo_root, run_fd, state, state_version)
     return 0
 
 
@@ -1013,6 +1317,7 @@ def _bind_parent(args: argparse.Namespace) -> int:
         repo_root,
         run_fd,
         state,
+        state_version,
     ):
         if (
             not args.parent_session_id
@@ -1031,7 +1336,7 @@ def _bind_parent(args: argparse.Namespace) -> int:
         if args.permission_mode:
             orchestration["permission_mode"] = args.permission_mode
         orchestration["updated_at"] = _utc_now()
-        _save_state(run_dir, repo_root, run_fd, state)
+        _save_state(run_dir, repo_root, run_fd, state, state_version)
     return 0
 
 
@@ -1041,6 +1346,7 @@ def _begin_phase(args: argparse.Namespace) -> int:
         repo_root,
         run_fd,
         state,
+        state_version,
     ):
         phases = state["phases"]
         if args.phase not in phases:
@@ -1051,7 +1357,7 @@ def _begin_phase(args: argparse.Namespace) -> int:
         phase["findings"] = []
         phase["evidence"] = []
         phase["updated_at"] = _utc_now()
-        _save_state(run_dir, repo_root, run_fd, state)
+        _save_state(run_dir, repo_root, run_fd, state, state_version)
     return 0
 
 
@@ -1095,6 +1401,7 @@ def _record_phase(args: argparse.Namespace) -> int:
         repo_root,
         run_fd,
         state,
+        state_version,
     ):
         phases = state["phases"]
         if args.phase not in phases:
@@ -1109,7 +1416,7 @@ def _record_phase(args: argparse.Namespace) -> int:
         phase["findings"] = list(args.finding)
         phase["evidence"] = list(args.evidence)
         phase["updated_at"] = _utc_now()
-        _save_state(run_dir, repo_root, run_fd, state)
+        _save_state(run_dir, repo_root, run_fd, state, state_version)
     return 0
 
 
@@ -1119,6 +1426,7 @@ def _close_open_phases(args: argparse.Namespace) -> int:
         repo_root,
         run_fd,
         state,
+        state_version,
     ):
         if args.status not in TERMINAL_PHASE_STATUSES:
             raise UserError(
@@ -1147,7 +1455,7 @@ def _close_open_phases(args: argparse.Namespace) -> int:
             phase["updated_at"] = _utc_now()
             updated = True
         if updated:
-            _save_state(run_dir, repo_root, run_fd, state)
+            _save_state(run_dir, repo_root, run_fd, state, state_version)
     return 0
 
 
@@ -1197,14 +1505,292 @@ def _finish_child(args: argparse.Namespace) -> int:
         repo_root,
         run_fd,
         state,
+        state_version,
     ):
         _transition_child_terminal(
             state,
             child_status=args.child_status,
             child_session_id=args.child_session_id,
         )
-        _save_state(run_dir, repo_root, run_fd, state)
+        _save_state(run_dir, repo_root, run_fd, state, state_version)
     return 0
+
+
+class _CaptureLimitExceeded(Exception):
+    pass
+
+
+def _parse_linux_proc_stat(raw: str) -> tuple[str, int] | None:
+    closing_parenthesis = raw.rfind(")")
+    if closing_parenthesis <= 0:
+        return None
+    fields = raw[closing_parenthesis + 1 :].split()
+    if len(fields) < 3 or len(fields[0]) != 1:
+        return None
+    try:
+        process_group = int(fields[2])
+    except ValueError:
+        return None
+    return fields[0], process_group
+
+
+def _linux_process_group_state(
+    pgid: int,
+    *,
+    proc_root: pathlib.Path = pathlib.Path("/proc"),
+    deadline: float | None = None,
+    max_entries: int = PROC_GROUP_SCAN_MAX_ENTRIES,
+) -> LinuxProcessGroupState:
+    if deadline is None:
+        deadline = time.monotonic() + PROC_GROUP_SCAN_TIMEOUT_SECONDS
+    if max_entries <= 0:
+        return "unknown"
+    saw_zombie = False
+    entry_count = 0
+    try:
+        entries = os.scandir(proc_root)
+    except OSError:
+        return "unknown"
+    with entries:
+        for entry in entries:
+            entry_count += 1
+            if entry_count > max_entries or time.monotonic() >= deadline:
+                return "unknown"
+            if not entry.name.isdecimal():
+                continue
+            try:
+                raw = (pathlib.Path(entry.path) / "stat").read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return "unknown"
+            parsed = _parse_linux_proc_stat(raw)
+            if parsed is None:
+                return "unknown"
+            state, process_group = parsed
+            if process_group != pgid:
+                continue
+            if state != "Z":
+                return "live"
+            saw_zombie = True
+    if saw_zombie:
+        return "zombie-only"
+    return "no-members"
+
+
+def _process_group_exists(
+    pgid: int,
+    *,
+    proc_root: pathlib.Path = pathlib.Path("/proc"),
+    platform: str = sys.platform,
+) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if not platform.startswith("linux"):
+        return True
+    state = _linux_process_group_state(pgid, proc_root=proc_root)
+    if state == "zombie-only":
+        return False
+    if state != "no-members":
+        return True
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_process_group(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _drain_process_output_once(
+    selector: selectors.BaseSelector,
+    captures: dict[str, bytearray],
+    *,
+    timeout: float,
+    capture: bool,
+    max_capture_bytes: int,
+) -> None:
+    for key, _mask in selector.select(timeout):
+        try:
+            chunk = os.read(key.fd, PROCESS_DRAIN_CHUNK_BYTES)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            selector.unregister(key.fd)
+            continue
+        if not capture:
+            continue
+        retained = sum(len(value) for value in captures.values())
+        if retained + len(chunk) > max_capture_bytes:
+            raise _CaptureLimitExceeded
+        captures[cast(str, key.data)].extend(chunk)
+
+
+def _cleanup_smoke_process(
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector,
+    captures: dict[str, bytearray],
+    *,
+    cleanup_timeout: float,
+    max_capture_bytes: int,
+) -> None:
+    _kill_process_group(process.pid)
+    deadline = time.monotonic() + cleanup_timeout
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        _drain_process_output_once(
+            selector,
+            captures,
+            timeout=min(PROCESS_POLL_INTERVAL_SECONDS, max(0.0, remaining)),
+            capture=False,
+            max_capture_bytes=max_capture_bytes,
+        )
+        returncode = process.poll()
+        if (
+            returncode is not None
+            and not _process_group_exists(process.pid)
+            and not selector.get_map()
+        ):
+            return
+    reasons: list[str] = []
+    if process.poll() is None:
+        reasons.append("failed to reap smoke process")
+    if _process_group_exists(process.pid):
+        reasons.append("failed to prove smoke process-group disappearance")
+    if selector.get_map():
+        reasons.append("failed to drain smoke process pipes")
+    raise UserError("; ".join(reasons) or "smoke process cleanup timed out")
+
+
+def _run_bounded_smoke_process(
+    command: list[str],
+    *,
+    cwd: pathlib.Path,
+    timeout: float = SMOKE_TIMEOUT_SECONDS,
+    cleanup_timeout: float = SMOKE_CLEANUP_TIMEOUT_SECONDS,
+    max_capture_bytes: int = SMOKE_CAPTURE_MAX_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    if not command or not all(isinstance(argument, str) for argument in command):
+        raise UserError("fallback readiness smoke command must be a nonempty argv")
+    if timeout <= 0 or cleanup_timeout <= 0 or max_capture_bytes <= 0:
+        raise UserError("fallback readiness smoke bounds must be positive")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise UserError(f"cannot start fallback readiness smoke: {error}") from error
+    assert process.stdout is not None
+    assert process.stderr is not None
+    selector = selectors.DefaultSelector()
+    captures = {"stdout": bytearray(), "stderr": bytearray()}
+    failure: tuple[int, str] | None = None
+    cleanup_complete = False
+    try:
+        for name, stream in (
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+        ):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream.fileno(), selectors.EVENT_READ, name)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                _drain_process_output_once(
+                    selector,
+                    captures,
+                    timeout=min(
+                        PROCESS_POLL_INTERVAL_SECONDS,
+                        max(0.0, remaining),
+                    ),
+                    capture=True,
+                    max_capture_bytes=max_capture_bytes,
+                )
+            except _CaptureLimitExceeded:
+                failure = (
+                    125,
+                    f"BLOCKED: smoke output exceeded {max_capture_bytes} bytes",
+                )
+                break
+            returncode = process.poll()
+            if returncode is None:
+                continue
+            if _process_group_exists(process.pid):
+                failure = (
+                    126,
+                    "BLOCKED: smoke left a live descendant in its process group",
+                )
+                break
+            if not selector.get_map():
+                break
+        else:
+            failure = (
+                124,
+                f"BLOCKED: smoke exceeded {timeout:g} second hard timeout",
+            )
+
+        if failure is not None:
+            _cleanup_smoke_process(
+                process,
+                selector,
+                captures,
+                cleanup_timeout=cleanup_timeout,
+                max_capture_bytes=max_capture_bytes,
+            )
+            cleanup_complete = True
+            returncode, reason = failure
+            stderr = captures["stderr"].decode("utf-8", errors="replace")
+            if stderr and not stderr.endswith("\n"):
+                stderr += "\n"
+            stderr += reason + "\n"
+            return subprocess.CompletedProcess(
+                command,
+                returncode,
+                stdout=captures["stdout"].decode("utf-8", errors="replace"),
+                stderr=stderr,
+            )
+
+        returncode = process.poll()
+        if returncode is None:
+            raise UserError("smoke process reached an impossible terminal state")
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            stdout=captures["stdout"].decode("utf-8", errors="replace"),
+            stderr=captures["stderr"].decode("utf-8", errors="replace"),
+        )
+    except BaseException:
+        if not cleanup_complete:
+            _cleanup_smoke_process(
+                process,
+                selector,
+                captures,
+                cleanup_timeout=cleanup_timeout,
+                max_capture_bytes=max_capture_bytes,
+            )
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
 
 
 def _classify_smoke(
@@ -1226,36 +1812,82 @@ def _classify_smoke(
 
 
 def _run_fallback_smoke(args: argparse.Namespace) -> int:
-    with _locked_run_state(args.run_dir) as (
-        run_dir,
-        repo_root,
-        run_fd,
-        state,
-    ):
-        smoke = state["fallback_readiness_smoke"]
-        if not smoke["enabled"]:
-            raise UserError("fallback readiness smoke is disabled for this run")
+    run_dir, repo_root, run_fd = _open_run_directory(args.run_dir)
+    run_identity = _directory_identity(os.fstat(run_fd))
+    try:
+        with _open_run_lock_descriptor(run_fd) as (
+            lock_fd,
+            lock_identity,
+        ):
+            with _acquired_run_lock(run_fd, lock_fd, lock_identity):
+                _verify_run_directory_identity(
+                    run_dir,
+                    repo_root,
+                    run_fd,
+                    expected_identity=run_identity,
+                )
+                state, snapshot_state_version = _load_state_from_fd(
+                    run_dir,
+                    repo_root,
+                    run_fd,
+                )
+                snapshot_smoke = copy.deepcopy(state["fallback_readiness_smoke"])
+                if not snapshot_smoke["enabled"]:
+                    raise UserError("fallback readiness smoke is disabled for this run")
+                command = list(snapshot_smoke["command"])
+                smoke_cwd = pathlib.Path(state["repo_root"])
 
-        command = list(smoke["command"])
-        completed = subprocess.run(
-            command,
-            cwd=state["repo_root"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        status, sample = _classify_smoke(
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            returncode=completed.returncode,
-        )
-        smoke["status"] = status
-        smoke["sample"] = sample
-        smoke["stdout"] = completed.stdout
-        smoke["stderr"] = completed.stderr
-        smoke["returncode"] = completed.returncode
-        smoke["updated_at"] = _utc_now()
-        _save_state(run_dir, repo_root, run_fd, state)
+            completed = _run_bounded_smoke_process(
+                command,
+                cwd=smoke_cwd,
+            )
+            status, sample = _classify_smoke(
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                returncode=completed.returncode,
+            )
+            with _acquired_run_lock(run_fd, lock_fd, lock_identity):
+                _verify_run_directory_identity(
+                    run_dir,
+                    repo_root,
+                    run_fd,
+                    expected_identity=run_identity,
+                )
+                latest_state, latest_state_version = _load_state_from_fd(
+                    run_dir,
+                    repo_root,
+                    run_fd,
+                )
+                latest_smoke = latest_state["fallback_readiness_smoke"]
+                if (
+                    latest_state_version != snapshot_state_version
+                    and latest_smoke != snapshot_smoke
+                ):
+                    raise UserError(
+                        "fallback readiness smoke state changed while the "
+                        "command was running"
+                    )
+                latest_smoke["status"] = status
+                latest_smoke["sample"] = sample
+                latest_smoke["stdout"] = completed.stdout
+                latest_smoke["stderr"] = completed.stderr
+                latest_smoke["returncode"] = completed.returncode
+                latest_smoke["updated_at"] = _utc_now()
+                _save_state(
+                    run_dir,
+                    repo_root,
+                    run_fd,
+                    latest_state,
+                    latest_state_version,
+                )
+                _verify_run_directory_identity(
+                    run_dir,
+                    repo_root,
+                    run_fd,
+                    expected_identity=run_identity,
+                )
+    finally:
+        os.close(run_fd)
     if sample:
         print(sample)
     return 0 if status == "passed" else 1
@@ -1346,11 +1978,16 @@ def _write_summary(
     if smoke["sample"]:
         lines.append(f"- Sample: `{smoke['sample']}`")
     summary_path = run_dir / "summary.md"
+    summary_version = _expected_artifact_version(
+        run_fd,
+        summary_path.name,
+        required=False,
+    )
     _atomic_write_regular(
         run_fd,
         summary_path.name,
         "\n".join(lines) + "\n",
-        require_existing=False,
+        expected_version=summary_version,
     )
     return summary_path
 
@@ -1361,6 +1998,7 @@ def _finalize(args: argparse.Namespace) -> int:
         repo_root,
         run_fd,
         state,
+        state_version,
     ):
         summary_path = _write_summary(
             run_dir,
@@ -1368,7 +2006,7 @@ def _finalize(args: argparse.Namespace) -> int:
             state,
             require_terminal=args.require_terminal,
         )
-        _save_state(run_dir, repo_root, run_fd, state)
+        _save_state(run_dir, repo_root, run_fd, state, state_version)
     print(summary_path)
     return 0
 
@@ -1379,6 +2017,7 @@ def _reconcile_parent(args: argparse.Namespace) -> int:
         repo_root,
         run_fd,
         state,
+        state_version,
     ):
         _transition_child_terminal(
             state,
@@ -1392,7 +2031,7 @@ def _reconcile_parent(args: argparse.Namespace) -> int:
             state,
             require_terminal=True,
         )
-        _save_state(run_dir, repo_root, run_fd, state)
+        _save_state(run_dir, repo_root, run_fd, state, state_version)
     if args.json:
         print(
             json.dumps(
@@ -1494,6 +2133,31 @@ def _build_parser() -> argparse.ArgumentParser:
             "Require the run to be a direct no-symlink descendant of this exact "
             "repository root."
         ),
+    )
+    refresh_prompts.add_argument(
+        "--expected-run-dev",
+        type=int,
+        help="Require the run directory to have this device identity.",
+    )
+    refresh_prompts.add_argument(
+        "--expected-run-ino",
+        type=int,
+        help="Require the run directory to have this inode identity.",
+    )
+    refresh_prompts.add_argument(
+        "--expected-run-uid",
+        type=int,
+        help="Require the run directory to have this owner identity.",
+    )
+    refresh_prompts.add_argument(
+        "--expected-run-gid",
+        type=int,
+        help="Require the run directory to have this group identity.",
+    )
+    refresh_prompts.add_argument(
+        "--expected-run-mode",
+        type=int,
+        help="Require the run directory to have this exact POSIX mode.",
     )
     refresh_prompts.add_argument(
         "--json",

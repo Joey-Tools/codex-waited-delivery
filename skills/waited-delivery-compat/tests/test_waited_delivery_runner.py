@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import importlib.util
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -366,6 +368,159 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 self.assertEqual(completed.returncode, 1)
                 self.assertEqual(external_target.read_bytes(), sentinel)
 
+    def test_refresh_prompts_rejects_replaced_run_directory_identity(self) -> None:
+        run_dir = self._prepare("--no-fallback-smoke")
+        original = run_dir.stat()
+        original_dir = self.root / "original-run-directory"
+        run_dir.rename(original_dir)
+        shutil.copytree(original_dir, run_dir)
+        sentinel = "replacement prompt must remain unchanged\n"
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (run_dir / prompt_name).write_text(sentinel, encoding="utf-8")
+
+        completed = self._run_runner(
+            "refresh-prompts",
+            "--run-dir",
+            str(run_dir),
+            "--expected-repo-root",
+            str(self.repo.resolve()),
+            "--expected-run-dev",
+            str(original.st_dev),
+            "--expected-run-ino",
+            str(original.st_ino),
+            "--expected-run-uid",
+            str(original.st_uid),
+            "--expected-run-gid",
+            str(original.st_gid),
+            "--expected-run-mode",
+            str(original.st_mode & 0o7777),
+            "--json",
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("expected bridge identity", completed.stderr)
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            self.assertEqual(
+                (run_dir / prompt_name).read_text(encoding="utf-8"),
+                sentinel,
+            )
+
+    def test_state_save_uses_loaded_identity_and_digest_version(self) -> None:
+        mutations = {
+            "missing": "is missing before update",
+            "replaced": "was replaced before update",
+            "content-changed": "content changed before update",
+            "unreadable": "is unreadable before update",
+        }
+        for mutation, expected_error in mutations.items():
+            with self.subTest(mutation=mutation):
+                module = self._load_runner_module()
+                run_dir = self._prepare("--no-fallback-smoke")
+                opened_run_dir, repo_root, run_fd = module._open_run_directory(run_dir)
+                try:
+                    state, state_version = module._load_state_from_fd(
+                        opened_run_dir,
+                        repo_root,
+                        run_fd,
+                    )
+                    state_path = run_dir / "state.json"
+                    original_content = state_path.read_bytes()
+                    original_stat = state_path.stat()
+                    self.assertEqual(state_version.device, original_stat.st_dev)
+                    self.assertEqual(state_version.inode, original_stat.st_ino)
+                    self.assertEqual(state_version.size, len(original_content))
+                    self.assertEqual(
+                        state_version.sha256,
+                        hashlib.sha256(original_content).hexdigest(),
+                    )
+
+                    if mutation == "missing":
+                        state_path.unlink()
+                    elif mutation == "replaced":
+                        replacement = run_dir / "replacement-state.json"
+                        replacement.write_bytes(original_content)
+                        replacement.replace(state_path)
+                    elif mutation == "content-changed":
+                        with state_path.open("r+b") as state_file:
+                            state_file.write(
+                                b"[" if original_content[:1] != b"[" else b"{"
+                            )
+                            state_file.flush()
+                    else:
+                        state_path.unlink()
+                        state_path.mkdir()
+
+                    with self.assertRaisesRegex(
+                        module.UserError,
+                        expected_error,
+                    ):
+                        module._save_state(
+                            opened_run_dir,
+                            repo_root,
+                            run_fd,
+                            state,
+                            state_version,
+                        )
+                finally:
+                    module.os.close(run_fd)
+
+    def test_atomic_write_binds_published_temp_file_identity(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        opened_run_dir, _repo_root, run_fd = module._open_run_directory(run_dir)
+        artifact_name = "child-prompt.md"
+        attacker_name = "attacker-prompt.md"
+        (opened_run_dir / attacker_name).write_text(
+            "attacker replacement\n",
+            encoding="utf-8",
+        )
+        expected_version = module._expected_artifact_version(
+            run_fd,
+            artifact_name,
+            required=True,
+        )
+        self.assertIsNotNone(expected_version)
+        real_replace = module.os.replace
+
+        def replace_then_substitute(
+            source: str,
+            destination: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+        ) -> None:
+            real_replace(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+            real_replace(
+                attacker_name,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        try:
+            with mock.patch.object(
+                module.os,
+                "replace",
+                side_effect=replace_then_substitute,
+            ):
+                with self.assertRaisesRegex(
+                    module.UserError,
+                    "publication identity mismatch",
+                ):
+                    module._atomic_write_regular(
+                        run_fd,
+                        artifact_name,
+                        "intended publication\n",
+                        expected_version=expected_version,
+                    )
+        finally:
+            module.os.close(run_fd)
+
     def test_refresh_prompts_serializes_state_rmw_with_phase_and_child_updates(
         self,
     ) -> None:
@@ -507,6 +662,217 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         smoke = state["fallback_readiness_smoke"]
         self.assertEqual(smoke["status"], "passed")
         self.assertEqual(smoke["sample"], "READY")
+
+    def test_run_fallback_smoke_releases_lock_and_merges_other_updates(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare()
+        self._attach_child(run_dir, "child-smoke-race")
+        smoke_started = threading.Event()
+        release_smoke = threading.Event()
+        phase_finished = threading.Event()
+        child_finished = threading.Event()
+        failures: list[BaseException] = []
+        smoke_run_descriptor_opens: list[int] = []
+        smoke_lock_descriptor_opens: list[int] = []
+        real_open_run_directory = module._open_run_directory
+        real_open_run_lock_descriptor = module._open_run_lock_descriptor
+
+        def blocking_smoke(
+            command: list[str],
+            *,
+            cwd: pathlib.Path,
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertTrue(command)
+            self.assertEqual(cwd, self.repo.resolve())
+            smoke_started.set()
+            if not release_smoke.wait(5):
+                raise RuntimeError("timed out waiting to release smoke")
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="READY\n",
+                stderr="",
+            )
+
+        def tracked_open_run_directory(*args, **kwargs):
+            if threading.current_thread().name == "smoke":
+                smoke_run_descriptor_opens.append(1)
+            return real_open_run_directory(*args, **kwargs)
+
+        def tracked_open_run_lock_descriptor(*args, **kwargs):
+            if threading.current_thread().name == "smoke":
+                smoke_lock_descriptor_opens.append(1)
+            return real_open_run_lock_descriptor(*args, **kwargs)
+
+        def run_smoke() -> None:
+            try:
+                module._run_fallback_smoke(argparse.Namespace(run_dir=str(run_dir)))
+            except BaseException as error:
+                failures.append(error)
+
+        def record_phase() -> None:
+            try:
+                module._record_phase(
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        phase="tests",
+                        status="passed",
+                        summary="completed while smoke was running",
+                        finding=[],
+                        evidence=["deterministic lock-free smoke interleaving"],
+                    )
+                )
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                phase_finished.set()
+
+        def finish_child() -> None:
+            try:
+                module._finish_child(
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        child_status="completed",
+                        child_session_id="child-smoke-race",
+                    )
+                )
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                child_finished.set()
+
+        with mock.patch.object(
+            module,
+            "_run_bounded_smoke_process",
+            side_effect=blocking_smoke,
+        ):
+            with mock.patch.object(
+                module,
+                "_open_run_directory",
+                side_effect=tracked_open_run_directory,
+            ):
+                with mock.patch.object(
+                    module,
+                    "_open_run_lock_descriptor",
+                    side_effect=tracked_open_run_lock_descriptor,
+                ):
+                    smoke_thread = threading.Thread(target=run_smoke, name="smoke")
+                    phase_thread = threading.Thread(
+                        target=record_phase,
+                        name="record-phase",
+                    )
+                    child_thread = threading.Thread(
+                        target=finish_child,
+                        name="finish-child",
+                    )
+                    smoke_thread.start()
+                    self.assertTrue(smoke_started.wait(5), failures)
+                    phase_thread.start()
+                    child_thread.start()
+                    try:
+                        self.assertTrue(phase_finished.wait(5))
+                        self.assertTrue(child_finished.wait(5))
+                    finally:
+                        release_smoke.set()
+                    smoke_thread.join(5)
+                    phase_thread.join(5)
+                    child_thread.join(5)
+
+        self.assertFalse(smoke_thread.is_alive())
+        self.assertFalse(phase_thread.is_alive())
+        self.assertFalse(child_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(smoke_run_descriptor_opens, [1])
+        self.assertEqual(smoke_lock_descriptor_opens, [1])
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["phases"]["tests"]["status"], "passed")
+        self.assertEqual(
+            state["phases"]["tests"]["summary"],
+            "completed while smoke was running",
+        )
+        self.assertEqual(state["orchestration"]["child_status"], "completed")
+        self.assertEqual(state["fallback_readiness_smoke"]["status"], "passed")
+        self.assertEqual(state["fallback_readiness_smoke"]["sample"], "READY")
+
+    def test_bounded_smoke_kills_timed_out_process_group(self) -> None:
+        module = self._load_runner_module()
+        helper = self.root / "hanging-smoke.py"
+        helper.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import subprocess
+                import sys
+                import time
+
+                print(os.getpgrp(), flush=True)
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"]
+                )
+                time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        completed = module._run_bounded_smoke_process(
+            [sys.executable, str(helper)],
+            cwd=self.repo,
+            timeout=0.75,
+            cleanup_timeout=3,
+        )
+
+        self.assertEqual(completed.returncode, 124)
+        self.assertIn("hard timeout", completed.stderr)
+        process_group = int(completed.stdout.strip().splitlines()[0])
+        self.assertFalse(module._process_group_exists(process_group))
+
+    def test_bounded_smoke_kills_process_group_at_byte_ceiling(self) -> None:
+        module = self._load_runner_module()
+        helper = self.root / "noisy-smoke.py"
+        process_group_path = self.root / "noisy-smoke-pgid.txt"
+        helper.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import sys
+                import time
+
+                pathlib.Path(sys.argv[1]).write_text(
+                    str(os.getpgrp()),
+                    encoding="utf-8",
+                )
+                sys.stdout.write("x" * (1024 * 1024))
+                sys.stdout.flush()
+                time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        completed = module._run_bounded_smoke_process(
+            [sys.executable, str(helper), str(process_group_path)],
+            cwd=self.repo,
+            timeout=5,
+            cleanup_timeout=3,
+            max_capture_bytes=1024,
+        )
+
+        self.assertEqual(completed.returncode, 125)
+        self.assertIn("output exceeded 1024 bytes", completed.stderr)
+        self.assertLessEqual(
+            len(completed.stdout.encode("utf-8"))
+            + len(
+                completed.stderr.replace(
+                    "BLOCKED: smoke output exceeded 1024 bytes\n",
+                    "",
+                ).encode("utf-8")
+            ),
+            1024,
+        )
+        process_group = int(process_group_path.read_text(encoding="utf-8"))
+        self.assertFalse(module._process_group_exists(process_group))
 
     def test_rejects_passed_review_for_dirty_or_unproven_state(self) -> None:
         run_dir = self._prepare()
