@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -1091,6 +1092,102 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(smoke["status"], "passed")
         self.assertEqual(smoke["sample"], "READY")
 
+    def test_run_fallback_smoke_binds_prompt_snapshot_under_lock(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare()
+        prompt_path = run_dir / module.FALLBACK_SMOKE_PROMPT_NAME
+        original_prompt = prompt_path.read_bytes()
+        malicious_prompt = self.root / "malicious-smoke-prompt.md"
+        malicious_prompt.write_text("__FORCE_BLOCK__\n", encoding="utf-8")
+        real_acquired_run_lock = module._acquired_run_lock
+        real_read_regular_artifact = module._read_regular_artifact
+        lock_depth = 0
+        lock_acquisitions = 0
+        prompt_read_under_lock = False
+        captured_snapshot_fds: list[int] = []
+
+        @contextlib.contextmanager
+        def tracked_acquired_run_lock(*args, **kwargs):
+            nonlocal lock_acquisitions, lock_depth
+            with real_acquired_run_lock(*args, **kwargs):
+                lock_acquisitions += 1
+                if lock_acquisitions == 2:
+                    self.assertEqual(len(captured_snapshot_fds), 1)
+                    with self.assertRaises(OSError):
+                        os.fstat(captured_snapshot_fds[0])
+                lock_depth += 1
+                try:
+                    yield
+                finally:
+                    lock_depth -= 1
+
+        def tracked_read_regular_artifact(*args, **kwargs):
+            nonlocal prompt_read_under_lock
+            artifact = real_read_regular_artifact(*args, **kwargs)
+            if args[1] == module.FALLBACK_SMOKE_PROMPT_NAME:
+                self.assertGreater(lock_depth, 0)
+                prompt_read_under_lock = True
+            return artifact
+
+        def replacing_smoke(
+            command: list[str],
+            *,
+            cwd: pathlib.Path,
+            pass_fds: tuple[int, ...],
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(cwd, self.repo.resolve())
+            self.assertEqual(len(pass_fds), 1)
+            snapshot_fd = pass_fds[0]
+            captured_snapshot_fds.append(snapshot_fd)
+            prompt_index = command.index("--prompt-file") + 1
+            snapshot_path = pathlib.Path(command[prompt_index])
+            self.assertNotEqual(snapshot_path, prompt_path)
+            prompt_path.unlink()
+            prompt_path.symlink_to(malicious_prompt)
+            self.assertEqual(snapshot_path.read_bytes(), original_prompt)
+            self.assertEqual(
+                fcntl.fcntl(snapshot_fd, fcntl.F_GETFL) & os.O_ACCMODE,
+                os.O_RDONLY,
+            )
+            self.assertEqual(os.fstat(snapshot_fd).st_nlink, 0)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="READY\n",
+                stderr="",
+            )
+
+        with (
+            mock.patch.object(
+                module,
+                "_acquired_run_lock",
+                side_effect=tracked_acquired_run_lock,
+            ),
+            mock.patch.object(
+                module,
+                "_read_regular_artifact",
+                side_effect=tracked_read_regular_artifact,
+            ),
+            mock.patch.object(
+                module,
+                "_run_bounded_smoke_process",
+                side_effect=replacing_smoke,
+            ),
+        ):
+            result = module._run_fallback_smoke(
+                argparse.Namespace(run_dir=str(run_dir))
+            )
+
+        self.assertEqual(result, 0)
+        self.assertTrue(prompt_read_under_lock)
+        self.assertEqual(lock_acquisitions, 2)
+        self.assertEqual(len(captured_snapshot_fds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(captured_snapshot_fds[0])
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["fallback_readiness_smoke"]["status"], "passed")
+        self.assertEqual(state["fallback_readiness_smoke"]["sample"], "READY")
+
     def test_run_fallback_smoke_releases_lock_and_merges_other_updates(self) -> None:
         module = self._load_runner_module()
         run_dir = self._prepare()
@@ -1109,9 +1206,11 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             command: list[str],
             *,
             cwd: pathlib.Path,
+            pass_fds: tuple[int, ...],
         ) -> subprocess.CompletedProcess[str]:
             self.assertTrue(command)
             self.assertEqual(cwd, self.repo.resolve())
+            self.assertEqual(len(pass_fds), 1)
             smoke_started.set()
             if not release_smoke.wait(5):
                 raise RuntimeError("timed out waiting to release smoke")

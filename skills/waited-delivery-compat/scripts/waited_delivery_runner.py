@@ -19,6 +19,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -61,6 +62,7 @@ Output contract:
 """
 RUN_LOCK_NAME = ".state.lock"
 STATE_FILE_NAME = "state.json"
+FALLBACK_SMOKE_PROMPT_NAME = "fallback-smoke.prompt.md"
 RUNS_DIR_NAME = "waited-delivery"
 STATE_MAX_BYTES = 4 * 1024 * 1024
 FILE_MODE = 0o600
@@ -880,6 +882,177 @@ def _fd_execution_path(file_fd: int, name: str) -> pathlib.Path:
     raise UserError(f"cannot expose descriptor-bound compatibility artifact: {name}")
 
 
+@contextlib.contextmanager
+def _immutable_smoke_prompt_snapshot(
+    content: bytes,
+) -> Iterator[tuple[pathlib.Path, int]]:
+    with tempfile.TemporaryDirectory(
+        prefix="waited-delivery-smoke-prompt-"
+    ) as snapshot_dir_str:
+        snapshot_dir = pathlib.Path(snapshot_dir_str)
+        snapshot_name = "prompt.snapshot"
+        snapshot_dir_fd: int | None = None
+        write_fd: int | None = None
+        snapshot_fd: int | None = None
+        try:
+            try:
+                named_directory = os.lstat(snapshot_dir)
+                snapshot_dir_fd = os.open(
+                    snapshot_dir,
+                    _directory_open_flags(),
+                )
+                opened_directory = os.fstat(snapshot_dir_fd)
+                if (
+                    not stat.S_ISDIR(named_directory.st_mode)
+                    or not stat.S_ISDIR(opened_directory.st_mode)
+                    or not _same_object(named_directory, opened_directory)
+                    or opened_directory.st_uid != os.geteuid()
+                    or stat.S_IMODE(opened_directory.st_mode) != DIRECTORY_MODE
+                ):
+                    raise UserError(
+                        "smoke prompt snapshot directory is not owner-private"
+                    )
+
+                write_fd = os.open(
+                    snapshot_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    FILE_MODE,
+                    dir_fd=snapshot_dir_fd,
+                )
+                os.fchmod(write_fd, FILE_MODE)
+                offset = 0
+                while offset < len(content):
+                    written = os.write(write_fd, content[offset:])
+                    if written <= 0:
+                        raise UserError("cannot write immutable smoke prompt snapshot")
+                    offset += written
+                os.fsync(write_fd)
+                os.close(write_fd)
+                write_fd = None
+
+                snapshot_fd = os.open(
+                    snapshot_name,
+                    _regular_open_flags(),
+                    dir_fd=snapshot_dir_fd,
+                )
+                before = os.fstat(snapshot_fd)
+                named_before = os.stat(
+                    snapshot_name,
+                    dir_fd=snapshot_dir_fd,
+                    follow_symlinks=False,
+                )
+                first_content = _read_fd_bounded(
+                    snapshot_fd,
+                    snapshot_name,
+                    max_bytes=max(len(content), 1),
+                )
+                middle = os.fstat(snapshot_fd)
+                os.lseek(snapshot_fd, 0, os.SEEK_SET)
+                second_content = _read_fd_bounded(
+                    snapshot_fd,
+                    snapshot_name,
+                    max_bytes=max(len(content), 1),
+                )
+                after = os.fstat(snapshot_fd)
+                named_after = os.stat(
+                    snapshot_name,
+                    dir_fd=snapshot_dir_fd,
+                    follow_symlinks=False,
+                )
+                stable_stats = (
+                    before,
+                    named_before,
+                    middle,
+                    after,
+                    named_after,
+                )
+                expected_access = (
+                    before.st_uid,
+                    before.st_gid,
+                    stat.S_IMODE(before.st_mode),
+                )
+                if (
+                    any(not stat.S_ISREG(value.st_mode) for value in stable_stats)
+                    or any(
+                        not _same_object(before, value) for value in stable_stats[1:]
+                    )
+                    or any(
+                        (
+                            value.st_uid,
+                            value.st_gid,
+                            stat.S_IMODE(value.st_mode),
+                        )
+                        != expected_access
+                        for value in stable_stats[1:]
+                    )
+                    or before.st_uid != os.geteuid()
+                    or stat.S_IMODE(before.st_mode) != FILE_MODE
+                    or any(value.st_nlink != 1 for value in stable_stats)
+                    or any(value.st_size != len(content) for value in stable_stats)
+                    or first_content != content
+                    or second_content != content
+                    or (fcntl.fcntl(snapshot_fd, fcntl.F_GETFL) & os.O_ACCMODE)
+                    != os.O_RDONLY
+                ):
+                    raise UserError(
+                        "immutable smoke prompt snapshot identity, access, size, "
+                        "or content mismatch"
+                    )
+                os.lseek(snapshot_fd, 0, os.SEEK_SET)
+                os.unlink(snapshot_name, dir_fd=snapshot_dir_fd)
+                os.fsync(snapshot_dir_fd)
+                unlinked = os.fstat(snapshot_fd)
+                if (
+                    not _same_object(before, unlinked)
+                    or unlinked.st_nlink != 0
+                    or (
+                        unlinked.st_uid,
+                        unlinked.st_gid,
+                        stat.S_IMODE(unlinked.st_mode),
+                    )
+                    != expected_access
+                    or unlinked.st_size != len(content)
+                ):
+                    raise UserError(
+                        "immutable smoke prompt snapshot retained a mutable name "
+                        "or changed after unlink"
+                    )
+                execution_path = _fd_execution_path(
+                    snapshot_fd,
+                    snapshot_name,
+                )
+                os.lseek(snapshot_fd, 0, os.SEEK_SET)
+            except UserError:
+                raise
+            except OSError as error:
+                raise UserError(
+                    "cannot create immutable descriptor-bound smoke prompt snapshot"
+                ) from error
+
+            yield execution_path, snapshot_fd
+        finally:
+            if write_fd is not None:
+                os.close(write_fd)
+            if snapshot_fd is not None:
+                os.close(snapshot_fd)
+            if snapshot_dir_fd is not None:
+                try:
+                    os.stat(
+                        snapshot_name,
+                        dir_fd=snapshot_dir_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    os.unlink(snapshot_name, dir_fd=snapshot_dir_fd)
+                os.close(snapshot_dir_fd)
+
+
 def _validate_runner_loaded_from_descriptor(file_fd: int) -> pathlib.Path:
     execution_path = _fd_execution_path(file_fd, "waited_delivery_runner.py")
     loaded_path = pathlib.Path(os.path.abspath(__file__))
@@ -1446,7 +1619,7 @@ def _prepare(args: argparse.Namespace) -> int:
     contract_path = run_dir / "child-contract.md"
     child_prompt_path = run_dir / "child-prompt.md"
     parent_prompt_path = run_dir / "parent-prompt.md"
-    smoke_prompt_path = run_dir / "fallback-smoke.prompt.md"
+    smoke_prompt_path = run_dir / FALLBACK_SMOKE_PROMPT_NAME
     smoke_command_path = run_dir / "fallback-smoke.command.txt"
 
     state: WaitedDeliveryState = {
@@ -2276,12 +2449,17 @@ def _run_bounded_smoke_process(
     command: list[str],
     *,
     cwd: pathlib.Path,
+    pass_fds: tuple[int, ...] = (),
     timeout: float = SMOKE_TIMEOUT_SECONDS,
     cleanup_timeout: float = SMOKE_CLEANUP_TIMEOUT_SECONDS,
     max_capture_bytes: int = SMOKE_CAPTURE_MAX_BYTES,
 ) -> subprocess.CompletedProcess[str]:
     if not command or not all(isinstance(argument, str) for argument in command):
         raise UserError("fallback readiness smoke command must be a nonempty argv")
+    if any(not isinstance(file_fd, int) or file_fd < 0 for file_fd in pass_fds):
+        raise UserError(
+            "fallback readiness smoke pass_fds must be nonnegative integers"
+        )
     if timeout <= 0 or cleanup_timeout <= 0 or max_capture_bytes <= 0:
         raise UserError("fallback readiness smoke bounds must be positive")
     signal_transaction = _SmokeSignalTransaction()
@@ -2290,6 +2468,7 @@ def _run_bounded_smoke_process(
         completed = _run_bounded_smoke_process_supervised(
             command,
             cwd=cwd,
+            pass_fds=pass_fds,
             timeout=timeout,
             cleanup_timeout=cleanup_timeout,
             max_capture_bytes=max_capture_bytes,
@@ -2315,6 +2494,7 @@ def _run_bounded_smoke_process_supervised(
     command: list[str],
     *,
     cwd: pathlib.Path,
+    pass_fds: tuple[int, ...],
     timeout: float,
     cleanup_timeout: float,
     max_capture_bytes: int,
@@ -2339,6 +2519,7 @@ def _run_bounded_smoke_process_supervised(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 close_fds=True,
+                pass_fds=pass_fds,
                 start_new_session=True,
             )
         except OSError as error:
@@ -2477,73 +2658,115 @@ def _run_fallback_smoke(args: argparse.Namespace) -> int:
             lock_fd,
             lock_identity,
         ):
-            with _acquired_run_lock(run_fd, lock_fd, lock_identity):
-                _verify_run_directory_identity(
-                    run_dir,
-                    repo_root,
-                    run_fd,
-                    expected_identity=run_identity,
-                )
-                state, snapshot_state_version = _load_state_from_fd(
-                    run_dir,
-                    repo_root,
-                    run_fd,
-                )
-                snapshot_smoke = copy.deepcopy(state["fallback_readiness_smoke"])
-                if not snapshot_smoke["enabled"]:
-                    raise UserError("fallback readiness smoke is disabled for this run")
-                command = list(snapshot_smoke["command"])
-                smoke_cwd = pathlib.Path(state["repo_root"])
-
-            completed = _run_bounded_smoke_process(
-                command,
-                cwd=smoke_cwd,
-            )
-            status, sample = _classify_smoke(
-                stdout=completed.stdout,
-                stderr=completed.stderr,
-                returncode=completed.returncode,
-            )
-            with _acquired_run_lock(run_fd, lock_fd, lock_identity):
-                _verify_run_directory_identity(
-                    run_dir,
-                    repo_root,
-                    run_fd,
-                    expected_identity=run_identity,
-                )
-                latest_state, latest_state_version = _load_state_from_fd(
-                    run_dir,
-                    repo_root,
-                    run_fd,
-                )
-                latest_smoke = latest_state["fallback_readiness_smoke"]
-                if (
-                    latest_state_version != snapshot_state_version
-                    and latest_smoke != snapshot_smoke
-                ):
-                    raise UserError(
-                        "fallback readiness smoke state changed while the "
-                        "command was running"
+            with contextlib.ExitStack() as smoke_snapshot_stack:
+                with _acquired_run_lock(run_fd, lock_fd, lock_identity):
+                    _verify_run_directory_identity(
+                        run_dir,
+                        repo_root,
+                        run_fd,
+                        expected_identity=run_identity,
                     )
-                latest_smoke["status"] = status
-                latest_smoke["sample"] = sample
-                latest_smoke["stdout"] = completed.stdout
-                latest_smoke["stderr"] = completed.stderr
-                latest_smoke["returncode"] = completed.returncode
-                latest_smoke["updated_at"] = _utc_now()
-                _save_state(
-                    run_dir,
-                    repo_root,
-                    run_fd,
-                    latest_state,
-                    latest_state_version,
+                    state, snapshot_state_version = _load_state_from_fd(
+                        run_dir,
+                        repo_root,
+                        run_fd,
+                    )
+                    snapshot_smoke = copy.deepcopy(state["fallback_readiness_smoke"])
+                    if not snapshot_smoke["enabled"]:
+                        raise UserError(
+                            "fallback readiness smoke is disabled for this run"
+                        )
+                    expected_prompt_path = run_dir / FALLBACK_SMOKE_PROMPT_NAME
+                    if snapshot_smoke["prompt_file"] != str(
+                        expected_prompt_path
+                    ) or state["artifacts"]["fallback_smoke_prompt"] != str(
+                        expected_prompt_path
+                    ):
+                        raise UserError(
+                            "fallback readiness smoke prompt path does not match "
+                            "the descriptor-bound run artifact"
+                        )
+                    command = list(snapshot_smoke["command"])
+                    prompt_indexes = [
+                        index
+                        for index, argument in enumerate(command)
+                        if argument == "--prompt-file"
+                    ]
+                    if (
+                        len(prompt_indexes) != 1
+                        or prompt_indexes[0] + 1 >= len(command)
+                        or command[prompt_indexes[0] + 1] != str(expected_prompt_path)
+                    ):
+                        raise UserError(
+                            "fallback readiness smoke command does not bind the "
+                            "expected prompt artifact"
+                        )
+                    prompt_artifact = _read_regular_artifact(
+                        run_fd,
+                        FALLBACK_SMOKE_PROMPT_NAME,
+                        max_bytes=STATE_MAX_BYTES,
+                    )
+                    prompt_execution_path, prompt_snapshot_fd = (
+                        smoke_snapshot_stack.enter_context(
+                            _immutable_smoke_prompt_snapshot(
+                                prompt_artifact.content,
+                            )
+                        )
+                    )
+                    command[prompt_indexes[0] + 1] = str(prompt_execution_path)
+                    smoke_cwd = pathlib.Path(state["repo_root"])
+
+                completed = _run_bounded_smoke_process(
+                    command,
+                    cwd=smoke_cwd,
+                    pass_fds=(prompt_snapshot_fd,),
                 )
-                _verify_run_directory_identity(
-                    run_dir,
-                    repo_root,
-                    run_fd,
-                    expected_identity=run_identity,
+                status, sample = _classify_smoke(
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    returncode=completed.returncode,
                 )
+                smoke_snapshot_stack.close()
+                with _acquired_run_lock(run_fd, lock_fd, lock_identity):
+                    _verify_run_directory_identity(
+                        run_dir,
+                        repo_root,
+                        run_fd,
+                        expected_identity=run_identity,
+                    )
+                    latest_state, latest_state_version = _load_state_from_fd(
+                        run_dir,
+                        repo_root,
+                        run_fd,
+                    )
+                    latest_smoke = latest_state["fallback_readiness_smoke"]
+                    if (
+                        latest_state_version != snapshot_state_version
+                        and latest_smoke != snapshot_smoke
+                    ):
+                        raise UserError(
+                            "fallback readiness smoke state changed while the "
+                            "command was running"
+                        )
+                    latest_smoke["status"] = status
+                    latest_smoke["sample"] = sample
+                    latest_smoke["stdout"] = completed.stdout
+                    latest_smoke["stderr"] = completed.stderr
+                    latest_smoke["returncode"] = completed.returncode
+                    latest_smoke["updated_at"] = _utc_now()
+                    _save_state(
+                        run_dir,
+                        repo_root,
+                        run_fd,
+                        latest_state,
+                        latest_state_version,
+                    )
+                    _verify_run_directory_identity(
+                        run_dir,
+                        repo_root,
+                        run_fd,
+                        expected_identity=run_identity,
+                    )
     finally:
         os.close(run_fd)
     if sample:
