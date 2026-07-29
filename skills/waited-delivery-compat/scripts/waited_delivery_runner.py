@@ -2195,6 +2195,16 @@ def _process_group_exists(
     return True
 
 
+def _process_group_is_addressable(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _kill_process_group(pgid: int) -> None:
     try:
         os.killpg(pgid, signal.SIGKILL)
@@ -2248,14 +2258,14 @@ def _cleanup_smoke_process(
         returncode = process.poll()
         if (
             returncode is not None
-            and not _process_group_exists(process.pid)
+            and not _process_group_is_addressable(process.pid)
             and not selector.get_map()
         ):
             return
     reasons: list[str] = []
     if process.poll() is None:
         reasons.append("failed to reap smoke process")
-    if _process_group_exists(process.pid):
+    if _process_group_is_addressable(process.pid):
         reasons.append("failed to prove smoke process-group disappearance")
     if selector.get_map():
         reasons.append("failed to drain smoke process pipes")

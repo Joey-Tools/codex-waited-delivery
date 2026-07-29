@@ -1222,6 +1222,28 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(state["fallback_readiness_smoke"]["status"], "passed")
         self.assertEqual(state["fallback_readiness_smoke"]["sample"], "READY")
 
+    def test_zombie_only_group_remains_addressable_for_cleanup(self) -> None:
+        module = self._load_runner_module()
+        proc_root = self.root / "proc"
+        process_dir = proc_root / "201"
+        process_dir.mkdir(parents=True)
+        (process_dir / "stat").write_text(
+            "201 (fixture) Z 1 77 1 0\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(module.os, "killpg", return_value=None) as killpg:
+            self.assertFalse(
+                module._process_group_exists(
+                    77,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+            self.assertTrue(module._process_group_is_addressable(77))
+
+        self.assertEqual(killpg.call_args_list, [mock.call(77, 0), mock.call(77, 0)])
+
     def test_bounded_smoke_kills_timed_out_process_group(self) -> None:
         module = self._load_runner_module()
         helper = self.root / "hanging-smoke.py"
