@@ -877,17 +877,66 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         process_group = int(process_group_path.read_text(encoding="utf-8"))
         self.assertFalse(module._process_group_exists(process_group))
 
+    def test_bounded_smoke_selector_failure_precedes_process_launch(self) -> None:
+        module = self._load_runner_module()
+        launch_marker = self.root / "selector-failure-launched.txt"
+        helper = self.root / "selector-failure-smoke.py"
+        helper.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import sys
+
+                pathlib.Path(sys.argv[1]).write_text("launched", encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            module.selectors,
+            "DefaultSelector",
+            side_effect=OSError("selector unavailable"),
+        ):
+            with mock.patch.object(
+                module.subprocess,
+                "Popen",
+                wraps=module.subprocess.Popen,
+            ) as popen:
+                with self.assertRaisesRegex(
+                    module.UserError,
+                    "cannot initialize fallback readiness smoke selector",
+                ):
+                    module._run_bounded_smoke_process(
+                        [sys.executable, str(helper), str(launch_marker)],
+                        cwd=self.repo,
+                    )
+
+        popen.assert_not_called()
+        self.assertFalse(launch_marker.exists())
+
     def test_smoke_nonzero_status_overrides_ready_output(self) -> None:
         module = self._load_runner_module()
         for returncode in (1, 7, 124, 125, 126, -signal.SIGKILL):
-            with self.subTest(returncode=returncode):
-                status, sample = module._classify_smoke(
-                    "READY\n",
-                    "",
-                    returncode,
-                )
-                self.assertEqual(status, "blocked")
-                self.assertNotEqual(sample, "READY")
+            for stdout, stderr in (
+                ("READY\n", ""),
+                ("", "READY\n"),
+                ("READY\n", "READY\n"),
+            ):
+                with self.subTest(
+                    returncode=returncode,
+                    ready_streams=(bool(stdout), bool(stderr)),
+                ):
+                    status, sample = module._classify_smoke(
+                        stdout,
+                        stderr,
+                        returncode,
+                    )
+                    self.assertEqual(status, "blocked")
+                    self.assertIsNotNone(sample)
+                    assert sample is not None
+                    self.assertTrue(sample.startswith("BLOCKED:"))
+                    self.assertNotEqual(sample, "READY")
 
     def test_ready_output_does_not_override_bounded_process_failures(self) -> None:
         module = self._load_runner_module()
@@ -1087,6 +1136,170 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                         f"process group {process_group} survived "
                         f"{signal.Signals(signum).name}",
                     )
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.communicate(timeout=5)
+                    if process_group is not None and module._process_group_exists(
+                        process_group
+                    ):
+                        os.killpg(process_group, signal.SIGKILL)
+
+    def test_smoke_redelivers_to_returning_handler_after_group_cleanup(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        helper = self.root / "custom-handler-signal-resistant-smoke.py"
+        harness = self.root / "custom-handler-smoke-signal-harness.py"
+        process_group_path = self.root / "custom-handler-smoke-pgid.txt"
+        handler_result_path = self.root / "custom-handler-result.txt"
+        completed_result_path = self.root / "custom-handler-completed.txt"
+        helper.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import signal
+                import subprocess
+                import sys
+                import time
+
+                for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
+                    signal.signal(signum, signal.SIG_IGN)
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import signal,time;"
+                            "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
+                            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                            "signal.signal(signal.SIGQUIT,signal.SIG_IGN);"
+                            "time.sleep(60)"
+                        ),
+                    ]
+                )
+                pathlib.Path(sys.argv[1]).write_text(
+                    str(os.getpgrp()),
+                    encoding="utf-8",
+                )
+                print("READY", flush=True)
+                time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+        harness.write_text(
+            textwrap.dedent(
+                f"""\
+                import importlib.util
+                import os
+                import pathlib
+                import signal
+                import sys
+
+                process_group_path = pathlib.Path(sys.argv[1])
+                handler_result_path = pathlib.Path(sys.argv[2])
+                completed_result_path = pathlib.Path(sys.argv[3])
+
+                def returning_handler(signum, _frame):
+                    process_group = int(
+                        process_group_path.read_text(encoding="utf-8")
+                    )
+                    try:
+                        os.killpg(process_group, 0)
+                    except ProcessLookupError:
+                        group_state = "gone"
+                    except PermissionError:
+                        group_state = "live"
+                    else:
+                        group_state = "live"
+                    handler_result_path.write_text(
+                        f"{{signum}}:{{group_state}}",
+                        encoding="utf-8",
+                    )
+
+                for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
+                    signal.signal(signum, returning_handler)
+
+                spec = importlib.util.spec_from_file_location(
+                    "waited_delivery_runner_custom_signal_harness",
+                    {str(SCRIPT_PATH)!r},
+                )
+                if spec is None or spec.loader is None:
+                    raise RuntimeError("cannot load waited-delivery runner")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+                completed = module._run_bounded_smoke_process(
+                    [
+                        sys.executable,
+                        {str(helper)!r},
+                        str(process_group_path),
+                    ],
+                    cwd=pathlib.Path({str(self.repo)!r}),
+                    timeout=60,
+                    cleanup_timeout=3,
+                )
+                completed_result_path.write_text(
+                    str(completed.returncode),
+                    encoding="utf-8",
+                )
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
+            with self.subTest(signum=signal.Signals(signum).name):
+                process_group_path.unlink(missing_ok=True)
+                handler_result_path.unlink(missing_ok=True)
+                completed_result_path.unlink(missing_ok=True)
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(harness),
+                        str(process_group_path),
+                        str(handler_result_path),
+                        str(completed_result_path),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                process_group: int | None = None
+                try:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if process_group_path.is_file():
+                            process_group = int(
+                                process_group_path.read_text(encoding="utf-8")
+                            )
+                            break
+                        if process.poll() is not None:
+                            break
+                        time.sleep(0.02)
+                    self.assertIsNotNone(
+                        process_group,
+                        "smoke helper did not publish its process group",
+                    )
+                    os.kill(process.pid, signum)
+                    stdout, stderr = process.communicate(timeout=10)
+                    self.assertEqual(
+                        process.returncode,
+                        0,
+                        f"stdout={stdout!r}\nstderr={stderr!r}",
+                    )
+                    self.assertEqual(
+                        handler_result_path.read_text(encoding="utf-8"),
+                        f"{signum}:gone",
+                    )
+                    self.assertEqual(
+                        completed_result_path.read_text(encoding="utf-8"),
+                        str(128 + signum),
+                    )
+                    assert process_group is not None
+                    self.assertFalse(module._process_group_exists(process_group))
                 finally:
                     if process.poll() is None:
                         process.kill()

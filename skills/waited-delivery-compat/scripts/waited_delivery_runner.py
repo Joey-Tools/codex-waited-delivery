@@ -1609,6 +1609,10 @@ class _SmokeSignalTransaction:
         self._raised = True
         raise _DeferredSmokeTermination(self._pending_signal)
 
+    @property
+    def pending_signal(self) -> int | None:
+        return self._pending_signal
+
     def _capture_pending_masked(
         self,
         sigpending: object,
@@ -1686,9 +1690,7 @@ class _SmokeSignalTransaction:
                     f"cannot restore smoke supervision terminal signal mask: {error}"
                 ) from error
 
-        if self._pending_signal is not None:
-            raise SystemExit(128 + self._pending_signal)
-        return False
+        return isinstance(exc, _DeferredSmokeTermination)
 
 
 def _parse_linux_proc_stat(raw: str) -> tuple[str, int] | None:
@@ -1856,8 +1858,10 @@ def _run_bounded_smoke_process(
         raise UserError("fallback readiness smoke command must be a nonempty argv")
     if timeout <= 0 or cleanup_timeout <= 0 or max_capture_bytes <= 0:
         raise UserError("fallback readiness smoke bounds must be positive")
-    with _SmokeSignalTransaction() as signal_transaction:
-        return _run_bounded_smoke_process_supervised(
+    signal_transaction = _SmokeSignalTransaction()
+    completed: subprocess.CompletedProcess[str] | None = None
+    with signal_transaction:
+        completed = _run_bounded_smoke_process_supervised(
             command,
             cwd=cwd,
             timeout=timeout,
@@ -1865,6 +1869,20 @@ def _run_bounded_smoke_process(
             max_capture_bytes=max_capture_bytes,
             signal_transaction=signal_transaction,
         )
+    if signal_transaction.pending_signal is not None:
+        signum = signal_transaction.pending_signal
+        return subprocess.CompletedProcess(
+            command,
+            128 + signum,
+            stdout="" if completed is None else completed.stdout,
+            stderr=(
+                f"BLOCKED: smoke interrupted by {signal.Signals(signum).name} "
+                "after process-group cleanup\n"
+            ),
+        )
+    if completed is None:
+        raise UserError("smoke process completed without a result")
+    return completed
 
 
 def _run_bounded_smoke_process_supervised(
@@ -1876,116 +1894,127 @@ def _run_bounded_smoke_process_supervised(
     max_capture_bytes: int,
     signal_transaction: _SmokeSignalTransaction,
 ) -> subprocess.CompletedProcess[str]:
-    signal_transaction.raise_if_pending()
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            start_new_session=True,
-        )
+        selector = selectors.DefaultSelector()
     except OSError as error:
-        raise UserError(f"cannot start fallback readiness smoke: {error}") from error
-    assert process.stdout is not None
-    assert process.stderr is not None
-    selector = selectors.DefaultSelector()
+        raise UserError(
+            f"cannot initialize fallback readiness smoke selector: {error}"
+        ) from error
     captures = {"stdout": bytearray(), "stderr": bytearray()}
     failure: tuple[int, str] | None = None
     cleanup_complete = False
     try:
-        for name, stream in (
-            ("stdout", process.stdout),
-            ("stderr", process.stderr),
-        ):
-            os.set_blocking(stream.fileno(), False)
-            selector.register(stream.fileno(), selectors.EVENT_READ, name)
         signal_transaction.raise_if_pending()
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise UserError(
+                f"cannot start fallback readiness smoke: {error}"
+            ) from error
+        try:
+            if process.stdout is None or process.stderr is None:
+                raise UserError("smoke process pipes were not created")
+            for name, stream in (
+                ("stdout", process.stdout),
+                ("stderr", process.stderr),
+            ):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream.fileno(), selectors.EVENT_READ, name)
             signal_transaction.raise_if_pending()
-            remaining = deadline - time.monotonic()
-            try:
-                _drain_process_output_once(
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                signal_transaction.raise_if_pending()
+                remaining = deadline - time.monotonic()
+                try:
+                    _drain_process_output_once(
+                        selector,
+                        captures,
+                        timeout=min(
+                            PROCESS_POLL_INTERVAL_SECONDS,
+                            max(0.0, remaining),
+                        ),
+                        capture=True,
+                        max_capture_bytes=max_capture_bytes,
+                    )
+                except _CaptureLimitExceeded:
+                    failure = (
+                        125,
+                        f"BLOCKED: smoke output exceeded {max_capture_bytes} bytes",
+                    )
+                    break
+                signal_transaction.raise_if_pending()
+                returncode = process.poll()
+                if returncode is None:
+                    continue
+                if _process_group_exists(process.pid):
+                    failure = (
+                        126,
+                        "BLOCKED: smoke left a live descendant in its process group",
+                    )
+                    break
+                if not selector.get_map():
+                    break
+            else:
+                failure = (
+                    124,
+                    f"BLOCKED: smoke exceeded {timeout:g} second hard timeout",
+                )
+
+            if failure is not None:
+                _cleanup_smoke_process(
+                    process,
                     selector,
                     captures,
-                    timeout=min(
-                        PROCESS_POLL_INTERVAL_SECONDS,
-                        max(0.0, remaining),
-                    ),
-                    capture=True,
+                    cleanup_timeout=cleanup_timeout,
                     max_capture_bytes=max_capture_bytes,
                 )
-            except _CaptureLimitExceeded:
-                failure = (
-                    125,
-                    f"BLOCKED: smoke output exceeded {max_capture_bytes} bytes",
+                cleanup_complete = True
+                returncode, reason = failure
+                stderr = captures["stderr"].decode("utf-8", errors="replace")
+                if stderr and not stderr.endswith("\n"):
+                    stderr += "\n"
+                stderr += reason + "\n"
+                return subprocess.CompletedProcess(
+                    command,
+                    returncode,
+                    stdout=captures["stdout"].decode("utf-8", errors="replace"),
+                    stderr=stderr,
                 )
-                break
-            signal_transaction.raise_if_pending()
+
             returncode = process.poll()
             if returncode is None:
-                continue
-            if _process_group_exists(process.pid):
-                failure = (
-                    126,
-                    "BLOCKED: smoke left a live descendant in its process group",
-                )
-                break
-            if not selector.get_map():
-                break
-        else:
-            failure = (
-                124,
-                f"BLOCKED: smoke exceeded {timeout:g} second hard timeout",
-            )
-
-        if failure is not None:
-            _cleanup_smoke_process(
-                process,
-                selector,
-                captures,
-                cleanup_timeout=cleanup_timeout,
-                max_capture_bytes=max_capture_bytes,
-            )
-            cleanup_complete = True
-            returncode, reason = failure
-            stderr = captures["stderr"].decode("utf-8", errors="replace")
-            if stderr and not stderr.endswith("\n"):
-                stderr += "\n"
-            stderr += reason + "\n"
+                raise UserError("smoke process reached an impossible terminal state")
             return subprocess.CompletedProcess(
                 command,
                 returncode,
                 stdout=captures["stdout"].decode("utf-8", errors="replace"),
-                stderr=stderr,
+                stderr=captures["stderr"].decode("utf-8", errors="replace"),
             )
-
-        returncode = process.poll()
-        if returncode is None:
-            raise UserError("smoke process reached an impossible terminal state")
-        return subprocess.CompletedProcess(
-            command,
-            returncode,
-            stdout=captures["stdout"].decode("utf-8", errors="replace"),
-            stderr=captures["stderr"].decode("utf-8", errors="replace"),
-        )
-    except BaseException:
-        if not cleanup_complete:
-            _cleanup_smoke_process(
-                process,
-                selector,
-                captures,
-                cleanup_timeout=cleanup_timeout,
-                max_capture_bytes=max_capture_bytes,
-            )
-        raise
+        except BaseException:
+            if not cleanup_complete:
+                _cleanup_smoke_process(
+                    process,
+                    selector,
+                    captures,
+                    cleanup_timeout=cleanup_timeout,
+                    max_capture_bytes=max_capture_bytes,
+                )
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
     finally:
         selector.close()
-        process.stdout.close()
-        process.stderr.close()
 
 
 def _classify_smoke(
@@ -1994,12 +2023,17 @@ def _classify_smoke(
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     if returncode != 0:
         err_lines = [line.strip() for line in stderr.splitlines() if line.strip()]
-        if err_lines:
-            return "blocked", err_lines[-1]
-        blocked = next((line for line in lines if line.startswith("BLOCKED:")), None)
+        blocked = next(
+            (
+                line
+                for line in reversed((*lines, *err_lines))
+                if line.startswith("BLOCKED:")
+            ),
+            None,
+        )
         if blocked:
             return "blocked", blocked
-        return "blocked", f"process exited with code {returncode}"
+        return "blocked", f"BLOCKED: process exited with code {returncode}"
     if lines and lines[-1] == "READY":
         return "passed", "READY"
     blocked = next((line for line in lines if line.startswith("BLOCKED:")), None)
