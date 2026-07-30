@@ -178,6 +178,7 @@ class OrchestrationState(TypedDict):
 class WaitedDeliveryState(TypedDict):
     schema_version: int
     run_id: str
+    preparation_id: str | None
     repo_root: str
     goal: str
     created_at: str
@@ -388,6 +389,49 @@ def _validate_component_name(name: str, *, label: str) -> None:
         raise UserError(f"{label} must be one path component: {name!r}")
 
 
+def _preflight_utf8_artifact(name: str, content: str) -> None:
+    try:
+        content.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise UserError(
+            f"run artifact is not valid UTF-8 before run creation: {name}"
+        ) from error
+
+
+def _generate_run_id(transaction_time: str) -> str:
+    return (
+        f"{dt.datetime.fromisoformat(transaction_time):%Y%m%dT%H%M%SZ}-"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+
+
+def _prospective_run_directory(
+    repo_root: pathlib.Path,
+    run_id: str,
+) -> pathlib.Path:
+    _validate_component_name(run_id, label="run id")
+    try:
+        encoded_run_id = os.fsencode(run_id)
+    except UnicodeEncodeError as error:
+        raise UserError(
+            "run id cannot be represented by the repository filesystem"
+        ) from error
+    if b"\0" in encoded_run_id:
+        raise UserError("run id cannot contain a NUL byte")
+    try:
+        name_max = os.pathconf(repo_root, "PC_NAME_MAX")
+    except (OSError, ValueError) as error:
+        raise UserError(
+            "repository component-length limit cannot be determined safely"
+        ) from error
+    if name_max >= 0 and len(encoded_run_id) > name_max:
+        raise UserError(
+            f"run id exceeds the repository component-length limit "
+            f"({len(encoded_run_id)} > {name_max} bytes)"
+        )
+    return repo_root / ".codex-tmp" / RUNS_DIR_NAME / run_id
+
+
 def _open_absolute_directory(path: pathlib.Path) -> int:
     if not path.is_absolute():
         raise UserError(f"directory path must be absolute: {path}")
@@ -418,7 +462,28 @@ def _ensure_directory_at(parent_fd: int, name: str) -> int:
         os.mkdir(name, DIRECTORY_MODE, dir_fd=parent_fd)
     except FileExistsError:
         pass
-    return _open_directory_at(parent_fd, name)
+    directory_fd = _open_directory_at(parent_fd, name)
+    try:
+        descriptor_stat = os.fstat(directory_fd)
+        named_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(descriptor_stat.st_mode)
+            or not stat.S_ISDIR(named_stat.st_mode)
+            or not _same_object(descriptor_stat, named_stat)
+        ):
+            raise UserError(f"run parent directory identity mismatch: {name}")
+        os.fsync(parent_fd)
+        named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(named_after.st_mode) or not _same_object(
+            descriptor_stat, named_after
+        ):
+            raise UserError(
+                f"run parent directory changed while persisting its entry: {name}"
+            )
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
 
 
 def _run_layout(
@@ -553,7 +618,7 @@ def _create_run_directory(
     repo_root: pathlib.Path,
     run_id: str,
 ) -> tuple[pathlib.Path, int]:
-    _validate_component_name(run_id, label="run id")
+    run_dir = _prospective_run_directory(repo_root, run_id)
     repo_fd = _open_absolute_directory(repo_root)
     codex_tmp_fd: int | None = None
     runs_fd: int | None = None
@@ -567,13 +632,19 @@ def _create_run_directory(
                 f"run directory already exists for run id: {run_id}"
             ) from error
         run_fd = _open_directory_at(runs_fd, run_id)
+        _verify_run_directory_identity(run_dir, repo_root, run_fd)
+        os.fsync(runs_fd)
+        _verify_run_directory_identity(run_dir, repo_root, run_fd)
+    except OSError as error:
+        raise UserError(
+            "run directory parents are unsafe or unavailable for creation"
+        ) from error
     finally:
         if runs_fd is not None:
             os.close(runs_fd)
         if codex_tmp_fd is not None:
             os.close(codex_tmp_fd)
         os.close(repo_fd)
-    run_dir = repo_root / ".codex-tmp" / RUNS_DIR_NAME / run_id
     try:
         _verify_run_directory_identity(run_dir, repo_root, run_fd)
     except Exception:
@@ -1036,6 +1107,7 @@ def _load_state_from_fd(
     if not isinstance(payload, dict):
         raise UserError(f"invalid state payload: {run_dir / STATE_FILE_NAME}")
     state = cast(WaitedDeliveryState, payload)
+    state.setdefault("preparation_id", None)
     if state.get("repo_root") != str(repo_root):
         raise UserError(
             "state repo_root does not exactly match the run directory repository"
@@ -1511,14 +1583,39 @@ def _prepare(args: argparse.Namespace) -> int:
         if args.changed_file
         else _collect_changed_files(repo_root)
     )
+    initial_transaction_time = _utc_now()
     run_id = (
         args.run_id
-        or f"{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
+        if args.run_id is not None
+        else _generate_run_id(initial_transaction_time)
     )
+    run_dir = _prospective_run_directory(repo_root, run_id)
+    preparation_id = args.preparation_id
+    preparation_lease_fd = args.preparation_lease_fd
+    if (preparation_id is None) != (preparation_lease_fd is None):
+        raise UserError(
+            "preparation id and inherited preparation lease fd must be supplied together"
+        )
+    if preparation_id is not None:
+        _validate_component_name(preparation_id, label="preparation id")
+        assert preparation_lease_fd is not None
+        if preparation_lease_fd < 0:
+            raise UserError("preparation lease fd must be nonnegative")
+        try:
+            lease_stat = os.fstat(preparation_lease_fd)
+        except OSError as error:
+            raise UserError("preparation lease fd is not open") from error
+        if (
+            not stat.S_ISREG(lease_stat.st_mode)
+            or lease_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(lease_stat.st_mode) != FILE_MODE
+        ):
+            raise UserError(
+                "preparation lease fd must be an owner-private regular file"
+            )
     phases_order = args.phase or list(DEFAULT_PHASES)
     if "internal_review" not in phases_order:
         raise UserError("phase order must include the required internal_review phase")
-    run_dir, run_fd = _create_run_directory(repo_root, run_id)
 
     state_path = run_dir / "state.json"
     contract_path = run_dir / "child-contract.md"
@@ -1526,11 +1623,10 @@ def _prepare(args: argparse.Namespace) -> int:
     parent_prompt_path = run_dir / "parent-prompt.md"
     smoke_prompt_path = run_dir / FALLBACK_SMOKE_PROMPT_NAME
     smoke_command_path = run_dir / "fallback-smoke.command.txt"
-    initial_transaction_time = _utc_now()
-
     state: WaitedDeliveryState = {
-        "schema_version": 3,
+        "schema_version": 4,
         "run_id": run_id,
+        "preparation_id": preparation_id,
         "repo_root": str(repo_root),
         "goal": args.goal,
         "created_at": initial_transaction_time,
@@ -1580,36 +1676,56 @@ def _prepare(args: argparse.Namespace) -> int:
         transaction_time=initial_transaction_time,
         context="initial state",
     )
+    initial_artifacts = {
+        smoke_prompt_path.name: FALLBACK_SMOKE_PROMPT,
+        contract_path.name: _build_child_contract(state),
+        child_prompt_path.name: _build_child_prompt(run_dir, state),
+        parent_prompt_path.name: _build_parent_prompt(run_dir, state),
+        smoke_command_path.name: (
+            _shell_command(state["fallback_readiness_smoke"]["command"]) + "\n"
+        ),
+        state_path.name: initial_state_json,
+    }
+    for artifact_name, artifact_content in initial_artifacts.items():
+        _preflight_utf8_artifact(artifact_name, artifact_content)
+
+    run_dir, run_fd = _create_run_directory(repo_root, run_id)
     try:
         with _run_lock(run_fd):
             _atomic_write_regular(
                 run_fd,
                 smoke_prompt_path.name,
-                FALLBACK_SMOKE_PROMPT,
+                initial_artifacts[smoke_prompt_path.name],
                 expected_version=None,
             )
             _atomic_write_regular(
                 run_fd,
                 contract_path.name,
-                _build_child_contract(state),
+                initial_artifacts[contract_path.name],
                 expected_version=None,
             )
-            _write_current_prompts(
-                run_dir,
+            _atomic_write_regular(
                 run_fd,
-                state,
-                require_existing=False,
+                child_prompt_path.name,
+                initial_artifacts[child_prompt_path.name],
+                expected_version=None,
+            )
+            _atomic_write_regular(
+                run_fd,
+                parent_prompt_path.name,
+                initial_artifacts[parent_prompt_path.name],
+                expected_version=None,
             )
             _atomic_write_regular(
                 run_fd,
                 smoke_command_path.name,
-                _shell_command(state["fallback_readiness_smoke"]["command"]) + "\n",
+                initial_artifacts[smoke_command_path.name],
                 expected_version=None,
             )
             _atomic_write_regular(
                 run_fd,
                 state_path.name,
-                initial_state_json,
+                initial_artifacts[state_path.name],
                 expected_version=None,
                 max_content_bytes=STATE_MAX_BYTES,
             )
@@ -1622,6 +1738,8 @@ def _prepare(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "run_dir": str(run_dir),
+                    "preparation_id": state["preparation_id"],
+                    "preparation_lease_inherited": (preparation_lease_fd is not None),
                     "state_json": state["artifacts"]["state_json"],
                     "child_contract": state["artifacts"]["child_contract"],
                     "child_prompt": state["artifacts"]["child_prompt"],
@@ -3080,6 +3198,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--goal", required=True, help="Short delivery goal for the current run."
     )
     prepare.add_argument("--run-id", help="Optional explicit run identifier.")
+    prepare.add_argument(
+        "--preparation-id",
+        help="Optional stable adapter preparation transaction identifier.",
+    )
+    prepare.add_argument(
+        "--preparation-lease-fd",
+        type=int,
+        help="Inherited adapter preparation lease descriptor.",
+    )
     prepare.add_argument(
         "--json",
         action="store_true",

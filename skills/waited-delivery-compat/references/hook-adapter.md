@@ -14,9 +14,10 @@ default.
 The adapter adds one explicitly enabled layer above the bridge:
 
 - `UserPromptSubmit` hook records the current session metadata in a repo-local session index only when its command includes `--enable-compat-hook`
-- every session-index command takes one descriptor-bound repo-local transaction lock before loading the index and holds it through selection, bridge/state work, mutation, and atomic commit, so concurrent hook and active-run commands cannot overwrite one another from stale snapshots
-- `prepare-active-run` resolves an unambiguous observed session and binds it to a new `run_dir`
-- `Stop` hook checks that session index and blocks premature finish while the run is still active only when its command includes `--enable-compat-hook`
+- every session-index load/mutation/commit uses a descriptor-bound repo-local transaction, while `prepare-active-run` uses two short transactions around bridge work so other commands can observe and respect the durable intermediate reservation
+- `prepare-active-run` resolves an unambiguous observed session, persists an exact `preparing` reservation and inherited preparation lease before bridge execution, then CAS-promotes only the same fully-attested run to `active`
+- `recover-active-run` reports, resumes, or clears the exact reservation only after the inherited lease proves the cooperating adapter/bridge/runner writer chain is quiescent
+- `Stop` hook checks that session index and blocks premature finish while the run is active or preparation recovery is pending only when its command includes `--enable-compat-hook`
 - before rendering an active-run continuation, `Stop` calls `refresh-prompts-live` so both persisted prompts use the currently loaded compatibility runner instead of a removed historical absolute path
 - before that refresh, `Stop` opens the repo/run path component-by-component without following links, requires the indexed `run_dir` to be a direct child of the current repo's `.codex-tmp/waited-delivery`, requires exact `state.repo_root` equality, and requires regular no-follow state and prompt files. It accepts either the current user plus mode `0700`, or the exact owned legacy mode `0755`; the latter is tightened to `0700` through the open directory descriptor and revalidated for unchanged device/inode and owner/group before any artifact read. Every other access policy fails closed. It records the resulting run directory's exact device/inode and POSIX uid/gid/mode.
 - `Stop` keeps that run descriptor open while refresh runs. It stable-reads both bridge and runner sources, binding each named entry, object identity, uid/gid/mode, size, and two bounded byte reads plus SHA-256 digest, then revalidates both source versions before process launch. It frames those exact bytes with magic, bounded lengths, and digests and sends them through anonymous stdin to a fixed Python `-I -B -S -c` bootstrap after removing Python environment-injection variables. The bootstrap requires exact bytes and EOF before compiling the bridge in memory; the bridge then sends the runner through a separately framed anonymous pipe to another fixed bootstrap. Neither layer creates a regular-file source snapshot, inherits a source descriptor, or falls back to a source path or sibling lookup. The outer refresh process runs in a new session with a seven-second hard deadline, a captured-byte ceiling, and bounded whole-process-group kill/drain/reap. Its selector services source input together with stdout/stderr, classifies an early reader close or incomplete input as terminal `126`, closes the writer before cleanup, and never accepts success before the whole frame is delivered. One deferred `SIGHUP`/`SIGTERM`/`SIGQUIT` transaction remains armed until cleanup finishes and only then restores and redelivers the first terminal signal. On Linux, the protected cleanup property is absence of live same-PGID members that can retain resources or act: a bounded byte-oriented `/proc` scan accepts a proven zombie-only group, including a non-UTF-8 process name, while unreadable, iteration-failed, or parse-ambiguous evidence remains live and fails closed. Under the run lock, the runner revalidates its injected bytes immediately before the first prompt/state write. Refresh schema `3` returns exact bridge/runner source-provenance versions, both `anonymous-pipe-memory` transports, non-reopenability, canonical compile filenames, isolated-execution attestation, and each newly published prompt version. The adapter compares those receipts to its stable-bound versions and rereads state/prompts through the pinned run descriptor before rendering guidance. Timestamp-only churn is deliberately excluded because it changes none of the protected properties. A source replacement, owner/group drift, mode change, or content change observed before launch fails before any prompt/state write, while a source-path A→B→A change after stable binding cannot execute the intermediate object.
@@ -31,17 +32,19 @@ The adapter stores repo-local state under:
 
 - `.codex-tmp/waited-delivery-hook-adapter/index.json`
 - `.codex-tmp/waited-delivery-hook-adapter/index.lock`
+- `.codex-tmp/waited-delivery-hook-adapter/prepare-<preparation-id>.lease`
 
-The adapter directory is owner-only `0700`; each newly committed index snapshot
-and the transaction lock are `0600`. Both files are opened descriptor-relative
-with no-follow semantics. Index reads bind the named entry, regular-file object
-identity, owner/access policy, size, and two bounded byte reads. A changed index
-is written completely to a verified `0600` sibling temporary file, fsynced,
-atomically replaced, and directory-fsynced. Deliberate inode replacement at
-commit is expected; following or overwriting an object outside the adapter
-directory, exposing a newly persisted prompt through the umask, partial JSON
-visibility, and lost cooperative read-modify-write updates are the protected
-properties.
+The adapter directory is owner-only `0700`; each newly committed index snapshot,
+transaction lock, and preparation lease is `0600`. Directory name entries are
+descriptor-revalidated and parent-directory-fsynced. The files are opened
+descriptor-relative with no-follow semantics. Index reads bind the named entry,
+regular-file object identity, owner/access policy, size, and two bounded byte
+reads. A changed index is written completely to a verified `0600` sibling
+temporary file, fsynced, atomically replaced, and directory-fsynced. Deliberate
+inode replacement at commit is expected; following or overwriting an object
+outside the adapter directory, exposing a newly persisted prompt through the
+umask, partial JSON visibility, and lost cooperative read-modify-write updates
+are the protected properties.
 
 Current records are keyed by `session_id` and include:
 
@@ -53,6 +56,19 @@ Current records are keyed by `session_id` and include:
 - `run_dir`
 - `status`
 - `updated_at`
+- `preparation_id`
+- `preparation_run_id`
+- `preparation_lease_path`
+- `preparation_started_at`
+- `preparation_reason`
+
+Index schema `2` treats `preparing` and `recovery_required` as explicit
+recovery fences. The transaction identity remains present after activation so
+a replace-then-fsync/readback ambiguity can be resumed idempotently. Schema
+`1` records are decoded as legacy records without inventing transaction
+provenance. Every preparing record is preflighted against a projected
+`recovery_required` record with the maximum bounded reason, so a near-limit
+phase-one commit cannot prevent later recovery fencing.
 
 The adapter also keeps `latest_session_id` as an observation hint, but `prepare-active-run` no longer trusts it blindly once multiple sessions have been observed for the same repo.
 When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the default explicit parent-session selector for the current interactive thread instead of relying on repo-global recency.
@@ -73,6 +89,7 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   - reads payload JSON from stdin
   - looks up the active `run_dir` for the current `session_id`
   - allows stop if no active run exists
+  - blocks without opening the prospective run or refreshing prompts when the record is `preparing` or `recovery_required`, and emits the exact `recover-active-run` command
   - blocks stop with a continuation prompt when the run is still active or not yet reconciled
   - regenerates `child-prompt.md` and `parent-prompt.md` through framed anonymous-pipe bridge and runner source delivery before referring the parent back to either file
   - refuses to launch when either named source changes object identity, access policy, size, or content between its initial stable read and final prelaunch revalidation; timestamp-only changes remain benign
@@ -125,10 +142,11 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
 
 ## Active-Run Commands
 
-All index-backed commands below use the same exclusive load-through-commit
-transaction as the prompt and Stop hooks. Bridge work stays inside that
-transaction so a concurrent hook cannot load a stale association and later
-replace another command's update.
+Every index mutation below uses the same descriptor-bound atomic commit and
+index-version CAS as the prompt and Stop hooks. `prepare-active-run` does not
+hold `index.lock` across bridge work: phase one commits a durable reservation,
+the inherited preparation lease spans bridge/runner work, and phase two
+reopens the index and verifies the exact reservation before activation.
 
 - `prepare-active-run`
   - resolves the target session from the adapter index
@@ -137,8 +155,22 @@ replace another command's update.
   - auto-selects only when the repo index currently contains exactly one observed session
   - fails safe if `CODEX_THREAD_ID` points at a session the repo index has not observed yet
   - fails safe with an ambiguity error when multiple sessions are present and no selector was provided
-  - calls `waited_delivery_bridge.py prepare-live`
-  - records the returned `run_dir` as the active run for that session
+  - replaces an existing association only when its direct repo-local run path, access policy, state, prompts, repo root, and terminal status pass descriptor-bound no-follow validation
+  - rejects another pending preparation for the session or the same run path reserved by another session
+  - validates the complete prospective schema `2` reservation and worst-case recovery-reason capacity before creating its owner-private `0600` lease
+  - commits `preparing` before calling `waited_delivery_bridge.py prepare-live`, and passes the locked lease descriptor plus a stable preparation UUID through bridge to runner
+  - requires the bridge receipt to return the exact reserved `run_dir`, preparation UUID, and runner lease-inheritance attestation
+  - validates the reserved run directory and schema `4` state/prompt artifacts through pinned no-follow descriptors, including exact repo root, run ID, parent session, and preparation UUID
+  - CAS-promotes only the unchanged reservation to `active`, revalidates the run after commit, and removes the exact lease before emitting success JSON
+  - on bridge failure, holds the index lock while retiring its original inherited lease reference exactly once, then independently reopens and nonblocking-locks the lease; a busy or close-ambiguous lease remains `recovery_required` without any run-entry read
+  - clears only a quiescent unchanged reservation whose exact run entry is descriptor-proven absent; present, partial, mismatched, or unprovable results remain `recovery_required`
+- `recover-active-run`
+  - requires exact `--session-id` and `--preparation-id`
+  - defaults to `--action doctor`; a busy inherited lease returns `in_progress` without inspecting changing run artifacts
+  - reports quiescent states as `absent`, `partial_or_untrusted`, `complete_not_activated`, or `active`
+  - `--action resume` validates a complete same-transaction run and idempotently CAS-promotes it to `active`
+  - `--action clear-absent` acquires the lease, descriptor-proves the reserved entry remains absent, clears only the unchanged reservation, and removes only the exact lease file
+  - never deletes, recursively cleans, follows, or adopts an unattested run directory
 - `attach-child-active-run`
   - requires `--run-dir` to already belong to one observed session
   - rejects a blank `--child-session-id` without moving the child state to `running`
@@ -155,6 +187,29 @@ replace another command's update.
   - clears the active-run association once the run is terminal and reconciled
 - `show-index`
   - prints the current adapter index for debugging
+
+## Recovery Boundaries
+
+The index, lease, and run tree are separate durable objects rather than one
+filesystem transaction. Their created directory entries are parent-fsynced,
+but the durable reservation still makes intermediate states visible and
+recoverable instead of making multi-file run creation atomic. The lease proves
+quiescence only for cooperating adapter/bridge/runner descendants that
+inherited it. Bridge-failure settlement first closes the adapter's original
+open-file-description reference and then requires a separately opened lease to
+acquire the lock; otherwise an inherited descendant can remain invisible behind
+the adapter's own lock. It does not exclude arbitrary same-UID writers, root,
+`ptrace`, debugger, or process-memory attacks, and no timestamp or PID is used
+to steal a busy lease.
+
+Absence is a descriptor-bound point-in-time observation. A missing, replaced,
+unreadable, incomplete, or transaction-mismatched run is never automatically
+deleted or promoted. A bridge receipt that names another path is not followed.
+If index publication is externally replaced after phase one, the adapter
+cannot reconstruct provenance from an orphaned directory. A stale verified
+lease may remain after an ambiguous index commit; same-transaction `resume`
+cleans it after proving the run is active. This recovery surface preserves
+evidence and availability, not automatic disk-space reclamation.
 
 ## Explicit Compatibility Hook Config
 

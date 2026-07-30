@@ -170,12 +170,13 @@ def _runner_command(*args: str) -> list[str]:
     return [sys.executable, str(RUNNER_PATH), *args]
 
 
-def _run_runner(*args: str) -> int:
+def _run_runner(*args: str, pass_fds: tuple[int, ...] = ()) -> int:
     completed = subprocess.run(
         _runner_command(*args),
         text=True,
         capture_output=True,
         check=False,
+        pass_fds=pass_fds,
     )
     if completed.stdout:
         print(completed.stdout, end="")
@@ -268,6 +269,17 @@ def _resolved_parent_ids(
 
 
 def _prepare_live(args: argparse.Namespace) -> int:
+    if (args.preparation_id is None) != (args.preparation_lease_fd is None):
+        raise UserError(
+            "preparation id and inherited preparation lease fd must be supplied together"
+        )
+    if args.preparation_lease_fd is not None:
+        if args.preparation_lease_fd < 0:
+            raise UserError("preparation lease fd must be nonnegative")
+        try:
+            os.fstat(args.preparation_lease_fd)
+        except OSError as error:
+            raise UserError("preparation lease fd is not open") from error
     (
         parent_session_id,
         parent_turn_id,
@@ -282,8 +294,12 @@ def _prepare_live(args: argparse.Namespace) -> int:
         args.goal,
         "--json",
     ]
-    if args.run_id:
+    if args.run_id is not None:
         runner_args.extend(["--run-id", args.run_id])
+    if args.preparation_id is not None:
+        runner_args.extend(["--preparation-id", args.preparation_id])
+        assert args.preparation_lease_fd is not None
+        runner_args.extend(["--preparation-lease-fd", str(args.preparation_lease_fd)])
     for phase in args.phase:
         runner_args.extend(["--phase", phase])
     for changed_file in args.changed_file:
@@ -304,7 +320,10 @@ def _prepare_live(args: argparse.Namespace) -> int:
         runner_args.extend(["--parent-transcript-path", parent_transcript_path])
     if permission_mode:
         runner_args.extend(["--permission-mode", permission_mode])
-    return _run_runner(*runner_args)
+    preparation_lease_fds = (
+        () if args.preparation_lease_fd is None else (args.preparation_lease_fd,)
+    )
+    return _run_runner(*runner_args, pass_fds=preparation_lease_fds)
 
 
 def _bind_parent_live(args: argparse.Namespace) -> int:
@@ -555,6 +574,8 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare_live.add_argument("--repo", required=True)
     prepare_live.add_argument("--goal", required=True)
     prepare_live.add_argument("--run-id")
+    prepare_live.add_argument("--preparation-id")
+    prepare_live.add_argument("--preparation-lease-fd", type=int)
     prepare_live.add_argument("--parent-session-id")
     prepare_live.add_argument("--parent-turn-id")
     prepare_live.add_argument("--parent-transcript-path")

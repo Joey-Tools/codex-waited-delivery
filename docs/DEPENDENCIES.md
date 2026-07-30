@@ -42,13 +42,23 @@ use one deterministic transaction timestamp and validate the full terminal
 candidate before summary publication. Prompt refresh validates the candidate
 state with its canonical prompt paths before replacing either prompt.
 
-The hook adapter applies the same pre-publication rule to
-`prepare-active-run`: it chooses and validates the run ID, builds the exact
-prospective session/index record with one transaction timestamp, and enforces
-the index byte ceiling before invoking the bridge. Capacity rejection cannot
-create a run directory or publish stdout, while the later atomic commit retains
-its index-version and descriptor-identity revalidation against concurrent
-out-of-band replacement.
+The runner applies the same pre-publication rule to initial run creation: it
+builds the full state, worst-case terminal projection, and all UTF-8 artifacts
+before opening or creating the run path, then descriptor-revalidates and
+parent-directory-fsyncs every created name before a successful receipt. The
+hook adapter then persists a schema `2` `preparing` reservation before invoking
+`prepare-live`. A
+descriptor-validated `0600` preparation lease is inherited across
+adapter/bridge/runner, runner state schema `4` records the same transaction
+UUID, and a second short index transaction promotes only that exact,
+fully-attested run to `active`. Index-capacity rejection cannot launch the
+bridge, create a run, or publish stdout. Recovery first proves the cooperative
+writer chain is quiescent by retiring the adapter's inherited reference once
+and reacquiring the lease through an independent open; a busy or ambiguous
+lease prevents run-entry inspection. Absent, partial, mismatched, tampered, or
+complete runs are then reported or handled through `recover-active-run`
+without recursive deletion, and an existing association cannot be replaced
+until its terminal state passes the same descriptor-bound path checks.
 
 Operators can avoid that layout dependency by passing `--external-helper` to
 the runner or bridge commands, or disable the readiness smoke when it is not

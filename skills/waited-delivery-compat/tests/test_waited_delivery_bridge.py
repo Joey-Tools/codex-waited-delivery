@@ -140,12 +140,19 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
         return run([sys.executable, str(RUNNER_PATH), *args])
 
     def _run_bridge(
-        self, *args: str, env: dict[str, str] | None = None
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        pass_fds: tuple[int, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         bridge_env = os.environ.copy()
         if env:
             bridge_env.update(env)
-        return run([sys.executable, str(BRIDGE_PATH), *args], env=bridge_env)
+        return run(
+            [sys.executable, str(BRIDGE_PATH), *args],
+            env=bridge_env,
+            pass_fds=pass_fds,
+        )
 
     def _version_args(
         self,
@@ -347,6 +354,52 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
             "/tmp/parent-env-1.jsonl",
         )
         self.assertEqual(state["orchestration"]["permission_mode"], "acceptEdits")
+
+    def test_prepare_live_forwards_preparation_identity_and_lease_to_runner(
+        self,
+    ) -> None:
+        preparation_id = "a" * 32
+        lease_path = self.root / "preparation.lease"
+        lease_path.write_text("lease\n", encoding="utf-8")
+        lease_path.chmod(0o600)
+        lease_fd = os.open(lease_path, os.O_RDONLY)
+        try:
+            completed = self._run_bridge(
+                "prepare-live",
+                "--repo",
+                str(self.repo),
+                "--goal",
+                "Bridge preparation lease",
+                "--run-id",
+                "bridge-preparation-lease",
+                "--preparation-id",
+                preparation_id,
+                "--preparation-lease-fd",
+                str(lease_fd),
+                "--parent-session-id",
+                "parent-preparation-lease",
+                "--external-helper",
+                str(self.fake_helper),
+                "--no-fallback-smoke",
+                pass_fds=(lease_fd,),
+            )
+        finally:
+            os.close(lease_fd)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["preparation_id"], preparation_id)
+        self.assertIs(payload["preparation_lease_inherited"], True)
+        state = json.loads(
+            (pathlib.Path(payload["run_dir"]) / "state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(state["preparation_id"], preparation_id)
+        self.assertEqual(
+            state["orchestration"]["parent_session_id"],
+            "parent-preparation-lease",
+        )
 
     def test_bind_parent_live_updates_existing_run(self) -> None:
         run_dir = self._prepare_run_dir()

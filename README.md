@@ -51,13 +51,33 @@ encoded size before publishing a summary or terminal state. Prompt refresh
 likewise binds its canonical prompt paths into a candidate and validates the
 candidate before replacing either prompt.
 
-`prepare-active-run` similarly reserves its explicit or generated run ID in a
-prospective hook-index snapshot and serializes that exact snapshot with one
-transaction timestamp before invoking the bridge. An over-limit snapshot
-therefore leaves the index unchanged, creates no run directory, and emits no
-success payload. The final index commit still revalidates the locked index
-version and descriptor-bound storage before atomic replacement, so
-out-of-band concurrent drift is rejected rather than overwritten.
+Runner `prepare` now constructs the complete prospective state, worst-case
+terminal projection, and every initial UTF-8 artifact before opening or
+creating the run path. An over-limit state, invalid explicit/automatic run ID,
+or unencodable prompt therefore emits no success payload and leaves the run
+tree untouched. Once creation begins, each parent/name entry is descriptor
+revalidated and parent-directory-fsynced before artifact publication, so a
+successful receipt does not outrun run-tree name durability.
+
+`prepare-active-run` uses a durable two-phase reservation instead of keeping
+one index transaction open across the bridge. Phase one writes an index-schema
+`2` `preparing` record with the exact session, run ID/path, preparation UUID,
+and owner-private preparation-lease path; it also reserves bounded capacity
+for a later recovery reason. The locked lease descriptor is inherited by the
+bridge and runner, so recovery cannot treat an absent path as quiescent while a
+cooperating descendant may still create it. Runner state schema `4` attests
+the same preparation UUID. Only an exact bridge receipt plus descriptor-bound
+state/prompt validation can CAS that same record to `active`. Bridge or final
+commit failures emit no success payload. After bridge failure, the adapter
+retires its original inherited lease reference exactly once while holding the
+index lock, then uses a separate open and nonblocking lock acquisition to prove
+the descendant chain is quiescent; a busy or ambiguous lease is fenced without
+reading the run entry. Only a proven quiescent absent entry can clear the
+unchanged reservation, while any present, partial, mismatched, tampered, or
+unprovable result remains recovery-fenced. An existing indexed run is likewise
+retired only after descriptor-bound terminal-state validation. Use
+`recover-active-run` with `doctor`, `resume`, or `clear-absent`; no recovery
+path recursively deletes a run directory.
 
 See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for the optional review
 compatibility/diagnostic dependency used by external lane-readiness smoke.

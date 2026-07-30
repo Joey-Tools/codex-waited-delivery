@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import hashlib
 import importlib.util
@@ -20,6 +21,7 @@ import textwrap
 import threading
 import time
 import unittest
+import uuid
 import zlib
 from collections.abc import Mapping
 from unittest import mock
@@ -1215,42 +1217,101 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             session_id=session_id,
             run_id=run_id,
         )
+        preparation_id = "1" * 32
         prospective_run_dir = (
             self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
         )
         prospective_index = json.loads(self._index_path().read_text(encoding="utf-8"))
         record = prospective_index["sessions"][session_id]
         record["run_dir"] = str(prospective_run_dir)
-        record["status"] = "active"
+        record["status"] = "preparing"
         record["updated_at"] = fixed_now
+        record["preparation_id"] = preparation_id
+        record["preparation_run_id"] = run_id
+        record["preparation_lease_path"] = str(
+            module._preparation_lease_path(self.repo.resolve(), preparation_id)
+        )
+        record["preparation_started_at"] = fixed_now
+        record["preparation_reason"] = None
         prospective_index["latest_session_id"] = session_id
         prospective_content = module._serialize_index_for_commit(
             prospective_index,
             transaction_time=fixed_now,
             context="test prospective index",
         )
+        recovery_projection = copy.deepcopy(prospective_index)
+        recovery_record = recovery_projection["sessions"][session_id]
+        recovery_record["status"] = "recovery_required"
+        recovery_record["preparation_reason"] = (
+            "x" * module.PREPARATION_REASON_MAX_CHARS
+        )
+        recovery_projection["updated_at"] = fixed_now
+        projected_content = (
+            json.dumps(
+                recovery_projection,
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        self.assertLess(len(prospective_content), len(projected_content))
         captured_stdout = io.StringIO()
+        real_bridge = module._run_bridge_json_with_lease
+        saw_durable_reservation = False
 
-        def create_run(*bridge_args: str) -> dict[str, object]:
+        def inspect_then_create(
+            lease_fd: int,
+            *bridge_args: str,
+        ) -> dict[str, object]:
+            nonlocal saw_durable_reservation
             run_id_index = bridge_args.index("--run-id") + 1
             self.assertEqual(bridge_args[run_id_index], run_id)
-            prospective_run_dir.mkdir(parents=True)
-            return {"run_dir": str(prospective_run_dir)}
+            preparation_index = bridge_args.index("--preparation-id") + 1
+            self.assertEqual(bridge_args[preparation_index], preparation_id)
+            durable = json.loads(self._index_path().read_text(encoding="utf-8"))
+            durable_record = durable["sessions"][session_id]
+            self.assertEqual(durable_record["status"], "preparing")
+            self.assertEqual(durable_record["preparation_id"], preparation_id)
+            self.assertEqual(durable_record["run_dir"], str(prospective_run_dir))
+            saw_durable_reservation = True
+            return real_bridge(lease_fd, *bridge_args)
 
         with (
             mock.patch.object(module, "_utc_now", return_value=fixed_now),
             mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
                 module,
                 "INDEX_MAX_BYTES",
-                len(prospective_content),
+                len(projected_content),
             ),
-            mock.patch.object(module, "_run_bridge_json", side_effect=create_run),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=inspect_then_create,
+            ),
             mock.patch.object(module.sys, "stdout", captured_stdout),
         ):
             self.assertEqual(module._prepare_active_run(args), 0)
 
+        self.assertTrue(saw_durable_reservation)
         self.assertTrue(prospective_run_dir.is_dir())
-        self.assertEqual(self._index_path().read_bytes(), prospective_content)
+        committed = json.loads(self._index_path().read_text(encoding="utf-8"))
+        committed_record = committed["sessions"][session_id]
+        self.assertEqual(committed_record["status"], "active")
+        self.assertEqual(committed_record["preparation_id"], preparation_id)
+        self.assertFalse(
+            pathlib.Path(committed_record["preparation_lease_path"]).exists()
+        )
+        state = json.loads(
+            (prospective_run_dir / "state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(state["preparation_id"], preparation_id)
         self.assertEqual(
             json.loads(captured_stdout.getvalue())["run_dir"],
             str(prospective_run_dir),
@@ -1273,41 +1334,72 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             session_id=session_id,
             run_id=run_id,
         )
+        preparation_id = "2" * 32
         prospective_run_dir = (
             self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
         )
         prospective_index = json.loads(self._index_path().read_text(encoding="utf-8"))
         record = prospective_index["sessions"][session_id]
         record["run_dir"] = str(prospective_run_dir)
-        record["status"] = "active"
+        record["status"] = "preparing"
         record["updated_at"] = fixed_now
+        record["preparation_id"] = preparation_id
+        record["preparation_run_id"] = run_id
+        record["preparation_lease_path"] = str(
+            module._preparation_lease_path(self.repo.resolve(), preparation_id)
+        )
+        record["preparation_started_at"] = fixed_now
+        record["preparation_reason"] = None
         prospective_index["latest_session_id"] = session_id
         prospective_content = module._serialize_index_for_commit(
             prospective_index,
             transaction_time=fixed_now,
             context="test prospective index",
         )
+        recovery_projection = copy.deepcopy(prospective_index)
+        recovery_record = recovery_projection["sessions"][session_id]
+        recovery_record["status"] = "recovery_required"
+        recovery_record["preparation_reason"] = (
+            "x" * module.PREPARATION_REASON_MAX_CHARS
+        )
+        recovery_projection["updated_at"] = fixed_now
+        projected_content = (
+            json.dumps(
+                recovery_projection,
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
         original_index = self._index_path().read_bytes()
         self.assertLess(len(original_index), len(prospective_content))
+        self.assertLess(len(prospective_content), len(projected_content))
         captured_stdout = io.StringIO()
 
         with (
             mock.patch.object(module, "_utc_now", return_value=fixed_now),
             mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
                 module,
                 "INDEX_MAX_BYTES",
-                len(prospective_content) - 1,
+                len(projected_content) - 1,
             ),
-            mock.patch.object(module, "_run_bridge_json") as bridge_mock,
+            mock.patch.object(module, "_create_preparation_lease") as lease_mock,
+            mock.patch.object(module, "_run_bridge_json_with_lease") as bridge_mock,
             mock.patch.object(module.sys, "stdout", captured_stdout),
             self.assertRaisesRegex(
                 module.RunSafetyError,
-                "prepare-active-run prospective index .* exceeds the adapter "
-                "index byte limit before index publication",
+                "would consume reserved preparation recovery capacity",
             ),
         ):
             module._prepare_active_run(args)
 
+        lease_mock.assert_not_called()
         bridge_mock.assert_not_called()
         self.assertFalse(prospective_run_dir.exists())
         self.assertEqual(captured_stdout.getvalue(), "")
@@ -1330,6 +1422,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             session_id=session_id,
             run_id=run_id,
         )
+        preparation_id = "3" * 32
         prospective_run_dir = (
             self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
         )
@@ -1348,28 +1441,41 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             + "\n"
         ).encode("utf-8")
         captured_stdout = io.StringIO()
+        real_bridge = module._run_bridge_json_with_lease
 
-        def create_run_then_drift(*_: str) -> dict[str, object]:
-            prospective_run_dir.mkdir(parents=True)
+        def create_run_then_drift(
+            lease_fd: int,
+            *bridge_args: str,
+        ) -> dict[str, object]:
+            durable = json.loads(self._index_path().read_text(encoding="utf-8"))
+            self.assertEqual(
+                durable["sessions"][session_id]["status"],
+                "preparing",
+            )
             replacement_path = self._index_path().with_name(
                 ".index.concurrent-replacement"
             )
             replacement_path.write_bytes(replacement_content)
             replacement_path.chmod(0o600)
             os.replace(replacement_path, self._index_path())
-            return {"run_dir": str(prospective_run_dir)}
+            return real_bridge(lease_fd, *bridge_args)
 
         with (
             mock.patch.object(module, "_utc_now", return_value=fixed_now),
             mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
                 module,
-                "_run_bridge_json",
+                "_run_bridge_json_with_lease",
                 side_effect=create_run_then_drift,
             ),
             mock.patch.object(module.sys, "stdout", captured_stdout),
             self.assertRaisesRegex(
-                module.RunSafetyError,
-                "adapter index changed outside the locked transaction",
+                module.UserError,
+                "recovery fence update also failed",
             ),
         ):
             module._prepare_active_run(args)
@@ -1379,6 +1485,903 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertTrue(prospective_run_dir.is_dir())
         committed = json.loads(self._index_path().read_text(encoding="utf-8"))
         self.assertIsNone(committed["sessions"][session_id]["run_dir"])
+        state = json.loads(
+            (prospective_run_dir / "state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["preparation_id"], preparation_id)
+        self.assertTrue(
+            module._preparation_lease_path(
+                self.repo.resolve(),
+                preparation_id,
+            ).exists()
+        )
+
+    def test_reservation_commit_failures_never_launch_bridge(self) -> None:
+        for failure_point in ("before-replace", "after-replace"):
+            with self.subTest(failure_point=failure_point):
+                session_id = f"session-reservation-{failure_point}"
+                run_id = f"reservation-{failure_point}"
+                preparation_id = (
+                    "a1" * 16 if failure_point == "before-replace" else "b2" * 16
+                )
+                observed = self._run_adapter(
+                    "user-prompt-submit-hook",
+                    input_payload=self._session_payload(session_id=session_id),
+                )
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                module = self._load_adapter_module()
+                args = self._prepare_active_args(
+                    module,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+                original_index = self._index_path().read_bytes()
+                real_save = module._atomic_save_index_at
+                save_calls = 0
+
+                def fail_reservation_commit(*save_args, **save_kwargs):
+                    nonlocal save_calls
+                    save_calls += 1
+                    if failure_point == "before-replace":
+                        raise module.RunSafetyError(
+                            "simulated reservation failure before replacement"
+                        )
+                    real_save(*save_args, **save_kwargs)
+                    raise module.RunSafetyError(
+                        "simulated reservation fsync ambiguity after replacement"
+                    )
+
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        module.uuid,
+                        "uuid4",
+                        return_value=uuid.UUID(hex=preparation_id),
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_atomic_save_index_at",
+                        side_effect=fail_reservation_commit,
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_run_bridge_json_with_lease",
+                    ) as bridge,
+                    mock.patch.object(module.sys, "stdout", stdout),
+                    self.assertRaises(module.UserError),
+                ):
+                    module._prepare_active_run(args)
+                self.assertEqual(save_calls, 1)
+                bridge.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                lease_path = module._preparation_lease_path(
+                    self.repo.resolve(),
+                    preparation_id,
+                )
+                if failure_point == "before-replace":
+                    self.assertEqual(self._index_path().read_bytes(), original_index)
+                    self.assertFalse(lease_path.exists())
+                else:
+                    record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                        "sessions"
+                    ][session_id]
+                    self.assertEqual(record["status"], "preparing")
+                    self.assertEqual(record["preparation_id"], preparation_id)
+                    self.assertTrue(lease_path.is_file())
+                self.assertFalse(
+                    (self.repo / ".codex-tmp" / "waited-delivery" / run_id).exists()
+                )
+
+    def test_prepare_bridge_failure_without_run_clears_exact_reservation(self) -> None:
+        session_id = "session-bridge-failure-absent"
+        run_id = "bridge-failure-absent"
+        preparation_id = "4" * 32
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        stdout = io.StringIO()
+        saw_busy_lease = False
+
+        def fail_before_create(
+            _lease_fd: int,
+            *_bridge_args: str,
+        ) -> dict[str, object]:
+            nonlocal saw_busy_lease
+            doctor = self._run_adapter(
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "doctor",
+            )
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+            self.assertEqual(json.loads(doctor.stdout)["status"], "in_progress")
+            saw_busy_lease = True
+            raise module.UserError("simulated bridge failure before creation")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=fail_before_create,
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "cleared safely"),
+        ):
+            module._prepare_active_run(args)
+
+        self.assertTrue(saw_busy_lease)
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "observed")
+        self.assertIsNone(record["run_dir"])
+        self.assertIsNone(record["preparation_id"])
+        self.assertFalse(
+            module._preparation_lease_path(
+                self.repo.resolve(),
+                preparation_id,
+            ).exists()
+        )
+        self.assertFalse(
+            (self.repo / ".codex-tmp" / "waited-delivery" / run_id).exists()
+        )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork semantics")
+    def test_bridge_failure_with_inherited_writer_never_clears_reservation(
+        self,
+    ) -> None:
+        session_id = "session-bridge-failure-inherited-writer"
+        run_id = "bridge-failure-inherited-writer"
+        preparation_id = "e5" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        run_dir = self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        ready_read, ready_write = os.pipe()
+        release_read, release_write = os.pipe()
+        child_pid: int | None = None
+        stdout = io.StringIO()
+
+        def fail_while_inherited_writer_survives(
+            _lease_fd: int,
+            *_bridge_args: str,
+        ) -> dict[str, object]:
+            nonlocal child_pid
+            child_pid = os.fork()
+            if child_pid == 0:
+                try:
+                    os.close(ready_read)
+                    os.close(release_write)
+                    os.write(ready_write, b"1")
+                    os.close(ready_write)
+                    if os.read(release_read, 1) != b"1":
+                        os._exit(96)
+                    os.close(release_read)
+                    run_dir.mkdir(parents=True, mode=0o700)
+                    run_dir.chmod(0o700)
+                except BaseException:
+                    os._exit(97)
+                os._exit(0)
+            os.close(ready_write)
+            os.close(release_read)
+            self.assertEqual(os.read(ready_read, 1), b"1")
+            os.close(ready_read)
+            raise module.UserError(
+                "simulated bridge death before inherited writer creates the run"
+            )
+
+        try:
+            with (
+                mock.patch.object(
+                    module.uuid,
+                    "uuid4",
+                    return_value=uuid.UUID(hex=preparation_id),
+                ),
+                mock.patch.object(
+                    module,
+                    "_run_bridge_json_with_lease",
+                    side_effect=fail_while_inherited_writer_survives,
+                ),
+                mock.patch.object(
+                    module,
+                    "_expected_run_entry_presence",
+                ) as presence,
+                mock.patch.object(module.sys, "stdout", stdout),
+                self.assertRaisesRegex(module.UserError, "remains recorded"),
+            ):
+                module._prepare_active_run(args)
+            presence.assert_not_called()
+            self.assertEqual(stdout.getvalue(), "")
+            record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                "sessions"
+            ][session_id]
+            self.assertEqual(record["status"], "recovery_required")
+            self.assertEqual(record["preparation_id"], preparation_id)
+            self.assertIn(
+                "inherited-writer quiescence could not be proved",
+                record["preparation_reason"],
+            )
+            self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+
+            os.write(release_write, b"1")
+            os.close(release_write)
+            release_write = -1
+            assert child_pid is not None
+            waited_pid, wait_status = os.waitpid(child_pid, 0)
+            self.assertEqual(waited_pid, child_pid)
+            self.assertTrue(os.WIFEXITED(wait_status))
+            self.assertEqual(os.WEXITSTATUS(wait_status), 0)
+            child_pid = None
+            self.assertTrue(run_dir.is_dir())
+            preserved = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                "sessions"
+            ][session_id]
+            self.assertEqual(preserved["status"], "recovery_required")
+            self.assertEqual(preserved["run_dir"], str(run_dir))
+        finally:
+            for file_descriptor in (
+                ready_read,
+                ready_write,
+                release_read,
+                release_write,
+            ):
+                if file_descriptor >= 0:
+                    try:
+                        os.close(file_descriptor)
+                    except OSError:
+                        pass
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child_pid, 0)
+
+    def test_ambiguous_inherited_lease_close_is_never_retried_or_cleared(
+        self,
+    ) -> None:
+        session_id = "session-ambiguous-inherited-close"
+        run_id = "ambiguous-inherited-close"
+        preparation_id = "f6" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        real_retire = module._retire_inherited_preparation_lease
+        stdout = io.StringIO()
+
+        def close_then_report_ambiguity(lease_fd: int) -> None:
+            real_retire(lease_fd)
+            raise OSError("simulated ambiguous close result")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=module.UserError("simulated bridge failure"),
+            ),
+            mock.patch.object(
+                module,
+                "_retire_inherited_preparation_lease",
+                side_effect=close_then_report_ambiguity,
+            ) as retire,
+            mock.patch.object(
+                module,
+                "_expected_run_entry_presence",
+            ) as presence,
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "remains recorded"),
+        ):
+            module._prepare_active_run(args)
+
+        retire.assert_called_once()
+        presence.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertIn(
+            "lease ownership could not be retired exactly once",
+            record["preparation_reason"],
+        )
+        self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+        self.assertFalse(
+            (self.repo / ".codex-tmp" / "waited-delivery" / run_id).exists()
+        )
+
+    def test_partial_prepare_fences_stop_and_active_mutations(self) -> None:
+        session_id = "session-partial-preparation"
+        run_id = "partial-preparation"
+        preparation_id = "5" * 32
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        run_dir = self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        stdout = io.StringIO()
+
+        def create_partial_then_fail(
+            _lease_fd: int,
+            *_bridge_args: str,
+        ) -> dict[str, object]:
+            run_dir.mkdir(parents=True, mode=0o700)
+            run_dir.chmod(0o700)
+            raise module.UserError("simulated failure after mkdir")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=create_partial_then_fail,
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "remains recorded"),
+        ):
+            module._prepare_active_run(args)
+
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+
+        stop_stdout = io.StringIO()
+        stop_stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                module.sys,
+                "stdin",
+                io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+            ),
+            mock.patch.object(module.sys, "stdout", stop_stdout),
+            mock.patch.object(module.sys, "stderr", stop_stderr),
+            mock.patch.object(module, "_load_stop_run_state") as load_run,
+        ):
+            self.assertEqual(module._stop_hook(argparse.Namespace()), 2)
+        load_run.assert_not_called()
+        self.assertEqual(stop_stdout.getvalue(), "")
+        self.assertIn("Do not finish.", stop_stderr.getvalue())
+        self.assertIn(preparation_id, stop_stderr.getvalue())
+        self.assertIn("recover-active-run", stop_stderr.getvalue())
+
+        retry_args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id="partial-preparation-retry",
+        )
+        with (
+            mock.patch.object(module, "_run_bridge_json_with_lease") as bridge,
+            self.assertRaisesRegex(module.UserError, "unfinished recovery_required"),
+        ):
+            module._prepare_active_run(retry_args)
+        bridge.assert_not_called()
+
+        attach_args = module._build_parser().parse_args(
+            [
+                "attach-child-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-session-id",
+                "child-partial",
+                "--session-id",
+                session_id,
+            ]
+        )
+        with (
+            mock.patch.object(module, "_run_bridge_passthrough") as bridge,
+            self.assertRaisesRegex(module.UserError, "recovery_required"),
+        ):
+            module._attach_child_active_run(attach_args)
+        bridge.assert_not_called()
+
+    def test_prepare_rejects_mismatched_bridge_receipt_without_output(self) -> None:
+        session_id = "session-mismatched-receipt"
+        run_id = "mismatched-receipt"
+        preparation_id = "c3" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                return_value={
+                    "run_dir": str(self.root / "unexpected-run"),
+                    "preparation_id": "wrong-preparation",
+                    "preparation_lease_inherited": True,
+                },
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "does not match the exact"),
+        ):
+            module._prepare_active_run(args)
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertIn("does not match", record["preparation_reason"])
+        self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+
+    def test_interrupted_prepare_remains_recoverable_and_clears_only_when_quiescent(
+        self,
+    ) -> None:
+        session_id = "session-interrupted-preparation"
+        run_id = "interrupted-preparation"
+        preparation_id = "6" * 32
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=KeyboardInterrupt,
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            module._prepare_active_run(args)
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "preparing")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        observed_again = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="updated while preparation remains fenced",
+                transcript_path="/tmp/updated-interrupted.jsonl",
+            ),
+        )
+        self.assertEqual(observed_again.returncode, 0, observed_again.stderr)
+        preserved = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(preserved["status"], "preparing")
+        self.assertEqual(preserved["preparation_id"], preparation_id)
+        self.assertEqual(preserved["run_dir"], record["run_dir"])
+        self.assertEqual(
+            preserved["transcript_path"],
+            "/tmp/updated-interrupted.jsonl",
+        )
+
+        doctor_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+            ]
+        )
+        doctor_stdout = io.StringIO()
+        with mock.patch.object(module.sys, "stdout", doctor_stdout):
+            self.assertEqual(module._recover_active_run(doctor_args), 0)
+        self.assertEqual(json.loads(doctor_stdout.getvalue())["status"], "absent")
+
+        clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+        clear_stdout = io.StringIO()
+        with mock.patch.object(module.sys, "stdout", clear_stdout):
+            self.assertEqual(module._recover_active_run(clear_args), 0)
+        self.assertEqual(json.loads(clear_stdout.getvalue())["status"], "cleared")
+        cleared = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(cleared["status"], "observed")
+        self.assertIsNone(cleared["run_dir"])
+        self.assertFalse(
+            module._preparation_lease_path(
+                self.repo.resolve(),
+                preparation_id,
+            ).exists()
+        )
+
+    def test_complete_failed_bridge_can_be_doctored_and_resumed(self) -> None:
+        session_id = "session-complete-failed-bridge"
+        run_id = "complete-failed-bridge"
+        preparation_id = "7" * 32
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        real_bridge = module._run_bridge_json_with_lease
+        stdout = io.StringIO()
+
+        def complete_then_fail(
+            lease_fd: int,
+            *bridge_args: str,
+        ) -> dict[str, object]:
+            real_bridge(lease_fd, *bridge_args)
+            raise module.UserError("simulated lost bridge receipt")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=complete_then_fail,
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "lost bridge receipt"),
+        ):
+            module._prepare_active_run(args)
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+
+        doctor = self._run_adapter(
+            "recover-active-run",
+            "--repo",
+            str(self.repo),
+            "--session-id",
+            session_id,
+            "--preparation-id",
+            preparation_id,
+            "--action",
+            "doctor",
+        )
+        self.assertEqual(doctor.returncode, 0, doctor.stderr)
+        self.assertEqual(
+            json.loads(doctor.stdout)["status"],
+            "complete_not_activated",
+        )
+        resumed = self._run_adapter(
+            "recover-active-run",
+            "--repo",
+            str(self.repo),
+            "--session-id",
+            session_id,
+            "--preparation-id",
+            preparation_id,
+            "--action",
+            "resume",
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(json.loads(resumed.stdout)["status"], "active")
+        active = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(active["status"], "active")
+        self.assertEqual(active["preparation_id"], preparation_id)
+        self.assertFalse(pathlib.Path(active["preparation_lease_path"]).exists())
+
+    def test_resume_rejects_mismatched_run_transaction_attestation(self) -> None:
+        session_id = "session-mismatched-attestation"
+        run_id = "mismatched-attestation"
+        preparation_id = "d4" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        real_bridge = module._run_bridge_json_with_lease
+
+        def complete_then_fail(
+            lease_fd: int,
+            *bridge_args: str,
+        ) -> dict[str, object]:
+            real_bridge(lease_fd, *bridge_args)
+            raise module.UserError("simulated receipt loss before attestation tamper")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=complete_then_fail,
+            ),
+            self.assertRaises(module.UserError),
+        ):
+            module._prepare_active_run(args)
+        run_dir = self.repo / ".codex-tmp" / "waited-delivery" / run_id
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["preparation_id"] = "tampered-transaction"
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        resumed = self._run_adapter(
+            "recover-active-run",
+            "--repo",
+            str(self.repo),
+            "--session-id",
+            session_id,
+            "--preparation-id",
+            preparation_id,
+            "--action",
+            "resume",
+        )
+        self.assertNotEqual(resumed.returncode, 0)
+        self.assertEqual(resumed.stdout, "")
+        self.assertIn(
+            "does not attest the preparation transaction",
+            resumed.stderr,
+        )
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+
+    def test_activation_commit_failures_keep_recoverable_identity_without_output(
+        self,
+    ) -> None:
+        for failure_point in ("before-replace", "after-replace"):
+            with self.subTest(failure_point=failure_point):
+                session_id = f"session-activation-{failure_point}"
+                run_id = f"activation-{failure_point}"
+                preparation_id = (
+                    "8" * 32 if failure_point == "before-replace" else "9" * 32
+                )
+                observed = self._run_adapter(
+                    "user-prompt-submit-hook",
+                    input_payload=self._session_payload(session_id=session_id),
+                )
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                module = self._load_adapter_module()
+                args = self._prepare_active_args(
+                    module,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+                real_save = module._atomic_save_index_at
+                save_calls = 0
+
+                def fail_activation_commit(*save_args, **save_kwargs):
+                    nonlocal save_calls
+                    save_calls += 1
+                    if save_calls == 2 and failure_point == "before-replace":
+                        raise module.RunSafetyError(
+                            "simulated activation CAS failure before replacement"
+                        )
+                    result = real_save(*save_args, **save_kwargs)
+                    if save_calls == 2 and failure_point == "after-replace":
+                        raise module.RunSafetyError(
+                            "simulated activation fsync ambiguity after replacement"
+                        )
+                    return result
+
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        module.uuid,
+                        "uuid4",
+                        return_value=uuid.UUID(hex=preparation_id),
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_atomic_save_index_at",
+                        side_effect=fail_activation_commit,
+                    ),
+                    mock.patch.object(module.sys, "stdout", stdout),
+                    self.assertRaisesRegex(
+                        module.UserError,
+                        "activation could not be verified",
+                    ),
+                ):
+                    module._prepare_active_run(args)
+                self.assertEqual(stdout.getvalue(), "")
+                record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                expected_status = (
+                    "recovery_required"
+                    if failure_point == "before-replace"
+                    else "active"
+                )
+                self.assertEqual(record["status"], expected_status)
+                self.assertEqual(record["preparation_id"], preparation_id)
+                self.assertTrue(
+                    pathlib.Path(record["preparation_lease_path"]).is_file()
+                )
+
+                resumed = self._run_adapter(
+                    "recover-active-run",
+                    "--repo",
+                    str(self.repo),
+                    "--session-id",
+                    session_id,
+                    "--preparation-id",
+                    preparation_id,
+                    "--action",
+                    "resume",
+                )
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                self.assertEqual(json.loads(resumed.stdout)["status"], "active")
+                recovered = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(recovered["status"], "active")
+                self.assertFalse(
+                    pathlib.Path(recovered["preparation_lease_path"]).exists()
+                )
+
+    def test_prepare_refuses_tampered_terminal_run_before_replacement(self) -> None:
+        for case in ("run-dir-symlink", "state-symlink", "repo-mismatch"):
+            with self.subTest(case=case):
+                session_id = f"session-existing-terminal-{case}"
+                run_id = f"existing-terminal-{case}"
+                run_dir = self._prepare_indexed_run(session_id, run_id)
+                state_path = run_dir / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["overall_status"] = "blocked"
+                state["orchestration"]["child_status"] = "completed"
+                state["orchestration"]["child_session_id"] = f"child-{case}"
+                for phase in state["phases"].values():
+                    phase["status"] = "blocked"
+                if case == "repo-mismatch":
+                    state["repo_root"] = str(self.root / "other-repo")
+                state_path.write_text(
+                    json.dumps(state, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                if case == "run-dir-symlink":
+                    external_run = self.root / f"external-{run_id}"
+                    run_dir.rename(external_run)
+                    run_dir.symlink_to(external_run, target_is_directory=True)
+                elif case == "state-symlink":
+                    external_state = self.root / f"external-{run_id}.json"
+                    state_path.rename(external_state)
+                    state_path.symlink_to(external_state)
+
+                original_index = self._index_path().read_bytes()
+                module = self._load_adapter_module()
+                args = self._prepare_active_args(
+                    module,
+                    session_id=session_id,
+                    run_id=f"replacement-{case}",
+                )
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        module,
+                        "_create_preparation_lease",
+                    ) as lease,
+                    mock.patch.object(
+                        module,
+                        "_run_bridge_json_with_lease",
+                    ) as bridge,
+                    mock.patch.object(module.sys, "stdout", stdout),
+                    self.assertRaisesRegex(
+                        module.UserError,
+                        "cannot be retired safely",
+                    ),
+                ):
+                    module._prepare_active_run(args)
+                lease.assert_not_called()
+                bridge.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(self._index_path().read_bytes(), original_index)
 
     def test_prepare_active_run_rejects_ambiguous_sessions_without_selector(
         self,

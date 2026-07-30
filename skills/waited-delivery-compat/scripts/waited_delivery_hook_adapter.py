@@ -29,7 +29,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 
 BRIDGE_PATH = pathlib.Path(__file__).resolve().with_name("waited_delivery_bridge.py")
 RUNNER_PATH = BRIDGE_PATH.with_name("waited_delivery_runner.py")
-INDEX_SCHEMA_VERSION = 1
+INDEX_SCHEMA_VERSION = 2
 INDEX_FILE_NAME = "index.json"
 INDEX_LOCK_FILE_NAME = "index.lock"
 INDEX_MAX_BYTES = 4 * 1024 * 1024
@@ -41,6 +41,7 @@ HOOK_COMMANDS = {"user-prompt-submit-hook", "stop-hook"}
 HOOK_ENABLE_FLAG = "--enable-compat-hook"
 NON_HOOK_COMMANDS = {
     "prepare-active-run",
+    "recover-active-run",
     "attach-child-active-run",
     "finish-child-active-run",
     "reconcile-active-run",
@@ -62,6 +63,8 @@ TERMINAL_PHASE_STATUSES = {
     "decision_point",
 }
 CHILD_TERMINAL_STATUSES = {"completed", "failed", "interrupted"}
+PREPARATION_STATUSES = {"preparing", "recovery_required"}
+PREPARATION_REASON_MAX_CHARS = 512
 RUNS_DIR_NAME = "waited-delivery"
 RUN_DIRECTORY_MODE = 0o700
 LEGACY_RUN_DIRECTORY_MODE = 0o755
@@ -137,6 +140,7 @@ LinuxRefreshProcessGroupState = Literal[
     "no-members",
     "unknown",
 ]
+RunEntryPresence = Literal["absent", "present"]
 
 
 class UserError(RuntimeError):
@@ -198,6 +202,15 @@ class RefreshLaunchSources(NamedTuple):
     runner: LaunchArtifactSource
 
 
+class PreparationReservation(NamedTuple):
+    session_id: str
+    preparation_id: str
+    run_id: str
+    run_dir: str
+    lease_path: str
+    started_at: str
+
+
 class SessionRecord(TypedDict):
     session_id: str
     cwd: str
@@ -207,6 +220,11 @@ class SessionRecord(TypedDict):
     run_dir: str | None
     status: str
     updated_at: str | None
+    preparation_id: str | None
+    preparation_run_id: str | None
+    preparation_lease_path: str | None
+    preparation_started_at: str | None
+    preparation_reason: str | None
 
 
 class AdapterIndex(TypedDict):
@@ -902,6 +920,24 @@ def _run_bridge_json(*args: str) -> dict[str, object]:
     return _bridge_json_payload(_run(_bridge_command(*args)))
 
 
+def _run_bridge_json_with_lease(
+    lease_fd: int,
+    *args: str,
+) -> dict[str, object]:
+    if lease_fd < 0:
+        raise RunSafetyError("preparation lease fd must be nonnegative")
+    return _bridge_json_payload(
+        _run(
+            _bridge_command(
+                *args,
+                "--preparation-lease-fd",
+                str(lease_fd),
+            ),
+            pass_fds=(lease_fd,),
+        )
+    )
+
+
 def _run_bridge_passthrough(*args: str) -> int:
     completed = _run(_bridge_command(*args))
     if completed.stdout:
@@ -949,7 +985,14 @@ def _decode_index(content: bytes, path: pathlib.Path) -> AdapterIndex:
     payload = json.loads(decoded)
     if not isinstance(payload, dict):
         raise UserError(f"invalid adapter index: {path}")
-    payload.setdefault("schema_version", INDEX_SCHEMA_VERSION)
+    schema_version = payload.get("schema_version", 1)
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in {1, INDEX_SCHEMA_VERSION}
+    ):
+        raise UserError(f"unsupported adapter index schema: {path}")
+    payload["schema_version"] = INDEX_SCHEMA_VERSION
     payload.setdefault("latest_session_id", None)
     payload.setdefault("updated_at", None)
     raw_sessions = payload.setdefault("sessions", {})
@@ -967,6 +1010,11 @@ def _decode_index(content: bytes, path: pathlib.Path) -> AdapterIndex:
         raw_record.setdefault("run_dir", None)
         raw_record.setdefault("status", "observed")
         raw_record.setdefault("updated_at", None)
+        raw_record.setdefault("preparation_id", None)
+        raw_record.setdefault("preparation_run_id", None)
+        raw_record.setdefault("preparation_lease_path", None)
+        raw_record.setdefault("preparation_started_at", None)
+        raw_record.setdefault("preparation_reason", None)
     return cast(AdapterIndex, payload)
 
 
@@ -989,6 +1037,22 @@ def _serialize_index_for_commit(
         raise RunSafetyError(
             f"{context} exceeds the adapter index byte limit before index "
             f"publication ({len(content)} > {INDEX_MAX_BYTES} bytes); "
+            "the existing index remains unchanged. Remove or shorten stale session "
+            "metadata and retry."
+        )
+    projected = copy.deepcopy(candidate)
+    for raw_record in projected["sessions"].values():
+        if raw_record.get("status") not in PREPARATION_STATUSES:
+            continue
+        raw_record["status"] = "recovery_required"
+        raw_record["preparation_reason"] = "x" * PREPARATION_REASON_MAX_CHARS
+    projected_content = (
+        json.dumps(projected, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(projected_content) > INDEX_MAX_BYTES:
+        raise RunSafetyError(
+            f"{context} would consume reserved preparation recovery capacity "
+            f"({len(projected_content)} > {INDEX_MAX_BYTES} projected bytes); "
             "the existing index remains unchanged. Remove or shorten stale session "
             "metadata and retry."
         )
@@ -1047,6 +1111,33 @@ def _open_or_create_directory_at(
                 raise RunSafetyError(
                     f"adapter index directory is not owner-private: {name}"
                 )
+        try:
+            os.fsync(parent_fd)
+        except OSError as error:
+            raise RunSafetyError(
+                f"adapter index directory entry cannot be persisted: {name}"
+            ) from error
+        named_durable = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor_durable = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(named_durable.st_mode)
+            or not stat.S_ISDIR(descriptor_durable.st_mode)
+            or not _same_object(descriptor_stat, descriptor_durable)
+            or not _same_object(descriptor_durable, named_durable)
+            or (
+                descriptor_durable.st_uid,
+                descriptor_durable.st_gid,
+                stat.S_IMODE(descriptor_durable.st_mode),
+            )
+            != (
+                named_durable.st_uid,
+                named_durable.st_gid,
+                stat.S_IMODE(named_durable.st_mode),
+            )
+        ):
+            raise RunSafetyError(
+                f"adapter index directory changed while persisting its entry: {name}"
+            )
         return directory_fd
     except Exception:
         os.close(directory_fd)
@@ -1696,6 +1787,50 @@ def _open_directory_at(parent_fd: int, name: str) -> int:
 
 def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _bound_directory_identity(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    *,
+    label: str,
+) -> RunDirectoryIdentity:
+    try:
+        descriptor_stat = os.fstat(directory_fd)
+        named_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise RunSafetyError(f"{label} directory binding cannot be restated") from error
+    if (
+        not stat.S_ISDIR(descriptor_stat.st_mode)
+        or not stat.S_ISDIR(named_stat.st_mode)
+        or not _same_object(descriptor_stat, named_stat)
+    ):
+        raise RunSafetyError(f"{label} directory binding changed")
+    descriptor_identity = _run_directory_identity(descriptor_stat)
+    if descriptor_identity != _run_directory_identity(named_stat):
+        raise RunSafetyError(f"{label} directory access identity changed")
+    return descriptor_identity
+
+
+def _revalidate_bound_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    expected: RunDirectoryIdentity,
+    *,
+    label: str,
+) -> None:
+    if (
+        _bound_directory_identity(
+            parent_fd,
+            name,
+            directory_fd,
+            label=label,
+        )
+        != expected
+    ):
+        raise RunSafetyError(f"{label} directory identity changed")
 
 
 def _run_directory_identity(file_stat: os.stat_result) -> RunDirectoryIdentity:
@@ -2564,7 +2699,10 @@ def _update_session_observation(
 ) -> SessionRecord:
     existing = index["sessions"].get(session_id)
     run_dir = existing["run_dir"] if existing else None
-    status = "active" if existing and existing["run_dir"] else "observed"
+    if existing and existing["status"] in PREPARATION_STATUSES:
+        status = existing["status"]
+    else:
+        status = "active" if existing and existing["run_dir"] else "observed"
     record: SessionRecord = {
         "session_id": session_id,
         "cwd": cwd,
@@ -2574,10 +2712,602 @@ def _update_session_observation(
         "run_dir": run_dir,
         "status": status,
         "updated_at": _utc_now(),
+        "preparation_id": existing.get("preparation_id") if existing else None,
+        "preparation_run_id": (
+            existing.get("preparation_run_id") if existing else None
+        ),
+        "preparation_lease_path": (
+            existing.get("preparation_lease_path") if existing else None
+        ),
+        "preparation_started_at": (
+            existing.get("preparation_started_at") if existing else None
+        ),
+        "preparation_reason": (
+            existing.get("preparation_reason") if existing else None
+        ),
     }
     index["sessions"][session_id] = record
     index["latest_session_id"] = session_id
     return record
+
+
+def _bounded_preparation_reason(reason: str) -> str:
+    sanitized = "".join(
+        character
+        if 0x20 <= ord(character) <= 0x7E and character not in {'"', "\\"}
+        else "?"
+        for character in reason
+    )
+    if len(sanitized) <= PREPARATION_REASON_MAX_CHARS:
+        return sanitized
+    digest = hashlib.sha256(sanitized.encode("ascii")).hexdigest()
+    suffix = f"... [bytes={len(sanitized)} sha256={digest}]"
+    retained = PREPARATION_REASON_MAX_CHARS - len(suffix)
+    return sanitized[:retained] + suffix
+
+
+def _preparation_recovery_argv(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(pathlib.Path(__file__).resolve()),
+        "recover-active-run",
+        "--repo",
+        str(repo_root),
+        "--session-id",
+        reservation.session_id,
+        "--preparation-id",
+        reservation.preparation_id,
+    ]
+
+
+def _preparation_recovery_message(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+    *,
+    reason: str,
+) -> str:
+    return (
+        f"{reason} Preparation {reservation.preparation_id} remains recorded at "
+        f"{reservation.run_dir}. Recover it with: "
+        f"{_shell_command(_preparation_recovery_argv(repo_root, reservation))}"
+    )
+
+
+def _reservation_from_record(record: SessionRecord) -> PreparationReservation:
+    preparation_id = record.get("preparation_id")
+    run_id = record.get("preparation_run_id")
+    run_dir = record.get("run_dir")
+    lease_path = record.get("preparation_lease_path")
+    started_at = record.get("preparation_started_at")
+    if not all(
+        isinstance(value, str) and bool(value)
+        for value in (preparation_id, run_id, run_dir, lease_path, started_at)
+    ):
+        raise RunSafetyError(
+            f"session {record['session_id']} has an incomplete preparation reservation"
+        )
+    return PreparationReservation(
+        session_id=record["session_id"],
+        preparation_id=cast(str, preparation_id),
+        run_id=cast(str, run_id),
+        run_dir=cast(str, run_dir),
+        lease_path=cast(str, lease_path),
+        started_at=cast(str, started_at),
+    )
+
+
+def _require_exact_reservation(
+    record: SessionRecord,
+    reservation: PreparationReservation,
+    *,
+    allow_active: bool,
+) -> None:
+    allowed_statuses = set(PREPARATION_STATUSES)
+    if allow_active:
+        allowed_statuses.add("active")
+    if (
+        record["status"] not in allowed_statuses
+        or record["session_id"] != reservation.session_id
+        or record.get("preparation_id") != reservation.preparation_id
+        or record.get("preparation_run_id") != reservation.run_id
+        or record.get("preparation_lease_path") != reservation.lease_path
+        or record.get("preparation_started_at") != reservation.started_at
+        or record.get("run_dir") != reservation.run_dir
+    ):
+        raise RunSafetyError(
+            "preparation reservation changed before the requested transition"
+        )
+
+
+def _clear_preparation_reservation(
+    record: SessionRecord,
+    *,
+    updated_at: str,
+) -> None:
+    record["run_dir"] = None
+    record["status"] = "observed"
+    record["updated_at"] = updated_at
+    record["preparation_id"] = None
+    record["preparation_run_id"] = None
+    record["preparation_lease_path"] = None
+    record["preparation_started_at"] = None
+    record["preparation_reason"] = None
+
+
+def _mark_preparation_recovery(
+    record: SessionRecord,
+    *,
+    reason: str,
+    updated_at: str,
+) -> None:
+    record["status"] = "recovery_required"
+    record["updated_at"] = updated_at
+    record["preparation_reason"] = _bounded_preparation_reason(reason)
+
+
+def _activate_preparation(
+    record: SessionRecord,
+    *,
+    updated_at: str,
+) -> None:
+    record["status"] = "active"
+    record["updated_at"] = updated_at
+    record["preparation_reason"] = None
+
+
+def _clear_preparation_metadata(record: SessionRecord) -> None:
+    record["preparation_id"] = None
+    record["preparation_run_id"] = None
+    record["preparation_lease_path"] = None
+    record["preparation_started_at"] = None
+    record["preparation_reason"] = None
+
+
+def _complete_session_record(
+    record: SessionRecord,
+    *,
+    updated_at: str,
+) -> None:
+    record["run_dir"] = None
+    record["status"] = "completed"
+    record["updated_at"] = updated_at
+    _clear_preparation_metadata(record)
+
+
+def _require_active_record(record: SessionRecord) -> None:
+    if record["status"] != "active":
+        raise UserError(
+            f"session {record['session_id']} is {record['status']}; "
+            "recover or finish its preparation before mutating the run"
+        )
+
+
+def _reservation_run_path(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> pathlib.Path:
+    _validate_component_name(reservation.run_id, label="reserved run id")
+    expected = repo_root / ".codex-tmp" / RUNS_DIR_NAME / reservation.run_id
+    if pathlib.Path(reservation.run_dir) != expected:
+        raise RunSafetyError(
+            "preparation reservation run_dir does not match its repository and run id"
+        )
+    return expected
+
+
+def _preparation_lease_name(preparation_id: str) -> str:
+    _validate_component_name(preparation_id, label="preparation id")
+    return f"prepare-{preparation_id}.lease"
+
+
+def _preparation_lease_path(
+    repo_root: pathlib.Path,
+    preparation_id: str,
+) -> pathlib.Path:
+    return _adapter_dir(repo_root) / _preparation_lease_name(preparation_id)
+
+
+def _preparation_lease_content(
+    reservation: PreparationReservation,
+) -> bytes:
+    return (
+        json.dumps(
+            {
+                "preparation_id": reservation.preparation_id,
+                "run_dir": reservation.run_dir,
+                "run_id": reservation.run_id,
+                "schema_version": 1,
+                "session_id": reservation.session_id,
+                "started_at": reservation.started_at,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _validate_preparation_lease_fd(
+    adapter_fd: int,
+    lease_fd: int,
+    reservation: PreparationReservation,
+) -> None:
+    name = _preparation_lease_name(reservation.preparation_id)
+    expected_content = _preparation_lease_content(reservation)
+    try:
+        descriptor_stat = os.fstat(lease_fd)
+        named_stat = os.stat(name, dir_fd=adapter_fd, follow_symlinks=False)
+        content = os.pread(lease_fd, len(expected_content) + 1, 0)
+    except OSError as error:
+        raise RunSafetyError(
+            "preparation lease cannot be revalidated through its descriptor"
+        ) from error
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or not stat.S_ISREG(named_stat.st_mode)
+        or not _same_object(descriptor_stat, named_stat)
+        or descriptor_stat.st_uid != os.geteuid()
+        or descriptor_stat.st_gid != named_stat.st_gid
+        or stat.S_IMODE(descriptor_stat.st_mode) != INDEX_FILE_MODE
+        or stat.S_IMODE(named_stat.st_mode) != INDEX_FILE_MODE
+        or descriptor_stat.st_size != len(expected_content)
+        or named_stat.st_size != len(expected_content)
+        or content != expected_content
+    ):
+        raise RunSafetyError(
+            "preparation lease identity, access policy, or content changed"
+        )
+
+
+def _create_preparation_lease(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> int:
+    expected_path = _preparation_lease_path(
+        repo_root,
+        reservation.preparation_id,
+    )
+    if pathlib.Path(reservation.lease_path) != expected_path:
+        raise RunSafetyError(
+            "preparation reservation lease path does not match its transaction id"
+        )
+    repo_fd: int | None = None
+    codex_tmp_fd: int | None = None
+    adapter_fd: int | None = None
+    lease_fd: int | None = None
+    lease_visible = False
+    try:
+        repo_fd, codex_tmp_fd, adapter_fd = _open_index_directories(repo_root)
+        name = _preparation_lease_name(reservation.preparation_id)
+        try:
+            lease_fd = os.open(
+                name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                INDEX_FILE_MODE,
+                dir_fd=adapter_fd,
+            )
+        except OSError as error:
+            raise RunSafetyError(
+                "preparation lease cannot be created safely"
+            ) from error
+        lease_visible = True
+        os.fchmod(lease_fd, INDEX_FILE_MODE)
+        _write_all(lease_fd, _preparation_lease_content(reservation))
+        os.fsync(lease_fd)
+        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+        _validate_preparation_lease_fd(adapter_fd, lease_fd, reservation)
+        os.fsync(adapter_fd)
+        lease_visible = False
+        result = lease_fd
+        lease_fd = None
+        return result
+    except Exception:
+        if lease_visible and adapter_fd is not None and lease_fd is not None:
+            try:
+                _validate_preparation_lease_fd(adapter_fd, lease_fd, reservation)
+                os.unlink(
+                    _preparation_lease_name(reservation.preparation_id),
+                    dir_fd=adapter_fd,
+                )
+                os.fsync(adapter_fd)
+            except Exception:
+                pass
+        raise
+    finally:
+        if lease_fd is not None:
+            os.close(lease_fd)
+        if adapter_fd is not None:
+            os.close(adapter_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        if repo_fd is not None:
+            os.close(repo_fd)
+
+
+def _acquire_preparation_lease(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> int:
+    expected_path = _preparation_lease_path(
+        repo_root,
+        reservation.preparation_id,
+    )
+    if pathlib.Path(reservation.lease_path) != expected_path:
+        raise RunSafetyError(
+            "preparation reservation lease path does not match its transaction id"
+        )
+    repo_fd: int | None = None
+    codex_tmp_fd: int | None = None
+    adapter_fd: int | None = None
+    lease_fd: int | None = None
+    try:
+        repo_fd, codex_tmp_fd, adapter_fd = _open_index_directories(repo_root)
+        try:
+            lease_fd = os.open(
+                _preparation_lease_name(reservation.preparation_id),
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=adapter_fd,
+            )
+        except OSError as error:
+            raise RunSafetyError(
+                "preparation lease is missing or cannot be opened safely; "
+                "writer quiescence is unproven"
+            ) from error
+        _validate_preparation_lease_fd(adapter_fd, lease_fd, reservation)
+        try:
+            fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RunSafetyError(
+                "preparation lease is still held; the bridge or runner may still "
+                "be creating the reserved run"
+            ) from error
+        _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+        _validate_preparation_lease_fd(adapter_fd, lease_fd, reservation)
+        result = lease_fd
+        lease_fd = None
+        return result
+    finally:
+        if lease_fd is not None:
+            os.close(lease_fd)
+        if adapter_fd is not None:
+            os.close(adapter_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        if repo_fd is not None:
+            os.close(repo_fd)
+
+
+def _remove_preparation_lease(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+    lease_fd: int,
+) -> None:
+    repo_fd: int | None = None
+    codex_tmp_fd: int | None = None
+    adapter_fd: int | None = None
+    try:
+        repo_fd, codex_tmp_fd, adapter_fd = _open_index_directories(repo_root)
+        _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+        _validate_preparation_lease_fd(adapter_fd, lease_fd, reservation)
+        os.unlink(
+            _preparation_lease_name(reservation.preparation_id),
+            dir_fd=adapter_fd,
+        )
+        os.fsync(adapter_fd)
+        try:
+            os.stat(
+                _preparation_lease_name(reservation.preparation_id),
+                dir_fd=adapter_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise RunSafetyError("preparation lease removal could not be verified")
+        _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+    except OSError as error:
+        raise RunSafetyError("preparation lease removal failed") from error
+    finally:
+        if adapter_fd is not None:
+            os.close(adapter_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        if repo_fd is not None:
+            os.close(repo_fd)
+
+
+def _retire_inherited_preparation_lease(lease_fd: int) -> None:
+    """Close one local inherited-lease reference without retrying ambiguity."""
+
+    os.close(lease_fd)
+
+
+def _expected_run_entry_presence(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> RunEntryPresence:
+    """Prove point-in-time absence or conservatively report possible presence."""
+
+    _reservation_run_path(repo_root, reservation)
+    repo_fd: int | None = None
+    codex_tmp_fd: int | None = None
+    runs_fd: int | None = None
+    try:
+        try:
+            repo_fd = _open_absolute_directory(repo_root)
+            codex_tmp_fd = _open_directory_at(repo_fd, ".codex-tmp")
+        except OSError as error:
+            raise RunSafetyError(
+                "preparation run parent path cannot be opened without following links"
+            ) from error
+        codex_tmp_identity = _bound_directory_identity(
+            repo_fd,
+            ".codex-tmp",
+            codex_tmp_fd,
+            label="preparation .codex-tmp",
+        )
+        try:
+            runs_fd = _open_directory_at(codex_tmp_fd, RUNS_DIR_NAME)
+        except FileNotFoundError:
+            _revalidate_bound_directory(
+                repo_fd,
+                ".codex-tmp",
+                codex_tmp_fd,
+                codex_tmp_identity,
+                label="preparation .codex-tmp",
+            )
+            try:
+                os.stat(
+                    RUNS_DIR_NAME,
+                    dir_fd=codex_tmp_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return "absent"
+            except OSError as error:
+                raise RunSafetyError(
+                    "preparation runs root absence cannot be revalidated"
+                ) from error
+            raise RunSafetyError(
+                "preparation runs root appeared during absence validation"
+            )
+        except OSError as error:
+            raise RunSafetyError(
+                "preparation runs root cannot be opened without following links"
+            ) from error
+        runs_identity = _bound_directory_identity(
+            codex_tmp_fd,
+            RUNS_DIR_NAME,
+            runs_fd,
+            label="preparation runs root",
+        )
+        try:
+            os.stat(
+                reservation.run_id,
+                dir_fd=runs_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            _revalidate_bound_directory(
+                codex_tmp_fd,
+                RUNS_DIR_NAME,
+                runs_fd,
+                runs_identity,
+                label="preparation runs root",
+            )
+            _revalidate_bound_directory(
+                repo_fd,
+                ".codex-tmp",
+                codex_tmp_fd,
+                codex_tmp_identity,
+                label="preparation .codex-tmp",
+            )
+            try:
+                os.stat(
+                    reservation.run_id,
+                    dir_fd=runs_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return "absent"
+            except OSError as error:
+                raise RunSafetyError(
+                    "reserved run entry absence cannot be revalidated"
+                ) from error
+            raise RunSafetyError(
+                "reserved run entry appeared during absence validation"
+            )
+        except OSError as error:
+            raise RunSafetyError(
+                "reserved run entry presence cannot be determined"
+            ) from error
+        _revalidate_bound_directory(
+            codex_tmp_fd,
+            RUNS_DIR_NAME,
+            runs_fd,
+            runs_identity,
+            label="preparation runs root",
+        )
+        _revalidate_bound_directory(
+            repo_fd,
+            ".codex-tmp",
+            codex_tmp_fd,
+            codex_tmp_identity,
+            label="preparation .codex-tmp",
+        )
+        return "present"
+    finally:
+        if runs_fd is not None:
+            os.close(runs_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        if repo_fd is not None:
+            os.close(repo_fd)
+
+
+def _require_reserved_state_attestation(
+    run_dir: pathlib.Path,
+    state: dict[str, object],
+    reservation: PreparationReservation,
+) -> None:
+    if run_dir != pathlib.Path(reservation.run_dir):
+        raise RunSafetyError("reserved run resolved to an unexpected repository path")
+    if state.get("schema_version") != 4:
+        raise RunSafetyError(
+            "reserved run state does not use the preparation-aware schema"
+        )
+    if state.get("run_id") != reservation.run_id:
+        raise RunSafetyError(
+            "reserved run state does not attest the preparation run id"
+        )
+    if state.get("preparation_id") != reservation.preparation_id:
+        raise RunSafetyError(
+            "reserved run state does not attest the preparation transaction"
+        )
+    orchestration = _state_orchestration(state)
+    if orchestration.get("parent_session_id") != reservation.session_id:
+        raise RunSafetyError(
+            "reserved run state does not attest the preparation session"
+        )
+
+
+def _validate_reserved_run_state(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> tuple[
+    pathlib.Path,
+    dict[str, object],
+    RunDirectoryIdentity,
+    int,
+]:
+    run_dir = _reservation_run_path(repo_root, reservation)
+    loaded_run_dir, state, run_identity, run_fd = _load_stop_run_state(
+        repo_root,
+        reservation.run_dir,
+    )
+    try:
+        if loaded_run_dir != run_dir:
+            raise RunSafetyError(
+                "reserved run resolved to an unexpected repository path"
+            )
+        _require_reserved_state_attestation(loaded_run_dir, state, reservation)
+    except Exception:
+        os.close(run_fd)
+        raise
+    return loaded_run_dir, state, run_identity, run_fd
 
 
 def _build_stop_continuation_prompt(
@@ -2863,6 +3593,34 @@ def _block_unsafe_stop(error: RunSafetyError, payload: dict[str, object]) -> int
     return 2
 
 
+def _block_preparation_stop(
+    repo_root: pathlib.Path,
+    record: SessionRecord,
+    payload: dict[str, object],
+) -> int:
+    try:
+        reservation = _reservation_from_record(record)
+    except RunSafetyError as error:
+        return _block_unsafe_stop(error, payload)
+    reason = record.get("preparation_reason")
+    lines = [
+        "Do not finish.",
+        (
+            f"This session has a {record['status']} waited-delivery preparation "
+            f"({reservation.preparation_id})."
+        ),
+        "Do not open, refresh, or mutate the prospective run while recovery is pending.",
+    ]
+    if isinstance(reason, str) and reason:
+        lines.append(f"Recorded reason: {reason}")
+    lines.append(
+        "Inspect or recover the exact reservation with: "
+        f"{_shell_command(_preparation_recovery_argv(repo_root, reservation))}"
+    )
+    print("\n".join(lines), file=sys.stderr)
+    return 2
+
+
 def _handle_pinned_stop_run(
     *,
     payload: dict[str, object],
@@ -2874,9 +3632,7 @@ def _handle_pinned_stop_run(
     run_fd: int,
 ) -> int:
     if _run_is_terminal(state):
-        record["run_dir"] = None
-        record["status"] = "completed"
-        record["updated_at"] = _utc_now()
+        _complete_session_record(record, updated_at=_utc_now())
         return 0
     if payload.get("stop_hook_active"):
         return 0
@@ -2973,6 +3729,22 @@ def _stop_hook(_: argparse.Namespace) -> int:
             record = index["sessions"].get(session_id)
             if record is None or not record["run_dir"]:
                 stop_result = 0
+            elif record["status"] in PREPARATION_STATUSES:
+                if payload.get("stop_hook_active"):
+                    stop_result = 0
+                else:
+                    stop_result = _block_preparation_stop(
+                        repo_root,
+                        record,
+                        payload,
+                    )
+            elif record["status"] != "active":
+                stop_result = _block_unsafe_stop(
+                    RunSafetyError(
+                        "waited-delivery run ownership is not active or recoverable"
+                    ),
+                    payload,
+                )
             else:
                 try:
                     run_dir, state, run_identity, run_fd = _load_stop_run_state(
@@ -3008,83 +3780,478 @@ def _stop_hook(_: argparse.Namespace) -> int:
         return _fail_open_hook_response(error)
 
 
+def _build_prepare_bridge_args(
+    args: argparse.Namespace,
+    *,
+    repo_root: pathlib.Path,
+    record: SessionRecord,
+    reservation: PreparationReservation,
+) -> list[str]:
+    bridge_args = [
+        "prepare-live",
+        "--repo",
+        str(repo_root),
+        "--goal",
+        args.goal,
+        "--parent-session-id",
+        record["session_id"],
+        "--run-id",
+        reservation.run_id,
+        "--preparation-id",
+        reservation.preparation_id,
+    ]
+    if record["transcript_path"]:
+        bridge_args.extend(["--parent-transcript-path", record["transcript_path"]])
+    if record["permission_mode"]:
+        bridge_args.extend(["--permission-mode", record["permission_mode"]])
+    for phase in args.phase:
+        bridge_args.extend(["--phase", phase])
+    for changed_file in args.changed_file:
+        bridge_args.extend(["--changed-file", changed_file])
+    for blocker in args.known_blocker:
+        bridge_args.extend(["--known-blocker", blocker])
+    bridge_args.extend(["--external-lane", args.external_lane])
+    bridge_args.extend(["--fallback-lane", args.fallback_lane])
+    bridge_args.extend(["--fallback-entrypoint", args.fallback_entrypoint])
+    bridge_args.extend(["--external-helper", args.external_helper])
+    if args.no_fallback_smoke:
+        bridge_args.append("--no-fallback-smoke")
+    return bridge_args
+
+
+def _fence_preparation(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+    *,
+    reason: str,
+) -> None:
+    transaction_time = _utc_now()
+    with _index_transaction(
+        repo_root,
+        write=True,
+        commit_time=transaction_time,
+        context="prepare-active-run recovery fence",
+    ) as index:
+        record = index["sessions"].get(reservation.session_id)
+        if record is None:
+            raise RunSafetyError(
+                "preparation reservation disappeared before recovery fencing"
+            )
+        _require_exact_reservation(record, reservation, allow_active=True)
+        if record["status"] != "active":
+            _mark_preparation_recovery(
+                record,
+                reason=reason,
+                updated_at=transaction_time,
+            )
+        index["latest_session_id"] = reservation.session_id
+
+
+def _preparation_reservation_persisted(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> bool | None:
+    try:
+        with _index_transaction(repo_root, write=False) as index:
+            record = index["sessions"].get(reservation.session_id)
+            if record is None:
+                return False
+            try:
+                _require_exact_reservation(
+                    record,
+                    reservation,
+                    allow_active=True,
+                )
+            except RunSafetyError:
+                return False
+            return True
+    except Exception:
+        return None
+
+
+def _settle_failed_bridge(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+    *,
+    inherited_lease_fd: int,
+    reason: str,
+) -> Literal["active", "cleared", "fenced"]:
+    transaction_time = _utc_now()
+    outcome: Literal["active", "cleared", "fenced"] = "fenced"
+    recovery_lease_fd: int | None = None
+    inherited_lease_open = True
+    try:
+        with _index_transaction(
+            repo_root,
+            write=True,
+            commit_time=transaction_time,
+            context="prepare-active-run bridge failure recovery",
+        ) as index:
+            record = index["sessions"].get(reservation.session_id)
+            if record is None:
+                raise RunSafetyError(
+                    "preparation reservation disappeared after bridge failure"
+                )
+            _require_exact_reservation(record, reservation, allow_active=True)
+            if record["status"] == "active":
+                outcome = "active"
+                return outcome
+
+            inherited_lease_open = False
+            try:
+                _retire_inherited_preparation_lease(inherited_lease_fd)
+            except OSError as error:
+                _mark_preparation_recovery(
+                    record,
+                    reason=(
+                        f"{reason}; inherited lease ownership could not be "
+                        f"retired exactly once, so writer quiescence is "
+                        f"unproven: {error}"
+                    ),
+                    updated_at=transaction_time,
+                )
+            else:
+                try:
+                    recovery_lease_fd = _acquire_preparation_lease(
+                        repo_root,
+                        reservation,
+                    )
+                except RunSafetyError as error:
+                    _mark_preparation_recovery(
+                        record,
+                        reason=(
+                            f"{reason}; inherited-writer quiescence could not be "
+                            f"proved: {error}"
+                        ),
+                        updated_at=transaction_time,
+                    )
+                else:
+                    try:
+                        presence = _expected_run_entry_presence(
+                            repo_root,
+                            reservation,
+                        )
+                    except RunSafetyError as error:
+                        _mark_preparation_recovery(
+                            record,
+                            reason=f"{reason}; run-entry validation failed: {error}",
+                            updated_at=transaction_time,
+                        )
+                    else:
+                        if presence == "absent":
+                            _clear_preparation_reservation(
+                                record,
+                                updated_at=transaction_time,
+                            )
+                            outcome = "cleared"
+                        else:
+                            _mark_preparation_recovery(
+                                record,
+                                reason=f"{reason}; the reserved run entry may exist",
+                                updated_at=transaction_time,
+                            )
+            index["latest_session_id"] = reservation.session_id
+        if outcome == "cleared":
+            assert recovery_lease_fd is not None
+            _remove_preparation_lease(
+                repo_root,
+                reservation,
+                recovery_lease_fd,
+            )
+        return outcome
+    finally:
+        if inherited_lease_open:
+            os.close(inherited_lease_fd)
+        if recovery_lease_fd is not None:
+            os.close(recovery_lease_fd)
+
+
+def _activate_reserved_preparation(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> None:
+    run_dir, _state, run_identity, run_fd = _validate_reserved_run_state(
+        repo_root,
+        reservation,
+    )
+    try:
+        transaction_time = _utc_now()
+        with _index_transaction(
+            repo_root,
+            write=True,
+            commit_time=transaction_time,
+            context="prepare-active-run activation",
+        ) as index:
+            record = index["sessions"].get(reservation.session_id)
+            if record is None:
+                raise RunSafetyError(
+                    "preparation reservation disappeared before activation"
+                )
+            _require_exact_reservation(record, reservation, allow_active=True)
+            current_state, current_identity = _validate_stop_run_state_descriptor(
+                repo_root,
+                run_dir,
+                run_fd,
+                expected_identity=run_identity,
+            )
+            if current_identity != run_identity:
+                raise RunSafetyError("reserved run identity changed before activation")
+            _require_reserved_state_attestation(
+                run_dir,
+                current_state,
+                reservation,
+            )
+            if record["status"] != "active":
+                _activate_preparation(record, updated_at=transaction_time)
+            index["latest_session_id"] = reservation.session_id
+        final_state, final_identity = _validate_stop_run_state_descriptor(
+            repo_root,
+            run_dir,
+            run_fd,
+            expected_identity=run_identity,
+        )
+        if final_identity != run_identity:
+            raise RunSafetyError("reserved run identity changed after activation")
+        _require_reserved_state_attestation(run_dir, final_state, reservation)
+    finally:
+        os.close(run_fd)
+
+
 def _prepare_active_run(args: argparse.Namespace) -> int:
     repo_root = _resolve_repo_root(args.repo, strict=True)
     assert repo_root is not None
     transaction_time = _utc_now()
     run_id = (
         args.run_id
-        or f"{dt.datetime.fromisoformat(transaction_time):%Y%m%dT%H%M%SZ}-"
-        f"{uuid.uuid4().hex[:8]}"
+        if args.run_id is not None
+        else (
+            f"{dt.datetime.fromisoformat(transaction_time):%Y%m%dT%H%M%SZ}-"
+            f"{uuid.uuid4().hex[:8]}"
+        )
     )
     _validate_component_name(run_id, label="run id")
+    preparation_id = uuid.uuid4().hex
     prospective_run_dir = repo_root / ".codex-tmp" / RUNS_DIR_NAME / run_id
-    index_context = "prepare-active-run prospective index (no run created)"
-    with _index_transaction(
-        repo_root,
-        write=True,
-        commit_time=transaction_time,
-        context=index_context,
-    ) as index:
-        record = _resolve_session_record(
-            index,
-            repo_root=repo_root,
-            session_id=args.session_id,
-            transcript_path=args.transcript_path,
-            prompt_text=args.prompt_text,
-            host_session_id=_current_thread_session_id(),
-        )
-        if record["run_dir"]:
-            state = _load_run_state(record["run_dir"])
-            if state is not None and not _run_is_terminal(state):
-                raise UserError(
-                    f"session {record['session_id']} already has an active "
-                    f"waited-delivery run: {record['run_dir']}"
-                )
-        record["run_dir"] = str(prospective_run_dir)
-        record["status"] = "active"
-        record["updated_at"] = transaction_time
-        index["latest_session_id"] = record["session_id"]
-        _serialize_index_for_commit(
-            index,
-            transaction_time=transaction_time,
+    reservation: PreparationReservation | None = None
+    bridge_args: list[str] | None = None
+    lease_fd: int | None = None
+    index_context = "prepare-active-run durable preparation reservation"
+    try:
+        with _index_transaction(
+            repo_root,
+            write=True,
+            commit_time=transaction_time,
             context=index_context,
-        )
-        bridge_args = [
-            "prepare-live",
-            "--repo",
-            str(repo_root),
-            "--goal",
-            args.goal,
-            "--parent-session-id",
-            record["session_id"],
-            "--run-id",
-            run_id,
-        ]
-        if record["transcript_path"]:
-            bridge_args.extend(["--parent-transcript-path", record["transcript_path"]])
-        if record["permission_mode"]:
-            bridge_args.extend(["--permission-mode", record["permission_mode"]])
-        for phase in args.phase:
-            bridge_args.extend(["--phase", phase])
-        for changed_file in args.changed_file:
-            bridge_args.extend(["--changed-file", changed_file])
-        for blocker in args.known_blocker:
-            bridge_args.extend(["--known-blocker", blocker])
-        bridge_args.extend(["--external-lane", args.external_lane])
-        bridge_args.extend(["--fallback-lane", args.fallback_lane])
-        bridge_args.extend(["--fallback-entrypoint", args.fallback_entrypoint])
-        bridge_args.extend(["--external-helper", args.external_helper])
-        if args.no_fallback_smoke:
-            bridge_args.append("--no-fallback-smoke")
-        payload = _run_bridge_json(*bridge_args)
-        run_dir = payload.get("run_dir")
-        if run_dir != str(prospective_run_dir):
-            raise UserError(
-                "prepare-live returned an unexpected run_dir for the reserved run id"
+        ) as index:
+            record = _resolve_session_record(
+                index,
+                repo_root=repo_root,
+                session_id=args.session_id,
+                transcript_path=args.transcript_path,
+                prompt_text=args.prompt_text,
+                host_session_id=_current_thread_session_id(),
             )
-    print(json.dumps(payload))
-    return 0
+            if record["status"] in PREPARATION_STATUSES:
+                existing_reservation = _reservation_from_record(record)
+                raise UserError(
+                    _preparation_recovery_message(
+                        repo_root,
+                        existing_reservation,
+                        reason=(
+                            f"session {record['session_id']} already has an "
+                            f"unfinished {record['status']} preparation."
+                        ),
+                    )
+                )
+            if record["run_dir"]:
+                try:
+                    (
+                        _existing_run_dir,
+                        existing_state,
+                        _existing_identity,
+                        existing_run_fd,
+                    ) = _load_stop_run_state(
+                        repo_root,
+                        record["run_dir"],
+                    )
+                except RunSafetyError as error:
+                    raise UserError(
+                        f"session {record['session_id']} has an indexed run that "
+                        f"cannot be retired safely: {error}"
+                    ) from error
+                try:
+                    existing_run_terminal = _run_is_terminal(existing_state)
+                finally:
+                    os.close(existing_run_fd)
+                if not existing_run_terminal:
+                    raise UserError(
+                        f"session {record['session_id']} already has an active "
+                        f"waited-delivery run: {record['run_dir']}"
+                    )
+            for other in index["sessions"].values():
+                if other["session_id"] != record["session_id"] and other.get(
+                    "run_dir"
+                ) == str(prospective_run_dir):
+                    raise UserError(
+                        "another session already reserves the requested run id: "
+                        f"{other['session_id']}"
+                    )
+            reservation = PreparationReservation(
+                session_id=record["session_id"],
+                preparation_id=preparation_id,
+                run_id=run_id,
+                run_dir=str(prospective_run_dir),
+                lease_path=str(_preparation_lease_path(repo_root, preparation_id)),
+                started_at=transaction_time,
+            )
+            record["run_dir"] = reservation.run_dir
+            record["status"] = "preparing"
+            record["updated_at"] = transaction_time
+            record["preparation_id"] = reservation.preparation_id
+            record["preparation_run_id"] = reservation.run_id
+            record["preparation_lease_path"] = reservation.lease_path
+            record["preparation_started_at"] = reservation.started_at
+            record["preparation_reason"] = None
+            index["latest_session_id"] = record["session_id"]
+            _serialize_index_for_commit(
+                index,
+                transaction_time=transaction_time,
+                context=index_context,
+            )
+            lease_fd = _create_preparation_lease(repo_root, reservation)
+            bridge_args = _build_prepare_bridge_args(
+                args,
+                repo_root=repo_root,
+                record=record,
+                reservation=reservation,
+            )
+    except Exception as error:
+        if reservation is not None and lease_fd is not None:
+            persisted = _preparation_reservation_persisted(
+                repo_root,
+                reservation,
+            )
+            if persisted is False:
+                try:
+                    _remove_preparation_lease(
+                        repo_root,
+                        reservation,
+                        lease_fd,
+                    )
+                except Exception as cleanup_error:
+                    os.close(lease_fd)
+                    lease_fd = None
+                    raise UserError(
+                        "The preparation reservation was not published and no "
+                        "bridge was launched, but exact lease cleanup failed: "
+                        f"{cleanup_error}"
+                    ) from error
+                os.close(lease_fd)
+                lease_fd = None
+                raise UserError(
+                    "The preparation reservation was not published; no bridge "
+                    f"was launched and its exact lease was removed: {error}"
+                ) from error
+            os.close(lease_fd)
+            lease_fd = None
+            raise UserError(
+                _preparation_recovery_message(
+                    repo_root,
+                    reservation,
+                    reason=(
+                        "The durable preparation reservation could not be "
+                        f"verified before bridge launch: {error}"
+                    ),
+                )
+            ) from error
+        raise
+
+    assert reservation is not None
+    assert bridge_args is not None
+    assert lease_fd is not None
+    try:
+        try:
+            payload = _run_bridge_json_with_lease(lease_fd, *bridge_args)
+        except Exception as error:
+            reason = f"prepare-live failed: {error}"
+            failed_lease_fd = lease_fd
+            lease_fd = None
+            outcome = _settle_failed_bridge(
+                repo_root,
+                reservation,
+                inherited_lease_fd=failed_lease_fd,
+                reason=reason,
+            )
+            if outcome == "cleared":
+                raise UserError(
+                    f"{reason}; the quiescent reserved run entry was absent, "
+                    "so the exact preparation reservation was cleared safely"
+                ) from error
+            raise UserError(
+                _preparation_recovery_message(
+                    repo_root,
+                    reservation,
+                    reason=reason,
+                )
+            ) from error
+        if (
+            payload.get("run_dir") != reservation.run_dir
+            or payload.get("preparation_id") != reservation.preparation_id
+            or payload.get("preparation_lease_inherited") is not True
+        ):
+            reason = (
+                "prepare-live returned a result that does not match the exact "
+                "reserved run directory and preparation transaction"
+            )
+            _fence_preparation(
+                repo_root,
+                reservation,
+                reason=reason,
+            )
+            raise UserError(
+                _preparation_recovery_message(
+                    repo_root,
+                    reservation,
+                    reason=reason,
+                )
+            )
+        try:
+            _activate_reserved_preparation(repo_root, reservation)
+        except Exception as error:
+            reason = f"prepared run activation could not be verified: {error}"
+            try:
+                _fence_preparation(
+                    repo_root,
+                    reservation,
+                    reason=reason,
+                )
+            except Exception as fence_error:
+                reason = f"{reason}; recovery fence update also failed: {fence_error}"
+            raise UserError(
+                _preparation_recovery_message(
+                    repo_root,
+                    reservation,
+                    reason=reason,
+                )
+            ) from error
+        try:
+            _remove_preparation_lease(repo_root, reservation, lease_fd)
+        except Exception as error:
+            raise UserError(
+                _preparation_recovery_message(
+                    repo_root,
+                    reservation,
+                    reason=(
+                        "The run is active, but preparation lease cleanup could "
+                        f"not be verified: {error}"
+                    ),
+                )
+            ) from error
+        print(json.dumps(payload))
+        return 0
+    finally:
+        if lease_fd is not None:
+            os.close(lease_fd)
 
 
 def _attach_child_active_run(args: argparse.Namespace) -> int:
@@ -3097,6 +4264,7 @@ def _attach_child_active_run(args: argparse.Namespace) -> int:
             session_id=args.session_id,
             run_dir=args.run_dir,
         )
+        _require_active_record(record)
         exit_code = _run_bridge_passthrough(
             "attach-child-live",
             "--run-dir",
@@ -3134,6 +4302,7 @@ def _finish_child_active_run(args: argparse.Namespace) -> int:
             session_id=args.session_id,
             run_dir=args.run_dir,
         )
+        _require_active_record(record)
         bridge_args = [
             "finish-child-live",
             "--run-dir",
@@ -3162,6 +4331,7 @@ def _reconcile_active_run(args: argparse.Namespace) -> int:
             session_id=args.session_id,
             run_dir=args.run_dir,
         )
+        _require_active_record(record)
         bridge_args = [
             "reconcile-live",
             "--run-dir",
@@ -3174,14 +4344,240 @@ def _reconcile_active_run(args: argparse.Namespace) -> int:
         payload = _run_bridge_json(*bridge_args)
         state = _load_run_state(args.run_dir)
         if state is not None and _run_is_terminal(state):
-            record["run_dir"] = None
-            record["status"] = "completed"
+            _complete_session_record(record, updated_at=_utc_now())
         else:
             record["run_dir"] = args.run_dir
             record["status"] = "active"
-        record["updated_at"] = _utc_now()
+            record["updated_at"] = _utc_now()
         index["latest_session_id"] = record["session_id"]
     print(json.dumps(payload))
+    return 0
+
+
+def _preparation_doctor_payload(
+    repo_root: pathlib.Path,
+    record: SessionRecord,
+    reservation: PreparationReservation,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "session_id": reservation.session_id,
+        "preparation_id": reservation.preparation_id,
+        "run_id": reservation.run_id,
+        "run_dir": reservation.run_dir,
+        "index_status": record["status"],
+        "recorded_reason": record.get("preparation_reason"),
+    }
+    if record["status"] == "active":
+        try:
+            _run_dir, _state, _identity, run_fd = _validate_reserved_run_state(
+                repo_root,
+                reservation,
+            )
+        except RunSafetyError as error:
+            result.update(
+                {
+                    "status": "active_unverified",
+                    "detail": _bounded_preparation_reason(str(error)),
+                }
+            )
+        else:
+            os.close(run_fd)
+            result["status"] = "active"
+        return result
+    try:
+        lease_fd = _acquire_preparation_lease(repo_root, reservation)
+    except RunSafetyError as error:
+        detail = _bounded_preparation_reason(str(error))
+        result.update(
+            {
+                "status": (
+                    "in_progress"
+                    if "still held" in str(error)
+                    else "quiescence_unproven"
+                ),
+                "detail": detail,
+            }
+        )
+        return result
+    try:
+        try:
+            presence = _expected_run_entry_presence(repo_root, reservation)
+        except RunSafetyError as error:
+            result.update(
+                {
+                    "status": "presence_unproven",
+                    "detail": _bounded_preparation_reason(str(error)),
+                }
+            )
+            return result
+        result["entry_presence"] = presence
+        if presence == "absent":
+            result["status"] = "absent"
+            return result
+        try:
+            _run_dir, _state, _identity, run_fd = _validate_reserved_run_state(
+                repo_root,
+                reservation,
+            )
+        except RunSafetyError as error:
+            result.update(
+                {
+                    "status": "partial_or_untrusted",
+                    "detail": _bounded_preparation_reason(str(error)),
+                }
+            )
+            return result
+        else:
+            os.close(run_fd)
+            result["status"] = "complete_not_activated"
+            return result
+    finally:
+        os.close(lease_fd)
+
+
+def _recover_active_run(args: argparse.Namespace) -> int:
+    repo_root = _resolve_repo_root(args.repo, strict=True)
+    assert repo_root is not None
+    with _index_transaction(repo_root, write=False) as index:
+        record = _resolve_session_record(
+            index,
+            repo_root=repo_root,
+            session_id=args.session_id,
+        )
+        reservation = _reservation_from_record(record)
+        if reservation.preparation_id != args.preparation_id:
+            raise RunSafetyError(
+                "requested preparation id does not match the indexed reservation"
+            )
+        record_snapshot = copy.deepcopy(record)
+
+    if args.action == "doctor":
+        print(
+            json.dumps(
+                _preparation_doctor_payload(
+                    repo_root,
+                    record_snapshot,
+                    reservation,
+                ),
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.action == "resume":
+        if record_snapshot["status"] == "active":
+            _run_dir, _state, _identity, run_fd = _validate_reserved_run_state(
+                repo_root,
+                reservation,
+            )
+            os.close(run_fd)
+            try:
+                os.lstat(reservation.lease_path)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise RunSafetyError(
+                    "active preparation lease cleanup status cannot be inspected"
+                ) from error
+            else:
+                lease_fd = _acquire_preparation_lease(repo_root, reservation)
+                try:
+                    _remove_preparation_lease(
+                        repo_root,
+                        reservation,
+                        lease_fd,
+                    )
+                finally:
+                    os.close(lease_fd)
+            print(
+                json.dumps(
+                    {
+                        "preparation_id": reservation.preparation_id,
+                        "run_dir": reservation.run_dir,
+                        "status": "active",
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        lease_fd = _acquire_preparation_lease(repo_root, reservation)
+        try:
+            try:
+                _activate_reserved_preparation(repo_root, reservation)
+            except Exception as error:
+                reason = f"recovery resume failed: {error}"
+                try:
+                    _fence_preparation(
+                        repo_root,
+                        reservation,
+                        reason=reason,
+                    )
+                except Exception as fence_error:
+                    reason = (
+                        f"{reason}; recovery fence update also failed: {fence_error}"
+                    )
+                raise UserError(
+                    _preparation_recovery_message(
+                        repo_root,
+                        reservation,
+                        reason=reason,
+                    )
+                ) from error
+            _remove_preparation_lease(repo_root, reservation, lease_fd)
+        finally:
+            os.close(lease_fd)
+        print(
+            json.dumps(
+                {
+                    "preparation_id": reservation.preparation_id,
+                    "run_dir": reservation.run_dir,
+                    "status": "active",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if record_snapshot["status"] == "active":
+        raise UserError("an active preparation cannot be cleared as absent")
+    lease_fd = _acquire_preparation_lease(repo_root, reservation)
+    try:
+        transaction_time = _utc_now()
+        with _index_transaction(
+            repo_root,
+            write=True,
+            commit_time=transaction_time,
+            context="recover-active-run clear absent reservation",
+        ) as index:
+            record = index["sessions"].get(reservation.session_id)
+            if record is None:
+                raise RunSafetyError(
+                    "preparation reservation disappeared before absent clear"
+                )
+            _require_exact_reservation(record, reservation, allow_active=False)
+            if _expected_run_entry_presence(repo_root, reservation) != "absent":
+                raise UserError(
+                    "reserved run entry is present; use doctor and resume a complete "
+                    "matching run, or retain the recovery fence"
+                )
+            _clear_preparation_reservation(
+                record,
+                updated_at=transaction_time,
+            )
+            index["latest_session_id"] = reservation.session_id
+        _remove_preparation_lease(repo_root, reservation, lease_fd)
+    finally:
+        os.close(lease_fd)
+    print(
+        json.dumps(
+            {
+                "preparation_id": reservation.preparation_id,
+                "run_dir": reservation.run_dir,
+                "status": "cleared",
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -3259,6 +4655,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("--no-fallback-smoke", action="store_true")
     prepare.set_defaults(func=_prepare_active_run)
+
+    recover = subparsers.add_parser("recover-active-run")
+    recover.add_argument("--repo", required=True)
+    recover.add_argument("--session-id", required=True)
+    recover.add_argument("--preparation-id", required=True)
+    recover.add_argument(
+        "--action",
+        choices=("doctor", "resume", "clear-absent"),
+        default="doctor",
+    )
+    recover.set_defaults(func=_recover_active_run)
 
     attach = subparsers.add_parser("attach-child-active-run")
     attach.add_argument("--repo", required=True)

@@ -390,7 +390,8 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         )
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(state["schema_version"], 3)
+        self.assertEqual(state["schema_version"], 4)
+        self.assertIsNone(state["preparation_id"])
         self.assertEqual(state["goal"], "Wrap current repo changes")
         self.assertEqual(state["overall_status"], "pending")
         self.assertEqual(state["changed_files"], ["tracked.txt", "notes.md"])
@@ -753,6 +754,301 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertTrue(run_dir.is_dir())
         self.assertEqual(payload["parent_prompt"], str(run_dir / "parent-prompt.md"))
         self.assertEqual(payload["child_prompt"], str(run_dir / "child-prompt.md"))
+        self.assertIsNone(payload["preparation_id"])
+
+    def test_prepare_preflights_exact_and_plus_one_terminal_capacity_before_creation(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        fixed_now = "2026-07-30T07:08:09+00:00"
+        run_id = "r" * 200
+        args = module._build_parser().parse_args(
+            [
+                "prepare",
+                "--repo",
+                str(self.repo),
+                "--goal",
+                "Preflight the complete initial state",
+                "--run-id",
+                run_id,
+                "--external-helper",
+                str(self.fake_helper),
+                "--no-fallback-smoke",
+            ]
+        )
+        captured_state: dict[str, object] = {}
+        real_serialize = module._serialize_state_for_save
+
+        class PlannedCreation(RuntimeError):
+            pass
+
+        def capture_serialize(state, **kwargs):
+            content = real_serialize(state, **kwargs)
+            captured_state["state"] = copy.deepcopy(state)
+            return content
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "_serialize_state_for_save",
+                side_effect=capture_serialize,
+            ),
+            mock.patch.object(
+                module,
+                "_create_run_directory",
+                side_effect=PlannedCreation,
+            ),
+            self.assertRaises(PlannedCreation),
+        ):
+            module._prepare(args)
+
+        state = captured_state["state"]
+        self.assertIsInstance(state, dict)
+        projected = module._terminal_capacity_projection(
+            state,
+            transaction_time=fixed_now,
+        )
+        projected_size = len(
+            (json.dumps(projected, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        )
+        shutil.rmtree(self.repo / ".codex-tmp")
+        exact_stdout = io.StringIO()
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(module, "STATE_MAX_BYTES", projected_size),
+            contextlib.redirect_stdout(exact_stdout),
+        ):
+            self.assertEqual(module._prepare(args), 0)
+        run_dir = module._prospective_run_directory(self.repo.resolve(), run_id)
+        self.assertEqual(exact_stdout.getvalue(), f"{run_dir}\n")
+        self.assertTrue(run_dir.is_dir())
+        self.assertEqual(
+            {
+                ".state.lock",
+                "child-contract.md",
+                "child-prompt.md",
+                "fallback-smoke.command.txt",
+                "fallback-smoke.prompt.md",
+                "parent-prompt.md",
+                "state.json",
+            },
+            {path.name for path in run_dir.iterdir() if path.is_file()},
+        )
+
+        shutil.rmtree(self.repo / ".codex-tmp")
+        rejected_stdout = io.StringIO()
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(module, "STATE_MAX_BYTES", projected_size - 1),
+            mock.patch.object(module, "_create_run_directory") as creator,
+            contextlib.redirect_stdout(rejected_stdout),
+            self.assertRaisesRegex(
+                module.UserError,
+                "initial state would consume reserved terminal capacity",
+            ),
+        ):
+            module._prepare(args)
+        creator.assert_not_called()
+        self.assertEqual(rejected_stdout.getvalue(), "")
+        self.assertFalse((self.repo / ".codex-tmp").exists())
+
+    def test_prepare_auto_id_capacity_preflight_precedes_unavailable_parent(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        fixed_now = "2026-07-30T08:09:10+00:00"
+        generated_run_id = "a" * 200
+        args = module._build_parser().parse_args(
+            [
+                "prepare",
+                "--repo",
+                str(self.repo),
+                "--goal",
+                "Preflight an automatic run id",
+                "--external-helper",
+                str(self.fake_helper),
+                "--no-fallback-smoke",
+            ]
+        )
+        captured_state: dict[str, object] = {}
+        real_serialize = module._serialize_state_for_save
+
+        class PlannedCreation(RuntimeError):
+            pass
+
+        def capture_serialize(state, **kwargs):
+            content = real_serialize(state, **kwargs)
+            captured_state["state"] = copy.deepcopy(state)
+            return content
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "_generate_run_id",
+                return_value=generated_run_id,
+            ),
+            mock.patch.object(
+                module,
+                "_serialize_state_for_save",
+                side_effect=capture_serialize,
+            ),
+            mock.patch.object(
+                module,
+                "_create_run_directory",
+                side_effect=PlannedCreation,
+            ),
+            self.assertRaises(PlannedCreation),
+        ):
+            module._prepare(args)
+        projected = module._terminal_capacity_projection(
+            captured_state["state"],
+            transaction_time=fixed_now,
+        )
+        projected_size = len(
+            (json.dumps(projected, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        )
+
+        shutil.rmtree(self.repo / ".codex-tmp")
+        unavailable_parent = self.repo / ".codex-tmp"
+        unavailable_parent.write_text("not a directory\n", encoding="utf-8")
+        rejected_stdout = io.StringIO()
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "_generate_run_id",
+                return_value=generated_run_id,
+            ),
+            mock.patch.object(module, "STATE_MAX_BYTES", projected_size - 1),
+            mock.patch.object(module, "_create_run_directory") as creator,
+            contextlib.redirect_stdout(rejected_stdout),
+            self.assertRaisesRegex(
+                module.UserError,
+                "initial state would consume reserved terminal capacity",
+            ),
+        ):
+            module._prepare(args)
+        creator.assert_not_called()
+        self.assertEqual(rejected_stdout.getvalue(), "")
+        self.assertEqual(
+            unavailable_parent.read_text(encoding="utf-8"),
+            "not a directory\n",
+        )
+
+        exact_stdout = io.StringIO()
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "_generate_run_id",
+                return_value=generated_run_id,
+            ),
+            mock.patch.object(module, "STATE_MAX_BYTES", projected_size),
+            contextlib.redirect_stdout(exact_stdout),
+            self.assertRaises(module.UserError),
+        ):
+            module._prepare(args)
+        self.assertEqual(exact_stdout.getvalue(), "")
+        self.assertTrue(unavailable_parent.is_file())
+
+    def test_prepare_rejects_empty_oversized_and_non_utf8_inputs_before_creation(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        name_max = os.pathconf(self.repo, "PC_NAME_MAX")
+        oversized_run_id = "x" * (name_max + 1)
+        cases = (
+            ("empty-explicit", "", "goal", None),
+            ("oversized-explicit", oversized_run_id, "goal", None),
+            ("non-utf8-artifact", "non-utf8", "goal-\ud800", None),
+            ("oversized-auto", None, "goal", oversized_run_id),
+        )
+        for label, run_id, goal, generated in cases:
+            with self.subTest(case=label):
+                shutil.rmtree(self.repo / ".codex-tmp", ignore_errors=True)
+                argv = [
+                    "prepare",
+                    "--repo",
+                    str(self.repo),
+                    "--goal",
+                    goal,
+                    "--external-helper",
+                    str(self.fake_helper),
+                    "--no-fallback-smoke",
+                ]
+                if run_id is not None:
+                    argv.extend(["--run-id", run_id])
+                args = module._build_parser().parse_args(argv)
+                patches = (
+                    mock.patch.object(
+                        module,
+                        "_generate_run_id",
+                        return_value=generated,
+                    )
+                    if generated is not None
+                    else contextlib.nullcontext()
+                )
+                stdout = io.StringIO()
+                with (
+                    patches,
+                    mock.patch.object(module, "_create_run_directory") as creator,
+                    contextlib.redirect_stdout(stdout),
+                    self.assertRaises(module.UserError),
+                ):
+                    module._prepare(args)
+                creator.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertFalse((self.repo / ".codex-tmp").exists())
+
+    def test_prepare_persists_directory_entries_before_artifact_publication(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        run_id = "directory-durability-failure"
+        args = module._build_parser().parse_args(
+            [
+                "prepare",
+                "--repo",
+                str(self.repo),
+                "--goal",
+                "Persist run directory entries",
+                "--run-id",
+                run_id,
+                "--external-helper",
+                str(self.fake_helper),
+                "--no-fallback-smoke",
+            ]
+        )
+        real_fsync = module.os.fsync
+        fsync_calls = 0
+        stdout = io.StringIO()
+
+        def fail_run_entry_fsync(file_descriptor: int) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 3:
+                raise OSError("simulated run-entry durability failure")
+            real_fsync(file_descriptor)
+
+        with (
+            mock.patch.object(module.os, "fsync", side_effect=fail_run_entry_fsync),
+            mock.patch.object(module, "_atomic_write_regular") as artifact_writer,
+            contextlib.redirect_stdout(stdout),
+            self.assertRaisesRegex(
+                module.UserError,
+                "run directory parents are unsafe or unavailable",
+            ),
+        ):
+            module._prepare(args)
+
+        self.assertEqual(fsync_calls, 3)
+        artifact_writer.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertTrue(
+            (self.repo / ".codex-tmp" / module.RUNS_DIR_NAME / run_id).is_dir()
+        )
 
     def test_refresh_prompts_replaces_legacy_runner_commands(self) -> None:
         run_dir = self._prepare("--no-fallback-smoke")

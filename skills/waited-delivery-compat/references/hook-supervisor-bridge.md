@@ -28,6 +28,8 @@ The current outer adapter already follows this rule: it may observe product-spec
 - `prepare-live`
   - wraps `waited_delivery_runner.py prepare --json`
   - injects parent metadata from args or env
+  - for an adapter reservation, requires `--preparation-id` together with an inherited open `--preparation-lease-fd`, keeps that descriptor across its own process, forwards both the descriptor and stable transaction ID to the runner, and returns the runner's lease-inheritance attestation
+  - lets the runner publish schema `4` state with the same preparation ID; it does not select, clear, or activate the adapter reservation itself
 - `bind-parent-live`
   - patches parent metadata into an existing run when the ids or other outer-adapter metadata become known later
 - `attach-child-live`
@@ -64,4 +66,5 @@ The current outer adapter already follows this rule: it may observe product-spec
 - Call `refresh-prompts-live` only through the outer adapter's anonymous-pipe source launcher. Other bridge commands retain their ordinary source-path CLI behavior.
 - If stock App / hooks later expose different metadata names, only the outer adapter should need to change.
 - `prepare-live` and `attach-child-live` prefer explicit CLI args over env vars when both are present.
+- Preparation IDs are correlation evidence rather than secrets or authentication credentials. The inherited lease coordinates only the adapter/bridge/runner chain; a runner descendant may retain the same open-file-description after the bridge process exits, so the outer adapter must retire its own inherited reference and independently reacquire the lock before declaring that chain quiescent. Recovery and CAS policy remain owned by the outer adapter.
 - The bridge remains useful even when an outer hook can only provide `session_id`, `transcript_path`, or `permission_mode` but not a true `turn_id`.
