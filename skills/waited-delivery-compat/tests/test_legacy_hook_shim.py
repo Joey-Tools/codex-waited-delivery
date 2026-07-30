@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import fcntl
+import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -146,7 +148,7 @@ class LegacyHookShimTests(unittest.TestCase):
                     self.assertEqual(completed.stdout, expected.stdout)
                     self.assertEqual(completed.stderr, expected.stderr)
 
-    def test_legacy_runner_snapshot_survives_owner_bit_masking_umask(self) -> None:
+    def test_legacy_runner_pipe_survives_owner_bit_masking_umask(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             expected = self._invoke_runner(COMPAT_RUNNER, "--help", root=root)
@@ -163,67 +165,50 @@ class LegacyHookShimTests(unittest.TestCase):
                     self.assertEqual(completed.stdout, expected.stdout)
                     self.assertEqual(completed.stderr, expected.stderr)
 
-    def test_legacy_runner_snapshot_rejects_directory_drift(self) -> None:
+    def test_legacy_runner_pipe_writer_and_exec_failures_are_reaped(self) -> None:
         for runner in (LEGACY_RUNNER, HISTORICAL_TARGET_RUNNER):
-            expected_errors = {
-                "replacement": "identity or access policy changed",
-                "unsafe-access": "identity or access policy changed",
-                "unreadable": "cannot be hardened without following links",
-            }
-            for mutation, expected_error in expected_errors.items():
-                with self.subTest(runner=runner, mutation=mutation):
-                    module = self._load_redirect_module(runner)
-                    real_chmod = os.chmod
-                    displaced: list[Path] = []
+            with self.subTest(runner=runner, failure="writer"):
+                module = self._load_redirect_module(runner)
+                with mock.patch.object(
+                    module.os,
+                    "write",
+                    side_effect=OSError("injected writer failure"),
+                ):
+                    read_fd, writer_pid = module._runner_source_pipe(
+                        b"raise SystemExit(0)\n"
+                    )
+                try:
+                    self.assertTrue(stat.S_ISFIFO(os.fstat(read_fd).st_mode))
+                    self.assertEqual(os.read(read_fd, 1), b"")
+                finally:
+                    os.close(read_fd)
+                waited_pid, writer_status = os.waitpid(writer_pid, 0)
+                self.assertEqual(waited_pid, writer_pid)
+                self.assertTrue(os.WIFEXITED(writer_status))
+                self.assertEqual(os.WEXITSTATUS(writer_status), 126)
 
-                    def mutate_directory(
-                        path: str | os.PathLike[str],
-                        _mode: int,
-                        *,
-                        follow_symlinks: bool,
-                    ) -> None:
-                        snapshot_dir = Path(path)
-                        if mutation == "replacement":
-                            displaced_dir = snapshot_dir.with_name(
-                                f"{snapshot_dir.name}.displaced"
-                            )
-                            snapshot_dir.rename(displaced_dir)
-                            displaced.append(displaced_dir)
-                            snapshot_dir.mkdir(mode=0o700)
-                            real_chmod(
-                                snapshot_dir,
-                                0o700,
-                                follow_symlinks=follow_symlinks,
-                            )
-                        elif mutation == "unsafe-access":
-                            real_chmod(
-                                snapshot_dir,
-                                0o755,
-                                follow_symlinks=follow_symlinks,
-                            )
-                        else:
-                            raise PermissionError(
-                                "injected snapshot directory access failure"
-                            )
+            with self.subTest(runner=runner, failure="exec"):
+                module = self._load_redirect_module(runner)
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(
+                        module,
+                        "_stable_runner_source",
+                        return_value=b"raise SystemExit(0)\n",
+                    ),
+                    mock.patch.object(
+                        module.os,
+                        "execv",
+                        side_effect=OSError("injected exec failure"),
+                    ),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    self.assertEqual(module.main(), 126)
+                self.assertIn("injected exec failure", stderr.getvalue())
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(-1, os.WNOHANG)
 
-                    try:
-                        with mock.patch.object(
-                            module.os,
-                            "chmod",
-                            side_effect=mutate_directory,
-                        ):
-                            with self.assertRaisesRegex(
-                                RuntimeError,
-                                expected_error,
-                            ):
-                                module._private_runner_snapshot(
-                                    b"raise SystemExit(0)\n"
-                                )
-                    finally:
-                        for displaced_dir in displaced:
-                            shutil.rmtree(displaced_dir)
-
-    def test_legacy_runner_executes_snapshot_after_target_symlink_replacement(
+    def test_legacy_runner_executes_pipe_bytes_after_target_symlink_replacement(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -278,12 +263,11 @@ class LegacyHookShimTests(unittest.TestCase):
             ) -> None:
                 compat_runner.unlink()
                 compat_runner.symlink_to(malicious_runner)
-                snapshot_fd = int(arguments[4])
-                self.assertEqual(
-                    fcntl.fcntl(snapshot_fd, fcntl.F_GETFL) & os.O_ACCMODE,
-                    os.O_RDONLY,
-                )
-                self.assertEqual(os.fstat(snapshot_fd).st_nlink, 0)
+                self.assertEqual(arguments[1:5], ["-I", "-B", "-S", "-c"])
+                source_fd = int(arguments[7])
+                self.assertTrue(stat.S_ISFIFO(os.fstat(source_fd).st_mode))
+                self.assertNotIn("/dev/fd/", " ".join(arguments))
+                self.assertNotIn("/proc/self/fd/", " ".join(arguments))
                 environment = os.environ.copy()
                 environment["PYTHONDONTWRITEBYTECODE"] = "1"
                 completed = subprocess.run(
@@ -291,7 +275,7 @@ class LegacyHookShimTests(unittest.TestCase):
                     check=False,
                     cwd=root,
                     env=environment,
-                    pass_fds=(snapshot_fd,),
+                    pass_fds=(source_fd,),
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

@@ -19,7 +19,6 @@ import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import traceback
 import uuid
@@ -66,9 +65,63 @@ RUNS_DIR_NAME = "waited-delivery"
 RUN_DIRECTORY_MODE = 0o700
 LEGACY_RUN_DIRECTORY_MODE = 0o755
 STATE_MAX_BYTES = 4 * 1024 * 1024
-PROMPT_REFRESH_SCHEMA_VERSION = 2
-LAUNCH_SNAPSHOT_DIRECTORY_MODE = 0o700
-LAUNCH_SNAPSHOT_FILE_MODE = 0o600
+PROMPT_REFRESH_SCHEMA_VERSION = 3
+SOURCE_FRAME_MAGIC = b"WDLPIPE1"
+SOURCE_FRAME_HEADER_BYTES = 8 + 8 + 32 + 8 + 32
+SOURCE_PIPE_BOOTSTRAP = """\
+import hashlib
+import sys
+
+MAX_SOURCE_BYTES = 4 * 1024 * 1024
+
+def read_exact(stream, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(min(64 * 1024, remaining))
+        if not chunk:
+            raise SystemExit("truncated waited-delivery source frame")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+stream = sys.stdin.buffer
+if read_exact(stream, 8) != b"WDLPIPE1":
+    raise SystemExit("invalid waited-delivery source frame")
+bridge_size = int.from_bytes(read_exact(stream, 8), "big")
+bridge_sha256 = read_exact(stream, 32).hex()
+runner_size = int.from_bytes(read_exact(stream, 8), "big")
+runner_sha256 = read_exact(stream, 32).hex()
+if (
+    bridge_size <= 0
+    or bridge_size > MAX_SOURCE_BYTES
+    or runner_size <= 0
+    or runner_size > MAX_SOURCE_BYTES
+):
+    raise SystemExit("waited-delivery source frame size is outside the bound")
+bridge_source = read_exact(stream, bridge_size)
+runner_source = read_exact(stream, runner_size)
+if stream.read(1):
+    raise SystemExit("waited-delivery source frame has trailing bytes")
+if hashlib.sha256(bridge_source).hexdigest() != bridge_sha256:
+    raise SystemExit("waited-delivery bridge source digest mismatch")
+if hashlib.sha256(runner_source).hexdigest() != runner_sha256:
+    raise SystemExit("waited-delivery runner source digest mismatch")
+bridge_path = sys.argv[1]
+runner_path = sys.argv[2]
+bridge_args = sys.argv[3:]
+sys.argv[:] = [bridge_path, *bridge_args]
+bridge_globals = {
+    "__name__": "__main__",
+    "__file__": bridge_path,
+    "__package__": None,
+    "__cached__": None,
+    "_WAITED_DELIVERY_BOUND_BRIDGE_SOURCE": bridge_source,
+    "_WAITED_DELIVERY_BOUND_RUNNER_SOURCE": runner_source,
+    "_WAITED_DELIVERY_BOUND_RUNNER_PATH": runner_path,
+}
+exec(compile(bridge_source, bridge_path, "exec"), bridge_globals)
+"""
 REFRESH_TIMEOUT_SECONDS = 7.0
 REFRESH_CLEANUP_TIMEOUT_SECONDS = 2.0
 REFRESH_CAPTURE_MAX_BYTES = 256 * 1024
@@ -133,17 +186,15 @@ class RefreshedPrompts(NamedTuple):
     parent_version: StopArtifactVersion
 
 
-class LaunchArtifactSnapshot(NamedTuple):
+class LaunchArtifactSource(NamedTuple):
     source_path: pathlib.Path
     source_version: StopArtifactVersion
-    snapshot_fd: int
-    snapshot_version: StopArtifactVersion
-    execution_path: pathlib.Path
+    content: bytes
 
 
-class RefreshLaunchSnapshots(NamedTuple):
-    bridge: LaunchArtifactSnapshot
-    runner: LaunchArtifactSnapshot
+class RefreshLaunchSources(NamedTuple):
+    bridge: LaunchArtifactSource
+    runner: LaunchArtifactSource
 
 
 class SessionRecord(TypedDict):
@@ -487,6 +538,72 @@ def _drain_refresh_output_once(
         captures[cast(str, key.data)].extend(chunk)
 
 
+def _service_refresh_io_once(
+    selector: selectors.BaseSelector,
+    captures: dict[str, bytearray],
+    *,
+    input_bytes: bytes,
+    input_offset: int,
+    timeout: float,
+    max_capture_bytes: int,
+) -> tuple[int, bool]:
+    input_rejected = False
+    for key, mask in selector.select(timeout):
+        if key.data == "stdin":
+            if not (mask & selectors.EVENT_WRITE):
+                continue
+            try:
+                written = os.write(
+                    key.fd,
+                    input_bytes[
+                        input_offset : input_offset + REFRESH_DRAIN_CHUNK_BYTES
+                    ],
+                )
+            except (BrokenPipeError, ConnectionResetError):
+                written = 0
+                input_rejected = True
+            except BlockingIOError:
+                continue
+            if written > 0:
+                input_offset += written
+            if input_rejected or input_offset == len(input_bytes):
+                selector.unregister(key.fd)
+                cast(object, key.fileobj).close()  # type: ignore[attr-defined]
+            continue
+        try:
+            chunk = os.read(key.fd, REFRESH_DRAIN_CHUNK_BYTES)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            selector.unregister(key.fd)
+            continue
+        retained = sum(len(value) for value in captures.values())
+        if retained + len(chunk) > max_capture_bytes:
+            raise _RefreshCaptureLimitExceeded
+        captures[cast(str, key.data)].extend(chunk)
+    return input_offset, input_rejected
+
+
+def _close_refresh_input(
+    selector: selectors.BaseSelector,
+    stream: object | None,
+) -> None:
+    if stream is None:
+        return
+    fileno = getattr(stream, "fileno", None)
+    close = getattr(stream, "close", None)
+    if callable(fileno):
+        try:
+            selector.unregister(fileno())
+        except (KeyError, ValueError, OSError):
+            pass
+    if callable(close):
+        try:
+            close()
+        except OSError:
+            pass
+
+
 def _cleanup_refresh_process(
     process: subprocess.Popen[bytes],
     selector: selectors.BaseSelector,
@@ -531,6 +648,7 @@ def _run_bounded_refresh_process(
     *,
     pass_fds: tuple[int, ...],
     env: dict[str, str],
+    input_bytes: bytes | None = None,
     timeout: float = REFRESH_TIMEOUT_SECONDS,
     cleanup_timeout: float = REFRESH_CLEANUP_TIMEOUT_SECONDS,
     max_capture_bytes: int = REFRESH_CAPTURE_MAX_BYTES,
@@ -539,6 +657,12 @@ def _run_bounded_refresh_process(
         raise UserError("prompt refresh command must be a nonempty argv")
     if any(not isinstance(file_fd, int) or file_fd < 0 for file_fd in pass_fds):
         raise UserError("prompt refresh pass_fds must be nonnegative integers")
+    if input_bytes is not None and not isinstance(input_bytes, bytes):
+        raise UserError("prompt refresh input must be bytes")
+    if input_bytes is not None and len(input_bytes) > (
+        SOURCE_FRAME_HEADER_BYTES + 2 * STATE_MAX_BYTES
+    ):
+        raise UserError("prompt refresh input exceeds the source-frame byte bound")
     if timeout <= 0 or cleanup_timeout <= 0 or max_capture_bytes <= 0:
         raise UserError("prompt refresh process bounds must be positive")
     signal_transaction = _RefreshSignalTransaction()
@@ -548,6 +672,7 @@ def _run_bounded_refresh_process(
             command,
             pass_fds=pass_fds,
             env=env,
+            input_bytes=input_bytes,
             timeout=timeout,
             cleanup_timeout=cleanup_timeout,
             max_capture_bytes=max_capture_bytes,
@@ -574,6 +699,7 @@ def _run_bounded_refresh_process_supervised(
     *,
     pass_fds: tuple[int, ...],
     env: dict[str, str],
+    input_bytes: bytes | None,
     timeout: float,
     cleanup_timeout: float,
     max_capture_bytes: int,
@@ -593,7 +719,9 @@ def _run_bounded_refresh_process_supervised(
         try:
             process = subprocess.Popen(
                 command,
-                stdin=subprocess.DEVNULL,
+                stdin=(
+                    subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL
+                ),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 close_fds=True,
@@ -612,22 +740,35 @@ def _run_bounded_refresh_process_supervised(
             ):
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream.fileno(), selectors.EVENT_READ, name)
+            input_offset = 0
+            input_rejected = False
+            if input_bytes is not None:
+                if process.stdin is None:
+                    raise UserError("prompt refresh input pipe was not created")
+                os.set_blocking(process.stdin.fileno(), False)
+                selector.register(
+                    process.stdin,
+                    selectors.EVENT_WRITE,
+                    "stdin",
+                )
             signal_transaction.raise_if_pending()
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 signal_transaction.raise_if_pending()
                 remaining = deadline - time.monotonic()
                 try:
-                    _drain_refresh_output_once(
+                    input_offset, rejected_now = _service_refresh_io_once(
                         selector,
                         captures,
+                        input_bytes=b"" if input_bytes is None else input_bytes,
+                        input_offset=input_offset,
                         timeout=min(
                             REFRESH_POLL_INTERVAL_SECONDS,
                             max(0.0, remaining),
                         ),
-                        capture=True,
                         max_capture_bytes=max_capture_bytes,
                     )
+                    input_rejected = input_rejected or rejected_now
                 except _RefreshCaptureLimitExceeded:
                     failure = (
                         125,
@@ -635,10 +776,28 @@ def _run_bounded_refresh_process_supervised(
                         f"{max_capture_bytes} bytes",
                     )
                     break
+                if (
+                    input_bytes is not None
+                    and input_rejected
+                    and input_offset != len(input_bytes)
+                ):
+                    failure = (
+                        126,
+                        "BLOCKED: prompt refresh rejected its source frame before "
+                        "the complete payload was delivered",
+                    )
+                    break
                 signal_transaction.raise_if_pending()
                 returncode = process.poll()
                 if returncode is None:
                     continue
+                if input_bytes is not None and input_offset != len(input_bytes):
+                    failure = (
+                        126,
+                        "BLOCKED: prompt refresh rejected its source frame before "
+                        "the complete payload was delivered",
+                    )
+                    break
                 if _refresh_process_group_has_live_members(
                     process.pid,
                     deadline=deadline,
@@ -658,6 +817,7 @@ def _run_bounded_refresh_process_supervised(
                 )
 
             if failure is not None:
+                _close_refresh_input(selector, process.stdin)
                 _cleanup_refresh_process(
                     process,
                     selector,
@@ -691,6 +851,7 @@ def _run_bounded_refresh_process_supervised(
             )
         except BaseException:
             if not cleanup_complete:
+                _close_refresh_input(selector, process.stdin)
                 _cleanup_refresh_process(
                     process,
                     selector,
@@ -700,6 +861,7 @@ def _run_bounded_refresh_process_supervised(
                 )
             raise
         finally:
+            _close_refresh_input(selector, process.stdin)
             if process.stdout is not None:
                 process.stdout.close()
             if process.stderr is not None:
@@ -1719,318 +1881,28 @@ def _read_stop_absolute_regular_artifact(
         os.close(parent_fd)
 
 
-def _read_stop_fd_regular_artifact(
-    file_fd: int,
-    name: str,
-    *,
-    max_bytes: int,
-) -> StopArtifactRead:
-    def read_bounded() -> bytes:
-        chunks: list[bytes] = []
-        offset = 0
-        while True:
-            chunk = os.pread(
-                file_fd,
-                min(65536, max_bytes + 1 - offset),
-                offset,
-            )
-            if not chunk:
-                break
-            chunks.append(chunk)
-            offset += len(chunk)
-            if offset > max_bytes:
-                raise RunSafetyError(
-                    f"compatibility launch snapshot exceeds byte limit: {name}"
-                )
-        return b"".join(chunks)
-
-    try:
-        access_mode = fcntl.fcntl(file_fd, fcntl.F_GETFL) & os.O_ACCMODE
-        if access_mode != os.O_RDONLY:
-            raise RunSafetyError(
-                f"compatibility launch snapshot must be opened read-only: {name}"
-            )
-        before = os.fstat(file_fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise RunSafetyError(
-                f"compatibility launch snapshot must be a regular file: {name}"
-            )
-        if before.st_size > max_bytes:
-            raise RunSafetyError(
-                f"compatibility launch snapshot exceeds byte limit: {name}"
-            )
-        expected_access = (
-            before.st_uid,
-            before.st_gid,
-            stat.S_IMODE(before.st_mode),
-        )
-        first_content = read_bounded()
-        middle = os.fstat(file_fd)
-        second_content = read_bounded()
-        after = os.fstat(file_fd)
-        stable_stats = (before, middle, after)
-        if (
-            any(not stat.S_ISREG(value.st_mode) for value in stable_stats)
-            or any(not _same_object(before, value) for value in stable_stats[1:])
-            or any(value.st_size != before.st_size for value in stable_stats[1:])
-            or any(
-                (
-                    value.st_uid,
-                    value.st_gid,
-                    stat.S_IMODE(value.st_mode),
-                )
-                != expected_access
-                for value in stable_stats[1:]
-            )
-            or len(first_content) != before.st_size
-            or len(second_content) != before.st_size
-            or first_content != second_content
-        ):
-            raise RunSafetyError(
-                f"compatibility launch snapshot identity, access, size, or content "
-                f"changed while read: {name}"
-            )
-        return StopArtifactRead(
-            content=second_content,
-            version=StopArtifactVersion(
-                device=after.st_dev,
-                inode=after.st_ino,
-                uid=after.st_uid,
-                gid=after.st_gid,
-                mode=stat.S_IMODE(after.st_mode),
-                size=after.st_size,
-                sha256=hashlib.sha256(second_content).hexdigest(),
-            ),
-        )
-    except RunSafetyError:
-        raise
-    except OSError as error:
-        raise RunSafetyError(
-            f"compatibility launch snapshot cannot be read stably: {name}"
-        ) from error
-
-
-def _fd_execution_path(file_fd: int, name: str) -> pathlib.Path:
-    descriptor_stat = os.fstat(file_fd)
-    for root in (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")):
-        candidate = root / str(file_fd)
-        probe_fd: int | None = None
-        try:
-            probe_fd = os.open(
-                candidate,
-                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
-            )
-            candidate_stat = os.fstat(probe_fd)
-        except OSError:
-            continue
-        finally:
-            if probe_fd is not None:
-                os.close(probe_fd)
-        if _same_object(descriptor_stat, candidate_stat):
-            return candidate
-    raise RunSafetyError(
-        f"cannot expose descriptor-bound compatibility snapshot for execution: {name}"
-    )
-
-
-def _write_launch_snapshot(
-    snapshot_dir_fd: int,
-    name: str,
-    source_path: pathlib.Path,
-    source: StopArtifactRead,
-) -> LaunchArtifactSnapshot:
-    write_fd: int | None = None
-    snapshot_fd: int | None = None
-    keep_snapshot_fd = False
-    try:
-        write_fd = os.open(
-            name,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            LAUNCH_SNAPSHOT_FILE_MODE,
-            dir_fd=snapshot_dir_fd,
-        )
-        os.fchmod(write_fd, LAUNCH_SNAPSHOT_FILE_MODE)
-        offset = 0
-        while offset < len(source.content):
-            written = os.write(write_fd, source.content[offset:])
-            if written <= 0:
-                raise RunSafetyError(
-                    f"cannot write compatibility launch snapshot: {name}"
-                )
-            offset += written
-        os.fsync(write_fd)
-        os.close(write_fd)
-        write_fd = None
-
-        snapshot_fd = os.open(
-            name,
-            _regular_open_flags(),
-            dir_fd=snapshot_dir_fd,
-        )
-        descriptor_stat = os.fstat(snapshot_fd)
-        named_stat = os.stat(
-            name,
-            dir_fd=snapshot_dir_fd,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISREG(descriptor_stat.st_mode)
-            or not stat.S_ISREG(named_stat.st_mode)
-            or not _same_object(descriptor_stat, named_stat)
-            or descriptor_stat.st_uid != os.geteuid()
-            or stat.S_IMODE(descriptor_stat.st_mode) != LAUNCH_SNAPSHOT_FILE_MODE
-        ):
-            raise RunSafetyError(
-                f"compatibility launch snapshot is not owner-private: {name}"
-            )
-        snapshot = _read_stop_fd_regular_artifact(
-            snapshot_fd,
-            name,
-            max_bytes=STATE_MAX_BYTES,
-        )
-        if (
-            snapshot.content != source.content
-            or snapshot.version.size != source.version.size
-            or snapshot.version.sha256 != source.version.sha256
-        ):
-            raise RunSafetyError(
-                f"compatibility launch snapshot does not match bound source: {name}"
-            )
-        os.unlink(name, dir_fd=snapshot_dir_fd)
-        execution_path = _fd_execution_path(snapshot_fd, name)
-        keep_snapshot_fd = True
-        return LaunchArtifactSnapshot(
-            source_path=source_path,
-            source_version=source.version,
-            snapshot_fd=snapshot_fd,
-            snapshot_version=snapshot.version,
-            execution_path=execution_path,
-        )
-    except RunSafetyError:
-        raise
-    except OSError as error:
-        raise RunSafetyError(
-            f"cannot create descriptor-bound compatibility launch snapshot: {name}"
-        ) from error
-    finally:
-        if write_fd is not None:
-            os.close(write_fd)
-        if snapshot_fd is not None and not keep_snapshot_fd:
-            os.close(snapshot_fd)
-        if snapshot_fd is not None:
-            try:
-                os.stat(
-                    name,
-                    dir_fd=snapshot_dir_fd,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                pass
-            else:
-                os.unlink(name, dir_fd=snapshot_dir_fd)
-
-
-def _harden_launch_snapshot_directory(
-    snapshot_dir: pathlib.Path,
-) -> os.stat_result:
-    initial = os.lstat(snapshot_dir)
-    if not stat.S_ISDIR(initial.st_mode) or initial.st_uid != os.geteuid():
-        raise RunSafetyError(
-            "compatibility launch snapshot is not a current-user directory"
-        )
-    try:
-        os.chmod(
-            snapshot_dir,
-            LAUNCH_SNAPSHOT_DIRECTORY_MODE,
-            follow_symlinks=False,
-        )
-    except (NotImplementedError, OSError) as error:
-        raise RunSafetyError(
-            "compatibility launch snapshot directory cannot be hardened without "
-            "following links"
-        ) from error
-    hardened = os.lstat(snapshot_dir)
-    if (
-        not stat.S_ISDIR(hardened.st_mode)
-        or not _same_object(initial, hardened)
-        or (hardened.st_uid, hardened.st_gid) != (initial.st_uid, initial.st_gid)
-        or hardened.st_uid != os.geteuid()
-        or stat.S_IMODE(hardened.st_mode) != LAUNCH_SNAPSHOT_DIRECTORY_MODE
-    ):
-        raise RunSafetyError(
-            "compatibility launch snapshot directory identity or access policy changed"
-        )
-    return hardened
-
-
 @contextlib.contextmanager
-def _verified_refresh_launch_snapshots() -> Iterator[RefreshLaunchSnapshots]:
-    with tempfile.TemporaryDirectory(
-        prefix="waited-delivery-refresh-launch-"
-    ) as snapshot_dir_str:
-        snapshot_dir = pathlib.Path(snapshot_dir_str)
-        snapshot_dir_fd: int | None = None
-        snapshots: list[LaunchArtifactSnapshot] = []
-        try:
-            named_directory = _harden_launch_snapshot_directory(snapshot_dir)
-            snapshot_dir_fd = os.open(
-                snapshot_dir,
-                _directory_open_flags(),
-            )
-            opened_directory = os.fstat(snapshot_dir_fd)
-            if (
-                not stat.S_ISDIR(named_directory.st_mode)
-                or not stat.S_ISDIR(opened_directory.st_mode)
-                or not _same_object(named_directory, opened_directory)
-                or (
-                    opened_directory.st_uid,
-                    opened_directory.st_gid,
-                    stat.S_IMODE(opened_directory.st_mode),
-                )
-                != (
-                    named_directory.st_uid,
-                    named_directory.st_gid,
-                    stat.S_IMODE(named_directory.st_mode),
-                )
-                or opened_directory.st_uid != os.geteuid()
-                or stat.S_IMODE(opened_directory.st_mode)
-                != LAUNCH_SNAPSHOT_DIRECTORY_MODE
-            ):
-                raise RunSafetyError(
-                    "compatibility launch snapshot directory is not owner-private"
-                )
-            bound_bridge = _read_stop_absolute_regular_artifact(
-                BRIDGE_PATH,
-                max_bytes=STATE_MAX_BYTES,
-            )
-            bound_runner = _read_stop_absolute_regular_artifact(
-                RUNNER_PATH,
-                max_bytes=STATE_MAX_BYTES,
-            )
-            bridge = _write_launch_snapshot(
-                snapshot_dir_fd,
-                "waited_delivery_bridge.py",
-                BRIDGE_PATH,
-                bound_bridge,
-            )
-            snapshots.append(bridge)
-            runner = _write_launch_snapshot(
-                snapshot_dir_fd,
-                "waited_delivery_runner.py",
-                RUNNER_PATH,
-                bound_runner,
-            )
-            snapshots.append(runner)
-            yield RefreshLaunchSnapshots(bridge=bridge, runner=runner)
-        finally:
-            for snapshot in reversed(snapshots):
-                os.close(snapshot.snapshot_fd)
-            if snapshot_dir_fd is not None:
-                os.close(snapshot_dir_fd)
+def _verified_refresh_launch_sources() -> Iterator[RefreshLaunchSources]:
+    bound_bridge = _read_stop_absolute_regular_artifact(
+        BRIDGE_PATH,
+        max_bytes=STATE_MAX_BYTES,
+    )
+    bound_runner = _read_stop_absolute_regular_artifact(
+        RUNNER_PATH,
+        max_bytes=STATE_MAX_BYTES,
+    )
+    yield RefreshLaunchSources(
+        bridge=LaunchArtifactSource(
+            source_path=BRIDGE_PATH,
+            source_version=bound_bridge.version,
+            content=bound_bridge.content,
+        ),
+        runner=LaunchArtifactSource(
+            source_path=RUNNER_PATH,
+            source_version=bound_runner.version,
+            content=bound_runner.content,
+        ),
+    )
 
 
 def _validate_launch_artifact_version(
@@ -2057,32 +1929,47 @@ def _validate_launch_artifact_version(
         )
 
 
-def _revalidate_refresh_launch_snapshots(
-    snapshots: RefreshLaunchSnapshots,
+def _revalidate_refresh_launch_sources(
+    sources: RefreshLaunchSources,
 ) -> None:
-    for name, snapshot in (
-        ("waited_delivery_bridge.py", snapshots.bridge),
-        ("waited_delivery_runner.py", snapshots.runner),
+    for name, source in (
+        ("waited_delivery_bridge.py", sources.bridge),
+        ("waited_delivery_runner.py", sources.runner),
     ):
-        source = _read_stop_absolute_regular_artifact(
-            snapshot.source_path,
+        current = _read_stop_absolute_regular_artifact(
+            source.source_path,
             max_bytes=STATE_MAX_BYTES,
         )
         _validate_launch_artifact_version(
             name,
-            source.version,
-            snapshot.source_version,
+            current.version,
+            source.source_version,
         )
-        executed = _read_stop_fd_regular_artifact(
-            snapshot.snapshot_fd,
-            name,
-            max_bytes=STATE_MAX_BYTES,
+
+
+def _refresh_source_frame(sources: RefreshLaunchSources) -> bytes:
+    bridge_content = sources.bridge.content
+    runner_content = sources.runner.content
+    if (
+        not bridge_content
+        or len(bridge_content) > STATE_MAX_BYTES
+        or not runner_content
+        or len(runner_content) > STATE_MAX_BYTES
+    ):
+        raise RunSafetyError(
+            "compatibility launch source is outside the source-frame byte bound"
         )
-        _validate_launch_artifact_version(
-            name,
-            executed.version,
-            snapshot.snapshot_version,
+    return b"".join(
+        (
+            SOURCE_FRAME_MAGIC,
+            len(bridge_content).to_bytes(8, "big"),
+            hashlib.sha256(bridge_content).digest(),
+            len(runner_content).to_bytes(8, "big"),
+            hashlib.sha256(runner_content).digest(),
+            bridge_content,
+            runner_content,
         )
+    )
 
 
 def _isolated_python_environment() -> dict[str, str]:
@@ -2116,40 +2003,39 @@ def _expected_version_args(
 
 
 def _run_refresh_bridge_json(
-    snapshots: RefreshLaunchSnapshots,
+    sources: RefreshLaunchSources,
     *args: str,
 ) -> dict[str, object]:
-    _revalidate_refresh_launch_snapshots(snapshots)
+    _revalidate_refresh_launch_sources(sources)
     command = [
         sys.executable,
         "-I",
         "-B",
         "-S",
-        str(snapshots.bridge.execution_path),
+        "-c",
+        SOURCE_PIPE_BOOTSTRAP,
+        str(BRIDGE_PATH),
+        str(RUNNER_PATH),
         "refresh-prompts-live",
-        "--executed-bridge-fd",
-        str(snapshots.bridge.snapshot_fd),
-        "--executed-runner-fd",
-        str(snapshots.runner.snapshot_fd),
+        "--published-bridge-path",
+        str(BRIDGE_PATH),
         "--published-runner-path",
         str(RUNNER_PATH),
         *_expected_version_args(
             "bridge",
-            snapshots.bridge.snapshot_version,
+            sources.bridge.source_version,
         ),
         *_expected_version_args(
             "runner",
-            snapshots.runner.snapshot_version,
+            sources.runner.source_version,
         ),
         *args,
     ]
     completed = _run_bounded_refresh_process(
         command,
-        pass_fds=(
-            snapshots.bridge.snapshot_fd,
-            snapshots.runner.snapshot_fd,
-        ),
+        pass_fds=(),
         env=_isolated_python_environment(),
+        input_bytes=_refresh_source_frame(sources),
     )
     return _bridge_json_payload(completed)
 
@@ -2347,9 +2233,9 @@ def _refresh_recovery_prompts(
     repo_root: pathlib.Path,
     run_identity: RunDirectoryIdentity,
 ) -> RefreshedPrompts:
-    with _verified_refresh_launch_snapshots() as snapshots:
+    with _verified_refresh_launch_sources() as sources:
         payload = _run_refresh_bridge_json(
-            snapshots,
+            sources,
             "--run-dir",
             str(run_dir),
             "--expected-repo-root",
@@ -2373,15 +2259,20 @@ def _refresh_recovery_prompts(
             raise RunSafetyError(
                 "refresh-prompts-live did not attest isolated Python execution"
             )
-        for field in ("bridge_fd_access", "runner_fd_access"):
-            if payload.get(field) != "read-only":
+        for field in ("bridge_source_transport", "runner_source_transport"):
+            if payload.get(field) != "anonymous-pipe-memory":
                 raise RunSafetyError(
-                    f"refresh-prompts-live did not attest read-only {field}"
+                    f"refresh-prompts-live did not attest anonymous in-memory {field}"
+                )
+        for field in ("bridge_source_reopenable", "runner_source_reopenable"):
+            if payload.get(field) is not False:
+                raise RunSafetyError(
+                    f"refresh-prompts-live did not attest non-reopenable {field}"
                 )
         expected_paths = {
             "runner_path": RUNNER_PATH,
-            "executed_bridge_path": snapshots.bridge.execution_path,
-            "executed_runner_path": snapshots.runner.execution_path,
+            "compiled_bridge_path": BRIDGE_PATH,
+            "compiled_runner_path": RUNNER_PATH,
             "child_prompt": run_dir / "child-prompt.md",
             "parent_prompt": run_dir / "parent-prompt.md",
         }
@@ -2410,14 +2301,14 @@ def _refresh_recovery_prompts(
             "parent_prompt_version",
         )
         _validate_launch_artifact_version(
-            "waited_delivery_bridge.py executed snapshot",
+            "waited_delivery_bridge.py bound source",
             bridge_version,
-            snapshots.bridge.snapshot_version,
+            sources.bridge.source_version,
         )
         _validate_launch_artifact_version(
-            "waited_delivery_runner.py executed snapshot",
+            "waited_delivery_runner.py bound source",
             runner_version,
-            snapshots.runner.snapshot_version,
+            sources.runner.source_version,
         )
         returned_identity_values = (
             payload.get("run_dev"),

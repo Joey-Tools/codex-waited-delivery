@@ -41,14 +41,17 @@ Legacy hook removal is a two-release migration:
    redirect to the sibling packaged
    `skills/waited-delivery-compat/scripts/waited_delivery_runner.py`. It opens
    that source with `O_NOFOLLOW`, binds its regular-file object, current-user
-   access policy, bounded size, and two equal byte reads, then copies those
-   verified bytes into an owner-private `0600` snapshot. It unlinks the
-   snapshot before passing only its inherited read-only descriptor to the
-   current Python interpreter, preserving the canonical compatibility path in
-   `__file__`, the original runner arguments, and process signals. Replacing
-   the source path after binding cannot change the executed bytes. Aggregate
-   and private-overlay packaging must preserve both legacy files and the
-   compatibility runner at those relative release paths. Record that
+   access policy, bounded size, and two equal byte reads, then forks a one-shot
+   writer that transfers those verified bytes through an anonymous pipe. The
+   current Python interpreter is replaced by a fixed `-I -B -S -c` bootstrap
+   that verifies the exact length, EOF, and SHA-256 digest, reaps the writer,
+   preserves the canonical compatibility path in `__file__` and the original
+   runner arguments, and compiles the bytes in memory. No regular-file source
+   snapshot is created. Replacing or modifying the source path after binding,
+   including through a pre-held writable descriptor or hard link, cannot
+   change the executed bytes. Aggregate and private-overlay packaging must
+   preserve both legacy files and the compatibility runner at those relative
+   release paths. Record that
    active-skill-to-inert-directory identity change with its own append-only
    `removed_links` migration entry while keeping the target installed.
 2. Remove every default `UserPromptSubmit` and `Stop` registration on each host,

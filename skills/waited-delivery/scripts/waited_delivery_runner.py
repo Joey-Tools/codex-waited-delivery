@@ -3,26 +3,66 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import stat
 import sys
-import tempfile
 
 
 RUNNER_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 RUNNER_READ_CHUNK_BYTES = 64 * 1024
-SNAPSHOT_FILE_MODE = 0o600
-SNAPSHOT_DIRECTORY_MODE = 0o700
-DESCRIPTOR_BOOTSTRAP = """\
+PIPE_BOOTSTRAP = """\
+import hashlib
 import os
 import sys
 
 canonical_path = sys.argv[1]
 runner_fd = int(sys.argv[2])
-runner_args = sys.argv[3:]
-with os.fdopen(runner_fd, "rb", closefd=True) as runner:
-    runner_source = runner.read()
+writer_pid = int(sys.argv[3])
+expected_size = int(sys.argv[4])
+expected_sha256 = sys.argv[5]
+runner_args = sys.argv[6:]
+frame_error = None
+runner_source = b""
+try:
+    if expected_size <= 0 or expected_size > 4 * 1024 * 1024:
+        raise SystemExit("invalid compatibility runner pipe size")
+    with os.fdopen(runner_fd, "rb", closefd=True) as runner:
+        runner_fd = -1
+        chunks = []
+        remaining = expected_size
+        while remaining:
+            chunk = runner.read(min(64 * 1024, remaining))
+            if not chunk:
+                raise SystemExit("truncated compatibility runner pipe")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if runner.read(1):
+            raise SystemExit("oversized compatibility runner pipe")
+    runner_source = b"".join(chunks)
+    if hashlib.sha256(runner_source).hexdigest() != expected_sha256:
+        raise SystemExit("compatibility runner pipe digest mismatch")
+except BaseException as error:
+    frame_error = error
+    if runner_fd >= 0:
+        try:
+            os.close(runner_fd)
+        except OSError:
+            pass
+try:
+    waited_pid, writer_status = os.waitpid(writer_pid, 0)
+except ChildProcessError:
+    pass
+else:
+    if (
+        waited_pid != writer_pid
+        or not os.WIFEXITED(writer_status)
+        or os.WEXITSTATUS(writer_status) != 0
+    ):
+        raise SystemExit("compatibility runner pipe writer failed")
+if frame_error is not None:
+    raise frame_error
 sys.argv[:] = [canonical_path, *runner_args]
 runner_globals = {
     "__name__": "__main__",
@@ -120,143 +160,62 @@ def _stable_runner_source(path: Path) -> bytes:
         os.close(runner_fd)
 
 
-def _harden_snapshot_directory(snapshot_dir: Path) -> os.stat_result:
-    initial = os.lstat(snapshot_dir)
-    if not stat.S_ISDIR(initial.st_mode) or initial.st_uid != os.geteuid():
-        raise RuntimeError("runner snapshot directory is not a current-user directory")
+def _runner_source_pipe(content: bytes) -> tuple[int, int]:
+    if not hasattr(os, "fork"):
+        raise RuntimeError("compatibility runner pipe requires POSIX fork support")
+    read_fd, write_fd = os.pipe()
     try:
-        os.chmod(
-            snapshot_dir,
-            SNAPSHOT_DIRECTORY_MODE,
-            follow_symlinks=False,
-        )
-    except (NotImplementedError, OSError) as error:
-        raise RuntimeError(
-            "runner snapshot directory cannot be hardened without following links"
-        ) from error
-    hardened = os.lstat(snapshot_dir)
-    if (
-        not stat.S_ISDIR(hardened.st_mode)
-        or not _same_object(initial, hardened)
-        or (hardened.st_uid, hardened.st_gid) != (initial.st_uid, initial.st_gid)
-        or hardened.st_uid != os.geteuid()
-        or stat.S_IMODE(hardened.st_mode) != SNAPSHOT_DIRECTORY_MODE
-    ):
-        raise RuntimeError(
-            "runner snapshot directory identity or access policy changed"
-        )
-    return hardened
-
-
-def _private_runner_snapshot(content: bytes) -> int:
-    snapshot_dir = Path(tempfile.mkdtemp(prefix="waited-delivery-runner-redirect-"))
-    snapshot_name = "waited_delivery_runner.snapshot"
-    directory_fd: int | None = None
-    write_fd: int | None = None
-    snapshot_fd: int | None = None
-    name_exists = False
-    try:
-        named_directory = _harden_snapshot_directory(snapshot_dir)
-        directory_fd = os.open(
-            snapshot_dir,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        opened_directory = os.fstat(directory_fd)
-        if (
-            not stat.S_ISDIR(opened_directory.st_mode)
-            or _object_access_identity(opened_directory)
-            != _object_access_identity(named_directory)
-            or opened_directory.st_uid != os.geteuid()
-            or stat.S_IMODE(opened_directory.st_mode) != SNAPSHOT_DIRECTORY_MODE
-        ):
-            raise RuntimeError("runner snapshot directory is not owner-private")
-        write_fd = os.open(
-            snapshot_name,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            SNAPSHOT_FILE_MODE,
-            dir_fd=directory_fd,
-        )
-        name_exists = True
-        os.fchmod(write_fd, SNAPSHOT_FILE_MODE)
-        offset = 0
-        while offset < len(content):
-            written = os.write(write_fd, content[offset:])
-            if written <= 0:
-                raise RuntimeError("cannot write compatibility runner snapshot")
-            offset += written
-        os.fsync(write_fd)
+        writer_pid = os.fork()
+    except BaseException:
+        os.close(read_fd)
         os.close(write_fd)
-        write_fd = None
-
-        snapshot_fd = os.open(
-            snapshot_name,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=directory_fd,
-        )
-        named_snapshot = os.stat(
-            snapshot_name,
-            dir_fd=directory_fd,
-            follow_symlinks=False,
-        )
-        opened_snapshot = os.fstat(snapshot_fd)
-        if (
-            not stat.S_ISREG(named_snapshot.st_mode)
-            or not stat.S_ISREG(opened_snapshot.st_mode)
-            or _runner_version(opened_snapshot) != _runner_version(named_snapshot)
-            or opened_snapshot.st_uid != os.geteuid()
-            or stat.S_IMODE(opened_snapshot.st_mode) != SNAPSHOT_FILE_MODE
-            or opened_snapshot.st_size != len(content)
-            or _read_runner_fd(snapshot_fd) != content
-        ):
-            raise RuntimeError("compatibility runner snapshot verification failed")
-        os.lseek(snapshot_fd, 0, os.SEEK_SET)
-        os.unlink(snapshot_name, dir_fd=directory_fd)
-        name_exists = False
-        os.fsync(directory_fd)
-        os.close(directory_fd)
-        directory_fd = None
-        os.rmdir(snapshot_dir)
-        result_fd = snapshot_fd
-        snapshot_fd = None
-        return result_fd
-    finally:
-        if write_fd is not None:
-            os.close(write_fd)
-        if snapshot_fd is not None:
-            os.close(snapshot_fd)
-        if directory_fd is not None:
-            if name_exists:
-                try:
-                    os.unlink(snapshot_name, dir_fd=directory_fd)
-                except FileNotFoundError:
-                    pass
-            os.close(directory_fd)
+        raise
+    if writer_pid == 0:
         try:
-            os.rmdir(snapshot_dir)
-        except FileNotFoundError:
+            os.close(read_fd)
+            offset = 0
+            while offset < len(content):
+                written = os.write(write_fd, content[offset:])
+                if written <= 0:
+                    os._exit(126)
+                offset += written
+            os.close(write_fd)
+        except BaseException:
+            os._exit(126)
+        os._exit(0)
+    os.close(write_fd)
+    try:
+        os.set_inheritable(read_fd, True)
+    except BaseException:
+        os.close(read_fd)
+        try:
+            os.waitpid(writer_pid, 0)
+        except ChildProcessError:
             pass
+        raise
+    return read_fd, writer_pid
 
 
-def _exec_runner_snapshot(
+def _exec_runner_pipe(
     canonical_path: Path,
-    snapshot_fd: int,
+    source_fd: int,
+    writer_pid: int,
+    source: bytes,
 ) -> None:
-    os.set_inheritable(snapshot_fd, True)
     os.execv(
         sys.executable,
         [
             sys.executable,
+            "-I",
+            "-B",
+            "-S",
             "-c",
-            DESCRIPTOR_BOOTSTRAP,
+            PIPE_BOOTSTRAP,
             str(canonical_path),
-            str(snapshot_fd),
+            str(source_fd),
+            str(writer_pid),
+            str(len(source)),
+            hashlib.sha256(source).hexdigest(),
             *sys.argv[1:],
         ],
     )
@@ -264,12 +223,13 @@ def _exec_runner_snapshot(
 
 
 def main() -> int:
-    snapshot_fd: int | None = None
+    source_fd: int | None = None
+    writer_pid: int | None = None
     try:
         runner_path = _compat_runner_path()
         source = _stable_runner_source(runner_path)
-        snapshot_fd = _private_runner_snapshot(source)
-        _exec_runner_snapshot(runner_path, snapshot_fd)
+        source_fd, writer_pid = _runner_source_pipe(source)
+        _exec_runner_pipe(runner_path, source_fd, writer_pid, source)
     except (IndexError, OSError, RuntimeError) as error:
         print(
             f"ERROR: waited-delivery compatibility runner is unavailable: {error}",
@@ -277,9 +237,14 @@ def main() -> int:
         )
         return 126
     finally:
-        if snapshot_fd is not None:
-            os.close(snapshot_fd)
-    raise AssertionError("runner snapshot execution returned unexpectedly")
+        if source_fd is not None:
+            os.close(source_fd)
+        if writer_pid is not None:
+            try:
+                os.waitpid(writer_pid, 0)
+            except ChildProcessError:
+                pass
+    raise AssertionError("runner pipe execution returned unexpectedly")
 
 
 if __name__ == "__main__":

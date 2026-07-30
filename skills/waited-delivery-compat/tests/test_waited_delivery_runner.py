@@ -12,6 +12,7 @@ import os
 import pathlib
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,16 +38,23 @@ def run(
     env: dict[str, str] | None = None,
     pass_fds: tuple[int, ...] = (),
     umask: int = -1,
+    input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    completed = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
         env=env,
-        text=True,
+        input=input_bytes,
         capture_output=True,
         check=False,
         pass_fds=pass_fds,
         umask=umask,
+    )
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        stdout=completed.stdout.decode("utf-8", errors="replace"),
+        stderr=completed.stderr.decode("utf-8", errors="replace"),
     )
 
 
@@ -161,8 +169,8 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         )
         return completed
 
-    def _runner_version(self, runner_fd: int) -> dict[str, int | str]:
-        file_stat = os.fstat(runner_fd)
+    def _runner_version(self) -> dict[str, int | str]:
+        file_stat = SCRIPT_PATH.stat()
         content = SCRIPT_PATH.read_bytes()
         return {
             "device": file_stat.st_dev,
@@ -176,11 +184,10 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
 
     def _runner_version_args(
         self,
-        runner_fd: int,
         *,
         sha256: str | None = None,
     ) -> list[str]:
-        version = self._runner_version(runner_fd)
+        version = self._runner_version()
         return [
             "--expected-runner-dev",
             str(version["device"]),
@@ -198,8 +205,8 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             sha256 or str(version["sha256"]),
         ]
 
-    def _bridge_version_args(self, bridge_fd: int) -> list[str]:
-        file_stat = os.fstat(bridge_fd)
+    def _bridge_version_args(self) -> list[str]:
+        file_stat = BRIDGE_PATH.stat()
         return [
             "--expected-bridge-dev",
             str(file_stat.st_dev),
@@ -222,35 +229,40 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         *args: str,
         expected_sha256: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
-        runner_fd = os.open(SCRIPT_PATH, os.O_RDONLY)
-        try:
-            return run(
-                [
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    "-S",
-                    f"/dev/fd/{runner_fd}",
-                    "refresh-prompts",
-                    "--executed-bridge-fd",
-                    str(bridge_fd),
-                    "--executed-runner-fd",
-                    str(runner_fd),
-                    "--published-runner-path",
-                    str(SCRIPT_PATH),
-                    *self._bridge_version_args(bridge_fd),
-                    *self._runner_version_args(
-                        runner_fd,
-                        sha256=expected_sha256,
-                    ),
-                    *args,
-                ],
-                pass_fds=(bridge_fd, runner_fd),
+        bridge = self._load_bridge_module()
+        runner_source = SCRIPT_PATH.read_bytes()
+        source_frame = b"".join(
+            (
+                bridge.RUNNER_FRAME_MAGIC,
+                len(runner_source).to_bytes(8, "big"),
+                hashlib.sha256(runner_source).digest(),
+                runner_source,
             )
-        finally:
-            os.close(runner_fd)
-            os.close(bridge_fd)
+        )
+        return run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                bridge.RUNNER_PIPE_BOOTSTRAP,
+                str(SCRIPT_PATH),
+                "refresh-prompts",
+                "--compiled-bridge-path",
+                str(BRIDGE_PATH),
+                "--compiled-runner-path",
+                str(SCRIPT_PATH),
+                "--published-runner-path",
+                str(SCRIPT_PATH),
+                *self._bridge_version_args(),
+                *self._runner_version_args(
+                    sha256=expected_sha256,
+                ),
+                *args,
+            ],
+            input_bytes=source_frame,
+        )
 
     def _load_runner_module(self):
         spec = importlib.util.spec_from_file_location(
@@ -259,6 +271,17 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         )
         if spec is None or spec.loader is None:
             raise RuntimeError("failed to load waited_delivery_runner module")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _load_bridge_module(self):
+        spec = importlib.util.spec_from_file_location(
+            "waited_delivery_runner_bridge_test_module",
+            BRIDGE_PATH,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("failed to load waited_delivery_bridge module")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
@@ -462,19 +485,21 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
-        self.assertEqual(payload["refresh_schema_version"], 2)
+        self.assertEqual(payload["refresh_schema_version"], 3)
         self.assertIs(payload["python_isolated"], True)
-        self.assertEqual(payload["bridge_fd_access"], "read-only")
-        self.assertEqual(payload["runner_fd_access"], "read-only")
+        self.assertEqual(
+            payload["bridge_source_transport"],
+            "anonymous-pipe-memory",
+        )
+        self.assertEqual(
+            payload["runner_source_transport"],
+            "anonymous-pipe-memory",
+        )
+        self.assertIs(payload["bridge_source_reopenable"], False)
+        self.assertIs(payload["runner_source_reopenable"], False)
         self.assertEqual(payload["runner_path"], str(SCRIPT_PATH))
-        self.assertIn(
-            pathlib.Path(payload["executed_bridge_path"]).parent,
-            (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")),
-        )
-        self.assertIn(
-            pathlib.Path(payload["executed_runner_path"]).parent,
-            (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")),
-        )
+        self.assertEqual(payload["compiled_bridge_path"], str(BRIDGE_PATH))
+        self.assertEqual(payload["compiled_runner_path"], str(SCRIPT_PATH))
         self.assertEqual(payload["child_prompt"], str(run_dir / "child-prompt.md"))
         self.assertEqual(payload["parent_prompt"], str(run_dir / "parent-prompt.md"))
         self._assert_file_version_payload(payload["bridge_version"], BRIDGE_PATH)
@@ -521,7 +546,9 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 1)
-        self.assertIn("compatibility runner content changed", completed.stderr)
+        self.assertIn(
+            "bound compatibility runner source content changed", completed.stderr
+        )
         for path, (expected_inode, expected_content) in before.items():
             self.assertEqual(path.stat().st_ino, expected_inode)
             self.assertEqual(path.read_bytes(), expected_content)
@@ -535,45 +562,40 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         before = {
             path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
         }
-        bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
-        runner_fd = os.open(SCRIPT_PATH, os.O_RDONLY)
-        try:
-            completed = run(
-                [
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    "-S",
-                    str(SCRIPT_PATH),
-                    "refresh-prompts",
-                    "--run-dir",
-                    str(run_dir),
-                    "--executed-bridge-fd",
-                    str(bridge_fd),
-                    "--executed-runner-fd",
-                    str(runner_fd),
-                    "--published-runner-path",
-                    str(SCRIPT_PATH),
-                    *self._bridge_version_args(bridge_fd),
-                    *self._runner_version_args(runner_fd),
-                    "--json",
-                ],
-                pass_fds=(bridge_fd, runner_fd),
-            )
-        finally:
-            os.close(runner_fd)
-            os.close(bridge_fd)
+        completed = run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(SCRIPT_PATH),
+                "refresh-prompts",
+                "--run-dir",
+                str(run_dir),
+                "--compiled-bridge-path",
+                str(BRIDGE_PATH),
+                "--compiled-runner-path",
+                str(SCRIPT_PATH),
+                "--published-runner-path",
+                str(SCRIPT_PATH),
+                *self._bridge_version_args(),
+                *self._runner_version_args(),
+                "--json",
+            ],
+        )
 
         self.assertEqual(completed.returncode, 1)
         self.assertIn(
-            "must be launched through its inherited descriptor path",
+            "requires anonymous-pipe-bound runner source",
             completed.stderr,
         )
         for path, (expected_inode, expected_content) in before.items():
             self.assertEqual(path.stat().st_ino, expected_inode)
             self.assertEqual(path.read_bytes(), expected_content)
 
-    def test_refresh_prompts_rejects_writable_runner_fd_before_writes(self) -> None:
+    def test_refresh_prompts_rejects_malformed_runner_frames_before_writes(
+        self,
+    ) -> None:
         run_dir = self._prepare("--no-fallback-smoke")
         watched_paths = tuple(
             run_dir / name
@@ -582,135 +604,136 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         before = {
             path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
         }
-        bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
-        runner_fd = os.open(SCRIPT_PATH, os.O_RDWR)
-        try:
-            completed = run(
-                [
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    "-S",
-                    f"/dev/fd/{runner_fd}",
-                    "refresh-prompts",
-                    "--run-dir",
-                    str(run_dir),
-                    "--executed-bridge-fd",
-                    str(bridge_fd),
-                    "--executed-runner-fd",
-                    str(runner_fd),
-                    "--published-runner-path",
-                    str(SCRIPT_PATH),
-                    *self._bridge_version_args(bridge_fd),
-                    *self._runner_version_args(runner_fd),
-                    "--json",
-                ],
-                pass_fds=(bridge_fd, runner_fd),
+        bridge = self._load_bridge_module()
+        runner_source = SCRIPT_PATH.read_bytes()
+        valid_frame = b"".join(
+            (
+                bridge.RUNNER_FRAME_MAGIC,
+                len(runner_source).to_bytes(8, "big"),
+                hashlib.sha256(runner_source).digest(),
+                runner_source,
             )
-        finally:
-            os.close(runner_fd)
-            os.close(bridge_fd)
-
-        self.assertEqual(completed.returncode, 1)
-        self.assertIn(
-            "must be opened read-only: waited_delivery_runner.py",
-            completed.stderr,
         )
-        for path, (expected_inode, expected_content) in before.items():
-            self.assertEqual(path.stat().st_ino, expected_inode)
-            self.assertEqual(path.read_bytes(), expected_content)
-
-    def test_refresh_prompts_revalidates_both_snapshots_before_writes(self) -> None:
-        for artifact_name in ("bridge", "runner"):
-            with self.subTest(artifact=artifact_name):
-                run_dir = self._prepare("--no-fallback-smoke")
-                watched_paths = tuple(
-                    run_dir / name
-                    for name in ("state.json", "child-prompt.md", "parent-prompt.md")
-                )
-                before = {
-                    path: (path.stat().st_ino, path.read_bytes())
-                    for path in watched_paths
-                }
-                module = self._load_runner_module()
-                bridge_fd = os.open(BRIDGE_PATH, os.O_RDONLY)
-                runner_fd = os.open(SCRIPT_PATH, os.O_RDONLY)
-                bridge_stat = os.fstat(bridge_fd)
-                runner_stat = os.fstat(runner_fd)
-                args = argparse.Namespace(
-                    run_dir=str(run_dir),
-                    expected_repo_root=None,
-                    expected_run_dev=None,
-                    expected_run_ino=None,
-                    expected_run_uid=None,
-                    expected_run_gid=None,
-                    expected_run_mode=None,
-                    executed_bridge_fd=bridge_fd,
-                    executed_runner_fd=runner_fd,
-                    published_runner_path=str(SCRIPT_PATH),
-                    expected_bridge_dev=bridge_stat.st_dev,
-                    expected_bridge_ino=bridge_stat.st_ino,
-                    expected_bridge_uid=bridge_stat.st_uid,
-                    expected_bridge_gid=bridge_stat.st_gid,
-                    expected_bridge_mode=bridge_stat.st_mode & 0o7777,
-                    expected_bridge_size=bridge_stat.st_size,
-                    expected_bridge_sha256=hashlib.sha256(
-                        BRIDGE_PATH.read_bytes()
-                    ).hexdigest(),
-                    expected_runner_dev=runner_stat.st_dev,
-                    expected_runner_ino=runner_stat.st_ino,
-                    expected_runner_uid=runner_stat.st_uid,
-                    expected_runner_gid=runner_stat.st_gid,
-                    expected_runner_mode=runner_stat.st_mode & 0o7777,
-                    expected_runner_size=runner_stat.st_size,
-                    expected_runner_sha256=hashlib.sha256(
-                        SCRIPT_PATH.read_bytes()
-                    ).hexdigest(),
-                    json=True,
-                )
-                real_read = module._read_inherited_regular_artifact
-                read_counts = {"bridge": 0, "runner": 0}
-
-                def drift_on_final_read(file_fd, name, *, max_bytes):
-                    artifact = real_read(file_fd, name, max_bytes=max_bytes)
-                    label = (
-                        "bridge" if name == "waited_delivery_bridge.py" else "runner"
-                    )
-                    read_counts[label] += 1
-                    if label == artifact_name and read_counts[label] == 2:
-                        artifact = module.ArtifactRead(
-                            content=artifact.content,
-                            version=artifact.version._replace(sha256="0" * 64),
-                        )
-                    return artifact
-
-                try:
-                    with (
-                        mock.patch.object(module, "_require_isolated_python"),
-                        mock.patch.object(
-                            module,
-                            "_validate_runner_loaded_from_descriptor",
-                            return_value=pathlib.Path(f"/dev/fd/{runner_fd}"),
-                        ),
-                        mock.patch.object(
-                            module,
-                            "_read_inherited_regular_artifact",
-                            side_effect=drift_on_final_read,
-                        ),
-                    ):
-                        with self.assertRaisesRegex(
-                            module.UserError,
-                            f"compatibility {artifact_name} content changed",
-                        ):
-                            module._refresh_prompts(args)
-                finally:
-                    os.close(runner_fd)
-                    os.close(bridge_fd)
-
-                self.assertEqual(read_counts[artifact_name], 2)
+        oversized = b"".join(
+            (
+                bridge.RUNNER_FRAME_MAGIC,
+                (4 * 1024 * 1024 + 1).to_bytes(8, "big"),
+                hashlib.sha256(runner_source).digest(),
+            )
+        )
+        digest_mismatch = bytearray(valid_frame)
+        digest_mismatch[16] ^= 0xFF
+        command = [
+            sys.executable,
+            "-I",
+            "-B",
+            "-S",
+            "-c",
+            bridge.RUNNER_PIPE_BOOTSTRAP,
+            str(SCRIPT_PATH),
+            "refresh-prompts",
+            "--run-dir",
+            str(run_dir),
+            "--compiled-bridge-path",
+            str(BRIDGE_PATH),
+            "--compiled-runner-path",
+            str(SCRIPT_PATH),
+            "--published-runner-path",
+            str(SCRIPT_PATH),
+            *self._bridge_version_args(),
+            *self._runner_version_args(),
+            "--json",
+        ]
+        variants = {
+            "truncated": valid_frame[:-1],
+            "oversized": oversized,
+            "trailing": valid_frame + b"x",
+            "digest-mismatch": bytes(digest_mismatch),
+        }
+        for name, source_frame in variants.items():
+            with self.subTest(frame=name):
+                completed = run(command, input_bytes=source_frame)
+                self.assertNotEqual(completed.returncode, 0)
                 for path, (expected_inode, expected_content) in before.items():
                     self.assertEqual(path.stat().st_ino, expected_inode)
                     self.assertEqual(path.read_bytes(), expected_content)
+
+    def test_refresh_prompts_revalidates_bound_runner_memory_before_writes(
+        self,
+    ) -> None:
+        run_dir = self._prepare("--no-fallback-smoke")
+        watched_paths = tuple(
+            run_dir / name
+            for name in ("state.json", "child-prompt.md", "parent-prompt.md")
+        )
+        before = {
+            path: (path.stat().st_ino, path.read_bytes()) for path in watched_paths
+        }
+        module = self._load_runner_module()
+        bridge_stat = BRIDGE_PATH.stat()
+        runner_stat = SCRIPT_PATH.stat()
+        runner_source = SCRIPT_PATH.read_bytes()
+        module._WAITED_DELIVERY_BOUND_RUNNER_SOURCE = runner_source
+        args = argparse.Namespace(
+            run_dir=str(run_dir),
+            expected_repo_root=None,
+            expected_run_dev=None,
+            expected_run_ino=None,
+            expected_run_uid=None,
+            expected_run_gid=None,
+            expected_run_mode=None,
+            compiled_bridge_path=str(BRIDGE_PATH),
+            compiled_runner_path=str(SCRIPT_PATH),
+            published_runner_path=str(SCRIPT_PATH),
+            expected_bridge_dev=bridge_stat.st_dev,
+            expected_bridge_ino=bridge_stat.st_ino,
+            expected_bridge_uid=bridge_stat.st_uid,
+            expected_bridge_gid=bridge_stat.st_gid,
+            expected_bridge_mode=bridge_stat.st_mode & 0o7777,
+            expected_bridge_size=bridge_stat.st_size,
+            expected_bridge_sha256=hashlib.sha256(BRIDGE_PATH.read_bytes()).hexdigest(),
+            expected_runner_dev=runner_stat.st_dev,
+            expected_runner_ino=runner_stat.st_ino,
+            expected_runner_uid=runner_stat.st_uid,
+            expected_runner_gid=runner_stat.st_gid,
+            expected_runner_mode=runner_stat.st_mode & 0o7777,
+            expected_runner_size=runner_stat.st_size,
+            expected_runner_sha256=hashlib.sha256(runner_source).hexdigest(),
+            json=True,
+        )
+        real_sha256 = module.hashlib.sha256
+        runner_hashes = 0
+
+        class DriftedDigest:
+            def hexdigest(self) -> str:
+                return "0" * 64
+
+        def drift_on_final_hash(content=b""):
+            nonlocal runner_hashes
+            if content is runner_source:
+                runner_hashes += 1
+                if runner_hashes == 2:
+                    return DriftedDigest()
+            return real_sha256(content)
+
+        with (
+            mock.patch.object(module, "_require_isolated_python"),
+            mock.patch.object(
+                module.hashlib,
+                "sha256",
+                side_effect=drift_on_final_hash,
+            ),
+            self.assertRaisesRegex(
+                module.UserError,
+                "bound compatibility runner source content changed before writes",
+            ),
+        ):
+            module._refresh_prompts(args)
+
+        self.assertEqual(runner_hashes, 2)
+        for path, (expected_inode, expected_content) in before.items():
+            self.assertEqual(path.stat().st_ino, expected_inode)
+            self.assertEqual(path.read_bytes(), expected_content)
 
     def test_refresh_prompts_rejects_symlinked_state_or_prompt_artifacts(self) -> None:
         for target_name in ("state.json", "child-prompt.md", "parent-prompt.md"):
@@ -954,14 +977,9 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 release_refresh = threading.Event()
                 mutation_attempted_lock = threading.Event()
                 failures: list[BaseException] = []
-                bridge_handle = BRIDGE_PATH.open("rb")
-                self.addCleanup(bridge_handle.close)
-                bridge_fd = bridge_handle.fileno()
-                bridge_stat = os.fstat(bridge_fd)
-                runner_handle = SCRIPT_PATH.open("rb")
-                self.addCleanup(runner_handle.close)
-                runner_fd = runner_handle.fileno()
-                runner_version = self._runner_version(runner_fd)
+                bridge_stat = BRIDGE_PATH.stat()
+                runner_version = self._runner_version()
+                module._WAITED_DELIVERY_BOUND_RUNNER_SOURCE = SCRIPT_PATH.read_bytes()
                 real_write_prompts = module._write_current_prompts
                 real_flock = fcntl.flock
 
@@ -986,8 +1004,8 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                             argparse.Namespace(
                                 run_dir=str(run_dir),
                                 expected_repo_root=None,
-                                executed_bridge_fd=bridge_fd,
-                                executed_runner_fd=runner_fd,
+                                compiled_bridge_path=str(BRIDGE_PATH),
+                                compiled_runner_path=str(SCRIPT_PATH),
                                 published_runner_path=str(SCRIPT_PATH),
                                 expected_bridge_dev=bridge_stat.st_dev,
                                 expected_bridge_ino=bridge_stat.st_ino,
@@ -1037,11 +1055,6 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
 
                 with (
                     mock.patch.object(module, "_require_isolated_python"),
-                    mock.patch.object(
-                        module,
-                        "_validate_runner_loaded_from_descriptor",
-                        return_value=SCRIPT_PATH,
-                    ),
                     mock.patch.object(
                         module.fcntl,
                         "flock",
@@ -1112,13 +1125,16 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(smoke["status"], "passed")
         self.assertEqual(smoke["sample"], "READY")
 
-    def test_fallback_snapshot_survives_owner_bit_masking_umask(self) -> None:
+    def test_fallback_prompt_uses_anonymous_pipe_under_restrictive_umask(
+        self,
+    ) -> None:
         probe = textwrap.dedent(
             """\
             import fcntl
             import importlib.util
             import os
             import pathlib
+            import stat
             import sys
 
             runner_path = pathlib.Path(sys.argv[1])
@@ -1132,19 +1148,35 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             content = b"fallback prompt\\n"
-            with module._immutable_smoke_prompt_snapshot(content) as (
+            with module._anonymous_smoke_prompt_pipe() as (
                 execution_path,
-                snapshot_fd,
+                read_fd,
+                write_stream,
             ):
-                metadata = os.fstat(snapshot_fd)
-                if metadata.st_mode & 0o7777 != 0o600:
-                    raise RuntimeError("snapshot access mismatch")
-                if metadata.st_nlink != 0:
-                    raise RuntimeError("snapshot name remains linked")
-                if fcntl.fcntl(snapshot_fd, fcntl.F_GETFL) & os.O_ACCMODE:
-                    raise RuntimeError("snapshot is not read-only")
+                write_fd = write_stream.fileno()
+                if not stat.S_ISFIFO(os.fstat(read_fd).st_mode):
+                    raise RuntimeError("read descriptor is not an anonymous pipe")
+                if not stat.S_ISFIFO(os.fstat(write_fd).st_mode):
+                    raise RuntimeError("write descriptor is not an anonymous pipe")
+                if (
+                    fcntl.fcntl(read_fd, fcntl.F_GETFL) & os.O_ACCMODE
+                ) != os.O_RDONLY:
+                    raise RuntimeError("read descriptor access mismatch")
+                if (
+                    fcntl.fcntl(write_fd, fcntl.F_GETFL) & os.O_ACCMODE
+                ) != os.O_WRONLY:
+                    raise RuntimeError("write descriptor access mismatch")
+                write_stream.write(content)
+                write_stream.close()
+                replacement_fd = os.open(os.devnull, os.O_RDONLY)
+                if replacement_fd != write_fd:
+                    raise RuntimeError("closed writer descriptor was not reused")
                 if execution_path.read_bytes() != content:
-                    raise RuntimeError("snapshot content mismatch")
+                    raise RuntimeError("pipe content mismatch")
+            try:
+                os.fstat(replacement_fd)
+            finally:
+                os.close(replacement_fd)
             """
         )
         completed = run(
@@ -1159,67 +1191,51 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "")
 
-    def test_fallback_snapshot_rejects_directory_drift(self) -> None:
+    def test_smoke_prompt_pipe_rejection_cleans_process_group(self) -> None:
         module = self._load_runner_module()
-        expected_errors = {
-            "replacement": "identity or access policy changed",
-            "unsafe-access": "identity or access policy changed",
-            "unreadable": "cannot be hardened without following links",
-        }
-        for mutation, expected_error in expected_errors.items():
-            with self.subTest(mutation=mutation):
-                real_chmod = os.chmod
-                displaced: list[pathlib.Path] = []
+        helper = self.root / "reject-smoke-prompt.py"
+        helper.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import subprocess
+                import sys
 
-                def mutate_directory(
-                    path: str | os.PathLike[str],
-                    _mode: int,
-                    *,
-                    follow_symlinks: bool,
-                ) -> None:
-                    snapshot_dir = pathlib.Path(path)
-                    if mutation == "replacement":
-                        displaced_dir = snapshot_dir.with_name(
-                            f"{snapshot_dir.name}.displaced"
-                        )
-                        snapshot_dir.rename(displaced_dir)
-                        displaced.append(displaced_dir)
-                        snapshot_dir.mkdir(mode=0o700)
-                        real_chmod(
-                            snapshot_dir,
-                            0o700,
-                            follow_symlinks=follow_symlinks,
-                        )
-                    elif mutation == "unsafe-access":
-                        real_chmod(
-                            snapshot_dir,
-                            0o755,
-                            follow_symlinks=follow_symlinks,
-                        )
-                    else:
-                        raise PermissionError(
-                            "injected snapshot directory access failure"
-                        )
+                os.close(int(sys.argv[1]))
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    stdin=subprocess.DEVNULL,
+                )
+                print(os.getpgrp(), flush=True)
+                """
+            ),
+            encoding="utf-8",
+        )
 
-                try:
-                    with mock.patch.object(
-                        module.os,
-                        "chmod",
-                        side_effect=mutate_directory,
-                    ):
-                        with self.assertRaisesRegex(
-                            module.UserError,
-                            expected_error,
-                        ):
-                            with module._immutable_smoke_prompt_snapshot(
-                                b"fallback prompt\n"
-                            ):
-                                self.fail("unsafe snapshot directory was accepted")
-                finally:
-                    for displaced_dir in displaced:
-                        shutil.rmtree(displaced_dir)
+        with module._anonymous_smoke_prompt_pipe() as (
+            _execution_path,
+            read_fd,
+            write_stream,
+        ):
+            completed = module._run_bounded_smoke_process(
+                [sys.executable, str(helper), str(read_fd)],
+                cwd=self.repo,
+                pass_fds=(read_fd,),
+                input_stream=write_stream,
+                input_bytes=b"x" * module.STATE_MAX_BYTES,
+                timeout=5,
+                cleanup_timeout=3,
+            )
 
-    def test_run_fallback_smoke_binds_prompt_snapshot_under_lock(self) -> None:
+        self.assertEqual(completed.returncode, 126, completed.stderr)
+        self.assertIn(
+            "rejected its prompt stream before complete delivery",
+            completed.stderr,
+        )
+        process_group = int(completed.stdout.strip().splitlines()[0])
+        self.assertFalse(module._process_group_exists(process_group))
+
+    def test_run_fallback_smoke_binds_prompt_pipe_under_lock(self) -> None:
         module = self._load_runner_module()
         run_dir = self._prepare()
         prompt_path = run_dir / module.FALLBACK_SMOKE_PROMPT_NAME
@@ -1231,7 +1247,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         lock_depth = 0
         lock_acquisitions = 0
         prompt_read_under_lock = False
-        captured_snapshot_fds: list[int] = []
+        captured_pipe_fds: list[int] = []
 
         @contextlib.contextmanager
         def tracked_acquired_run_lock(*args, **kwargs):
@@ -1239,9 +1255,10 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             with real_acquired_run_lock(*args, **kwargs):
                 lock_acquisitions += 1
                 if lock_acquisitions == 2:
-                    self.assertEqual(len(captured_snapshot_fds), 1)
-                    with self.assertRaises(OSError):
-                        os.fstat(captured_snapshot_fds[0])
+                    self.assertEqual(len(captured_pipe_fds), 2)
+                    for file_fd in captured_pipe_fds:
+                        with self.assertRaises(OSError):
+                            os.fstat(file_fd)
                 lock_depth += 1
                 try:
                     yield
@@ -1261,22 +1278,28 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             *,
             cwd: pathlib.Path,
             pass_fds: tuple[int, ...],
+            input_stream,
+            input_bytes: bytes,
         ) -> subprocess.CompletedProcess[str]:
             self.assertEqual(cwd, self.repo.resolve())
             self.assertEqual(len(pass_fds), 1)
-            snapshot_fd = pass_fds[0]
-            captured_snapshot_fds.append(snapshot_fd)
+            read_fd = pass_fds[0]
+            input_fd = input_stream.fileno()
+            captured_pipe_fds.extend((read_fd, input_fd))
             prompt_index = command.index("--prompt-file") + 1
-            snapshot_path = pathlib.Path(command[prompt_index])
-            self.assertNotEqual(snapshot_path, prompt_path)
+            pipe_path = pathlib.Path(command[prompt_index])
+            self.assertNotEqual(pipe_path, prompt_path)
             prompt_path.unlink()
             prompt_path.symlink_to(malicious_prompt)
-            self.assertEqual(snapshot_path.read_bytes(), original_prompt)
+            self.assertEqual(input_bytes, original_prompt)
+            input_stream.write(input_bytes)
+            input_stream.close()
+            self.assertEqual(pipe_path.read_bytes(), original_prompt)
             self.assertEqual(
-                fcntl.fcntl(snapshot_fd, fcntl.F_GETFL) & os.O_ACCMODE,
+                fcntl.fcntl(read_fd, fcntl.F_GETFL) & os.O_ACCMODE,
                 os.O_RDONLY,
             )
-            self.assertEqual(os.fstat(snapshot_fd).st_nlink, 0)
+            self.assertTrue(stat.S_ISFIFO(os.fstat(read_fd).st_mode))
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -1308,9 +1331,10 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertTrue(prompt_read_under_lock)
         self.assertEqual(lock_acquisitions, 2)
-        self.assertEqual(len(captured_snapshot_fds), 1)
-        with self.assertRaises(OSError):
-            os.fstat(captured_snapshot_fds[0])
+        self.assertEqual(len(captured_pipe_fds), 2)
+        for file_fd in captured_pipe_fds:
+            with self.assertRaises(OSError):
+                os.fstat(file_fd)
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["fallback_readiness_smoke"]["status"], "passed")
         self.assertEqual(state["fallback_readiness_smoke"]["sample"], "READY")
@@ -1334,10 +1358,15 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             *,
             cwd: pathlib.Path,
             pass_fds: tuple[int, ...],
+            input_stream,
+            input_bytes: bytes,
         ) -> subprocess.CompletedProcess[str]:
             self.assertTrue(command)
             self.assertEqual(cwd, self.repo.resolve())
             self.assertEqual(len(pass_fds), 1)
+            self.assertGreater(len(input_bytes), 0)
+            input_fd = input_stream.fileno()
+            self.assertNotIn(input_fd, pass_fds)
             smoke_started.set()
             if not release_smoke.wait(5):
                 raise RuntimeError("timed out waiting to release smoke")

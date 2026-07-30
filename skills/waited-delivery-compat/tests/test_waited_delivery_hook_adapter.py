@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -2264,12 +2265,12 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 self.assertEqual(entry["error_type"], "RunSafetyError")
                 self.assertIn(expected_error, entry["error_message"])
 
-    def test_refresh_snapshot_survives_owner_bit_masking_umask(self) -> None:
+    def test_refresh_source_frame_avoids_filesystem_snapshots_under_umask(
+        self,
+    ) -> None:
         probe = textwrap.dedent(
             """\
-            import fcntl
             import importlib.util
-            import os
             import pathlib
             import sys
 
@@ -2283,15 +2284,14 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             module = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
-            with module._verified_refresh_launch_snapshots() as snapshots:
-                for snapshot in (snapshots.bridge, snapshots.runner):
-                    metadata = os.fstat(snapshot.snapshot_fd)
-                    if metadata.st_mode & 0o7777 != 0o600:
-                        raise RuntimeError("snapshot access mismatch")
-                    if metadata.st_nlink != 0:
-                        raise RuntimeError("snapshot name remains linked")
-                    if fcntl.fcntl(snapshot.snapshot_fd, fcntl.F_GETFL) & os.O_ACCMODE:
-                        raise RuntimeError("snapshot is not read-only")
+            with module._verified_refresh_launch_sources() as sources:
+                frame = module._refresh_source_frame(sources)
+                if frame[:8] != module.SOURCE_FRAME_MAGIC:
+                    raise RuntimeError("source frame magic mismatch")
+                if sources.bridge.content not in frame:
+                    raise RuntimeError("bridge source is absent from frame")
+                if sources.runner.content not in frame:
+                    raise RuntimeError("runner source is absent from frame")
             """
         )
         completed = run(
@@ -2306,108 +2306,76 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "")
 
-    def test_refresh_snapshot_rejects_directory_drift(self) -> None:
+    def test_refresh_source_input_early_rejection_cleans_process_group(self) -> None:
         module = self._load_adapter_module()
-        expected_errors = {
-            "replacement": "identity or access policy changed",
-            "unsafe-access": "identity or access policy changed",
-            "unreadable": "cannot be hardened without following links",
-        }
-        for mutation, expected_error in expected_errors.items():
-            with self.subTest(mutation=mutation):
-                real_chmod = os.chmod
-                displaced: list[pathlib.Path] = []
+        pid_path = self.root / "early-source-reject.pid"
+        script = self.root / "early-source-reject.py"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import subprocess
+                import sys
 
-                def mutate_directory(
-                    path: str | os.PathLike[str],
-                    _mode: int,
-                    *,
-                    follow_symlinks: bool,
-                ) -> None:
-                    snapshot_dir = pathlib.Path(path)
-                    if mutation == "replacement":
-                        displaced_dir = snapshot_dir.with_name(
-                            f"{snapshot_dir.name}.displaced"
-                        )
-                        snapshot_dir.rename(displaced_dir)
-                        displaced.append(displaced_dir)
-                        snapshot_dir.mkdir(mode=0o700)
-                        real_chmod(
-                            snapshot_dir,
-                            0o700,
-                            follow_symlinks=follow_symlinks,
-                        )
-                    elif mutation == "unsafe-access":
-                        real_chmod(
-                            snapshot_dir,
-                            0o755,
-                            follow_symlinks=follow_symlinks,
-                        )
-                    else:
-                        raise PermissionError(
-                            "injected snapshot directory access failure"
-                        )
+                pathlib.Path(sys.argv[1]).write_text(
+                    str(__import__("os").getpid()),
+                    encoding="utf-8",
+                )
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    stdin=subprocess.DEVNULL,
+                )
+                """
+            ),
+            encoding="utf-8",
+        )
+        completed = module._run_bounded_refresh_process(
+            [sys.executable, str(script), str(pid_path)],
+            pass_fds=(),
+            env=os.environ.copy(),
+            input_bytes=b"x" * (2 * 1024 * 1024),
+            timeout=2.0,
+            cleanup_timeout=3.0,
+            max_capture_bytes=64 * 1024,
+        )
+        self.assertEqual(completed.returncode, 126, completed.stderr)
+        self.assertIn("rejected its source frame", completed.stderr)
+        pgid = int(pid_path.read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pgid, 0)
 
-                try:
-                    with mock.patch.object(
-                        module.os,
-                        "chmod",
-                        side_effect=mutate_directory,
-                    ):
-                        with self.assertRaisesRegex(
-                            module.RunSafetyError,
-                            expected_error,
-                        ):
-                            with module._verified_refresh_launch_snapshots():
-                                self.fail(
-                                    "unsafe launch snapshot directory was accepted"
-                                )
-                finally:
-                    for displaced_dir in displaced:
-                        shutil.rmtree(displaced_dir)
-
-    def test_launch_snapshot_closes_fd_when_execution_path_resolution_fails(
+    def test_refresh_source_frame_binds_lengths_digests_and_bytes(
         self,
     ) -> None:
         module = self._load_adapter_module()
-        source = module._read_stop_absolute_regular_artifact(
-            BRIDGE_PATH,
-            max_bytes=module.STATE_MAX_BYTES,
+        with module._verified_refresh_launch_sources() as sources:
+            frame = module._refresh_source_frame(sources)
+        offset = 8
+        self.assertEqual(frame[:offset], module.SOURCE_FRAME_MAGIC)
+        bridge_size = int.from_bytes(frame[offset : offset + 8], "big")
+        offset += 8
+        bridge_digest = frame[offset : offset + 32]
+        offset += 32
+        runner_size = int.from_bytes(frame[offset : offset + 8], "big")
+        offset += 8
+        runner_digest = frame[offset : offset + 32]
+        offset += 32
+        self.assertEqual(bridge_size, len(sources.bridge.content))
+        self.assertEqual(runner_size, len(sources.runner.content))
+        self.assertEqual(
+            bridge_digest,
+            hashlib.sha256(sources.bridge.content).digest(),
         )
-        snapshot_dir = self.root / "snapshot-resolution-failure"
-        snapshot_dir.mkdir(mode=0o700)
-        snapshot_dir_fd = os.open(snapshot_dir, os.O_RDONLY)
-        captured_fds: list[int] = []
-
-        def fail_execution_path(file_fd: int, name: str) -> pathlib.Path:
-            captured_fds.append(file_fd)
-            raise module.RunSafetyError(
-                f"cannot expose descriptor-bound compatibility snapshot: {name}"
-            )
-
-        try:
-            with mock.patch.object(
-                module,
-                "_fd_execution_path",
-                side_effect=fail_execution_path,
-            ):
-                with self.assertRaisesRegex(
-                    module.RunSafetyError,
-                    "cannot expose descriptor-bound compatibility snapshot",
-                ):
-                    module._write_launch_snapshot(
-                        snapshot_dir_fd,
-                        "waited_delivery_bridge.py",
-                        BRIDGE_PATH,
-                        source,
-                    )
-        finally:
-            os.close(snapshot_dir_fd)
-
-        self.assertEqual(len(captured_fds), 1)
-        with self.assertRaises(OSError):
-            os.fstat(captured_fds[0])
-        self.assertFalse((snapshot_dir / "waited_delivery_bridge.py").exists())
+        self.assertEqual(
+            runner_digest,
+            hashlib.sha256(sources.runner.content).digest(),
+        )
+        self.assertEqual(
+            frame[offset : offset + bridge_size],
+            sources.bridge.content,
+        )
+        offset += bridge_size
+        self.assertEqual(frame[offset:], sources.runner.content)
 
     def test_refresh_launch_revalidates_bridge_and_runner_before_process(
         self,
@@ -2444,12 +2412,12 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                         for path in watched_paths
                     }
                     run_identity = self._run_identity(module, run_dir)
-                    real_revalidate = module._revalidate_refresh_launch_snapshots
+                    real_revalidate = module._revalidate_refresh_launch_sources
                     displaced = self.root / (
                         f"displaced-launch-{artifact_name}-{mutation}.py"
                     )
 
-                    def mutate_before_revalidation(snapshots) -> None:
+                    def mutate_before_revalidation(sources) -> None:
                         original_stat = source_path.stat()
                         original_content = source_path.read_bytes()
                         if mutation == "replacement":
@@ -2470,21 +2438,18 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                                     original_stat.st_mtime_ns + 1_000_000_000,
                                 ),
                             )
-                        real_revalidate(snapshots)
+                        real_revalidate(sources)
 
-                    launch_glob = "waited-delivery-refresh-launch-*"
-                    before_launch_dirs = set(self.root.glob(launch_glob))
                     patches = (
                         mock.patch.object(module, "BRIDGE_PATH", bridge_path),
                         mock.patch.object(module, "RUNNER_PATH", runner_path),
                         mock.patch.object(
                             module,
-                            "_revalidate_refresh_launch_snapshots",
+                            "_revalidate_refresh_launch_sources",
                             side_effect=mutate_before_revalidation,
                         ),
-                        mock.patch.object(module.tempfile, "tempdir", str(self.root)),
                     )
-                    with patches[0], patches[1], patches[2], patches[3]:
+                    with patches[0], patches[1], patches[2]:
                         if mutation == "timestamps":
                             refreshed = module._refresh_recovery_prompts(
                                 run_dir,
@@ -2496,7 +2461,10 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                                 run_dir / "child-prompt.md",
                             )
                         else:
-                            with mock.patch.object(module, "_run") as process_run:
+                            with mock.patch.object(
+                                module,
+                                "_run_bounded_refresh_process",
+                            ) as process_run:
                                 with self.assertRaisesRegex(
                                     module.RunSafetyError,
                                     expected_errors[mutation],
@@ -2513,12 +2481,8 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                             ) in before.items():
                                 self.assertEqual(path.stat().st_ino, expected_inode)
                                 self.assertEqual(path.read_bytes(), expected_content)
-                    self.assertEqual(
-                        set(self.root.glob(launch_glob)),
-                        before_launch_dirs,
-                    )
 
-    def test_refresh_launch_executes_private_snapshots_across_source_aba(
+    def test_refresh_launch_executes_pipe_bound_sources_across_source_aba(
         self,
     ) -> None:
         for artifact_name in ("bridge", "runner"):
@@ -2551,16 +2515,21 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 real_run = module._run_bounded_refresh_process
                 process_commands: list[list[str]] = []
                 process_environments: list[dict[str, str] | None] = []
+                process_inputs: list[bytes | None] = []
+                process_pass_fds: list[tuple[int, ...]] = []
 
                 def run_during_source_aba(
                     cmd: list[str],
                     *,
                     pass_fds: tuple[int, ...],
                     env: dict[str, str],
+                    input_bytes: bytes | None = None,
                     **bounds: object,
                 ) -> subprocess.CompletedProcess[str]:
                     process_commands.append(cmd)
                     process_environments.append(env)
+                    process_inputs.append(input_bytes)
+                    process_pass_fds.append(pass_fds)
                     source_path.rename(displaced)
                     source_path.write_text(malicious, encoding="utf-8")
                     source_path.chmod(source_identity.st_mode & 0o7777)
@@ -2569,14 +2538,13 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                             cmd,
                             pass_fds=pass_fds,
                             env=env,
+                            input_bytes=input_bytes,
                             **bounds,
                         )
                     finally:
                         source_path.unlink()
                         displaced.rename(source_path)
 
-                launch_glob = "waited-delivery-refresh-launch-*"
-                before_launch_dirs = set(self.root.glob(launch_glob))
                 with (
                     mock.patch.object(
                         module,
@@ -2593,11 +2561,6 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                         "_run_bounded_refresh_process",
                         side_effect=run_during_source_aba,
                     ),
-                    mock.patch.object(
-                        module.tempfile,
-                        "tempdir",
-                        str(self.root),
-                    ),
                 ):
                     refreshed = module._refresh_recovery_prompts(
                         run_dir,
@@ -2607,10 +2570,20 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
 
                 self.assertEqual(len(process_commands), 1)
                 self.assertEqual(
-                    process_commands[0][1:4],
-                    ["-I", "-B", "-S"],
+                    process_commands[0][1:5],
+                    ["-I", "-B", "-S", "-c"],
                 )
-                self.assertNotEqual(process_commands[0][4], str(source_path))
+                self.assertEqual(
+                    process_commands[0][5],
+                    module.SOURCE_PIPE_BOOTSTRAP,
+                )
+                self.assertEqual(process_pass_fds, [()])
+                self.assertIsNotNone(process_inputs[0])
+                assert process_inputs[0] is not None
+                self.assertIn(
+                    source_path.read_bytes(),
+                    process_inputs[0],
+                )
                 self.assertIsNotNone(process_environments[0])
                 assert process_environments[0] is not None
                 self.assertFalse(
@@ -2629,10 +2602,6 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     prompt = (run_dir / prompt_name).read_text(encoding="utf-8")
                     self.assertIn(str(runner_path), prompt)
                     self.assertNotIn("legacy launch-window prompt", prompt)
-                self.assertEqual(
-                    set(self.root.glob(launch_glob)),
-                    before_launch_dirs,
-                )
 
     def test_stop_hook_fails_open_when_index_is_invalid(self) -> None:
         fake_home = self.root / "home-stop-invalid"

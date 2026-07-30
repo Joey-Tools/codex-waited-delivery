@@ -100,10 +100,16 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("--enable-compat-hook", skill)
         self.assertIn("`refresh-prompts`", skill)
         self.assertIn("`refresh-prompts-live`", skill)
-        self.assertIn("internal descriptor-only runner recovery target", skill)
-        self.assertIn("executes only the inherited snapshot FDs", skill)
+        self.assertIn("internal in-memory runner recovery target", skill)
+        self.assertIn(
+            "No source snapshot file or inherited source FD exists",
+            skill,
+        )
         self.assertIn("Python `-I -B -S`", skill)
-        self.assertIn("both inherited FDs to remain `O_RDONLY`", hook_reference)
+        self.assertIn(
+            "both `anonymous-pipe-memory` transports",
+            hook_reference,
+        )
         self.assertIn("allow_implicit_invocation: false", openai_yaml)
         self.assertIn("$waited-delivery-compat", openai_yaml)
         self.assertIn("<compat-skill-root>", hook_reference)

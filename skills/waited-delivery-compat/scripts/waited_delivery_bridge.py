@@ -5,12 +5,10 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
 import pathlib
-import stat
 import subprocess
 import sys
 from typing import NamedTuple, cast
@@ -22,7 +20,49 @@ TRANSCRIPT_PATH_ENV = "WAITED_DELIVERY_PARENT_TRANSCRIPT_PATH"
 PERMISSION_MODE_ENV = "WAITED_DELIVERY_PERMISSION_MODE"
 RUNNER_PATH = pathlib.Path(__file__).resolve().with_name("waited_delivery_runner.py")
 STATE_MAX_BYTES = 4 * 1024 * 1024
-PROMPT_REFRESH_SCHEMA_VERSION = 2
+PROMPT_REFRESH_SCHEMA_VERSION = 3
+RUNNER_FRAME_MAGIC = b"WDLRUN01"
+RUNNER_PIPE_BOOTSTRAP = """\
+import hashlib
+import sys
+
+MAX_SOURCE_BYTES = 4 * 1024 * 1024
+
+def read_exact(stream, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(min(64 * 1024, remaining))
+        if not chunk:
+            raise SystemExit("truncated waited-delivery runner frame")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+stream = sys.stdin.buffer
+if read_exact(stream, 8) != b"WDLRUN01":
+    raise SystemExit("invalid waited-delivery runner frame")
+runner_size = int.from_bytes(read_exact(stream, 8), "big")
+runner_sha256 = read_exact(stream, 32).hex()
+if runner_size <= 0 or runner_size > MAX_SOURCE_BYTES:
+    raise SystemExit("waited-delivery runner frame size is outside the bound")
+runner_source = read_exact(stream, runner_size)
+if stream.read(1):
+    raise SystemExit("waited-delivery runner frame has trailing bytes")
+if hashlib.sha256(runner_source).hexdigest() != runner_sha256:
+    raise SystemExit("waited-delivery runner source digest mismatch")
+runner_path = sys.argv[1]
+runner_args = sys.argv[2:]
+sys.argv[:] = [runner_path, *runner_args]
+runner_globals = {
+    "__name__": "__main__",
+    "__file__": runner_path,
+    "__package__": None,
+    "__cached__": None,
+    "_WAITED_DELIVERY_BOUND_RUNNER_SOURCE": runner_source,
+}
+exec(compile(runner_source, runner_path, "exec"), runner_globals)
+"""
 
 
 class UserError(RuntimeError):
@@ -37,135 +77,6 @@ class FileVersion(NamedTuple):
     mode: int
     size: int
     sha256: str
-
-
-class ArtifactRead(NamedTuple):
-    content: bytes
-    version: FileVersion
-
-
-def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
-    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
-
-
-def _read_inherited_regular_artifact(
-    file_fd: int,
-    name: str,
-    *,
-    max_bytes: int,
-) -> ArtifactRead:
-    def read_bounded() -> bytes:
-        chunks: list[bytes] = []
-        offset = 0
-        while True:
-            chunk = os.pread(
-                file_fd,
-                min(65536, max_bytes + 1 - offset),
-                offset,
-            )
-            if not chunk:
-                break
-            chunks.append(chunk)
-            offset += len(chunk)
-            if offset > max_bytes:
-                raise UserError(
-                    f"descriptor-bound compatibility artifact exceeds byte "
-                    f"limit: {name}"
-                )
-        return b"".join(chunks)
-
-    try:
-        access_mode = fcntl.fcntl(file_fd, fcntl.F_GETFL) & os.O_ACCMODE
-        if access_mode != os.O_RDONLY:
-            raise UserError(
-                f"descriptor-bound compatibility artifact must be opened "
-                f"read-only: {name}"
-            )
-        before = os.fstat(file_fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise UserError(
-                f"descriptor-bound compatibility artifact must be a regular "
-                f"file: {name}"
-            )
-        if before.st_size > max_bytes:
-            raise UserError(
-                f"descriptor-bound compatibility artifact exceeds byte limit: {name}"
-            )
-        expected_access = (
-            before.st_uid,
-            before.st_gid,
-            stat.S_IMODE(before.st_mode),
-        )
-        first_content = read_bounded()
-        middle = os.fstat(file_fd)
-        second_content = read_bounded()
-        after = os.fstat(file_fd)
-        stable_stats = (before, middle, after)
-        if (
-            any(not stat.S_ISREG(value.st_mode) for value in stable_stats)
-            or any(not _same_object(before, value) for value in stable_stats[1:])
-            or any(value.st_size != before.st_size for value in stable_stats[1:])
-            or any(
-                (
-                    value.st_uid,
-                    value.st_gid,
-                    stat.S_IMODE(value.st_mode),
-                )
-                != expected_access
-                for value in stable_stats[1:]
-            )
-            or len(first_content) != before.st_size
-            or len(second_content) != before.st_size
-            or first_content != second_content
-        ):
-            raise UserError(
-                f"descriptor-bound compatibility artifact identity, access, size, "
-                f"or content changed while read: {name}"
-            )
-        return ArtifactRead(
-            content=second_content,
-            version=FileVersion(
-                device=after.st_dev,
-                inode=after.st_ino,
-                uid=after.st_uid,
-                gid=after.st_gid,
-                mode=stat.S_IMODE(after.st_mode),
-                size=after.st_size,
-                sha256=hashlib.sha256(second_content).hexdigest(),
-            ),
-        )
-    except UserError:
-        raise
-    except OSError as error:
-        raise UserError(
-            f"cannot read descriptor-bound compatibility artifact: {name}"
-        ) from error
-
-
-def _fd_execution_path(file_fd: int, name: str) -> pathlib.Path:
-    try:
-        descriptor_stat = os.fstat(file_fd)
-    except OSError as error:
-        raise UserError(
-            f"cannot inspect descriptor-bound compatibility artifact: {name}"
-        ) from error
-    for root in (pathlib.Path("/dev/fd"), pathlib.Path("/proc/self/fd")):
-        candidate = root / str(file_fd)
-        probe_fd: int | None = None
-        try:
-            probe_fd = os.open(
-                candidate,
-                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
-            )
-            candidate_stat = os.fstat(probe_fd)
-        except OSError:
-            continue
-        finally:
-            if probe_fd is not None:
-                os.close(probe_fd)
-        if _same_object(descriptor_stat, candidate_stat):
-            return candidate
-    raise UserError(f"cannot expose descriptor-bound compatibility artifact: {name}")
 
 
 def _expected_file_version(
@@ -255,39 +166,6 @@ def _file_version_from_payload(
     )
 
 
-def _validate_loaded_from_descriptor(
-    file_fd: int,
-    name: str,
-) -> pathlib.Path:
-    execution_path = _fd_execution_path(file_fd, name)
-    loaded_path = pathlib.Path(os.path.abspath(__file__))
-    if loaded_path != execution_path:
-        raise UserError(
-            "compatibility bridge must be launched through its inherited "
-            "descriptor path"
-        )
-    loaded_fd: int | None = None
-    try:
-        loaded_fd = os.open(
-            loaded_path,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
-        )
-        loaded_stat = os.fstat(loaded_fd)
-        descriptor_stat = os.fstat(file_fd)
-    except OSError as error:
-        raise UserError(
-            "cannot bind loaded compatibility bridge to inherited descriptor"
-        ) from error
-    finally:
-        if loaded_fd is not None:
-            os.close(loaded_fd)
-    if not _same_object(loaded_stat, descriptor_stat):
-        raise UserError(
-            "loaded compatibility bridge does not match inherited descriptor"
-        )
-    return execution_path
-
-
 def _runner_command(*args: str) -> list[str]:
     return [sys.executable, str(RUNNER_PATH), *args]
 
@@ -321,35 +199,50 @@ def _require_isolated_python() -> None:
         raise UserError("refresh-prompts-live requires Python -I -B -S isolation")
 
 
-def _run_descriptor_runner_json(
-    bridge_fd: int,
-    runner_fd: int,
+def _runner_source_frame(source: bytes) -> bytes:
+    if not source or len(source) > STATE_MAX_BYTES:
+        raise UserError("bound compatibility runner is outside the byte bound")
+    return b"".join(
+        (
+            RUNNER_FRAME_MAGIC,
+            len(source).to_bytes(8, "big"),
+            hashlib.sha256(source).digest(),
+            source,
+        )
+    )
+
+
+def _run_in_memory_runner_json(
+    runner_source: bytes,
+    runner_path: pathlib.Path,
     *args: str,
 ) -> dict[str, object]:
-    execution_path = _fd_execution_path(
-        runner_fd,
-        "waited_delivery_runner.py",
-    )
     completed = subprocess.run(
         [
             sys.executable,
             "-I",
             "-B",
             "-S",
-            str(execution_path),
+            "-c",
+            RUNNER_PIPE_BOOTSTRAP,
+            str(runner_path),
             *args,
         ],
-        text=True,
-        capture_output=True,
+        input=_runner_source_frame(runner_source),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=False,
-        pass_fds=(bridge_fd, runner_fd),
         env=_isolated_python_environment(),
     )
     if completed.returncode != 0:
-        stderr = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+        stderr = (
+            completed.stderr.decode("utf-8", errors="replace").strip()
+            or completed.stdout.decode("utf-8", errors="replace").strip()
+            or "unknown error"
+        )
         raise UserError(stderr)
     try:
-        payload = json.loads(completed.stdout)
+        payload = json.loads(completed.stdout.decode("utf-8"))
     except json.JSONDecodeError as error:
         raise UserError(f"runner did not return valid JSON: {error}") from error
     if not isinstance(payload, dict):
@@ -484,51 +377,56 @@ def _refresh_prompts_live(args: argparse.Namespace) -> int:
         )
     expected_bridge = _expected_file_version(args, "bridge")
     expected_runner = _expected_file_version(args, "runner")
-    bridge_execution_path = _validate_loaded_from_descriptor(
-        args.executed_bridge_fd,
-        "waited_delivery_bridge.py",
-    )
-    bridge_artifact = _read_inherited_regular_artifact(
-        args.executed_bridge_fd,
-        "waited_delivery_bridge.py",
-        max_bytes=STATE_MAX_BYTES,
-    )
-    _validate_file_version(
-        bridge_artifact.version,
-        expected_bridge,
-        label="descriptor-bound compatibility bridge",
-    )
-    runner_execution_path = _fd_execution_path(
-        args.executed_runner_fd,
-        "waited_delivery_runner.py",
-    )
-    runner_artifact = _read_inherited_regular_artifact(
-        args.executed_runner_fd,
-        "waited_delivery_runner.py",
-        max_bytes=STATE_MAX_BYTES,
-    )
-    _validate_file_version(
-        runner_artifact.version,
-        expected_runner,
-        label="descriptor-bound compatibility runner",
-    )
-    published_runner_path = pathlib.Path(args.published_runner_path)
+    bridge_source = globals().get("_WAITED_DELIVERY_BOUND_BRIDGE_SOURCE")
+    runner_source = globals().get("_WAITED_DELIVERY_BOUND_RUNNER_SOURCE")
+    runner_source_path = globals().get("_WAITED_DELIVERY_BOUND_RUNNER_PATH")
+    if not isinstance(bridge_source, bytes) or not isinstance(runner_source, bytes):
+        raise UserError(
+            "refresh-prompts-live requires anonymous-pipe-bound source bytes"
+        )
     if (
-        not published_runner_path.is_absolute()
-        or not published_runner_path.name
-        or pathlib.PurePath(published_runner_path.name).name
-        != published_runner_path.name
+        len(bridge_source) != expected_bridge.size
+        or hashlib.sha256(bridge_source).hexdigest() != expected_bridge.sha256
     ):
-        raise UserError("published runner path must be an absolute file path")
+        raise UserError("bound compatibility bridge source content changed")
+    if (
+        len(runner_source) != expected_runner.size
+        or hashlib.sha256(runner_source).hexdigest() != expected_runner.sha256
+    ):
+        raise UserError("bound compatibility runner source content changed")
+    published_bridge_path = pathlib.Path(args.published_bridge_path)
+    published_runner_path = pathlib.Path(args.published_runner_path)
+    for label, published_path in (
+        ("bridge", published_bridge_path),
+        ("runner", published_runner_path),
+    ):
+        if (
+            not published_path.is_absolute()
+            or not published_path.name
+            or pathlib.PurePath(published_path.name).name != published_path.name
+        ):
+            raise UserError(f"published {label} path must be an absolute file path")
+    if pathlib.Path(os.path.abspath(__file__)) != published_bridge_path:
+        raise UserError(
+            "compatibility bridge compile filename does not match its published path"
+        )
+    if (
+        not isinstance(runner_source_path, str)
+        or pathlib.Path(runner_source_path) != published_runner_path
+    ):
+        raise UserError(
+            "bound compatibility runner compile filename does not match its "
+            "published path"
+        )
     runner_args = [
         "refresh-prompts",
         "--run-dir",
         args.run_dir,
         "--json",
-        "--executed-bridge-fd",
-        str(args.executed_bridge_fd),
-        "--executed-runner-fd",
-        str(args.executed_runner_fd),
+        "--compiled-bridge-path",
+        str(published_bridge_path),
+        "--compiled-runner-path",
+        str(published_runner_path),
         "--published-runner-path",
         str(published_runner_path),
     ]
@@ -569,27 +467,27 @@ def _refresh_prompts_live(args: argparse.Namespace) -> int:
             expected_runner.sha256,
         ]
     )
-    payload = _run_descriptor_runner_json(
-        args.executed_bridge_fd,
-        args.executed_runner_fd,
+    payload = _run_in_memory_runner_json(
+        runner_source,
+        published_runner_path,
         *runner_args,
     )
     if payload.get("refresh_schema_version") != PROMPT_REFRESH_SCHEMA_VERSION:
         raise UserError("runner returned an unsupported refresh schema")
     if payload.get("python_isolated") is not True:
         raise UserError("runner did not attest isolated Python execution")
-    if payload.get("bridge_fd_access") != "read-only":
-        raise UserError("runner did not attest read-only bridge descriptor access")
-    if payload.get("runner_fd_access") != "read-only":
-        raise UserError("runner did not attest read-only runner descriptor access")
-    if payload.get("executed_bridge_path") != str(bridge_execution_path):
-        raise UserError(
-            "runner receipt does not identify the descriptor-bound bridge path"
-        )
-    if payload.get("executed_runner_path") != str(runner_execution_path):
-        raise UserError(
-            "runner receipt does not identify the descriptor-bound execution path"
-        )
+    for field in ("bridge_source_transport", "runner_source_transport"):
+        if payload.get(field) != "anonymous-pipe-memory":
+            raise UserError(
+                f"runner did not attest anonymous in-memory source transport: {field}"
+            )
+    for field in ("bridge_source_reopenable", "runner_source_reopenable"):
+        if payload.get(field) is not False:
+            raise UserError(f"runner did not attest non-reopenable source: {field}")
+    if payload.get("compiled_bridge_path") != str(published_bridge_path):
+        raise UserError("runner receipt does not identify the bridge compile filename")
+    if payload.get("compiled_runner_path") != str(published_runner_path):
+        raise UserError("runner receipt does not identify the runner compile filename")
     returned_bridge = _file_version_from_payload(payload, "bridge_version")
     _validate_file_version(
         returned_bridge,
@@ -700,13 +598,7 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_prompts_live.add_argument("--run-dir", required=True)
     refresh_prompts_live.add_argument("--expected-repo-root")
     refresh_prompts_live.add_argument(
-        "--executed-bridge-fd",
-        type=int,
-        required=True,
-    )
-    refresh_prompts_live.add_argument(
-        "--executed-runner-fd",
-        type=int,
+        "--published-bridge-path",
         required=True,
     )
     refresh_prompts_live.add_argument(

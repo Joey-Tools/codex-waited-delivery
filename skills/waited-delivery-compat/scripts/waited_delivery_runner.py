@@ -19,11 +19,10 @@ import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from collections.abc import Iterator
-from typing import Literal, NamedTuple, TypedDict, cast
+from typing import BinaryIO, Literal, NamedTuple, TypedDict, cast
 
 
 TERMINAL_PHASE_STATUSES = {
@@ -74,7 +73,7 @@ PROCESS_DRAIN_CHUNK_BYTES = 64 * 1024
 PROCESS_POLL_INTERVAL_SECONDS = 0.02
 PROC_GROUP_SCAN_MAX_ENTRIES = 131_072
 PROC_GROUP_SCAN_TIMEOUT_SECONDS = 0.25
-PROMPT_REFRESH_SCHEMA_VERSION = 2
+PROMPT_REFRESH_SCHEMA_VERSION = 3
 
 
 class FileVersion(NamedTuple):
@@ -692,24 +691,6 @@ def _file_version_payload(version: FileVersion) -> dict[str, object]:
     }
 
 
-def _validate_file_version(
-    actual: FileVersion,
-    expected: FileVersion,
-    *,
-    label: str,
-) -> None:
-    if (actual.device, actual.inode) != (expected.device, expected.inode):
-        raise UserError(f"{label} was replaced")
-    if (actual.uid, actual.gid, actual.mode) != (
-        expected.uid,
-        expected.gid,
-        expected.mode,
-    ):
-        raise UserError(f"{label} access policy changed")
-    if actual.size != expected.size or actual.sha256 != expected.sha256:
-        raise UserError(f"{label} content changed")
-
-
 def _expected_file_version(
     args: argparse.Namespace,
     prefix: str,
@@ -768,100 +749,6 @@ def _read_absolute_regular_artifact(
         os.close(parent_fd)
 
 
-def _read_inherited_regular_artifact(
-    file_fd: int,
-    name: str,
-    *,
-    max_bytes: int,
-) -> ArtifactRead:
-    def read_bounded() -> bytes:
-        chunks: list[bytes] = []
-        offset = 0
-        while True:
-            chunk = os.pread(
-                file_fd,
-                min(65536, max_bytes + 1 - offset),
-                offset,
-            )
-            if not chunk:
-                break
-            chunks.append(chunk)
-            offset += len(chunk)
-            if offset > max_bytes:
-                raise ArtifactUnreadableError(
-                    f"descriptor-bound compatibility artifact exceeds byte "
-                    f"limit: {name}"
-                )
-        return b"".join(chunks)
-
-    try:
-        access_mode = fcntl.fcntl(file_fd, fcntl.F_GETFL) & os.O_ACCMODE
-        if access_mode != os.O_RDONLY:
-            raise ArtifactUnreadableError(
-                f"descriptor-bound compatibility artifact must be opened "
-                f"read-only: {name}"
-            )
-        before = os.fstat(file_fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise ArtifactUnreadableError(
-                f"descriptor-bound compatibility artifact must be a regular "
-                f"file: {name}"
-            )
-        if before.st_size > max_bytes:
-            raise ArtifactUnreadableError(
-                f"descriptor-bound compatibility artifact exceeds byte limit: {name}"
-            )
-        expected_access = (
-            before.st_uid,
-            before.st_gid,
-            stat.S_IMODE(before.st_mode),
-        )
-        first_content = read_bounded()
-        middle = os.fstat(file_fd)
-        second_content = read_bounded()
-        after = os.fstat(file_fd)
-        stable_stats = (before, middle, after)
-        if (
-            any(not stat.S_ISREG(value.st_mode) for value in stable_stats)
-            or any(not _same_object(before, value) for value in stable_stats[1:])
-            or any(value.st_size != before.st_size for value in stable_stats[1:])
-            or any(
-                (
-                    value.st_uid,
-                    value.st_gid,
-                    stat.S_IMODE(value.st_mode),
-                )
-                != expected_access
-                for value in stable_stats[1:]
-            )
-            or len(first_content) != before.st_size
-            or len(second_content) != before.st_size
-            or first_content != second_content
-        ):
-            raise ArtifactChangedError(
-                f"descriptor-bound compatibility artifact identity, access, size, "
-                f"or content changed while read: {name}"
-            )
-        return ArtifactRead(
-            content=second_content,
-            version=FileVersion(
-                device=after.st_dev,
-                inode=after.st_ino,
-                uid=after.st_uid,
-                gid=after.st_gid,
-                mode=stat.S_IMODE(after.st_mode),
-                size=after.st_size,
-                sha256=hashlib.sha256(second_content).hexdigest(),
-            ),
-        )
-    except (ArtifactUnreadableError, ArtifactChangedError):
-        raise
-    except OSError as error:
-        raise ArtifactUnreadableError(
-            f"cannot read descriptor-bound compatibility artifact: {name}"
-        ) from error
-
-
 def _fd_execution_path(file_fd: int, name: str) -> pathlib.Path:
     try:
         descriptor_stat = os.fstat(file_fd)
@@ -888,245 +775,32 @@ def _fd_execution_path(file_fd: int, name: str) -> pathlib.Path:
     raise UserError(f"cannot expose descriptor-bound compatibility artifact: {name}")
 
 
-def _harden_smoke_snapshot_directory(
-    snapshot_dir: pathlib.Path,
-) -> os.stat_result:
-    initial = os.lstat(snapshot_dir)
-    if not stat.S_ISDIR(initial.st_mode) or initial.st_uid != os.geteuid():
-        raise UserError("smoke prompt snapshot is not a current-user directory")
-    try:
-        os.chmod(
-            snapshot_dir,
-            DIRECTORY_MODE,
-            follow_symlinks=False,
-        )
-    except (NotImplementedError, OSError) as error:
-        raise UserError(
-            "smoke prompt snapshot directory cannot be hardened without following links"
-        ) from error
-    hardened = os.lstat(snapshot_dir)
-    if (
-        not stat.S_ISDIR(hardened.st_mode)
-        or not _same_object(initial, hardened)
-        or (hardened.st_uid, hardened.st_gid) != (initial.st_uid, initial.st_gid)
-        or hardened.st_uid != os.geteuid()
-        or stat.S_IMODE(hardened.st_mode) != DIRECTORY_MODE
-    ):
-        raise UserError(
-            "smoke prompt snapshot directory identity or access policy changed"
-        )
-    return hardened
-
-
 @contextlib.contextmanager
-def _immutable_smoke_prompt_snapshot(
-    content: bytes,
-) -> Iterator[tuple[pathlib.Path, int]]:
-    with tempfile.TemporaryDirectory(
-        prefix="waited-delivery-smoke-prompt-"
-    ) as snapshot_dir_str:
-        snapshot_dir = pathlib.Path(snapshot_dir_str)
-        snapshot_name = "prompt.snapshot"
-        snapshot_dir_fd: int | None = None
-        write_fd: int | None = None
-        snapshot_fd: int | None = None
-        try:
-            try:
-                named_directory = _harden_smoke_snapshot_directory(snapshot_dir)
-                snapshot_dir_fd = os.open(
-                    snapshot_dir,
-                    _directory_open_flags(),
-                )
-                opened_directory = os.fstat(snapshot_dir_fd)
-                if (
-                    not stat.S_ISDIR(named_directory.st_mode)
-                    or not stat.S_ISDIR(opened_directory.st_mode)
-                    or not _same_object(named_directory, opened_directory)
-                    or (
-                        opened_directory.st_uid,
-                        opened_directory.st_gid,
-                        stat.S_IMODE(opened_directory.st_mode),
-                    )
-                    != (
-                        named_directory.st_uid,
-                        named_directory.st_gid,
-                        stat.S_IMODE(named_directory.st_mode),
-                    )
-                    or opened_directory.st_uid != os.geteuid()
-                    or stat.S_IMODE(opened_directory.st_mode) != DIRECTORY_MODE
-                ):
-                    raise UserError(
-                        "smoke prompt snapshot directory is not owner-private"
-                    )
-
-                write_fd = os.open(
-                    snapshot_name,
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_CLOEXEC", 0)
-                    | getattr(os, "O_NOFOLLOW", 0),
-                    FILE_MODE,
-                    dir_fd=snapshot_dir_fd,
-                )
-                os.fchmod(write_fd, FILE_MODE)
-                offset = 0
-                while offset < len(content):
-                    written = os.write(write_fd, content[offset:])
-                    if written <= 0:
-                        raise UserError("cannot write immutable smoke prompt snapshot")
-                    offset += written
-                os.fsync(write_fd)
-                os.close(write_fd)
-                write_fd = None
-
-                snapshot_fd = os.open(
-                    snapshot_name,
-                    _regular_open_flags(),
-                    dir_fd=snapshot_dir_fd,
-                )
-                before = os.fstat(snapshot_fd)
-                named_before = os.stat(
-                    snapshot_name,
-                    dir_fd=snapshot_dir_fd,
-                    follow_symlinks=False,
-                )
-                first_content = _read_fd_bounded(
-                    snapshot_fd,
-                    snapshot_name,
-                    max_bytes=max(len(content), 1),
-                )
-                middle = os.fstat(snapshot_fd)
-                os.lseek(snapshot_fd, 0, os.SEEK_SET)
-                second_content = _read_fd_bounded(
-                    snapshot_fd,
-                    snapshot_name,
-                    max_bytes=max(len(content), 1),
-                )
-                after = os.fstat(snapshot_fd)
-                named_after = os.stat(
-                    snapshot_name,
-                    dir_fd=snapshot_dir_fd,
-                    follow_symlinks=False,
-                )
-                stable_stats = (
-                    before,
-                    named_before,
-                    middle,
-                    after,
-                    named_after,
-                )
-                expected_access = (
-                    before.st_uid,
-                    before.st_gid,
-                    stat.S_IMODE(before.st_mode),
-                )
-                if (
-                    any(not stat.S_ISREG(value.st_mode) for value in stable_stats)
-                    or any(
-                        not _same_object(before, value) for value in stable_stats[1:]
-                    )
-                    or any(
-                        (
-                            value.st_uid,
-                            value.st_gid,
-                            stat.S_IMODE(value.st_mode),
-                        )
-                        != expected_access
-                        for value in stable_stats[1:]
-                    )
-                    or before.st_uid != os.geteuid()
-                    or stat.S_IMODE(before.st_mode) != FILE_MODE
-                    or any(value.st_nlink != 1 for value in stable_stats)
-                    or any(value.st_size != len(content) for value in stable_stats)
-                    or first_content != content
-                    or second_content != content
-                    or (fcntl.fcntl(snapshot_fd, fcntl.F_GETFL) & os.O_ACCMODE)
-                    != os.O_RDONLY
-                ):
-                    raise UserError(
-                        "immutable smoke prompt snapshot identity, access, size, "
-                        "or content mismatch"
-                    )
-                os.lseek(snapshot_fd, 0, os.SEEK_SET)
-                os.unlink(snapshot_name, dir_fd=snapshot_dir_fd)
-                os.fsync(snapshot_dir_fd)
-                unlinked = os.fstat(snapshot_fd)
-                if (
-                    not _same_object(before, unlinked)
-                    or unlinked.st_nlink != 0
-                    or (
-                        unlinked.st_uid,
-                        unlinked.st_gid,
-                        stat.S_IMODE(unlinked.st_mode),
-                    )
-                    != expected_access
-                    or unlinked.st_size != len(content)
-                ):
-                    raise UserError(
-                        "immutable smoke prompt snapshot retained a mutable name "
-                        "or changed after unlink"
-                    )
-                execution_path = _fd_execution_path(
-                    snapshot_fd,
-                    snapshot_name,
-                )
-                os.lseek(snapshot_fd, 0, os.SEEK_SET)
-            except UserError:
-                raise
-            except OSError as error:
-                raise UserError(
-                    "cannot create immutable descriptor-bound smoke prompt snapshot"
-                ) from error
-
-            yield execution_path, snapshot_fd
-        finally:
-            if write_fd is not None:
-                os.close(write_fd)
-            if snapshot_fd is not None:
-                os.close(snapshot_fd)
-            if snapshot_dir_fd is not None:
-                try:
-                    os.stat(
-                        snapshot_name,
-                        dir_fd=snapshot_dir_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    pass
-                else:
-                    os.unlink(snapshot_name, dir_fd=snapshot_dir_fd)
-                os.close(snapshot_dir_fd)
-
-
-def _validate_runner_loaded_from_descriptor(file_fd: int) -> pathlib.Path:
-    execution_path = _fd_execution_path(file_fd, "waited_delivery_runner.py")
-    loaded_path = pathlib.Path(os.path.abspath(__file__))
-    if loaded_path != execution_path:
-        raise UserError(
-            "compatibility runner refresh must be launched through its inherited "
-            "descriptor path"
-        )
-    loaded_fd: int | None = None
+def _anonymous_smoke_prompt_pipe() -> Iterator[tuple[pathlib.Path, int, BinaryIO]]:
+    read_fd, write_fd = os.pipe()
+    write_stream: BinaryIO | None = None
     try:
-        loaded_fd = os.open(
-            loaded_path,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        write_stream = os.fdopen(write_fd, "wb", buffering=0)
+        execution_path = _fd_execution_path(
+            read_fd,
+            "fallback-smoke.prompt.md",
         )
-        loaded_stat = os.fstat(loaded_fd)
-        descriptor_stat = os.fstat(file_fd)
-    except OSError as error:
-        raise UserError(
-            "cannot bind loaded compatibility runner to inherited descriptor"
-        ) from error
+        yield execution_path, read_fd, write_stream
     finally:
-        if loaded_fd is not None:
-            os.close(loaded_fd)
-    if not _same_object(loaded_stat, descriptor_stat):
-        raise UserError(
-            "loaded compatibility runner does not match inherited descriptor"
-        )
-    return execution_path
+        if write_stream is None:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+        else:
+            try:
+                write_stream.close()
+            except OSError:
+                pass
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
 
 
 def _require_isolated_python() -> None:
@@ -1800,66 +1474,50 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
         )
     expected_bridge_version = _expected_file_version(args, "bridge")
     expected_runner_version = _expected_file_version(args, "runner")
-    runner_execution_path = _validate_runner_loaded_from_descriptor(
-        args.executed_runner_fd
-    )
-    bridge_execution_path = _fd_execution_path(
-        args.executed_bridge_fd,
-        "waited_delivery_bridge.py",
-    )
+    runner_source = globals().get("_WAITED_DELIVERY_BOUND_RUNNER_SOURCE")
+    if not isinstance(runner_source, bytes):
+        raise UserError("refresh-prompts requires anonymous-pipe-bound runner source")
+    compiled_bridge_path = pathlib.Path(args.compiled_bridge_path)
+    compiled_runner_path = pathlib.Path(args.compiled_runner_path)
     runner_path = pathlib.Path(args.published_runner_path)
-    if (
-        not runner_path.is_absolute()
-        or not runner_path.name
-        or pathlib.PurePath(runner_path.name).name != runner_path.name
+    for label, path in (
+        ("compiled bridge", compiled_bridge_path),
+        ("compiled runner", compiled_runner_path),
+        ("published runner", runner_path),
     ):
-        raise UserError("published runner path must be an absolute file path")
-    bridge_version = _read_inherited_regular_artifact(
-        args.executed_bridge_fd,
-        "waited_delivery_bridge.py",
-        max_bytes=STATE_MAX_BYTES,
-    ).version
-    _validate_file_version(
-        bridge_version,
-        expected_bridge_version,
-        label="compatibility bridge",
-    )
-    runner_version = _read_inherited_regular_artifact(
-        args.executed_runner_fd,
-        "waited_delivery_runner.py",
-        max_bytes=STATE_MAX_BYTES,
-    ).version
-    _validate_file_version(
-        runner_version,
-        expected_runner_version,
-        label="compatibility runner",
-    )
+        if (
+            not path.is_absolute()
+            or not path.name
+            or pathlib.PurePath(path.name).name != path.name
+        ):
+            raise UserError(f"{label} path must be an absolute file path")
+    if compiled_runner_path != pathlib.Path(os.path.abspath(__file__)):
+        raise UserError(
+            "compatibility runner compile filename does not match the loaded code"
+        )
+    if compiled_runner_path != runner_path:
+        raise UserError("compiled and published compatibility runner paths must match")
+    if (
+        len(runner_source) != expected_runner_version.size
+        or hashlib.sha256(runner_source).hexdigest() != expected_runner_version.sha256
+    ):
+        raise UserError("bound compatibility runner source content changed")
+    bridge_version = expected_bridge_version
+    runner_version = expected_runner_version
     with _locked_run_state(
         args.run_dir,
         expected_repo_root=args.expected_repo_root,
         expected_run_identity=expected_run_identity,
     ) as (run_dir, repo_root, run_fd, state, state_version):
         run_identity = _directory_identity(os.fstat(run_fd))
-        bridge_version = _read_inherited_regular_artifact(
-            args.executed_bridge_fd,
-            "waited_delivery_bridge.py",
-            max_bytes=STATE_MAX_BYTES,
-        ).version
-        _validate_file_version(
-            bridge_version,
-            expected_bridge_version,
-            label="compatibility bridge",
-        )
-        runner_version = _read_inherited_regular_artifact(
-            args.executed_runner_fd,
-            "waited_delivery_runner.py",
-            max_bytes=STATE_MAX_BYTES,
-        ).version
-        _validate_file_version(
-            runner_version,
-            expected_runner_version,
-            label="compatibility runner",
-        )
+        if (
+            len(runner_source) != expected_runner_version.size
+            or hashlib.sha256(runner_source).hexdigest()
+            != expected_runner_version.sha256
+        ):
+            raise UserError(
+                "bound compatibility runner source content changed before writes"
+            )
         (
             child_prompt_path,
             child_prompt_version,
@@ -1885,13 +1543,15 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
                 {
                     "refresh_schema_version": PROMPT_REFRESH_SCHEMA_VERSION,
                     "python_isolated": True,
-                    "bridge_fd_access": "read-only",
-                    "runner_fd_access": "read-only",
+                    "bridge_source_transport": "anonymous-pipe-memory",
+                    "runner_source_transport": "anonymous-pipe-memory",
+                    "bridge_source_reopenable": False,
+                    "runner_source_reopenable": False,
                     "run_dir": str(run_dir),
                     "runner_path": str(runner_path),
-                    "executed_bridge_path": str(bridge_execution_path),
+                    "compiled_bridge_path": str(compiled_bridge_path),
                     "bridge_version": _file_version_payload(bridge_version),
-                    "executed_runner_path": str(runner_execution_path),
+                    "compiled_runner_path": str(compiled_runner_path),
                     "runner_version": _file_version_payload(runner_version),
                     "child_prompt": str(child_prompt_path),
                     "child_prompt_version": _file_version_payload(child_prompt_version),
@@ -2455,6 +2115,69 @@ def _drain_process_output_once(
         captures[cast(str, key.data)].extend(chunk)
 
 
+def _service_smoke_io_once(
+    selector: selectors.BaseSelector,
+    captures: dict[str, bytearray],
+    *,
+    input_bytes: bytes,
+    input_offset: int,
+    timeout: float,
+    max_capture_bytes: int,
+) -> tuple[int, bool]:
+    input_rejected = False
+    for key, mask in selector.select(timeout):
+        if key.data == "prompt-input":
+            if not (mask & selectors.EVENT_WRITE):
+                continue
+            try:
+                written = os.write(
+                    key.fd,
+                    input_bytes[
+                        input_offset : input_offset + PROCESS_DRAIN_CHUNK_BYTES
+                    ],
+                )
+            except (BrokenPipeError, ConnectionResetError):
+                written = 0
+                input_rejected = True
+            except BlockingIOError:
+                continue
+            if written > 0:
+                input_offset += written
+            if input_rejected or input_offset == len(input_bytes):
+                selector.unregister(key.fd)
+                cast(BinaryIO, key.fileobj).close()
+            continue
+        try:
+            chunk = os.read(key.fd, PROCESS_DRAIN_CHUNK_BYTES)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            selector.unregister(key.fd)
+            continue
+        retained = sum(len(value) for value in captures.values())
+        if retained + len(chunk) > max_capture_bytes:
+            raise _CaptureLimitExceeded
+        captures[cast(str, key.data)].extend(chunk)
+    return input_offset, input_rejected
+
+
+def _close_smoke_input(
+    selector: selectors.BaseSelector,
+    input_stream: BinaryIO | None,
+) -> None:
+    if input_stream is None:
+        return
+    if not input_stream.closed:
+        try:
+            selector.unregister(input_stream)
+        except (KeyError, ValueError, OSError):
+            pass
+        try:
+            input_stream.close()
+        except OSError:
+            pass
+
+
 def _cleanup_smoke_process(
     process: subprocess.Popen[bytes],
     selector: selectors.BaseSelector,
@@ -2496,6 +2219,8 @@ def _run_bounded_smoke_process(
     *,
     cwd: pathlib.Path,
     pass_fds: tuple[int, ...] = (),
+    input_stream: BinaryIO | None = None,
+    input_bytes: bytes | None = None,
     timeout: float = SMOKE_TIMEOUT_SECONDS,
     cleanup_timeout: float = SMOKE_CLEANUP_TIMEOUT_SECONDS,
     max_capture_bytes: int = SMOKE_CAPTURE_MAX_BYTES,
@@ -2506,6 +2231,39 @@ def _run_bounded_smoke_process(
         raise UserError(
             "fallback readiness smoke pass_fds must be nonnegative integers"
         )
+    if (input_stream is None) != (input_bytes is None):
+        raise UserError(
+            "fallback readiness smoke input_stream and input_bytes must be supplied "
+            "together"
+        )
+    if input_bytes is not None and not isinstance(input_bytes, bytes):
+        raise UserError("fallback readiness smoke input must be bytes")
+    if input_stream is not None:
+        try:
+            input_stream_fd = input_stream.fileno()
+        except (AttributeError, OSError, ValueError) as error:
+            raise UserError(
+                "fallback readiness smoke input stream must be an open file object"
+            ) from error
+        try:
+            input_metadata = os.fstat(input_stream_fd)
+            input_access = fcntl.fcntl(input_stream_fd, fcntl.F_GETFL) & os.O_ACCMODE
+        except OSError as error:
+            raise UserError(
+                "fallback readiness smoke input stream cannot be verified"
+            ) from error
+        if not stat.S_ISFIFO(input_metadata.st_mode) or input_access != os.O_WRONLY:
+            raise UserError(
+                "fallback readiness smoke input stream must be an anonymous-pipe writer"
+            )
+        if input_stream_fd in pass_fds:
+            raise UserError(
+                "fallback readiness smoke input stream must remain parent-private"
+            )
+        if len(cast(bytes, input_bytes)) > STATE_MAX_BYTES:
+            raise UserError(
+                f"fallback readiness smoke input exceeds {STATE_MAX_BYTES} bytes"
+            )
     if timeout <= 0 or cleanup_timeout <= 0 or max_capture_bytes <= 0:
         raise UserError("fallback readiness smoke bounds must be positive")
     signal_transaction = _SmokeSignalTransaction()
@@ -2515,6 +2273,8 @@ def _run_bounded_smoke_process(
             command,
             cwd=cwd,
             pass_fds=pass_fds,
+            input_stream=input_stream,
+            input_bytes=input_bytes,
             timeout=timeout,
             cleanup_timeout=cleanup_timeout,
             max_capture_bytes=max_capture_bytes,
@@ -2541,6 +2301,8 @@ def _run_bounded_smoke_process_supervised(
     *,
     cwd: pathlib.Path,
     pass_fds: tuple[int, ...],
+    input_stream: BinaryIO | None,
+    input_bytes: bytes | None,
     timeout: float,
     cleanup_timeout: float,
     max_capture_bytes: int,
@@ -2555,6 +2317,8 @@ def _run_bounded_smoke_process_supervised(
     captures = {"stdout": bytearray(), "stderr": bytearray()}
     failure: tuple[int, str] | None = None
     cleanup_complete = False
+    input_offset = 0
+    input_rejected = False
     try:
         signal_transaction.raise_if_pending()
         try:
@@ -2581,32 +2345,64 @@ def _run_bounded_smoke_process_supervised(
             ):
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream.fileno(), selectors.EVENT_READ, name)
+            if input_bytes is not None:
+                if input_stream is None:
+                    raise UserError("smoke prompt input pipe was not supplied")
+                if input_bytes:
+                    os.set_blocking(input_stream.fileno(), False)
+                    selector.register(
+                        input_stream,
+                        selectors.EVENT_WRITE,
+                        "prompt-input",
+                    )
+                else:
+                    _close_smoke_input(selector, input_stream)
             signal_transaction.raise_if_pending()
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 signal_transaction.raise_if_pending()
                 remaining = deadline - time.monotonic()
                 try:
-                    _drain_process_output_once(
+                    input_offset, rejected_now = _service_smoke_io_once(
                         selector,
                         captures,
+                        input_bytes=b"" if input_bytes is None else input_bytes,
+                        input_offset=input_offset,
                         timeout=min(
                             PROCESS_POLL_INTERVAL_SECONDS,
                             max(0.0, remaining),
                         ),
-                        capture=True,
                         max_capture_bytes=max_capture_bytes,
                     )
+                    input_rejected = input_rejected or rejected_now
                 except _CaptureLimitExceeded:
                     failure = (
                         125,
                         f"BLOCKED: smoke output exceeded {max_capture_bytes} bytes",
                     )
                     break
+                if (
+                    input_bytes is not None
+                    and input_rejected
+                    and input_offset != len(input_bytes)
+                ):
+                    failure = (
+                        126,
+                        "BLOCKED: smoke rejected its prompt stream before complete "
+                        "delivery",
+                    )
+                    break
                 signal_transaction.raise_if_pending()
                 returncode = process.poll()
                 if returncode is None:
                     continue
+                if input_bytes is not None and input_offset != len(input_bytes):
+                    failure = (
+                        126,
+                        "BLOCKED: smoke rejected its prompt stream before complete "
+                        "delivery",
+                    )
+                    break
                 if _process_group_exists(process.pid):
                     failure = (
                         126,
@@ -2622,6 +2418,7 @@ def _run_bounded_smoke_process_supervised(
                 )
 
             if failure is not None:
+                _close_smoke_input(selector, input_stream)
                 _cleanup_smoke_process(
                     process,
                     selector,
@@ -2653,6 +2450,7 @@ def _run_bounded_smoke_process_supervised(
             )
         except BaseException:
             if not cleanup_complete:
+                _close_smoke_input(selector, input_stream)
                 _cleanup_smoke_process(
                     process,
                     selector,
@@ -2662,11 +2460,13 @@ def _run_bounded_smoke_process_supervised(
                 )
             raise
         finally:
+            _close_smoke_input(selector, input_stream)
             if process.stdout is not None:
                 process.stdout.close()
             if process.stderr is not None:
                 process.stderr.close()
     finally:
+        _close_smoke_input(selector, input_stream)
         selector.close()
 
 
@@ -2704,7 +2504,7 @@ def _run_fallback_smoke(args: argparse.Namespace) -> int:
             lock_fd,
             lock_identity,
         ):
-            with contextlib.ExitStack() as smoke_snapshot_stack:
+            with contextlib.ExitStack() as smoke_pipe_stack:
                 with _acquired_run_lock(run_fd, lock_fd, lock_identity):
                     _verify_run_directory_identity(
                         run_dir,
@@ -2752,12 +2552,8 @@ def _run_fallback_smoke(args: argparse.Namespace) -> int:
                         FALLBACK_SMOKE_PROMPT_NAME,
                         max_bytes=STATE_MAX_BYTES,
                     )
-                    prompt_execution_path, prompt_snapshot_fd = (
-                        smoke_snapshot_stack.enter_context(
-                            _immutable_smoke_prompt_snapshot(
-                                prompt_artifact.content,
-                            )
-                        )
+                    prompt_execution_path, prompt_read_fd, prompt_write_stream = (
+                        smoke_pipe_stack.enter_context(_anonymous_smoke_prompt_pipe())
                     )
                     command[prompt_indexes[0] + 1] = str(prompt_execution_path)
                     smoke_cwd = pathlib.Path(state["repo_root"])
@@ -2765,14 +2561,16 @@ def _run_fallback_smoke(args: argparse.Namespace) -> int:
                 completed = _run_bounded_smoke_process(
                     command,
                     cwd=smoke_cwd,
-                    pass_fds=(prompt_snapshot_fd,),
+                    pass_fds=(prompt_read_fd,),
+                    input_stream=prompt_write_stream,
+                    input_bytes=prompt_artifact.content,
                 )
                 status, sample = _classify_smoke(
                     stdout=completed.stdout,
                     stderr=completed.stderr,
                     returncode=completed.returncode,
                 )
-                smoke_snapshot_stack.close()
+                smoke_pipe_stack.close()
                 with _acquired_run_lock(run_fd, lock_fd, lock_identity):
                     _verify_run_directory_identity(
                         run_dir,
@@ -3055,16 +2853,14 @@ def _build_parser() -> argparse.ArgumentParser:
     refresh_prompts = subparsers.add_parser("refresh-prompts")
     refresh_prompts.add_argument("--run-dir", required=True)
     refresh_prompts.add_argument(
-        "--executed-bridge-fd",
-        type=int,
+        "--compiled-bridge-path",
         required=True,
-        help="Inherited read-only descriptor for the launching bridge snapshot.",
+        help="Canonical compile filename used for the in-memory bridge source.",
     )
     refresh_prompts.add_argument(
-        "--executed-runner-fd",
-        type=int,
+        "--compiled-runner-path",
         required=True,
-        help="Inherited read-only descriptor used to execute this runner snapshot.",
+        help="Canonical compile filename used for the in-memory runner source.",
     )
     refresh_prompts.add_argument(
         "--published-runner-path",
