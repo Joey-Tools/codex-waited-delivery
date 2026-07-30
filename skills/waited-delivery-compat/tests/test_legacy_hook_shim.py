@@ -165,6 +165,75 @@ class LegacyHookShimTests(unittest.TestCase):
                     self.assertEqual(completed.stdout, expected.stdout)
                     self.assertEqual(completed.stderr, expected.stderr)
 
+    def test_legacy_runner_rejects_no_writer_fifo_without_blocking(self) -> None:
+        layouts = (
+            (
+                LEGACY_RUNNER,
+                Path(
+                    "legacy-hook-shims/waited-delivery/scripts/"
+                    "waited_delivery_runner.py"
+                ),
+            ),
+            (
+                HISTORICAL_TARGET_RUNNER,
+                Path("skills/waited-delivery/scripts/waited_delivery_runner.py"),
+            ),
+        )
+        for source_runner, relative_redirect in layouts:
+            with self.subTest(runner=source_runner):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    redirect = root / relative_redirect
+                    redirect.parent.mkdir(parents=True)
+                    shutil.copy2(source_runner, redirect)
+                    compat_runner = (
+                        root
+                        / "skills"
+                        / "waited-delivery-compat"
+                        / "scripts"
+                        / "waited_delivery_runner.py"
+                    )
+                    compat_runner.parent.mkdir(parents=True)
+                    os.mkfifo(compat_runner, 0o600)
+                    environment = {
+                        "HOME": str(root),
+                        "PATH": os.environ.get("PATH", ""),
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    }
+
+                    completed = subprocess.run(
+                        [sys.executable, str(redirect), "--help"],
+                        check=False,
+                        cwd=root,
+                        env=environment,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=2,
+                    )
+
+                    self.assertEqual(completed.returncode, 126)
+                    self.assertEqual(completed.stdout, "")
+                    self.assertIn(
+                        "compatibility runner is not a regular file",
+                        completed.stderr,
+                    )
+
+    def test_legacy_runner_requires_nonblocking_source_open(self) -> None:
+        for runner in (LEGACY_RUNNER, HISTORICAL_TARGET_RUNNER):
+            with self.subTest(runner=runner):
+                module = self._load_redirect_module(runner)
+                with (
+                    mock.patch.object(module.os, "O_NONBLOCK", None),
+                    mock.patch.object(module.os, "open") as open_mock,
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "requires nonblocking source open",
+                    ),
+                ):
+                    module._stable_runner_source(COMPAT_RUNNER)
+                open_mock.assert_not_called()
+
     def test_legacy_runner_pipe_writer_and_exec_failures_are_reaped(self) -> None:
         for runner in (LEGACY_RUNNER, HISTORICAL_TARGET_RUNNER):
             with self.subTest(runner=runner, failure="writer"):

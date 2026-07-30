@@ -138,9 +138,17 @@ def _read_runner_fd(runner_fd: int) -> bytes:
 
 
 def _stable_runner_source(path: Path) -> bytes:
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nonblock is None:
+        raise RuntimeError(
+            "compatibility runner binding requires nonblocking source open"
+        )
     runner_fd = os.open(
         path,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | nonblock,
     )
     try:
         before = os.fstat(runner_fd)

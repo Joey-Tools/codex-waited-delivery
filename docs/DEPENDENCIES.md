@@ -40,14 +40,16 @@ Legacy hook removal is a two-release migration:
    writes state, or returns a blocking status. The runner is a fixed executable
    redirect to the sibling packaged
    `skills/waited-delivery-compat/scripts/waited_delivery_runner.py`. It opens
-   that source with `O_NOFOLLOW`, binds its regular-file object, current-user
-   access policy, bounded size, and two equal byte reads, then forks a one-shot
-   writer that transfers those verified bytes through an anonymous pipe. The
-   current Python interpreter is replaced by a fixed `-I -B -S -c` bootstrap
-   that verifies the exact length, EOF, and SHA-256 digest, reaps the writer,
-   preserves the canonical compatibility path in `__file__` and the original
-   runner arguments, and compiles the bytes in memory. No regular-file source
-   snapshot is created. Replacing or modifying the source path after binding,
+   that source with `O_NOFOLLOW | O_NONBLOCK`, rejects a FIFO or other
+   non-regular object after `fstat` without waiting for another endpoint, binds
+   the regular-file object, current-user access policy, bounded size, and two
+   equal byte reads, then forks a one-shot writer that transfers those verified
+   bytes through an anonymous pipe. The current Python interpreter is replaced
+   by a fixed `-I -B -S -c` bootstrap that verifies the exact length, EOF, and
+   SHA-256 digest, reaps the writer, preserves the canonical compatibility path
+   in `__file__` and the original runner arguments, and compiles the bytes in
+   memory. No regular-file source snapshot is created. Replacing or modifying
+   the source path after binding,
    including through a pre-held writable descriptor or hard link, cannot
    change the executed bytes. Aggregate and private-overlay packaging must
    preserve both legacy files and the compatibility runner at those relative
