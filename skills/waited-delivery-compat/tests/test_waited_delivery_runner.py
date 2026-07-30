@@ -420,6 +420,237 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertIn("tracked.txt", changed_files)
         self.assertNotIn(".codex-tmp/tracked.txt", changed_files)
 
+    def test_changed_files_parse_binary_nul_framing_and_dual_paths(self) -> None:
+        module = self._load_runner_module()
+        path_bytes = [
+            b"line\r\nname",
+            b"renamed-\xff\r\n",
+            b"source-\xfe\n\r",
+            b"copy-\x80",
+            b"copy-source-\x81\r",
+        ]
+        status_output = (
+            b"?? " + path_bytes[0] + b"\0"
+            b"R  " + path_bytes[1] + b"\0" + path_bytes[2] + b"\0"
+            b"C  " + path_bytes[3] + b"\0" + path_bytes[4] + b"\0"
+            b"?? .codex-tmp/ignored-\xfd\r\n\0"
+        )
+        completed = subprocess.CompletedProcess(
+            args=["git", "status"],
+            returncode=0,
+            stdout=status_output,
+            stderr=b"",
+        )
+
+        with mock.patch.object(
+            module.subprocess,
+            "run",
+            return_value=completed,
+        ) as run_mock:
+            changed_files = module._collect_changed_files(self.repo)
+
+        self.assertEqual(
+            [os.fsencode(path) for path in changed_files],
+            path_bytes,
+        )
+        self.assertEqual(
+            [module._display_filesystem_path(path) for path in changed_files],
+            [
+                "line\\r\\nname",
+                "renamed-\\xff\\r\\n",
+                "source-\\xfe\\n\\r",
+                "copy-\\x80",
+                "copy-source-\\x81\\r",
+            ],
+        )
+        serialized = json.dumps({"changed_files": changed_files})
+        reloaded = json.loads(serialized)["changed_files"]
+        self.assertEqual([os.fsencode(path) for path in reloaded], path_bytes)
+        run_mock.assert_called_once()
+        self.assertIs(run_mock.call_args.kwargs["text"], False)
+
+    def test_filesystem_path_display_escapes_unsafe_text_for_all_consumers(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        non_utf8_path = os.fsdecode(b"\xff")
+        unsafe_path = (
+            "plain-"
+            "\x1b"
+            "\t"
+            "\x7f"
+            "\u0085"
+            "\u2028"
+            "\u2029"
+            "\u202e"
+            "\u2066"
+            "\u200d"
+            "\ud800"
+            "\udc00"
+            "`"
+            "\\"
+            f"{non_utf8_path}"
+            "\r"
+            "\n"
+            "-end"
+        )
+        expected_display = (
+            "plain-"
+            "\\x1b"
+            "\\t"
+            "\\x7f"
+            "\\u0085"
+            "\\u2028"
+            "\\u2029"
+            "\\u202e"
+            "\\u2066"
+            "\\u200d"
+            "\\ud800"
+            "\\udc00"
+            "\\x60"
+            "\\\\"
+            "\\xff"
+            "\\r"
+            "\\n"
+            "-end"
+        )
+
+        displayed = module._display_filesystem_path(unsafe_path)
+
+        self.assertEqual(displayed, expected_display)
+        self.assertNotIn("`", displayed)
+        self.assertTrue(
+            all(
+                module.unicodedata.category(character)
+                not in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+                for character in displayed
+            )
+        )
+
+        run_dir = self._prepare("--no-fallback-smoke")
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        state["changed_files"] = [unsafe_path]
+        contract = module._build_child_contract(state)
+        self.assertIn(f"- `{expected_display}`", contract)
+
+        state["orchestration"]["child_status"] = "completed"
+        state["orchestration"]["child_session_id"] = "child-display"
+        with mock.patch.object(
+            module,
+            "_collect_changed_files",
+            return_value=[unsafe_path],
+        ):
+            with self.assertRaises(module.UserError) as raised:
+                module._validate_review_pass(state, ["terminal review evidence"])
+        self.assertEqual(
+            str(raised.exception),
+            "cannot record a passed review while implementation state is "
+            f"dirty or untracked: {expected_display}",
+        )
+
+    def test_filesystem_path_display_is_readable_unambiguous_and_bounded(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        self.assertEqual(
+            module._display_filesystem_path("src/文档/example file.py"),
+            "src/文档/example file.py",
+        )
+        self.assertEqual(
+            module._display_filesystem_path(" leading and trailing "),
+            "\\x20leading and trailing\\x20",
+        )
+        self.assertEqual(
+            module._display_filesystem_path(r"\x1b\T{bytes=1}"),
+            r"\\x1b\\T{bytes=1}",
+        )
+        literal_marker = "⟦truncated;identity=filesystem-bytes;bytes=1;sha256=literal⟧"
+        escaped_marker = module._display_filesystem_path(literal_marker)
+        self.assertEqual(
+            escaped_marker,
+            "\\u27e6truncated;identity=filesystem-bytes;bytes=1;sha256=literal\\u27e7",
+        )
+        self.assertNotIn("⟦", escaped_marker)
+        self.assertNotIn("⟧", escaped_marker)
+
+        long_path = "é" * 600
+        raw_path = os.fsencode(long_path)
+        displayed = module._display_filesystem_path(long_path)
+        expected_suffix = (
+            f"⟦truncated;identity=filesystem-bytes;bytes={len(raw_path)};"
+            f"sha256={hashlib.sha256(raw_path).hexdigest()}⟧"
+        )
+
+        self.assertLessEqual(
+            len(displayed.encode("utf-8")),
+            module.FILESYSTEM_PATH_DISPLAY_MAX_BYTES,
+        )
+        self.assertTrue(displayed.endswith(expected_suffix))
+        self.assertNotIn("`", displayed)
+
+    def test_filesystem_path_display_uses_explicit_surrogate_fallback_identity(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        short_path = "bad-\ud800-\udc00-\udc7f"
+        self.assertEqual(
+            module._display_filesystem_path(short_path),
+            "bad-\\ud800-\\udc00-\\udc7f",
+        )
+
+        fallback_path = "\ud800\udc00" * 400
+        fallback_identity = fallback_path.encode(
+            "utf-8",
+            errors="surrogatepass",
+        )
+        fallback_display = module._display_filesystem_path(fallback_path)
+        fallback_suffix = (
+            "⟦truncated;identity=utf8-surrogatepass;"
+            f"bytes={len(fallback_identity)};"
+            f"sha256={hashlib.sha256(fallback_identity).hexdigest()}⟧"
+        )
+        self.assertLessEqual(
+            len(fallback_display.encode("utf-8")),
+            module.FILESYSTEM_PATH_DISPLAY_MAX_BYTES,
+        )
+        self.assertTrue(fallback_display.endswith(fallback_suffix))
+
+        raw_path = b"\xff" * 600
+        filesystem_path = os.fsdecode(raw_path)
+        self.assertEqual(os.fsencode(filesystem_path), raw_path)
+        filesystem_display = module._display_filesystem_path(filesystem_path)
+        filesystem_suffix = (
+            "⟦truncated;identity=filesystem-bytes;"
+            f"bytes={len(raw_path)};"
+            f"sha256={hashlib.sha256(raw_path).hexdigest()}⟧"
+        )
+        self.assertLessEqual(
+            len(filesystem_display.encode("utf-8")),
+            module.FILESYSTEM_PATH_DISPLAY_MAX_BYTES,
+        )
+        self.assertTrue(filesystem_display.endswith(filesystem_suffix))
+
+    def test_changed_files_reject_incomplete_nul_framing(self) -> None:
+        module = self._load_runner_module()
+        malformed_outputs = {
+            "missing-terminal-nul": b"?? name",
+            "missing-rename-source": b"R  renamed\0",
+            "missing-copy-source": b"C  copied\0",
+        }
+
+        for case, status_output in malformed_outputs.items():
+            with self.subTest(case=case):
+                with mock.patch.object(
+                    module,
+                    "_run_bytes",
+                    return_value=status_output,
+                ):
+                    with self.assertRaisesRegex(
+                        module.UserError,
+                        "incomplete",
+                    ):
+                        module._collect_changed_files(self.repo)
+
     def test_prepare_requires_internal_review_phase(self) -> None:
         run_id = "missing-internal-review"
         completed = self._run_runner(
@@ -855,6 +1086,93 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                         )
                 finally:
                     module.os.close(run_fd)
+
+    def test_state_size_boundary_and_crossing_preserve_recoverable_state(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        opened_run_dir, repo_root, run_fd = module._open_run_directory(run_dir)
+        state_path = run_dir / "state.json"
+        fixed_now = "2026-07-30T00:00:00+00:00"
+        try:
+            state, state_version = module._load_state_from_fd(
+                opened_run_dir,
+                repo_root,
+                run_fd,
+            )
+            state["updated_at"] = fixed_now
+            exact_content = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
+
+            with (
+                mock.patch.object(module, "_utc_now", return_value=fixed_now),
+                mock.patch.object(
+                    module,
+                    "STATE_MAX_BYTES",
+                    len(exact_content),
+                ),
+            ):
+                state_version = module._save_state(
+                    opened_run_dir,
+                    repo_root,
+                    run_fd,
+                    state,
+                    state_version,
+                )
+
+            self.assertEqual(state_path.read_bytes(), exact_content)
+
+            state["known_blockers"].append("cross the state-size boundary")
+            oversized_content = (
+                json.dumps(state, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            before_failure = state_path.read_bytes()
+            entries_before_failure = sorted(path.name for path in run_dir.iterdir())
+
+            with (
+                mock.patch.object(module, "_utc_now", return_value=fixed_now),
+                mock.patch.object(
+                    module,
+                    "STATE_MAX_BYTES",
+                    len(oversized_content) - 1,
+                ),
+                mock.patch.object(module.uuid, "uuid4") as uuid_mock,
+                mock.patch.object(module.os, "replace") as replace_mock,
+            ):
+                with self.assertRaisesRegex(
+                    module.UserError,
+                    rf"{len(oversized_content)} > "
+                    rf"{len(oversized_content) - 1} bytes",
+                ):
+                    module._save_state(
+                        opened_run_dir,
+                        repo_root,
+                        run_fd,
+                        state,
+                        state_version,
+                    )
+                uuid_mock.assert_not_called()
+                replace_mock.assert_not_called()
+
+            self.assertEqual(state_path.read_bytes(), before_failure)
+            self.assertEqual(
+                sorted(path.name for path in run_dir.iterdir()),
+                entries_before_failure,
+            )
+            recovered, recovered_version = module._load_state_from_fd(
+                opened_run_dir,
+                repo_root,
+                run_fd,
+            )
+            self.assertEqual(recovered["known_blockers"], [])
+            self.assertEqual(
+                recovered_version.sha256,
+                hashlib.sha256(before_failure).hexdigest(),
+            )
+        finally:
+            module.os.close(run_fd)
 
     def test_atomic_write_binds_published_temp_file_identity(self) -> None:
         module = self._load_runner_module()

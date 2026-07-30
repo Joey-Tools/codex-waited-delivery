@@ -19,6 +19,23 @@ while implementation state is dirty/untracked, or when nonblank terminal
 reviewer evidence is missing. Bulk phase closure cannot mark review phases
 passed.
 
+The compatibility runner has no text-decoding dependency for dirty-file
+discovery: it consumes binary NUL-framed porcelain output and applies the
+runtime filesystem `surrogateescape` codec only after record boundaries and
+rename/copy path arity are known. Human-facing path rendering uses one
+backslash-based escape grammar for all Unicode control/format/line/paragraph
+separators, invalid bytes, backslashes, Markdown backticks, and edge spaces.
+Ordinary printable Unicode remains readable. Output is capped at `512` UTF-8
+bytes per path. A reserved `⟦truncated;...⟧` token cannot be forged by input
+because its delimiters are escaped in ordinary path content. The token binds
+identity kind, byte length, and SHA-256: exact `os.fsencode()` bytes for
+filesystem-encodable paths, or explicitly labeled, stable
+`utf8-surrogatepass` bytes for non-surrogateescape surrogates and other
+filesystem-codec failures. JSON state publication also has a strict `4 MiB`
+encoded-size ceiling checked after serialization but before temporary file
+allocation or replacement, so a rejected growth transition preserves the
+previous recoverable state.
+
 Operators can avoid that layout dependency by passing `--external-helper` to
 the runner or bridge commands, or disable the readiness smoke when it is not
 needed. Neither choice changes the internal reviewer identity or count.

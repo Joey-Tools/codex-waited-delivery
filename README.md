@@ -25,6 +25,24 @@ target. Remove that target only after every host has independently verified
 both the absence of stale hook registrations and the drain of active
 pre-rename runs.
 
+Dirty-file discovery reads `git status --porcelain=v1 -z` as bytes, validates
+its NUL framing, and retains both paths from rename/copy records. Filesystem
+`surrogateescape` decoding preserves non-UTF-8 path bytes in state JSON.
+Human-facing paths keep ordinary printable Unicode readable but use one
+unambiguous grammar for backslashes, Markdown backticks, leading/trailing
+spaces, undecodable bytes, and every Unicode control, format, line-separator,
+or paragraph-separator character. Each rendered path is at most `512` UTF-8
+bytes. A reserved, input-unforgeable `⟦truncated;...⟧` token records identity
+kind, byte length, and SHA-256: filesystem-encodable paths bind exact
+`os.fsencode()` bytes, while strings containing non-surrogateescape surrogates
+or otherwise rejected by the filesystem codec use an explicitly labeled,
+stable `utf8-surrogatepass` identity.
+
+State updates serialize completely before atomic publication. A serialized
+state of exactly `4 MiB` is accepted; any larger payload is rejected before a
+temporary name is allocated or a file is created or replaced, leaving the
+previous descriptor-bound state unchanged and recoverable.
+
 See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for the optional review
 compatibility/diagnostic dependency used by external lane-readiness smoke.
 

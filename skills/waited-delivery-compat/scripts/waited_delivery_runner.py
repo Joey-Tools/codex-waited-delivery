@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from collections.abc import Iterator
 from typing import BinaryIO, Literal, NamedTuple, TypedDict, cast
@@ -64,6 +65,7 @@ STATE_FILE_NAME = "state.json"
 FALLBACK_SMOKE_PROMPT_NAME = "fallback-smoke.prompt.md"
 RUNS_DIR_NAME = "waited-delivery"
 STATE_MAX_BYTES = 4 * 1024 * 1024
+FILESYSTEM_PATH_DISPLAY_MAX_BYTES = 512
 FILE_MODE = 0o600
 DIRECTORY_MODE = 0o700
 SMOKE_TIMEOUT_SECONDS = 30.0
@@ -209,6 +211,20 @@ def _run_json(cmd: list[str], *, cwd: pathlib.Path | None = None) -> str:
     return completed.stdout
 
 
+def _run_bytes(cmd: list[str], *, cwd: pathlib.Path | None = None) -> bytes:
+    completed = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        text=False,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = os.fsdecode(completed.stderr).strip() or "unknown error"
+        raise UserError(f"command failed: {' '.join(cmd)}\n{stderr}")
+    return completed.stdout
+
+
 def _resolve_repo_root(repo_arg: str) -> pathlib.Path:
     repo_path = pathlib.Path(repo_arg).resolve()
     stdout = _run_json(
@@ -218,7 +234,7 @@ def _resolve_repo_root(repo_arg: str) -> pathlib.Path:
 
 
 def _collect_changed_files(repo_root: pathlib.Path) -> list[str]:
-    stdout = _run_json(
+    stdout = _run_bytes(
         [
             "git",
             "-C",
@@ -231,21 +247,26 @@ def _collect_changed_files(repo_root: pathlib.Path) -> list[str]:
     )
     changed: list[str] = []
     seen: set[str] = set()
-    records = stdout.split("\0")
+    if not stdout:
+        return changed
+    if not stdout.endswith(b"\0"):
+        raise UserError("git status returned an incomplete NUL-framed record")
+    records = stdout[:-1].split(b"\0")
     record_index = 0
     while record_index < len(records):
         record = records[record_index]
         record_index += 1
-        if len(record) < 4:
-            continue
+        if len(record) < 4 or record[2:3] != b" " or not record[3:]:
+            raise UserError("git status returned a malformed NUL-framed record")
         status = record[:2]
         paths = [record[3:]]
-        if "R" in status or "C" in status:
+        if b"R" in status or b"C" in status:
             if record_index >= len(records) or not records[record_index]:
-                raise UserError("git status returned an incomplete rename record")
+                raise UserError("git status returned an incomplete rename/copy record")
             paths.append(records[record_index])
             record_index += 1
-        for path in paths:
+        for path_bytes in paths:
+            path = os.fsdecode(path_bytes)
             if path == ".codex-tmp" or path.startswith(".codex-tmp/"):
                 continue
             if path not in seen:
@@ -262,6 +283,82 @@ def _ensure_relative_paths(paths: list[str]) -> list[str]:
             raise UserError(f"changed-file must be repo-relative: {path}")
         result.append(candidate.as_posix())
     return result
+
+
+def _display_filesystem_path(path: str) -> str:
+    has_non_surrogateescape_surrogate = any(
+        unicodedata.category(character) == "Cs"
+        and not 0xDC80 <= ord(character) <= 0xDCFF
+        for character in path
+    )
+    if has_non_surrogateescape_surrogate:
+        identity_kind = "utf8-surrogatepass"
+        identity_bytes = path.encode("utf-8", errors="surrogatepass")
+    else:
+        try:
+            identity_bytes = os.fsencode(path)
+            identity_kind = "filesystem-bytes"
+        except UnicodeEncodeError:
+            identity_kind = "utf8-surrogatepass"
+            identity_bytes = path.encode("utf-8", errors="surrogatepass")
+
+    tokens: list[str] = []
+    last_index = len(path) - 1
+    for index, character in enumerate(path):
+        codepoint = ord(character)
+        if character == "\\":
+            token = "\\\\"
+        elif character == "`":
+            token = "\\x60"
+        elif character == "⟦":
+            token = "\\u27e6"
+        elif character == "⟧":
+            token = "\\u27e7"
+        elif character == " " and index in {0, last_index}:
+            token = "\\x20"
+        elif character == "\t":
+            token = "\\t"
+        elif character == "\r":
+            token = "\\r"
+        elif character == "\n":
+            token = "\\n"
+        elif 0xDC80 <= codepoint <= 0xDCFF:
+            token = f"\\x{codepoint - 0xDC00:02x}"
+        elif unicodedata.category(character) in {
+            "Cc",
+            "Cf",
+            "Cs",
+            "Zl",
+            "Zp",
+        } or codepoint in {0x2028, 0x2029}:
+            if codepoint <= 0x7F:
+                token = f"\\x{codepoint:02x}"
+            elif codepoint <= 0xFFFF:
+                token = f"\\u{codepoint:04x}"
+            else:
+                token = f"\\U{codepoint:08x}"
+        else:
+            token = character
+        tokens.append(token)
+
+    encoded_lengths = [len(token.encode("utf-8")) for token in tokens]
+    if sum(encoded_lengths) <= FILESYSTEM_PATH_DISPLAY_MAX_BYTES:
+        return "".join(tokens)
+
+    suffix = (
+        f"⟦truncated;identity={identity_kind};bytes={len(identity_bytes)};"
+        f"sha256={hashlib.sha256(identity_bytes).hexdigest()}⟧"
+    )
+    suffix_bytes = len(suffix.encode("utf-8"))
+    available_bytes = FILESYSTEM_PATH_DISPLAY_MAX_BYTES - suffix_bytes
+    displayed_tokens: list[str] = []
+    displayed_bytes = 0
+    for token, token_bytes in zip(tokens, encoded_lengths, strict=True):
+        if displayed_bytes + token_bytes > available_bytes:
+            break
+        displayed_tokens.append(token)
+        displayed_bytes += token_bytes
+    return "".join(displayed_tokens) + suffix
 
 
 def _directory_open_flags() -> int:
@@ -822,8 +919,14 @@ def _atomic_write_regular(
     content: str,
     *,
     expected_version: FileVersion | None,
+    max_content_bytes: int | None = None,
 ) -> FileVersion:
     encoded = content.encode("utf-8")
+    if max_content_bytes is not None and len(encoded) > max_content_bytes:
+        raise UserError(
+            f"run artifact exceeds maximum size before update: {name} "
+            f"({len(encoded)} > {max_content_bytes} bytes)"
+        )
     comparison_max_bytes = max(STATE_MAX_BYTES, len(encoded))
     _validate_expected_artifact(
         run_fd,
@@ -954,11 +1057,13 @@ def _save_state(
 ) -> FileVersion:
     _verify_run_directory_identity(run_dir, repo_root, run_fd)
     state["updated_at"] = _utc_now()
+    state_json = json.dumps(state, indent=2, sort_keys=True) + "\n"
     written_version = _atomic_write_regular(
         run_fd,
         STATE_FILE_NAME,
-        json.dumps(state, indent=2, sort_keys=True) + "\n",
+        state_json,
         expected_version=expected_state_version,
+        max_content_bytes=STATE_MAX_BYTES,
     )
     _verify_run_directory_identity(run_dir, repo_root, run_fd)
     return written_version
@@ -1145,7 +1250,7 @@ def _build_child_contract(state: WaitedDeliveryState) -> str:
     if changed_files:
         lines.extend(["", "## Changed Files"])
         for path in changed_files:
-            lines.append(f"- `{path}`")
+            lines.append(f"- `{_display_filesystem_path(path)}`")
 
     lines.extend(
         [
@@ -1428,6 +1533,7 @@ def _prepare(args: argparse.Namespace) -> int:
                 state_path.name,
                 json.dumps(state, indent=2, sort_keys=True) + "\n",
                 expected_version=None,
+                max_content_bytes=STATE_MAX_BYTES,
             )
             _verify_run_directory_identity(run_dir, repo_root, run_fd)
     finally:
@@ -1675,7 +1781,7 @@ def _validate_review_pass(state: WaitedDeliveryState, evidence: list[str]) -> No
         )
     changed_files = _collect_changed_files(pathlib.Path(state["repo_root"]))
     if changed_files:
-        sample = ", ".join(changed_files[:5])
+        sample = ", ".join(_display_filesystem_path(path) for path in changed_files[:5])
         suffix = "" if len(changed_files) <= 5 else ", ..."
         raise UserError(
             "cannot record a passed review while implementation state is "
