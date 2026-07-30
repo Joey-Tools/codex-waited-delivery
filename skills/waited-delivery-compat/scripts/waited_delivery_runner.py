@@ -2288,8 +2288,8 @@ class _SmokeSignalTransaction:
         return isinstance(exc, _DeferredSmokeTermination)
 
 
-def _parse_linux_proc_stat(raw: str) -> tuple[str, int] | None:
-    closing_parenthesis = raw.rfind(")")
+def _parse_linux_proc_stat(raw: bytes) -> tuple[str, int] | None:
+    closing_parenthesis = raw.rfind(b")")
     if closing_parenthesis <= 0:
         return None
     fields = raw[closing_parenthesis + 1 :].split()
@@ -2299,7 +2299,10 @@ def _parse_linux_proc_stat(raw: str) -> tuple[str, int] | None:
         process_group = int(fields[2])
     except ValueError:
         return None
-    return fields[0], process_group
+    state_value = fields[0][0]
+    if state_value > 0x7F:
+        return None
+    return chr(state_value), process_group
 
 
 def _linux_process_group_state(
@@ -2316,31 +2319,28 @@ def _linux_process_group_state(
     saw_zombie = False
     entry_count = 0
     try:
-        entries = os.scandir(proc_root)
+        with os.scandir(proc_root) as entries:
+            for entry in entries:
+                entry_count += 1
+                if entry_count > max_entries or time.monotonic() >= deadline:
+                    return "unknown"
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    raw = (pathlib.Path(entry.path) / "stat").read_bytes()
+                except FileNotFoundError:
+                    continue
+                parsed = _parse_linux_proc_stat(raw)
+                if parsed is None:
+                    return "unknown"
+                state, process_group = parsed
+                if process_group != pgid:
+                    continue
+                if state != "Z":
+                    return "live"
+                saw_zombie = True
     except OSError:
         return "unknown"
-    with entries:
-        for entry in entries:
-            entry_count += 1
-            if entry_count > max_entries or time.monotonic() >= deadline:
-                return "unknown"
-            if not entry.name.isdecimal():
-                continue
-            try:
-                raw = (pathlib.Path(entry.path) / "stat").read_text(encoding="utf-8")
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return "unknown"
-            parsed = _parse_linux_proc_stat(raw)
-            if parsed is None:
-                return "unknown"
-            state, process_group = parsed
-            if process_group != pgid:
-                continue
-            if state != "Z":
-                return "live"
-            saw_zombie = True
     if saw_zombie:
         return "zombie-only"
     return "no-members"

@@ -1344,10 +1344,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         proc_root = self.root / "proc"
         process_dir = proc_root / "201"
         process_dir.mkdir(parents=True)
-        (process_dir / "stat").write_text(
-            "201 (fixture) Z 1 77 1 0\n",
-            encoding="utf-8",
-        )
+        (process_dir / "stat").write_bytes(b"201 (fixture) Z 1 77 1 0\n")
 
         with mock.patch.object(module.os, "killpg", return_value=None) as killpg:
             self.assertFalse(
@@ -1360,6 +1357,144 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             self.assertTrue(module._process_group_is_addressable(77))
 
         self.assertEqual(killpg.call_args_list, [mock.call(77, 0), mock.call(77, 0)])
+
+    def test_linux_process_group_scan_handles_non_utf8_same_and_unrelated_members(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        proc_root = self.root / "proc-non-utf8"
+        same_zombie = proc_root / "201"
+        unrelated_live = proc_root / "202"
+        same_zombie.mkdir(parents=True)
+        unrelated_live.mkdir(parents=True)
+        (same_zombie / "stat").write_bytes(b"201 (same \xff zombie) Z 1 77 1 0\n")
+        (unrelated_live / "stat").write_bytes(b"202 (unrelated \xfe live) S 1 88 1 0\n")
+
+        self.assertEqual(
+            module._linux_process_group_state(77, proc_root=proc_root),
+            "zombie-only",
+        )
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertFalse(
+                module._process_group_exists(
+                    77,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+        same_live = proc_root / "203"
+        same_live.mkdir()
+        (same_live / "stat").write_bytes(b"203 (same \xfd live) S 1 77 1 0\n")
+        self.assertEqual(
+            module._linux_process_group_state(77, proc_root=proc_root),
+            "live",
+        )
+
+    def test_linux_process_group_no_members_rechecks_addressability(self) -> None:
+        module = self._load_runner_module()
+        proc_root = self.root / "proc-no-members"
+        unrelated_live = proc_root / "204"
+        unrelated_live.mkdir(parents=True)
+        (unrelated_live / "stat").write_bytes(b"204 (unrelated \xff live) S 1 88 1 0\n")
+
+        self.assertEqual(
+            module._linux_process_group_state(77, proc_root=proc_root),
+            "no-members",
+        )
+        with mock.patch.object(
+            module.os,
+            "killpg",
+            side_effect=[None, ProcessLookupError()],
+        ) as killpg:
+            self.assertFalse(
+                module._process_group_exists(
+                    77,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+        self.assertEqual(killpg.call_args_list, [mock.call(77, 0), mock.call(77, 0)])
+
+        with mock.patch.object(module.os, "killpg", return_value=None) as killpg:
+            self.assertTrue(
+                module._process_group_exists(
+                    77,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+        self.assertEqual(killpg.call_args_list, [mock.call(77, 0), mock.call(77, 0)])
+
+    def test_linux_process_group_scan_ambiguity_fails_closed(self) -> None:
+        module = self._load_runner_module()
+        proc_root = self.root / "proc-ambiguous"
+        process_dir = proc_root / "301"
+        process_dir.mkdir(parents=True)
+        stat_path = process_dir / "stat"
+        stat_path.write_bytes(b"301 (fixture) Z 1 91 1 0\n")
+
+        self.assertEqual(
+            module._linux_process_group_state(
+                91,
+                proc_root=proc_root,
+                deadline=time.monotonic() - 1,
+            ),
+            "unknown",
+        )
+
+        stat_path.write_bytes(b"ambiguous\n")
+        self.assertEqual(
+            module._linux_process_group_state(91, proc_root=proc_root),
+            "unknown",
+        )
+
+        stat_path.unlink()
+        stat_path.mkdir()
+        self.assertEqual(
+            module._linux_process_group_state(91, proc_root=proc_root),
+            "unknown",
+        )
+        stat_path.rmdir()
+        stat_path.write_bytes(b"301 (fixture) \xff 1 91 1 0\n")
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertTrue(
+                module._process_group_exists(
+                    91,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+    def test_linux_process_group_scan_iteration_error_fails_closed(self) -> None:
+        module = self._load_runner_module()
+
+        class FailingProcEntries:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError("injected proc iteration failure")
+
+        with mock.patch.object(
+            module.os,
+            "scandir",
+            side_effect=lambda _root: FailingProcEntries(),
+        ):
+            self.assertEqual(module._linux_process_group_state(101), "unknown")
+            with mock.patch.object(module.os, "killpg", return_value=None):
+                self.assertTrue(
+                    module._process_group_exists(
+                        101,
+                        platform="linux",
+                    )
+                )
 
     def test_bounded_smoke_kills_timed_out_process_group(self) -> None:
         module = self._load_runner_module()
