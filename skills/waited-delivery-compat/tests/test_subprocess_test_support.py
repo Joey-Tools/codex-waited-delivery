@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -219,6 +220,100 @@ class SubprocessTestSupportTests(unittest.TestCase):
                         platform="linux",
                     )
                 )
+
+    def test_cleanup_signals_and_proves_group_absence_before_leader_reap(
+        self,
+    ) -> None:
+        events: list[str] = []
+
+        class FakeProcess:
+            pid = 731
+
+            def wait(self):
+                raise AssertionError("observer owns the only reap")
+
+        class FakeObserver:
+            pid = 731
+            reaped = False
+
+            def signal_group(self, signum: int) -> None:
+                self.assert_not_reaped()
+                self.assert_signal(signum)
+                events.append("signal")
+
+            def exited(self) -> bool:
+                self.assert_not_reaped()
+                events.append("observe-exit")
+                return True
+
+            def reap(self, process) -> int:
+                self.assert_not_reaped()
+                self.assert_process(process)
+                events.append("reap")
+                self.reaped = True
+                return 0
+
+            def assert_not_reaped(self) -> None:
+                if self.reaped:
+                    raise AssertionError("operation occurred after leader reap")
+
+            def assert_signal(self, signum: int) -> None:
+                if signum != signal.SIGKILL:
+                    raise AssertionError("cleanup used an unexpected signal")
+
+            def assert_process(self, process) -> None:
+                if process.pid != self.pid:
+                    raise AssertionError("cleanup reaped an unrelated process")
+
+        class FakeSelector:
+            def get_map(self):
+                return {}
+
+        observer = FakeObserver()
+
+        def group_exists(pgid: int) -> bool:
+            observer.assert_not_reaped()
+            self.assertEqual(pgid, observer.pid)
+            events.append("prove-group-absence")
+            return False
+
+        with (
+            mock.patch.object(support, "_drain_once"),
+            mock.patch.object(
+                support,
+                "_process_group_exists",
+                side_effect=group_exists,
+            ),
+        ):
+            support._bounded_cleanup(
+                FakeProcess(),
+                observer,
+                FakeSelector(),
+                {"stdout": bytearray(), "stderr": bytearray()},
+                deadline=time.monotonic() + 1,
+                terminate_group=True,
+            )
+
+        self.assertEqual(
+            events,
+            ["signal", "observe-exit", "prove-group-absence", "reap"],
+        )
+
+    def test_observer_refuses_group_signal_after_reap(self) -> None:
+        observer = object.__new__(support._UnreapedLeaderObserver)
+        observer.pid = 733
+        observer._reaped = True
+
+        with (
+            mock.patch.object(support.os, "killpg") as killpg,
+            self.assertRaisesRegex(
+                AssertionError,
+                "after leader reap",
+            ),
+        ):
+            observer.signal_group(signal.SIGKILL)
+
+        killpg.assert_not_called()
 
     def test_selector_initialization_failure_precedes_pipe_and_process_launch(
         self,
@@ -486,7 +581,10 @@ class SubprocessTestSupportTests(unittest.TestCase):
             child_pid = int(child_pid_path.read_text(encoding="utf-8"))
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
-            self.assertGreaterEqual(zero_probes, 2)
+            if sys.platform.startswith("linux"):
+                self.assertGreaterEqual(zero_probes, 2)
+            else:
+                self.assertEqual(zero_probes, 0)
 
 
 if __name__ == "__main__":

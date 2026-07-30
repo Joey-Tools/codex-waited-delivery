@@ -23,6 +23,25 @@ Future hooks or app adapters should translate product-specific metadata into the
 If a future hook payload exposes only a subset of those fields, the bridge still accepts partial metadata and lets the runner persist what is actually known.
 The current outer adapter already follows this rule: it may observe product-specific values such as host-injected `CODEX_THREAD_ID`, but it translates them before calling the bridge rather than teaching the runner about undocumented product env names.
 
+## Adapter Execution Contract
+
+The outer adapter never path-executes this bridge or the runner. For every
+adapter-driven `prepare-live`, `bind-parent-live`, `attach-child-live`,
+`finish-child-live`, `reconcile-live`, and `refresh-prompts-live` operation, it
+first stable-binds both source objects and exact bytes. The repository root,
+`.codex-tmp`, adapter directory, index, lock, preparation lease, runs root,
+run, state/prompts, and bridge/runner source parents and files must be
+current-user-owned, reject group/other write, and carry no Darwin extended or
+Linux POSIX ACL; held descriptors revalidate that property at the operation
+boundary.
+
+The adapter sends a bounded two-source frame to a fixed Python `-I -B -S -c`
+bootstrap. That bootstrap verifies magic, lengths, EOF, and SHA-256 before
+compiling the bridge in memory. The bridge then sends the already bound runner
+bytes through a second bounded frame to another isolated bootstrap. Direct
+standalone bridge invocation remains a compatibility CLI, but it is not the
+adapter execution path.
+
 ## Commands
 
 - `prepare-live`
@@ -48,6 +67,7 @@ The current outer adapter already follows this rule: it may observe product-spec
   - requires the exact attached `child_session_id` and wraps `finish-child` so the bridge can persist the child's matching terminal status after `wait` and before parent-owned review
 - `reconcile-live`
   - requires that same exact child id and wraps `reconcile-parent --json`
+  - when called by the adapter, its result is not enough to clear the index; the adapter reopens and validates the terminal reconciled state through the pinned run-directory descriptor first
 - `print-env-contract`
   - prints the current env keys expected by the bridge
 
@@ -64,7 +84,7 @@ The current outer adapter already follows this rule: it may observe product-spec
 ## Notes
 
 - This bridge does not assume a specific Codex App or Codex CLI hook payload shape.
-- Call `refresh-prompts-live` only through the outer adapter's anonymous-pipe source launcher. Other bridge commands retain their ordinary source-path CLI behavior.
+- Call `refresh-prompts-live` only through the outer adapter's anonymous-pipe source launcher. Direct standalone use of the other bridge commands retains the ordinary compatibility CLI, but every adapter call uses stable-bound bridge and runner bytes through the isolated two-frame launch contract.
 - If stock App / hooks later expose different metadata names, only the outer adapter should need to change.
 - `prepare-live` and `attach-child-live` prefer explicit CLI args over env vars when both are present.
 - Preparation IDs are correlation evidence rather than secrets or authentication credentials. The inherited lease coordinates only the adapter/bridge/runner chain; a runner descendant may retain the same open-file-description after the bridge process exits, so the outer adapter must retire its own inherited reference and independently reacquire the lock before declaring that chain quiescent. Recovery and CAS policy remain owned by the outer adapter.

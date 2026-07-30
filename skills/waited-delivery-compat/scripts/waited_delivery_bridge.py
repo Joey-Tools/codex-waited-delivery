@@ -170,34 +170,12 @@ def _runner_command(*args: str) -> list[str]:
     return [sys.executable, str(RUNNER_PATH), *args]
 
 
-def _run_runner(*args: str, pass_fds: tuple[int, ...] = ()) -> int:
-    completed = subprocess.run(
-        _runner_command(*args),
-        text=True,
-        capture_output=True,
-        check=False,
-        pass_fds=pass_fds,
-    )
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.returncode != 0:
-        if completed.stderr:
-            print(completed.stderr, file=sys.stderr, end="")
-        return completed.returncode
-    return 0
-
-
 def _isolated_python_environment() -> dict[str, str]:
     return {
         name: value
         for name, value in os.environ.items()
         if not name.startswith("PYTHON") and name != "__PYVENV_LAUNCHER__"
     }
-
-
-def _require_isolated_python() -> None:
-    if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
-        raise UserError("refresh-prompts-live requires Python -I -B -S isolation")
 
 
 def _runner_source_frame(source: bytes) -> bytes:
@@ -213,11 +191,12 @@ def _runner_source_frame(source: bytes) -> bytes:
     )
 
 
-def _run_in_memory_runner_json(
+def _run_bound_runner(
     runner_source: bytes,
     runner_path: pathlib.Path,
     *args: str,
-) -> dict[str, object]:
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         [
             sys.executable,
@@ -233,17 +212,70 @@ def _run_in_memory_runner_json(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        pass_fds=pass_fds,
         env=_isolated_python_environment(),
+    )
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        stdout=completed.stdout.decode("utf-8", errors="replace"),
+        stderr=completed.stderr.decode("utf-8", errors="replace"),
+    )
+
+
+def _run_runner(*args: str, pass_fds: tuple[int, ...] = ()) -> int:
+    bound_source = globals().get("_WAITED_DELIVERY_BOUND_RUNNER_SOURCE")
+    bound_path = globals().get("_WAITED_DELIVERY_BOUND_RUNNER_PATH")
+    if bound_source is None and bound_path is None:
+        completed = subprocess.run(
+            _runner_command(*args),
+            text=True,
+            capture_output=True,
+            check=False,
+            pass_fds=pass_fds,
+        )
+    elif isinstance(bound_source, bytes) and isinstance(bound_path, str):
+        completed = _run_bound_runner(
+            bound_source,
+            pathlib.Path(bound_path),
+            *args,
+            pass_fds=pass_fds,
+        )
+    else:
+        raise UserError("incomplete bound compatibility runner source")
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.returncode != 0:
+        if completed.stderr:
+            print(completed.stderr, file=sys.stderr, end="")
+        return completed.returncode
+    return 0
+
+
+def _require_isolated_python() -> None:
+    if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
+        raise UserError("refresh-prompts-live requires Python -I -B -S isolation")
+
+
+def _run_in_memory_runner_json(
+    runner_source: bytes,
+    runner_path: pathlib.Path,
+    *args: str,
+) -> dict[str, object]:
+    completed = _run_bound_runner(
+        runner_source,
+        runner_path,
+        *args,
     )
     if completed.returncode != 0:
         stderr = (
-            completed.stderr.decode("utf-8", errors="replace").strip()
-            or completed.stdout.decode("utf-8", errors="replace").strip()
+            completed.stderr.strip()
+            or completed.stdout.strip()
             or "unknown error"
         )
         raise UserError(stderr)
     try:
-        payload = json.loads(completed.stdout.decode("utf-8"))
+        payload = json.loads(completed.stdout)
     except json.JSONDecodeError as error:
         raise UserError(f"runner did not return valid JSON: {error}") from error
     if not isinstance(payload, dict):

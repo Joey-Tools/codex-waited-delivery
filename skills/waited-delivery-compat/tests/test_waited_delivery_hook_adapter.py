@@ -999,6 +999,54 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             "persist through restrictive umask",
         )
 
+    def test_index_rejects_unsafe_parent_and_artifact_modes_without_mutation(
+        self,
+    ) -> None:
+        seeded = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-mode-seed"),
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        module = self._load_adapter_module()
+        index_path = self._index_path()
+        adapter_dir = index_path.parent
+        targets = (
+            ("repository-root", self.repo, 0o770),
+            ("codex-tmp-parent", self.repo / ".codex-tmp", 0o770),
+            ("adapter-directory", adapter_dir, 0o770),
+            ("index-file", index_path, 0o620),
+            ("index-lock", adapter_dir / "index.lock", 0o602),
+        )
+        for label, target, unsafe_mode in targets:
+            with self.subTest(case=label):
+                original_mode = target.stat().st_mode & 0o7777
+                target.chmod(unsafe_mode)
+                before_content = index_path.read_bytes()
+                before_stat = index_path.stat()
+                try:
+                    with self.assertRaises(module.RunSafetyError):
+                        with module._index_transaction(
+                            self.repo.resolve(),
+                            write=False,
+                        ):
+                            pass
+                    after_stat = index_path.stat()
+                    self.assertEqual(index_path.read_bytes(), before_content)
+                    self.assertEqual(
+                        (
+                            after_stat.st_dev,
+                            after_stat.st_ino,
+                            after_stat.st_mtime_ns,
+                        ),
+                        (
+                            before_stat.st_dev,
+                            before_stat.st_ino,
+                            before_stat.st_mtime_ns,
+                        ),
+                    )
+                finally:
+                    target.chmod(original_mode)
+
     def test_index_transaction_serializes_load_modify_save(self) -> None:
         seeded = self._run_adapter(
             "user-prompt-submit-hook",
@@ -1124,18 +1172,102 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             )
         finally:
             os.close(write_fd)
-            if pid_path.exists():
-                try:
-                    os.killpg(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
         try:
             self.assertEqual(completed.returncode, 124, completed.stderr)
             self.assertIn("hard timeout", completed.stderr)
+            process_group = int(pid_path.read_text(encoding="utf-8"))
+            self.assertFalse(
+                module._refresh_process_group_has_live_members(process_group)
+            )
             os.set_blocking(read_fd, False)
             self.assertEqual(os.read(read_fd, 1), b"")
         finally:
             os.close(read_fd)
+
+    def test_refresh_cleanup_keeps_leader_unreaped_until_group_absence(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        events: list[str] = []
+
+        class FakeProcess:
+            pid = 709
+
+        class FakeObserver:
+            reaped = False
+
+            def signal_group(self, signum: int) -> None:
+                if self.reaped:
+                    raise AssertionError("signal occurred after leader reap")
+                self_outer.assertEqual(signum, signal.SIGKILL)
+                events.append("signal")
+
+            def exited(self) -> bool:
+                if self.reaped:
+                    raise AssertionError("exit probe occurred after leader reap")
+                events.append("observe-exit")
+                return True
+
+            def reap(self, process) -> int:
+                if self.reaped:
+                    raise AssertionError("leader was reaped twice")
+                self_outer.assertEqual(process.pid, 709)
+                events.append("reap")
+                self.reaped = True
+                return 0
+
+        class FakeSelector:
+            def get_map(self):
+                return {}
+
+        self_outer = self
+        observer = FakeObserver()
+
+        def group_has_live_members(pgid: int, **_kwargs: object) -> bool:
+            if observer.reaped:
+                raise AssertionError("group probe occurred after leader reap")
+            self.assertEqual(pgid, 709)
+            events.append("prove-group-absence")
+            return False
+
+        with (
+            mock.patch.object(module, "_drain_refresh_output_once"),
+            mock.patch.object(
+                module,
+                "_refresh_process_group_has_live_members",
+                side_effect=group_has_live_members,
+            ),
+        ):
+            module._cleanup_refresh_process(
+                FakeProcess(),
+                observer,
+                FakeSelector(),
+                {"stdout": bytearray(), "stderr": bytearray()},
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+            )
+
+        self.assertEqual(
+            events,
+            ["signal", "observe-exit", "prove-group-absence", "reap"],
+        )
+
+    def test_refresh_observer_refuses_group_signal_after_leader_reap(self) -> None:
+        module = self._load_adapter_module()
+        observer = object.__new__(module._UnreapedLeaderObserver)
+        observer.pid = 711
+        observer._reaped = True
+
+        with (
+            mock.patch.object(module.os, "killpg") as killpg,
+            self.assertRaisesRegex(
+                module.UserError,
+                "after leader reap",
+            ),
+        ):
+            observer.signal_group(signal.SIGKILL)
+
+        killpg.assert_not_called()
 
     def test_linux_refresh_scan_accepts_zombie_only_process_group(self) -> None:
         module = self._load_adapter_module()
@@ -1359,14 +1491,13 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             sender.join(timeout=2)
             signal.signal(signal.SIGTERM, previous_handler)
             os.close(write_fd)
-            if pid_path.exists():
-                try:
-                    os.killpg(int(pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
         try:
             self.assertEqual(completed.returncode, 128 + signal.SIGTERM)
             self.assertEqual(received_signals, [signal.SIGTERM])
+            process_group = int(pid_path.read_text(encoding="utf-8"))
+            self.assertFalse(
+                module._refresh_process_group_has_live_members(process_group)
+            )
             os.set_blocking(read_fd, False)
             self.assertEqual(os.read(read_fd, 1), b"")
         finally:
@@ -1700,6 +1831,50 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 preparation_id,
             ).exists()
         )
+
+    def test_preparation_lease_rejects_unsafe_mode(self) -> None:
+        module = self._load_adapter_module()
+        reservation = self._seed_interrupted_preparation(
+            module,
+            session_id="session-unsafe-lease-mode",
+            run_id="unsafe-lease-mode",
+            preparation_id="ab" * 16,
+        )
+        lease_path = pathlib.Path(reservation.lease_path)
+        original_mode = lease_path.stat().st_mode & 0o7777
+        lease_path.chmod(0o620)
+        repo_fd: int | None = None
+        codex_tmp_fd: int | None = None
+        adapter_fd: int | None = None
+        lease_fd: int | None = None
+        try:
+            repo_fd, codex_tmp_fd, adapter_fd = module._open_index_directories(
+                self.repo.resolve()
+            )
+            lease_fd = os.open(
+                lease_path.name,
+                os.O_RDWR,
+                dir_fd=adapter_fd,
+            )
+            with self.assertRaisesRegex(
+                module.RunSafetyError,
+                "access policy",
+            ):
+                module._validate_preparation_lease_fd(
+                    adapter_fd,
+                    lease_fd,
+                    reservation,
+                )
+        finally:
+            if lease_fd is not None:
+                os.close(lease_fd)
+            if adapter_fd is not None:
+                os.close(adapter_fd)
+            if codex_tmp_fd is not None:
+                os.close(codex_tmp_fd)
+            if repo_fd is not None:
+                os.close(repo_fd)
+            lease_path.chmod(original_mode)
 
     def test_reservation_commit_failures_never_launch_bridge(self) -> None:
         for failure_point in ("before-replace", "after-replace"):
@@ -3606,6 +3781,64 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(run_dir.stat().st_mode & 0o7777, 0o777)
         self.assertEqual(parent_prompt.read_bytes(), original_prompt)
 
+    def test_state_reader_rejects_unsafe_parent_run_and_artifact_modes(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        cases = (
+            ("repository-root", "repo", 0o770),
+            ("codex-tmp-parent", "codex-tmp", 0o770),
+            ("runs-parent", "runs", 0o770),
+            ("run-directory", "run", 0o710),
+            ("state", "state.json", 0o620),
+            ("child-prompt", "child-prompt.md", 0o602),
+            ("parent-prompt", "parent-prompt.md", 0o620),
+        )
+        for label, target, unsafe_mode in cases:
+            with self.subTest(case=label):
+                run_dir = self._prepare_indexed_run(
+                    f"session-state-mode-{label}",
+                    f"state-mode-{label}",
+                )
+                target_path = (
+                    self.repo
+                    if target == "repo"
+                    else self.repo / ".codex-tmp"
+                    if target == "codex-tmp"
+                    else run_dir.parent
+                    if target == "runs"
+                    else run_dir
+                    if target == "run"
+                    else run_dir / target
+                )
+                state_path = run_dir / "state.json"
+                original_mode = target_path.stat().st_mode & 0o7777
+                target_path.chmod(unsafe_mode)
+                before_content = state_path.read_bytes()
+                before_stat = state_path.stat()
+                try:
+                    with self.assertRaises(module.RunSafetyError):
+                        module._load_stop_run_state(
+                            self.repo.resolve(),
+                            str(run_dir),
+                        )
+                    after_stat = state_path.stat()
+                    self.assertEqual(state_path.read_bytes(), before_content)
+                    self.assertEqual(
+                        (
+                            after_stat.st_dev,
+                            after_stat.st_ino,
+                            after_stat.st_mtime_ns,
+                        ),
+                        (
+                            before_stat.st_dev,
+                            before_stat.st_ino,
+                            before_stat.st_mtime_ns,
+                        ),
+                    )
+                finally:
+                    target_path.chmod(original_mode)
+
     def test_stop_hook_refreshes_prompt_for_active_legacy_child(self) -> None:
         session_id = "session-legacy-active"
         transcript_path = "/tmp/transcript-legacy-active.jsonl"
@@ -4315,6 +4548,259 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "")
 
+    def test_launch_sources_reject_unsafe_parent_and_source_modes(self) -> None:
+        module = self._load_adapter_module()
+        for target_name, unsafe_mode in (
+            ("source-parent", 0o770),
+            ("bridge", 0o620),
+            ("runner", 0o602),
+        ):
+            with self.subTest(target=target_name):
+                bridge_path, runner_path = self._private_launch_sources(
+                    f"unsafe-mode-{target_name}"
+                )
+                target_path = (
+                    bridge_path.parent
+                    if target_name == "source-parent"
+                    else bridge_path
+                    if target_name == "bridge"
+                    else runner_path
+                )
+                original_mode = target_path.stat().st_mode & 0o7777
+                target_path.chmod(unsafe_mode)
+                try:
+                    with (
+                        mock.patch.object(module, "BRIDGE_PATH", bridge_path),
+                        mock.patch.object(module, "RUNNER_PATH", runner_path),
+                        self.assertRaisesRegex(
+                            module.RunSafetyError,
+                            "writable by group or other users",
+                        ),
+                    ):
+                        with module._verified_refresh_launch_sources():
+                            self.fail("unsafe launch source was admitted")
+                finally:
+                    target_path.chmod(original_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin extended ACLs")
+    def test_adapter_rejects_darwin_acl_on_index_state_and_source_parents(
+        self,
+    ) -> None:
+        seeded = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-adapter-acl"),
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        run_dir = self._prepare_indexed_run(
+            "session-state-acl",
+            "state-acl",
+        )
+        module = self._load_adapter_module()
+        bridge_path, runner_path = self._private_launch_sources("darwin-acl")
+        cases = (
+            (
+                "index-parent",
+                self._index_path().parent,
+                lambda: self._read_index_under_module(module),
+            ),
+            (
+                "state",
+                run_dir / "state.json",
+                lambda: module._load_stop_run_state(
+                    self.repo.resolve(),
+                    str(run_dir),
+                ),
+            ),
+            (
+                "source-parent",
+                bridge_path.parent,
+                lambda: self._read_launch_sources_under_module(
+                    module,
+                    bridge_path,
+                    runner_path,
+                ),
+            ),
+        )
+        for label, target_path, action in cases:
+            with self.subTest(case=label):
+                acl_result = run(
+                    [
+                        "/bin/chmod",
+                        "+a",
+                        "everyone allow write",
+                        str(target_path),
+                    ]
+                )
+                self.assertEqual(acl_result.returncode, 0, acl_result.stderr)
+                try:
+                    with self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        "named or extended ACL",
+                    ):
+                        result = action()
+                        if (
+                            isinstance(result, tuple)
+                            and len(result) == 4
+                            and isinstance(result[3], int)
+                        ):
+                            os.close(result[3])
+                finally:
+                    remove_acl = run(["/bin/chmod", "-N", str(target_path)])
+                    self.assertEqual(
+                        remove_acl.returncode,
+                        0,
+                        remove_acl.stderr,
+                    )
+
+    def _read_index_under_module(self, module) -> None:
+        with module._index_transaction(self.repo.resolve(), write=False):
+            pass
+
+    def _read_launch_sources_under_module(
+        self,
+        module,
+        bridge_path: pathlib.Path,
+        runner_path: pathlib.Path,
+    ) -> None:
+        with (
+            mock.patch.object(module, "BRIDGE_PATH", bridge_path),
+            mock.patch.object(module, "RUNNER_PATH", runner_path),
+        ):
+            with module._verified_refresh_launch_sources():
+                pass
+
+    def test_adapter_darwin_acl_probe_accepts_only_exact_unsupported_errnos(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        libc = mock.Mock()
+        libc.acl_get_fd_np = mock.Mock(return_value=None)
+        libc.acl_free = mock.Mock(return_value=0)
+
+        with (
+            mock.patch.object(module.sys, "platform", "darwin"),
+            mock.patch.object(module.ctypes, "CDLL", return_value=libc),
+            mock.patch.object(module.ctypes, "set_errno"),
+            mock.patch.object(module.errno, "ENOENT", 2),
+            mock.patch.object(module.errno, "EACCES", 13),
+            mock.patch.object(module.errno, "EBADF", 9),
+            mock.patch.object(module.errno, "ENOMEM", 12),
+            mock.patch.object(module.errno, "EINVAL", 22),
+            mock.patch.object(module.errno, "ENOTSUP", 45),
+            mock.patch.object(module.errno, "ENOATTR", 93, create=True),
+            mock.patch.object(module.errno, "ENODATA", 96, create=True),
+            mock.patch.object(module.errno, "EOPNOTSUPP", 102, create=True),
+        ):
+            for error_number in (45, 102):
+                with (
+                    self.subTest(error_number=error_number),
+                    mock.patch.object(
+                        module.ctypes,
+                        "get_errno",
+                        return_value=error_number,
+                    ),
+                ):
+                    self.assertFalse(
+                        module._descriptor_has_extended_acl(
+                            123,
+                            label="synthetic Darwin adapter artifact",
+                        )
+                    )
+
+            rejected_errors = {
+                "bad-file-descriptor": module.errno.EBADF,
+                "permission-denied": module.errno.EACCES,
+                "invalid-acl-type": module.errno.EINVAL,
+                "out-of-memory": module.errno.ENOMEM,
+                "no-attribute": module.errno.ENOATTR,
+                "enotsup-adjacent": module.errno.ENOTSUP + 1,
+                "eopnotsupp-adjacent": module.errno.EOPNOTSUPP + 1,
+            }
+            for case, error_number in rejected_errors.items():
+                with (
+                    self.subTest(case=case, error_number=error_number),
+                    mock.patch.object(
+                        module.ctypes,
+                        "get_errno",
+                        return_value=error_number,
+                    ),
+                    self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        "extended ACL cannot be inspected safely",
+                    ),
+                ):
+                    module._descriptor_has_extended_acl(
+                        123,
+                        label="synthetic Darwin adapter artifact",
+                    )
+
+    def test_adapter_linux_posix_acl_xattr_is_rejected_fail_closed(self) -> None:
+        module = self._load_adapter_module()
+        state_path = self.repo / "tracked.txt"
+        state_fd = os.open(state_path, os.O_RDONLY)
+        try:
+            with (
+                mock.patch.object(module.sys, "platform", "linux"),
+                mock.patch.object(
+                    module.os,
+                    "getxattr",
+                    create=True,
+                    return_value=b"synthetic-posix-acl",
+                ),
+                self.assertRaisesRegex(
+                    module.RunSafetyError,
+                    "named or extended ACL",
+                ),
+            ):
+                module._require_no_extended_acl(
+                    state_fd,
+                    label="synthetic Linux adapter state",
+                )
+            with (
+                mock.patch.object(module.sys, "platform", "linux"),
+                mock.patch.object(
+                    module.os,
+                    "getxattr",
+                    create=True,
+                    side_effect=OSError(
+                        getattr(module.errno, "ENODATA", module.errno.ENOENT),
+                        "no POSIX ACL",
+                    ),
+                ),
+            ):
+                module._require_no_extended_acl(
+                    state_fd,
+                    label="synthetic Linux adapter state",
+                )
+
+            def default_acl_only(_file_fd, attribute):
+                if attribute == "system.posix_acl_access":
+                    raise OSError(
+                        getattr(module.errno, "ENODATA", module.errno.ENOENT),
+                        "no POSIX access ACL",
+                    )
+                return b"synthetic-posix-default-acl"
+
+            with (
+                mock.patch.object(module.sys, "platform", "linux"),
+                mock.patch.object(
+                    module.os,
+                    "getxattr",
+                    create=True,
+                    side_effect=default_acl_only,
+                ),
+                self.assertRaisesRegex(
+                    module.RunSafetyError,
+                    "named or extended ACL",
+                ),
+            ):
+                module._require_no_extended_acl(
+                    state_fd,
+                    label="synthetic Linux adapter default ACL",
+                )
+        finally:
+            os.close(state_fd)
+
     def test_refresh_source_input_early_rejection_cleans_process_group(self) -> None:
         module = self._load_adapter_module()
         pid_path = self.root / "early-source-reject.pid"
@@ -4385,6 +4871,77 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         )
         offset += bridge_size
         self.assertEqual(frame[offset:], sources.runner.content)
+
+    def test_all_bridge_entrypoints_use_isolated_pipe_bound_sources(self) -> None:
+        module = self._load_adapter_module()
+        bridge_path, runner_path = self._private_launch_sources(
+            "all-bridge-entrypoints"
+        )
+        invocations: list[
+            tuple[list[str], tuple[int, ...], dict[str, str], bytes | None]
+        ] = []
+
+        def capture_launch(
+            command: list[str],
+            *,
+            pass_fds: tuple[int, ...],
+            env: dict[str, str],
+            input_bytes: bytes | None,
+            **_bounds: object,
+        ) -> subprocess.CompletedProcess[str]:
+            invocations.append((command, pass_fds, env, input_bytes))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout='{"status":"ok"}\n',
+                stderr="",
+            )
+
+        with (
+            mock.patch.object(module, "BRIDGE_PATH", bridge_path),
+            mock.patch.object(module, "RUNNER_PATH", runner_path),
+            mock.patch.object(
+                module,
+                "_run_bounded_refresh_process",
+                side_effect=capture_launch,
+            ),
+        ):
+            self.assertEqual(
+                module._run_bridge_json("reconcile-live"),
+                {"status": "ok"},
+            )
+            self.assertEqual(
+                module._run_bridge_json_with_lease(37, "prepare-live"),
+                {"status": "ok"},
+            )
+            with mock.patch.object(module.sys, "stdout", io.StringIO()):
+                self.assertEqual(
+                    module._run_bridge_passthrough("finish-child-live"),
+                    0,
+                )
+
+        self.assertEqual(len(invocations), 3)
+        self.assertEqual(
+            [pass_fds for _command, pass_fds, _env, _frame in invocations],
+            [(), (37,), ()],
+        )
+        for command, _pass_fds, env, frame in invocations:
+            self.assertEqual(command[0], sys.executable)
+            self.assertEqual(command[1:5], ["-I", "-B", "-S", "-c"])
+            self.assertEqual(command[5], module.SOURCE_PIPE_BOOTSTRAP)
+            self.assertEqual(command[6], str(bridge_path))
+            self.assertEqual(command[7], str(runner_path))
+            self.assertIsNotNone(frame)
+            assert frame is not None
+            self.assertEqual(frame[:8], module.SOURCE_FRAME_MAGIC)
+            self.assertIn(bridge_path.read_bytes(), frame)
+            self.assertIn(runner_path.read_bytes(), frame)
+            self.assertFalse(
+                any(
+                    name.startswith("PYTHON") or name == "__PYVENV_LAUNCHER__"
+                    for name in env
+                )
+            )
 
     def test_refresh_launch_revalidates_bridge_and_runner_before_process(
         self,
@@ -4989,6 +5546,65 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         record = index["sessions"]["session-2"]
         self.assertEqual(record["status"], "completed")
         self.assertIsNone(record["run_dir"])
+
+    def test_reconcile_rejects_unsafe_forged_terminal_state_before_index_clear(
+        self,
+    ) -> None:
+        session_id = "session-forged-terminal-state"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "forged-terminal-state",
+        )
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                "child-forged-terminal",
+                "--session-id",
+                session_id,
+            ]
+        )
+        index_before = self._index_path().read_bytes()
+        state_path = run_dir / "state.json"
+
+        def forge_unsafe_terminal_state(*_args: str) -> dict[str, object]:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["overall_status"] = "passed"
+            state["orchestration"]["child_status"] = "completed"
+            state["orchestration"]["child_session_id"] = "child-forged-terminal"
+            for phase in state["phases"].values():
+                phase["status"] = "passed"
+            state_path.write_text(
+                json.dumps(state, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            state_path.chmod(0o666)
+            return {"overall_status": "passed"}
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=forge_unsafe_terminal_state,
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "writable by group or other users",
+            ),
+        ):
+            module._reconcile_active_run(args)
+
+        self.assertEqual(self._index_path().read_bytes(), index_before)
+        record = json.loads(index_before)["sessions"][session_id]
+        self.assertEqual(record["status"], "active")
+        self.assertEqual(record["run_dir"], str(run_dir))
 
     def test_finish_child_active_run_rejects_cross_session_run(self) -> None:
         run_dirs: dict[str, str] = {}

@@ -46,19 +46,28 @@ The runner applies the same pre-publication rule to initial run creation: it
 builds the full state, worst-case terminal projection, and all UTF-8 artifacts
 before opening or creating the run path, then descriptor-revalidates and
 parent-directory-fsyncs every created name before a successful receipt. The
-hook adapter then persists a schema `2` `preparing` reservation before invoking
-`prepare-live`. A
-descriptor-validated `0600` preparation lease is inherited across
-adapter/bridge/runner, runner state schema `4` records the same transaction
-UUID, and a second short index transaction promotes only that exact,
-fully-attested run to `active`. Index-capacity rejection cannot launch the
-bridge, create a run, or publish stdout. Recovery first proves the cooperative
-writer chain is quiescent by retiring the adapter's inherited reference once
-and reacquiring the lease through an independent open; a busy or ambiguous
-lease prevents run-entry inspection. Absent, partial, mismatched, tampered, or
-complete runs are then reported or handled through `recover-active-run`
-without recursive deletion, and an existing association cannot be replaced
-until its terminal state passes the same descriptor-bound path checks.
+hook adapter then persists a schema `3` `preparing` reservation before invoking
+`prepare-live`. Adapter index schema `3` reads schemas `1` and `2`, then
+upgrades them one way on the next successful index commit. A schema `2`
+adapter must reject schema `3` before any mutation; it must not downgrade the
+document or rewrite a `cleanup_complete` fence. A descriptor-validated `0600`
+preparation lease is inherited across adapter/bridge/runner, runner state
+schema `5` records the same transaction UUID, and a second short index
+transaction promotes only that exact, fully-attested run to `active`. Runner
+state schema `5` reads schemas `1` through `4`, then upgrades them one way on
+the next successful state publish. For oversized legacy text carried by
+schemas `1` through `4`, migration requires exact identity: unchanged values
+are allowed, while changed values are rejected. Schema `4` recovery is
+directional: a schema `5` runner may recover and upgrade it, but a schema `4`
+runner must reject schema `5`; every future schema fails closed.
+Index-capacity rejection cannot launch the bridge, create a run, or publish
+stdout. Recovery first proves the cooperative writer chain is quiescent by
+retiring the adapter's inherited reference once and reacquiring the lease
+through an independent open; a busy or ambiguous lease prevents run-entry
+inspection. Absent, partial, mismatched, tampered, or complete runs are then
+reported or handled through `recover-active-run` without recursive deletion,
+and an existing association cannot be replaced until its terminal state
+passes the same descriptor-bound path checks.
 
 Operators can avoid that layout dependency by passing `--external-helper` to
 the runner or bridge commands, or disable the readiness smoke when it is not

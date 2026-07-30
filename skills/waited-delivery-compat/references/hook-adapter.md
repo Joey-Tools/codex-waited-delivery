@@ -19,10 +19,13 @@ The adapter adds one explicitly enabled layer above the bridge:
 - `recover-active-run` reports, resumes, or clears the exact reservation only after descriptor-bound lease evidence proves the cooperating adapter/bridge/runner writer chain is quiescent; an already committed `cleanup_pending` record also supports the final-CAS recovery path after durable lease absence
 - `Stop` hook checks that session index and blocks premature finish while the run is active or a `preparing`, `recovery_required`, or `cleanup_pending` recovery fence is present only when its command includes `--enable-compat-hook`
 - before rendering an active-run continuation, `Stop` calls `refresh-prompts-live` so both persisted prompts use the currently loaded compatibility runner instead of a removed historical absolute path
-- before that refresh, `Stop` opens the repo/run path component-by-component without following links, requires the indexed `run_dir` to be a direct child of the current repo's `.codex-tmp/waited-delivery`, requires exact `state.repo_root` equality, and requires regular no-follow state and prompt files. It accepts either the current user plus mode `0700`, or the exact owned legacy mode `0755`; the latter is tightened to `0700` through the open directory descriptor and revalidated for unchanged device/inode and owner/group before any artifact read. Every other access policy fails closed. It records the resulting run directory's exact device/inode and POSIX uid/gid/mode.
-- `Stop` keeps that run descriptor open while refresh runs. It stable-reads both bridge and runner sources, binding each named entry, object identity, uid/gid/mode, size, and two bounded byte reads plus SHA-256 digest, then revalidates both source versions before process launch. It frames those exact bytes with magic, bounded lengths, and digests and sends them through anonymous stdin to a fixed Python `-I -B -S -c` bootstrap after removing Python environment-injection variables. The bootstrap requires exact bytes and EOF before compiling the bridge in memory; the bridge then sends the runner through a separately framed anonymous pipe to another fixed bootstrap. Neither layer creates a regular-file source snapshot, inherits a source descriptor, or falls back to a source path or sibling lookup. The outer refresh process runs in a new session with a seven-second hard deadline, a captured-byte ceiling, and bounded whole-process-group kill/drain/reap. Its selector services source input together with stdout/stderr, classifies an early reader close or incomplete input as terminal `126`, closes the writer before cleanup, and never accepts success before the whole frame is delivered. One deferred `SIGHUP`/`SIGTERM`/`SIGQUIT` transaction remains armed until cleanup finishes and only then restores and redelivers the first terminal signal. On Linux, the protected cleanup property is absence of live same-PGID members that can retain resources or act: a bounded byte-oriented `/proc` scan accepts a proven zombie-only group, including a non-UTF-8 process name, while unreadable, iteration-failed, or parse-ambiguous evidence remains live and fails closed. Under the run lock, the runner revalidates its injected bytes immediately before the first prompt/state write. Refresh schema `3` returns exact bridge/runner source-provenance versions, both `anonymous-pipe-memory` transports, non-reopenability, canonical compile filenames, isolated-execution attestation, and each newly published prompt version. The adapter compares those receipts to its stable-bound versions and rereads state/prompts through the pinned run descriptor before rendering guidance. Timestamp-only churn is deliberately excluded because it changes none of the protected properties. A source replacement, owner/group drift, mode change, or content change observed before launch fails before any prompt/state write, while a source-path A→B→A change after stable binding cannot execute the intermediate object.
+- every trusted adapter path applies one descriptor-bound access-policy gate: the repository root, `.codex-tmp`, adapter directory, index, lock, preparation lease, runs root, run, state/prompts, and bridge/runner source parents and files must be owned by the current user, reject group/other write, and carry no Darwin extended or Linux POSIX ACL. The held descriptors are revalidated at the corresponding commit, read, or launch boundary.
+- before prompt refresh, `Stop` opens the repo/run path component-by-component without following links, requires the indexed `run_dir` to be a direct child of the current repo's `.codex-tmp/waited-delivery`, requires exact `state.repo_root` equality, and requires regular no-follow state and prompt files. It accepts either the current user plus mode `0700`, or the exact owned legacy mode `0755`; the latter is tightened to `0700` through the open directory descriptor and revalidated for unchanged device/inode, owner/group, mode, and ACL policy before any artifact read. Every other access policy fails closed. It records the resulting run directory's exact device/inode and POSIX uid/gid/mode.
+- every adapter-to-bridge command—prepare, parent binding, child attachment, child finish, parent reconciliation, and prompt refresh—stable-reads both bridge and runner sources, binds each named entry, object identity, uid/gid/mode, ACL policy, size, and two bounded byte reads plus SHA-256 digest, and revalidates both versions before process launch. It frames those exact bytes with magic, bounded lengths, and digests and sends them through anonymous stdin to a fixed Python `-I -B -S -c` bootstrap after removing Python environment-injection variables. The bootstrap requires exact bytes and EOF before compiling the bridge in memory; the bridge sends the already bound runner bytes through a separately framed anonymous pipe to another fixed bootstrap. Neither layer creates a regular-file source snapshot, inherits a source descriptor, path-executes, reopens a source, or falls back to sibling lookup.
+- each adapter bridge subprocess starts a new session with a hard deadline, a captured-byte ceiling, and bounded whole-process-group cleanup. The leader remains unreaped while cleanup may still signal the group: Linux observes exit with `waitid(..., WNOWAIT)`, while Darwin uses `kqueue` `NOTE_EXIT`. Reap happens only after output pipes drain and the group is proven to contain no live members, so the same numeric PGID cannot be recycled before the final group signal. Darwin uses `libproc` to classify live, zombie-only, and absent membership; unknown evidence fails closed. The refresh selector additionally services source input together with stdout/stderr, classifies an early reader close or incomplete input as terminal `126`, closes the writer before cleanup, and never accepts success before the whole frame is delivered. One deferred `SIGHUP`/`SIGTERM`/`SIGQUIT` transaction remains armed until cleanup finishes and only then restores and redelivers the first terminal signal.
+- under the run lock, the runner revalidates its injected bytes immediately before the first prompt/state write. Refresh schema `3` returns exact bridge/runner source-provenance versions, both `anonymous-pipe-memory` transports, non-reopenability, canonical compile filenames, isolated-execution attestation, and each newly published prompt version. The adapter compares those receipts to its stable-bound versions and rereads state/prompts through the pinned run descriptor before rendering guidance. Timestamp-only churn is deliberately excluded because it changes none of the protected properties. A source replacement, owner/group drift, mode or ACL change, or content change observed before launch fails before any prompt/state write, while a source-path A→B→A change after stable binding cannot execute the intermediate object.
 - `finish-child-active-run` requires the exact attached child id, records the child's terminal status, and preserves the active-run association for parent-owned review
-- `reconcile-active-run` requires that same exact child id and clears the active-run association only when reconciliation finishes cleanly with the required `internal_review` phase and a nonblank attached child identity
+- `reconcile-active-run` requires that same exact child id and, after the bridge returns, reloads and validates the terminal reconciled state through the pinned run-directory descriptor; it clears the active-run association only when that exact state finishes cleanly with the required `internal_review` phase and a nonblank attached child identity
 
 This keeps hooks product-facing and lets the bridge remain product-agnostic.
 
@@ -34,17 +37,21 @@ The adapter stores repo-local state under:
 - `.codex-tmp/waited-delivery-hook-adapter/index.lock`
 - `.codex-tmp/waited-delivery-hook-adapter/prepare-<preparation-id>.lease`
 
-The adapter directory is owner-only `0700`; each newly committed index snapshot,
-transaction lock, and preparation lease is `0600`. Directory name entries are
+The repository root, `.codex-tmp`, and adapter directory are current-user-owned
+directories with no group/other write and no Darwin extended or Linux POSIX
+ACL; the adapter directory is exact `0700`. Each newly committed index
+snapshot, transaction lock, and preparation lease is a current-user-owned
+`0600` regular file with the same ACL exclusion. Directory name entries are
 descriptor-revalidated and parent-directory-fsynced. The files are opened
-descriptor-relative with no-follow semantics. Index reads bind the named entry,
-regular-file object identity, owner/access policy, size, and two bounded byte
-reads. A changed index is written completely to a verified `0600` sibling
-temporary file, fsynced, atomically replaced, and directory-fsynced. Deliberate
-inode replacement at commit is expected; following or overwriting an object
-outside the adapter directory, exposing a newly persisted prompt through the
-umask, partial JSON visibility, and lost cooperative read-modify-write updates
-are the protected properties.
+descriptor-relative with no-follow semantics. Index reads bind the named
+entry, regular-file object identity, owner/access/ACL policy, size, and two
+bounded byte reads. A changed index is written completely to a verified `0600`
+sibling temporary file, fsynced, atomically replaced, and directory-fsynced;
+the parent and final named object are descriptor-revalidated. Deliberate inode
+replacement at commit is expected; following or overwriting an object outside
+the adapter directory, accepting a writable or ACL-extended trust boundary,
+exposing a newly persisted prompt through the umask, partial JSON visibility,
+and lost cooperative read-modify-write updates are the protected properties.
 
 Current records are keyed by `session_id` and include:
 
@@ -103,7 +110,7 @@ When the host shell exposes `CODEX_THREAD_ID`, the adapter treats that as the de
   - regenerates `child-prompt.md` and `parent-prompt.md` through framed anonymous-pipe bridge and runner source delivery before referring the parent back to either file
   - refuses to launch when either named source changes object identity, access policy, size, or content between its initial stable read and final prelaunch revalidation; timestamp-only changes remain benign
   - executes no bridge or runner source path after stable binding, uses fixed Python `-I -B -S -c` bootstraps with Python injection variables removed, requires exact bounded frames plus EOF and SHA-256, and binds schema `3` receipts to source-provenance versions, both `anonymous-pipe-memory` transports, non-reopenability, and canonical compile filenames
-  - supervises that anonymous-pipe-bound refresh in a new session with a seven-second hard timeout, a `256 KiB` combined capture ceiling, and bounded process-group kill/drain/reap; early input rejection or incomplete delivery is terminal `126`; terminal `SIGHUP`, `SIGTERM`, and `SIGQUIT` are deferred until live descendants are gone and pipe ends can be closed; on Linux, proven zombie-only membership is terminal while unknown scan evidence fails closed
+  - supervises that anonymous-pipe-bound refresh in a new session with a seven-second hard timeout, a `256 KiB` combined capture ceiling, and bounded process-group kill/drain/reap; Linux `waitid(..., WNOWAIT)` or Darwin `kqueue` `NOTE_EXIT` observes the leader without reaping it until pipes drain and live group membership is absent; Darwin `libproc` distinguishes live, zombie-only, and absent groups, while unknown evidence fails closed; early input rejection or incomplete delivery is terminal `126`; terminal `SIGHUP`, `SIGTERM`, and `SIGQUIT` are deferred until cleanup completes
   - has the runner revalidate its injected bytes under the run lock immediately before the first prompt/state write, so a bound-content drift failure leaves those persistent artifacts unchanged
   - passes the exact current repo root plus the preflight run-directory device/inode, uid/gid, and mode through the bridge to the runner; the runner revalidates them under its run-level lock and atomically replaces prompt/state files through a pinned run-directory descriptor
   - accepts an exact owned legacy mode `0755` run directory only by tightening the already opened object to `0700` and revalidating its identity; fails closed without following record-provided prompt paths when the run points outside the repo, any run component or state/prompt file is a symlink/non-regular file, `state.repo_root` mismatches, or the pinned run object/access identity changes through a link, ordinary directory replacement, ownership drift, or another mode change
@@ -168,7 +175,7 @@ reopens the index and verifies the exact reservation before activation.
   - replaces an existing association only when its direct repo-local run path, access policy, state, prompts, repo root, and terminal status pass descriptor-bound no-follow validation
   - rejects another pending preparation for the session or the same run path reserved by another session
   - validates the complete prospective schema `3` reservation and worst-case recovery-reason capacity before creating its owner-private `0600` lease
-  - commits `preparing` before calling `waited_delivery_bridge.py prepare-live`, and passes the locked lease descriptor plus a stable preparation UUID through bridge to runner
+  - commits `preparing` before launching stable-bound bridge and runner bytes for `prepare-live` through the isolated two-frame Python `-I -B -S -c` chain, and passes the locked lease descriptor plus a stable preparation UUID through bridge to runner
   - requires the bridge receipt to return the exact reserved `run_dir`, preparation UUID, and runner lease-inheritance attestation
   - validates the reserved run directory and preparation-aware schema `4` or `5` state/prompt artifacts through pinned no-follow descriptors, including exact repo root, run ID, parent session, and preparation UUID; current writes use schema `5`, while schema `4` remains recovery-readable
   - CAS-promotes only the unchanged reservation to `active`, revalidates the run after commit, and removes the exact lease before emitting success JSON
@@ -184,17 +191,17 @@ reopens the index and verifies the exact reservation before activation.
 - `attach-child-active-run`
   - requires `--run-dir` to already belong to one observed session
   - rejects a blank `--child-session-id` without moving the child state to `running`
-  - wraps `attach-child-live` while preserving the session metadata already recorded in the index
+  - runs `attach-child-live` from the same stable-bound bridge/runner bytes while preserving the session metadata already recorded in the index
 - `finish-child-active-run`
   - requires `--run-dir` to already belong to one observed session
   - requires every supplied session/run selector to match the same index record
   - requires `--child-session-id` to exactly match the id recorded at attachment, including terminal replays
-  - wraps `finish-child-live` after `wait` while keeping the association active for parent-owned review
+  - runs `finish-child-live` from the same stable-bound bridge/runner bytes after `wait` while keeping the association active for parent-owned review
 - `reconcile-active-run`
   - requires `--run-dir` to already belong to one observed session
   - requires `--child-session-id` to exactly match the id recorded at attachment
-  - wraps `reconcile-live`
-  - clears the active-run association once the run is terminal and reconciled
+  - runs `reconcile-live` from the same stable-bound bridge/runner bytes
+  - reloads and validates the returned terminal reconciled state through the pinned run-directory descriptor before clearing the active-run association
 - `show-index`
   - prints the current adapter index for debugging
 

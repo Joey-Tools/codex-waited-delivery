@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import pathlib
+import select
 import selectors
 import shlex
 import signal
@@ -2995,6 +2996,232 @@ class _SmokeSignalTransaction:
         return isinstance(exc, _DeferredSmokeTermination)
 
 
+class _UnreapedLeaderObserver:
+    """Observe one session leader without releasing its PID/PGID identity."""
+
+    def __init__(self, pid: int, *, platform: str | None = None) -> None:
+        if pid <= 0:
+            raise UserError("process leader pid must be positive")
+        if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            raise UserError(
+                "process supervision requires the default SIGCHLD disposition"
+            )
+        self.pid = pid
+        self.platform = sys.platform if platform is None else platform
+        self._exited = False
+        self._reaped = False
+        self._kqueue: object | None = None
+        if self.platform == "darwin":
+            required = (
+                "kqueue",
+                "kevent",
+                "KQ_FILTER_PROC",
+                "KQ_NOTE_EXIT",
+                "KQ_EV_ADD",
+                "KQ_EV_ENABLE",
+                "KQ_EV_ONESHOT",
+            )
+            if any(not hasattr(select, name) for name in required):
+                raise UserError(
+                    "Darwin process supervision requires kqueue NOTE_EXIT"
+                )
+            kqueue: object | None = None
+            try:
+                kqueue = select.kqueue()
+                event = select.kevent(
+                    pid,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=(
+                        select.KQ_EV_ADD
+                        | select.KQ_EV_ENABLE
+                        | select.KQ_EV_ONESHOT
+                    ),
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+                observed = kqueue.control([event], 1, 0)
+            except OSError as error:
+                if kqueue is not None:
+                    try:
+                        kqueue.close()  # type: ignore[attr-defined]
+                    except OSError:
+                        pass
+                raise UserError(
+                    "cannot bind Darwin process-exit observation"
+                ) from error
+            self._kqueue = kqueue
+            self._accept_kqueue_events(observed)
+        elif self.platform.startswith("linux"):
+            if not callable(getattr(os, "waitid", None)):
+                raise UserError("Linux process supervision requires waitid")
+        else:
+            raise UserError(
+                f"process supervision is unsupported on platform {self.platform}"
+            )
+
+    def _accept_kqueue_events(self, events: list[object]) -> None:
+        for event in events:
+            if (
+                getattr(event, "ident", None) != self.pid
+                or not (getattr(event, "fflags", 0) & select.KQ_NOTE_EXIT)
+            ):
+                raise UserError(
+                    "Darwin process-exit observation returned an unrelated event"
+                )
+            self._exited = True
+
+    def exited(self) -> bool:
+        if self._reaped:
+            raise UserError("process leader was already reaped")
+        if self._exited:
+            return True
+        if self.platform == "darwin":
+            assert self._kqueue is not None
+            try:
+                events = self._kqueue.control(None, 1, 0)  # type: ignore[attr-defined]
+            except OSError as error:
+                raise UserError(
+                    "cannot inspect Darwin process-exit observation"
+                ) from error
+            self._accept_kqueue_events(events)
+            return self._exited
+        waitid = getattr(os, "waitid")
+        try:
+            result = waitid(
+                os.P_PID,
+                self.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError as error:
+            raise UserError(
+                "process leader was reaped outside its supervisor"
+            ) from error
+        except OSError as error:
+            raise UserError("cannot observe process leader without reaping") from error
+        if result is None:
+            return False
+        if result.si_pid != self.pid:
+            raise UserError("waitid returned an unrelated process leader")
+        self._exited = True
+        return True
+
+    def signal_group(self, signum: int) -> None:
+        if self._reaped:
+            raise UserError("refusing to signal a process group after leader reap")
+        try:
+            os.killpg(self.pid, signum)
+        except ProcessLookupError:
+            pass
+
+    def reap(self, process: subprocess.Popen[bytes]) -> int:
+        if process.pid != self.pid:
+            raise UserError("process leader identity changed before reap")
+        if not self.exited():
+            raise UserError("cannot reap a process leader before observed exit")
+        returncode = process.wait()
+        self._reaped = True
+        self.close()
+        return returncode
+
+    def close(self) -> None:
+        if self._kqueue is None:
+            return
+        kqueue = self._kqueue
+        self._kqueue = None
+        try:
+            kqueue.close()  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+
+class _DarwinProcBSDInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _darwin_process_group_state(
+    pgid: int,
+    *,
+    max_entries: int = PROC_GROUP_SCAN_MAX_ENTRIES,
+) -> LinuxProcessGroupState:
+    if max_entries <= 0:
+        return "unknown"
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        list_group = libproc.proc_listpgrppids
+        list_group.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        list_group.restype = ctypes.c_int
+        pid_info = libproc.proc_pidinfo
+        pid_info.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        pid_info.restype = ctypes.c_int
+        pid_array = (ctypes.c_int * max_entries)()
+        count = list_group(
+            pgid,
+            pid_array,
+            ctypes.sizeof(pid_array),
+        )
+    except (AttributeError, OSError, ValueError):
+        return "unknown"
+    if count < 0 or count >= max_entries:
+        return "unknown"
+    saw_zombie = False
+    for pid in pid_array[:count]:
+        if pid <= 0:
+            return "unknown"
+        info = _DarwinProcBSDInfo()
+        try:
+            size = pid_info(
+                pid,
+                3,
+                0,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+        except (OSError, ValueError):
+            return "unknown"
+        if size == 0:
+            continue
+        if (
+            size != ctypes.sizeof(info)
+            or info.pbi_pid != pid
+            or info.pbi_pgid != pgid
+        ):
+            return "unknown"
+        if info.pbi_status != 5:
+            return "live"
+        saw_zombie = True
+    if saw_zombie:
+        return "zombie-only"
+    return "no-members"
+
+
 def _parse_linux_proc_stat(raw: bytes) -> tuple[str, int] | None:
     closing_parenthesis = raw.rfind(b")")
     if closing_parenthesis <= 0:
@@ -3059,6 +3286,11 @@ def _process_group_exists(
     proc_root: pathlib.Path = pathlib.Path("/proc"),
     platform: str = sys.platform,
 ) -> bool:
+    if platform == "darwin":
+        return _darwin_process_group_state(pgid) not in {
+            "zombie-only",
+            "no-members",
+        }
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -3091,11 +3323,8 @@ def _process_group_is_addressable(pgid: int) -> bool:
     return True
 
 
-def _kill_process_group(pgid: int) -> None:
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+def _kill_process_group(observer: _UnreapedLeaderObserver) -> None:
+    observer.signal_group(signal.SIGKILL)
 
 
 def _drain_process_output_once(
@@ -3187,13 +3416,14 @@ def _close_smoke_input(
 
 def _cleanup_smoke_process(
     process: subprocess.Popen[bytes],
+    observer: _UnreapedLeaderObserver,
     selector: selectors.BaseSelector,
     captures: dict[str, bytearray],
     *,
     cleanup_timeout: float,
     max_capture_bytes: int,
 ) -> None:
-    _kill_process_group(process.pid)
+    _kill_process_group(observer)
     deadline = time.monotonic() + cleanup_timeout
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
@@ -3204,20 +3434,24 @@ def _cleanup_smoke_process(
             capture=False,
             max_capture_bytes=max_capture_bytes,
         )
-        returncode = process.poll()
         if (
-            returncode is not None
-            and not _process_group_is_addressable(process.pid)
+            observer.exited()
+            and not _process_group_exists(process.pid)
             and not selector.get_map()
         ):
+            observer.reap(process)
             return
     reasons: list[str] = []
-    if process.poll() is None:
+    leader_exited = observer.exited()
+    group_addressable = _process_group_exists(process.pid)
+    if not leader_exited:
         reasons.append("failed to reap smoke process")
-    if _process_group_is_addressable(process.pid):
+    if group_addressable:
         reasons.append("failed to prove smoke process-group disappearance")
     if selector.get_map():
         reasons.append("failed to drain smoke process pipes")
+    if leader_exited:
+        observer.reap(process)
     raise UserError("; ".join(reasons) or "smoke process cleanup timed out")
 
 
@@ -3374,6 +3608,15 @@ def _run_bounded_smoke_process_supervised(
                 f"cannot start fallback readiness smoke: {error}"
             ) from error
         try:
+            observer = _UnreapedLeaderObserver(process.pid)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        try:
             for child_read_stream in child_read_streams:
                 try:
                     child_read_stream.close()
@@ -3438,8 +3681,7 @@ def _run_bounded_smoke_process_supervised(
                     )
                     break
                 signal_transaction.raise_if_pending()
-                returncode = process.poll()
-                if returncode is None:
+                if not observer.exited():
                     continue
                 if input_bytes is not None and input_offset != len(input_bytes):
                     failure = (
@@ -3466,6 +3708,7 @@ def _run_bounded_smoke_process_supervised(
                 _close_smoke_input(selector, input_stream)
                 _cleanup_smoke_process(
                     process,
+                    observer,
                     selector,
                     captures,
                     cleanup_timeout=cleanup_timeout,
@@ -3484,9 +3727,8 @@ def _run_bounded_smoke_process_supervised(
                     stderr=stderr,
                 )
 
-            returncode = process.poll()
-            if returncode is None:
-                raise UserError("smoke process reached an impossible terminal state")
+            returncode = observer.reap(process)
+            cleanup_complete = True
             return subprocess.CompletedProcess(
                 command,
                 returncode,
@@ -3498,6 +3740,7 @@ def _run_bounded_smoke_process_supervised(
                 _close_smoke_input(selector, input_stream)
                 _cleanup_smoke_process(
                     process,
+                    observer,
                     selector,
                     captures,
                     cleanup_timeout=cleanup_timeout,
@@ -3505,6 +3748,7 @@ def _run_bounded_smoke_process_supervised(
                 )
             raise
         finally:
+            observer.close()
             _close_smoke_input(selector, input_stream)
             if process.stdout is not None:
                 process.stdout.close()

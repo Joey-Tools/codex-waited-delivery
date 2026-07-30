@@ -79,6 +79,33 @@ extended ACL. Before fallback-smoke `Popen`, the runner revalidates the bound
 run, lock, state, and prompt versions; a missing, replaced, unreadable,
 content-changed, or access-policy-changed object fails before process start.
 
+The hook adapter applies the same access-policy property to every object it
+trusts: the repository root, `.codex-tmp`, adapter directory, index, lock,
+preparation lease, runs root, run directory, state and prompt artifacts, and
+the bridge/runner source parent directories and files must be owned by the
+current user, reject group/other write, and carry no Darwin extended or Linux
+POSIX ACL. No-follow descriptor walks bind each parent, name entry, and opened
+object; policy is revalidated on the held descriptors at the operation's
+commit or launch boundary.
+
+Every adapter-to-bridge operation—prepare, parent binding, child attachment,
+child finish, parent reconciliation, and prompt refresh—stable-binds the
+bridge and runner source objects and exact bytes before launch. The adapter
+then sends a bounded two-source frame to a fixed Python `-I -B -S -c`
+bootstrap, which compiles the bridge in memory; that bridge sends the already
+bound runner bytes through a second bounded frame to another isolated
+bootstrap. Adapter-driven execution never path-executes or reopens either
+source after binding.
+
+Runner fallback smoke, adapter bridge supervision, and the subprocess test
+support keep the process-group leader unreaped while cleanup is still allowed
+to signal its group. Linux observes leader exit with `waitid(..., WNOWAIT)`;
+Darwin uses `kqueue` `NOTE_EXIT`. The leader is reaped only after output pipes
+are drained and the group is proven to have no live members, so its numeric
+PGID cannot be recycled before the last group signal. Darwin classifies
+live, zombie-only, and absent groups through `libproc`; unknown evidence fails
+closed.
+
 `prepare-active-run` uses a durable two-phase reservation instead of keeping
 one index transaction open across the bridge. Phase one writes an index-schema
 `3` `preparing` record with the exact session, run ID/path, preparation UUID,
@@ -108,7 +135,10 @@ misreading `cleanup_pending` as active. Any present, partial, mismatched, tamper
 or unprovable run remains recovery-fenced. An existing indexed run is likewise
 retired only after descriptor-bound terminal-state validation. Use
 `recover-active-run` with `doctor`, `resume`, or `clear-absent`; no recovery
-path recursively deletes a run directory.
+path recursively deletes a run directory. `reconcile-active-run` also reloads
+and validates the terminal reconciled state through its pinned run-directory
+descriptor after the bridge returns; only that exact state may authorize
+clearing the index association.
 
 See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for the optional review
 compatibility/diagnostic dependency used by external lane-readiness smoke.
@@ -119,3 +149,6 @@ compatibility/diagnostic dependency used by external lane-readiness smoke.
 python3 -m py_compile skills/waited-delivery-compat/scripts/*.py
 python3 -m unittest discover -s skills/waited-delivery-compat/tests
 ```
+
+CI runs the compatibility suite on both Ubuntu and macOS with Python `3.9`
+and the current supported Python.

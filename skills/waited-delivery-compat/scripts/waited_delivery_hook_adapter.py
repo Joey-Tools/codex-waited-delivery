@@ -7,12 +7,15 @@ from __future__ import annotations
 import argparse
 import copy
 import contextlib
+import ctypes
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import pathlib
+import select
 import selectors
 import shlex
 import shutil
@@ -35,6 +38,7 @@ INDEX_LOCK_FILE_NAME = "index.lock"
 INDEX_MAX_BYTES = 4 * 1024 * 1024
 INDEX_DIRECTORY_MODE = 0o700
 INDEX_FILE_MODE = 0o600
+UNTRUSTED_WRITE_MASK = stat.S_IWGRP | stat.S_IWOTH
 CURRENT_THREAD_ENV = "CODEX_THREAD_ID"
 HOOK_DEBUG_ENV = "WAITED_DELIVERY_HOOK_DEBUG"
 HOOK_COMMANDS = {"user-prompt-submit-hook", "stop-hook"}
@@ -446,6 +450,232 @@ class _RefreshSignalTransaction:
         return isinstance(exc, _DeferredRefreshTermination)
 
 
+class _UnreapedLeaderObserver:
+    """Observe one session leader without releasing its PID/PGID identity."""
+
+    def __init__(self, pid: int, *, platform: str | None = None) -> None:
+        if pid <= 0:
+            raise UserError("process leader pid must be positive")
+        if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            raise UserError(
+                "process supervision requires the default SIGCHLD disposition"
+            )
+        self.pid = pid
+        self.platform = sys.platform if platform is None else platform
+        self._exited = False
+        self._reaped = False
+        self._kqueue: object | None = None
+        if self.platform == "darwin":
+            required = (
+                "kqueue",
+                "kevent",
+                "KQ_FILTER_PROC",
+                "KQ_NOTE_EXIT",
+                "KQ_EV_ADD",
+                "KQ_EV_ENABLE",
+                "KQ_EV_ONESHOT",
+            )
+            if any(not hasattr(select, name) for name in required):
+                raise UserError(
+                    "Darwin process supervision requires kqueue NOTE_EXIT"
+                )
+            kqueue: object | None = None
+            try:
+                kqueue = select.kqueue()
+                event = select.kevent(
+                    pid,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=(
+                        select.KQ_EV_ADD
+                        | select.KQ_EV_ENABLE
+                        | select.KQ_EV_ONESHOT
+                    ),
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+                observed = kqueue.control([event], 1, 0)
+            except OSError as error:
+                if kqueue is not None:
+                    try:
+                        kqueue.close()  # type: ignore[attr-defined]
+                    except OSError:
+                        pass
+                raise UserError(
+                    "cannot bind Darwin process-exit observation"
+                ) from error
+            self._kqueue = kqueue
+            self._accept_kqueue_events(observed)
+        elif self.platform.startswith("linux"):
+            if not callable(getattr(os, "waitid", None)):
+                raise UserError("Linux process supervision requires waitid")
+        else:
+            raise UserError(
+                f"process supervision is unsupported on platform {self.platform}"
+            )
+
+    def _accept_kqueue_events(self, events: list[object]) -> None:
+        for event in events:
+            if (
+                getattr(event, "ident", None) != self.pid
+                or not (getattr(event, "fflags", 0) & select.KQ_NOTE_EXIT)
+            ):
+                raise UserError(
+                    "Darwin process-exit observation returned an unrelated event"
+                )
+            self._exited = True
+
+    def exited(self) -> bool:
+        if self._reaped:
+            raise UserError("process leader was already reaped")
+        if self._exited:
+            return True
+        if self.platform == "darwin":
+            assert self._kqueue is not None
+            try:
+                events = self._kqueue.control(None, 1, 0)  # type: ignore[attr-defined]
+            except OSError as error:
+                raise UserError(
+                    "cannot inspect Darwin process-exit observation"
+                ) from error
+            self._accept_kqueue_events(events)
+            return self._exited
+        waitid = getattr(os, "waitid")
+        try:
+            result = waitid(
+                os.P_PID,
+                self.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError as error:
+            raise UserError(
+                "process leader was reaped outside its supervisor"
+            ) from error
+        except OSError as error:
+            raise UserError("cannot observe process leader without reaping") from error
+        if result is None:
+            return False
+        if result.si_pid != self.pid:
+            raise UserError("waitid returned an unrelated process leader")
+        self._exited = True
+        return True
+
+    def signal_group(self, signum: int) -> None:
+        if self._reaped:
+            raise UserError("refusing to signal a process group after leader reap")
+        try:
+            os.killpg(self.pid, signum)
+        except ProcessLookupError:
+            pass
+
+    def reap(self, process: subprocess.Popen[bytes]) -> int:
+        if process.pid != self.pid:
+            raise UserError("process leader identity changed before reap")
+        if not self.exited():
+            raise UserError("cannot reap a process leader before observed exit")
+        returncode = process.wait()
+        self._reaped = True
+        self.close()
+        return returncode
+
+    def close(self) -> None:
+        if self._kqueue is None:
+            return
+        kqueue = self._kqueue
+        self._kqueue = None
+        try:
+            kqueue.close()  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+
+class _DarwinProcBSDInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _darwin_refresh_process_group_state(
+    pgid: int,
+    *,
+    max_entries: int = REFRESH_PROC_GROUP_SCAN_MAX_ENTRIES,
+) -> LinuxRefreshProcessGroupState:
+    if max_entries <= 0:
+        return "unknown"
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        list_group = libproc.proc_listpgrppids
+        list_group.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        list_group.restype = ctypes.c_int
+        pid_info = libproc.proc_pidinfo
+        pid_info.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        pid_info.restype = ctypes.c_int
+        pid_array = (ctypes.c_int * max_entries)()
+        count = list_group(
+            pgid,
+            pid_array,
+            ctypes.sizeof(pid_array),
+        )
+    except (AttributeError, OSError, ValueError):
+        return "unknown"
+    if count < 0 or count >= max_entries:
+        return "unknown"
+    saw_zombie = False
+    for pid in pid_array[:count]:
+        if pid <= 0:
+            return "unknown"
+        info = _DarwinProcBSDInfo()
+        try:
+            size = pid_info(
+                pid,
+                3,
+                0,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+        except (OSError, ValueError):
+            return "unknown"
+        if size == 0:
+            continue
+        if (
+            size != ctypes.sizeof(info)
+            or info.pbi_pid != pid
+            or info.pbi_pgid != pgid
+        ):
+            return "unknown"
+        if info.pbi_status != 5:
+            return "live"
+        saw_zombie = True
+    if saw_zombie:
+        return "zombie-only"
+    return "no-members"
+
+
 def _parse_linux_proc_stat(raw: bytes) -> tuple[str, int] | None:
     closing_parenthesis = raw.rfind(b")")
     if closing_parenthesis <= 0:
@@ -511,6 +741,11 @@ def _refresh_process_group_has_live_members(
     platform: str = sys.platform,
     deadline: float | None = None,
 ) -> bool:
+    if platform == "darwin":
+        return _darwin_refresh_process_group_state(pgid) not in {
+            "zombie-only",
+            "no-members",
+        }
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -539,11 +774,8 @@ def _refresh_process_group_has_live_members(
     return True
 
 
-def _kill_refresh_process_group(pgid: int) -> None:
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+def _kill_refresh_process_group(observer: _UnreapedLeaderObserver) -> None:
+    observer.signal_group(signal.SIGKILL)
 
 
 def _drain_refresh_output_once(
@@ -638,13 +870,14 @@ def _close_refresh_input(
 
 def _cleanup_refresh_process(
     process: subprocess.Popen[bytes],
+    observer: _UnreapedLeaderObserver,
     selector: selectors.BaseSelector,
     captures: dict[str, bytearray],
     *,
     cleanup_timeout: float,
     max_capture_bytes: int,
 ) -> None:
-    _kill_refresh_process_group(process.pid)
+    _kill_refresh_process_group(observer)
     deadline = time.monotonic() + cleanup_timeout
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
@@ -655,23 +888,27 @@ def _cleanup_refresh_process(
             capture=False,
             max_capture_bytes=max_capture_bytes,
         )
-        returncode = process.poll()
         if (
-            returncode is not None
+            observer.exited()
             and not _refresh_process_group_has_live_members(
                 process.pid,
                 deadline=deadline,
             )
             and not selector.get_map()
         ):
+            observer.reap(process)
             return
     reasons: list[str] = []
-    if process.poll() is None:
+    leader_exited = observer.exited()
+    group_has_live_members = _refresh_process_group_has_live_members(process.pid)
+    if not leader_exited:
         reasons.append("failed to reap prompt refresh process")
-    if _refresh_process_group_has_live_members(process.pid):
+    if group_has_live_members:
         reasons.append("failed to eliminate live prompt refresh process-group members")
     if selector.get_map():
         reasons.append("failed to drain prompt refresh process pipes")
+    if leader_exited:
+        observer.reap(process)
     raise UserError("; ".join(reasons) or "prompt refresh cleanup timed out")
 
 
@@ -764,6 +1001,15 @@ def _run_bounded_refresh_process_supervised(
         except OSError as error:
             raise UserError(f"cannot start prompt refresh: {error}") from error
         try:
+            observer = _UnreapedLeaderObserver(process.pid)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        try:
             if process.stdout is None or process.stderr is None:
                 raise UserError("prompt refresh process pipes were not created")
             for name, stream in (
@@ -820,8 +1066,7 @@ def _run_bounded_refresh_process_supervised(
                     )
                     break
                 signal_transaction.raise_if_pending()
-                returncode = process.poll()
-                if returncode is None:
+                if not observer.exited():
                     continue
                 if input_bytes is not None and input_offset != len(input_bytes):
                     failure = (
@@ -852,6 +1097,7 @@ def _run_bounded_refresh_process_supervised(
                 _close_refresh_input(selector, process.stdin)
                 _cleanup_refresh_process(
                     process,
+                    observer,
                     selector,
                     captures,
                     cleanup_timeout=cleanup_timeout,
@@ -870,11 +1116,8 @@ def _run_bounded_refresh_process_supervised(
                     stderr=stderr,
                 )
 
-            returncode = process.poll()
-            if returncode is None:
-                raise UserError(
-                    "prompt refresh process reached an impossible terminal state"
-                )
+            returncode = observer.reap(process)
+            cleanup_complete = True
             return subprocess.CompletedProcess(
                 command,
                 returncode,
@@ -886,6 +1129,7 @@ def _run_bounded_refresh_process_supervised(
                 _close_refresh_input(selector, process.stdin)
                 _cleanup_refresh_process(
                     process,
+                    observer,
                     selector,
                     captures,
                     cleanup_timeout=cleanup_timeout,
@@ -893,6 +1137,7 @@ def _run_bounded_refresh_process_supervised(
                 )
             raise
         finally:
+            observer.close()
             _close_refresh_input(selector, process.stdin)
             if process.stdout is not None:
                 process.stdout.close()
@@ -900,10 +1145,6 @@ def _run_bounded_refresh_process_supervised(
                 process.stderr.close()
     finally:
         selector.close()
-
-
-def _bridge_command(*args: str) -> list[str]:
-    return [sys.executable, str(BRIDGE_PATH), *args]
 
 
 def _bridge_json_payload(
@@ -925,7 +1166,13 @@ def _bridge_json_payload(
 
 
 def _run_bridge_json(*args: str) -> dict[str, object]:
-    return _bridge_json_payload(_run(_bridge_command(*args)))
+    with _verified_refresh_launch_sources() as sources:
+        return _bridge_json_payload(
+            _run_bound_bridge_process(
+                sources,
+                *args,
+            )
+        )
 
 
 def _run_bridge_json_with_lease(
@@ -934,20 +1181,24 @@ def _run_bridge_json_with_lease(
 ) -> dict[str, object]:
     if lease_fd < 0:
         raise RunSafetyError("preparation lease fd must be nonnegative")
-    return _bridge_json_payload(
-        _run(
-            _bridge_command(
+    with _verified_refresh_launch_sources() as sources:
+        return _bridge_json_payload(
+            _run_bound_bridge_process(
+                sources,
                 *args,
                 "--preparation-lease-fd",
                 str(lease_fd),
+                pass_fds=(lease_fd,),
             ),
-            pass_fds=(lease_fd,),
         )
-    )
 
 
 def _run_bridge_passthrough(*args: str) -> int:
-    completed = _run(_bridge_command(*args))
+    with _verified_refresh_launch_sources() as sources:
+        completed = _run_bound_bridge_process(
+            sources,
+            *args,
+        )
     if completed.stdout:
         print(completed.stdout, end="")
     if completed.returncode != 0 and completed.stderr:
@@ -1099,11 +1350,11 @@ def _open_or_create_directory_at(
             or not _same_object(descriptor_stat, named_stat)
         ):
             raise RunSafetyError(f"adapter index directory identity mismatch: {name}")
+        _require_owned_nonwritable_directory(
+            directory_fd,
+            label=f"adapter index directory {name}",
+        )
         if owner_private:
-            if descriptor_stat.st_uid != os.geteuid():
-                raise RunSafetyError(
-                    f"adapter index directory is not owned by the current user: {name}"
-                )
             if created or stat.S_IMODE(descriptor_stat.st_mode) != mode:
                 os.fchmod(directory_fd, mode)
             descriptor_after = os.fstat(directory_fd)
@@ -1119,6 +1370,10 @@ def _open_or_create_directory_at(
                 raise RunSafetyError(
                     f"adapter index directory is not owner-private: {name}"
                 )
+            _require_no_extended_acl(
+                directory_fd,
+                label=f"adapter index directory {name}",
+            )
         try:
             os.fsync(parent_fd)
         except OSError as error:
@@ -1146,6 +1401,10 @@ def _open_or_create_directory_at(
             raise RunSafetyError(
                 f"adapter index directory changed while persisting its entry: {name}"
             )
+        _require_owned_nonwritable_directory(
+            directory_fd,
+            label=f"adapter index directory {name}",
+        )
         return directory_fd
     except Exception:
         os.close(directory_fd)
@@ -1160,6 +1419,10 @@ def _open_index_directories(
     adapter_fd: int | None = None
     try:
         repo_fd = _open_absolute_directory(repo_root)
+        _require_owned_nonwritable_directory(
+            repo_fd,
+            label="repository root",
+        )
         codex_tmp_fd = _open_or_create_directory_at(
             repo_fd,
             ".codex-tmp",
@@ -1188,6 +1451,22 @@ def _revalidate_index_directories(
     codex_tmp_fd: int,
     adapter_fd: int,
 ) -> None:
+    _require_owned_nonwritable_directory(
+        repo_fd,
+        label="repository root",
+    )
+    _bound_directory_identity(
+        repo_fd,
+        ".codex-tmp",
+        codex_tmp_fd,
+        label="adapter .codex-tmp parent",
+    )
+    _bound_directory_identity(
+        codex_tmp_fd,
+        "waited-delivery-hook-adapter",
+        adapter_fd,
+        label="adapter index directory",
+    )
     codex_tmp_stat = os.fstat(codex_tmp_fd)
     named_codex_tmp = os.stat(
         ".codex-tmp",
@@ -1272,8 +1551,19 @@ def _revalidate_index_lock(adapter_fd: int, lock_fd: int) -> None:
         or not _same_object(descriptor_stat, named_stat)
         or descriptor_stat.st_uid != os.geteuid()
         or stat.S_IMODE(descriptor_stat.st_mode) != INDEX_FILE_MODE
+        or (
+            descriptor_stat.st_uid,
+            descriptor_stat.st_gid,
+            stat.S_IMODE(descriptor_stat.st_mode),
+        )
+        != (
+            named_stat.st_uid,
+            named_stat.st_gid,
+            stat.S_IMODE(named_stat.st_mode),
+        )
     ):
         raise RunSafetyError("adapter index lock identity or access policy mismatch")
+    _require_no_extended_acl(lock_fd, label="adapter index lock")
 
 
 def _pread_index_bytes(file_fd: int) -> bytes:
@@ -1327,6 +1617,7 @@ def _read_index_bytes_at(
             raise RunSafetyError(
                 "adapter index must be an owned, non-writable-by-others regular file"
             )
+        _require_no_extended_acl(file_fd, label="adapter index")
         first_content = _pread_index_bytes(file_fd)
         middle = os.fstat(file_fd)
         second_content = _pread_index_bytes(file_fd)
@@ -1362,6 +1653,7 @@ def _read_index_bytes_at(
                 "adapter index identity, access policy, size, or content changed "
                 "while read"
             )
+        _require_no_extended_acl(file_fd, label="adapter index")
         return (
             second_content,
             IndexFileVersion(
@@ -1448,6 +1740,10 @@ def _atomic_save_index_at(
                 "adapter index temporary file failed identity, access, or "
                 "content validation"
             )
+        _require_no_extended_acl(
+            temporary_fd,
+            label="adapter index temporary file",
+        )
         current = _read_index_bytes_at(adapter_fd)
         current_version = None if current is None else current[1]
         if current_version != expected_version:
@@ -1793,6 +2089,91 @@ def _open_directory_at(parent_fd: int, name: str) -> int:
     return os.open(name, _directory_open_flags(), dir_fd=parent_fd)
 
 
+def _descriptor_has_extended_acl(file_fd: int, *, label: str) -> bool:
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        acl_get_fd_np = libc.acl_get_fd_np
+        acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        acl_get_fd_np.restype = ctypes.c_void_p
+        acl_free = libc.acl_free
+        acl_free.argtypes = [ctypes.c_void_p]
+        acl_free.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        acl = acl_get_fd_np(file_fd, 0x00000100)
+        if not acl:
+            error_number = ctypes.get_errno()
+            if error_number in {
+                errno.ENOENT,
+                getattr(errno, "ENODATA", errno.ENOENT),
+                errno.ENOTSUP,
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+            }:
+                return False
+            raise RunSafetyError(f"{label} extended ACL cannot be inspected safely")
+        if acl_free(acl) != 0:
+            raise RunSafetyError(f"{label} extended ACL inspection cleanup failed")
+        return True
+    if sys.platform.startswith("linux"):
+        getxattr = getattr(os, "getxattr", None)
+        if getxattr is None:
+            raise RunSafetyError(
+                f"{label} POSIX ACL inspection is unavailable on this runtime"
+            )
+        for attribute in (
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+        ):
+            try:
+                getxattr(file_fd, attribute)
+            except OSError as error:
+                if error.errno in {
+                    getattr(errno, "ENODATA", -1),
+                    getattr(errno, "ENOATTR", -1),
+                    errno.ENOTSUP,
+                    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+                }:
+                    continue
+                raise RunSafetyError(
+                    f"{label} POSIX ACL cannot be inspected safely"
+                ) from error
+            except (TypeError, ValueError) as error:
+                raise RunSafetyError(
+                    f"{label} POSIX ACL cannot be inspected descriptor-relatively"
+                ) from error
+            return True
+        return False
+    raise RunSafetyError(
+        f"{label} ACL inspection is unsupported on platform {sys.platform}"
+    )
+
+
+def _require_no_extended_acl(file_fd: int, *, label: str) -> None:
+    if _descriptor_has_extended_acl(file_fd, label=label):
+        raise RunSafetyError(f"{label} must not carry a named or extended ACL")
+
+
+def _require_owned_nonwritable_directory(
+    directory_fd: int,
+    *,
+    label: str,
+) -> RunDirectoryIdentity:
+    try:
+        directory_stat = os.fstat(directory_fd)
+    except OSError as error:
+        raise RunSafetyError(f"{label} cannot be inspected safely") from error
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise RunSafetyError(f"{label} must be a directory")
+    identity = _run_directory_identity(directory_stat)
+    if identity.uid != os.geteuid():
+        raise RunSafetyError(f"{label} must be owned by the current user")
+    if identity.mode & UNTRUSTED_WRITE_MASK:
+        raise RunSafetyError(
+            f"{label} must not be writable by group or other users"
+        )
+    _require_no_extended_acl(directory_fd, label=label)
+    return identity
+
+
 def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
@@ -1815,7 +2196,10 @@ def _bound_directory_identity(
         or not _same_object(descriptor_stat, named_stat)
     ):
         raise RunSafetyError(f"{label} directory binding changed")
-    descriptor_identity = _run_directory_identity(descriptor_stat)
+    descriptor_identity = _require_owned_nonwritable_directory(
+        directory_fd,
+        label=label,
+    )
     if descriptor_identity != _run_directory_identity(named_stat):
         raise RunSafetyError(f"{label} directory access identity changed")
     return descriptor_identity
@@ -1898,9 +2282,36 @@ def _open_stop_run_directory(repo_root: pathlib.Path, run_name: str) -> int:
     codex_tmp_fd: int | None = None
     runs_fd: int | None = None
     try:
+        _require_owned_nonwritable_directory(
+            repo_fd,
+            label="repository root",
+        )
         codex_tmp_fd = _open_directory_at(repo_fd, ".codex-tmp")
+        _bound_directory_identity(
+            repo_fd,
+            ".codex-tmp",
+            codex_tmp_fd,
+            label="run .codex-tmp parent",
+        )
         runs_fd = _open_directory_at(codex_tmp_fd, RUNS_DIR_NAME)
-        return _open_directory_at(runs_fd, run_name)
+        _bound_directory_identity(
+            codex_tmp_fd,
+            RUNS_DIR_NAME,
+            runs_fd,
+            label="waited-delivery parent",
+        )
+        run_fd = _open_directory_at(runs_fd, run_name)
+        try:
+            _bound_directory_identity(
+                runs_fd,
+                run_name,
+                run_fd,
+                label="active run",
+            )
+        except Exception:
+            os.close(run_fd)
+            raise
+        return run_fd
     except OSError as error:
         raise RunSafetyError(
             "active run path contains a symlink, non-directory, or missing component"
@@ -1943,6 +2354,19 @@ def _read_stop_regular_artifact(
             or not _same_object(before, named_before)
         ):
             raise RunSafetyError(f"active run artifact must be a regular file: {name}")
+        if before.st_uid != os.geteuid() or named_before.st_uid != os.geteuid():
+            raise RunSafetyError(
+                f"active run artifact must be owned by the current user: {name}"
+            )
+        if (
+            stat.S_IMODE(before.st_mode) & UNTRUSTED_WRITE_MASK
+            or stat.S_IMODE(named_before.st_mode) & UNTRUSTED_WRITE_MASK
+        ):
+            raise RunSafetyError(
+                "active run artifact must not be writable by group or other "
+                f"users: {name}"
+            )
+        _require_no_extended_acl(file_fd, label=f"active run artifact {name}")
         if before.st_size > max_bytes:
             raise RunSafetyError(f"active run artifact exceeds byte limit: {name}")
         expected_access = (
@@ -2005,6 +2429,7 @@ def _read_stop_regular_artifact(
                 f"active run artifact identity, access, size, or content changed "
                 f"while read: {name}"
             )
+        _require_no_extended_acl(file_fd, label=f"active run artifact {name}")
         return StopArtifactRead(
             content=second_content,
             version=StopArtifactVersion(
@@ -2054,6 +2479,10 @@ def _read_stop_absolute_regular_artifact(
             f"absolute artifact parent cannot be opened without following links: {path}"
         ) from error
     try:
+        _require_owned_nonwritable_directory(
+            parent_fd,
+            label=f"absolute artifact parent {path.parent}",
+        )
         return _read_stop_regular_artifact(
             parent_fd,
             path.name,
@@ -2188,16 +2617,8 @@ def _run_refresh_bridge_json(
     sources: RefreshLaunchSources,
     *args: str,
 ) -> dict[str, object]:
-    _revalidate_refresh_launch_sources(sources)
-    command = [
-        sys.executable,
-        "-I",
-        "-B",
-        "-S",
-        "-c",
-        SOURCE_PIPE_BOOTSTRAP,
-        str(BRIDGE_PATH),
-        str(RUNNER_PATH),
+    completed = _run_bound_bridge_process(
+        sources,
         "refresh-prompts-live",
         "--published-bridge-path",
         str(BRIDGE_PATH),
@@ -2212,14 +2633,33 @@ def _run_refresh_bridge_json(
             sources.runner.source_version,
         ),
         *args,
+    )
+    return _bridge_json_payload(completed)
+
+
+def _run_bound_bridge_process(
+    sources: RefreshLaunchSources,
+    *args: str,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    _revalidate_refresh_launch_sources(sources)
+    command = [
+        sys.executable,
+        "-I",
+        "-B",
+        "-S",
+        "-c",
+        SOURCE_PIPE_BOOTSTRAP,
+        str(BRIDGE_PATH),
+        str(RUNNER_PATH),
+        *args,
     ]
-    completed = _run_bounded_refresh_process(
+    return _run_bounded_refresh_process(
         command,
-        pass_fds=(),
+        pass_fds=pass_fds,
         env=_isolated_python_environment(),
         input_bytes=_refresh_source_frame(sources),
     )
-    return _bridge_json_payload(completed)
 
 
 def _stop_artifact_version_from_payload(
@@ -2291,6 +2731,7 @@ def _validate_stop_run_state_descriptor(
     pinned = os.fstat(run_fd)
     if not stat.S_ISDIR(pinned.st_mode):
         raise RunSafetyError("active run path must end in a directory")
+    _require_no_extended_acl(run_fd, label="active run directory")
     pinned_identity = _run_directory_identity(pinned)
     if expected_identity is not None:
         if (
@@ -2362,6 +2803,7 @@ def _validate_stop_run_state_descriptor(
             )
     finally:
         os.close(current_fd)
+    _require_no_extended_acl(run_fd, label="active run directory")
     return cast(dict[str, object], payload), pinned_identity
 
 
@@ -2398,16 +2840,6 @@ def _load_stop_run_state(
         os.close(run_fd)
         raise
     return run_dir, state, run_identity, run_fd
-
-
-def _load_run_state(run_dir_str: str) -> dict[str, object] | None:
-    state_path = pathlib.Path(run_dir_str).resolve() / "state.json"
-    if not state_path.is_file():
-        return None
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        return None
-    return cast(dict[str, object], payload)
 
 
 def _refresh_recovery_prompts(
@@ -2985,6 +3417,7 @@ def _validate_preparation_lease_fd(
         raise RunSafetyError(
             "preparation lease identity, access policy, or content changed"
         )
+    _require_no_extended_acl(lease_fd, label="preparation lease")
 
 
 def _create_preparation_lease(
@@ -3293,6 +3726,10 @@ def _expected_run_entry_presence(
     try:
         try:
             repo_fd = _open_absolute_directory(repo_root)
+            _require_owned_nonwritable_directory(
+                repo_fd,
+                label="repository root",
+            )
             codex_tmp_fd = _open_directory_at(repo_fd, ".codex-tmp")
         except OSError as error:
             raise RunSafetyError(
@@ -4589,8 +5026,12 @@ def _reconcile_active_run(args: argparse.Namespace) -> int:
             args.child_session_id,
         ]
         payload = _run_bridge_json(*bridge_args)
-        state = _load_run_state(args.run_dir)
-        if state is not None and _run_is_terminal(state):
+        _run_dir, state, _run_identity, run_fd = _load_stop_run_state(
+            repo_root,
+            args.run_dir,
+        )
+        os.close(run_fd)
+        if _run_is_terminal(state):
             _complete_session_record(record, updated_at=_utc_now())
         else:
             record["run_dir"] = args.run_dir

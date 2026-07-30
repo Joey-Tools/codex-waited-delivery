@@ -2975,11 +2975,12 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                         return process
                 except FileNotFoundError:
                     pass
-                if process.poll() is not None:
-                    break
                 time.sleep(0.01)
-            process.kill()
-            process.communicate(timeout=5)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
             self.fail("smoke helper did not close its prompt reader")
 
         with module._anonymous_smoke_prompt_pipe() as (
@@ -3274,6 +3275,91 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(state["orchestration"]["child_status"], "completed")
         self.assertEqual(state["fallback_readiness_smoke"]["status"], "passed")
         self.assertEqual(state["fallback_readiness_smoke"]["sample"], "READY")
+
+    def test_smoke_cleanup_keeps_leader_unreaped_until_group_absence(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        events: list[str] = []
+
+        class FakeProcess:
+            pid = 719
+
+        class FakeObserver:
+            reaped = False
+
+            def signal_group(self, signum: int) -> None:
+                if self.reaped:
+                    raise AssertionError("signal occurred after leader reap")
+                self_outer.assertEqual(signum, signal.SIGKILL)
+                events.append("signal")
+
+            def exited(self) -> bool:
+                if self.reaped:
+                    raise AssertionError("exit probe occurred after leader reap")
+                events.append("observe-exit")
+                return True
+
+            def reap(self, process) -> int:
+                if self.reaped:
+                    raise AssertionError("leader was reaped twice")
+                self_outer.assertEqual(process.pid, 719)
+                events.append("reap")
+                self.reaped = True
+                return 0
+
+        class FakeSelector:
+            def get_map(self):
+                return {}
+
+        self_outer = self
+        observer = FakeObserver()
+
+        def group_exists(pgid: int) -> bool:
+            if observer.reaped:
+                raise AssertionError("group probe occurred after leader reap")
+            self.assertEqual(pgid, 719)
+            events.append("prove-group-absence")
+            return False
+
+        with (
+            mock.patch.object(module, "_drain_process_output_once"),
+            mock.patch.object(
+                module,
+                "_process_group_exists",
+                side_effect=group_exists,
+            ),
+        ):
+            module._cleanup_smoke_process(
+                FakeProcess(),
+                observer,
+                FakeSelector(),
+                {"stdout": bytearray(), "stderr": bytearray()},
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+            )
+
+        self.assertEqual(
+            events,
+            ["signal", "observe-exit", "prove-group-absence", "reap"],
+        )
+
+    def test_smoke_observer_refuses_group_signal_after_leader_reap(self) -> None:
+        module = self._load_runner_module()
+        observer = object.__new__(module._UnreapedLeaderObserver)
+        observer.pid = 721
+        observer._reaped = True
+
+        with (
+            mock.patch.object(module.os, "killpg") as killpg,
+            self.assertRaisesRegex(
+                module.UserError,
+                "after leader reap",
+            ),
+        ):
+            observer.signal_group(signal.SIGKILL)
+
+        killpg.assert_not_called()
 
     def test_zombie_only_group_remains_addressable_for_cleanup(self) -> None:
         module = self._load_runner_module()
@@ -3747,10 +3833,12 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
                         if process_group_path.is_file():
-                            process_group = int(
-                                process_group_path.read_text(encoding="utf-8")
-                            )
-                            break
+                            raw_process_group = process_group_path.read_text(
+                                encoding="utf-8"
+                            ).strip()
+                            if raw_process_group:
+                                process_group = int(raw_process_group)
+                                break
                         if process.poll() is not None:
                             break
                         time.sleep(0.02)
@@ -3775,10 +3863,6 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                     if process.poll() is None:
                         process.kill()
                         process.communicate(timeout=5)
-                    if process_group is not None and module._process_group_exists(
-                        process_group
-                    ):
-                        os.killpg(process_group, signal.SIGKILL)
 
     def test_smoke_redelivers_to_returning_handler_after_group_cleanup(
         self,
@@ -3907,10 +3991,12 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
                         if process_group_path.is_file():
-                            process_group = int(
-                                process_group_path.read_text(encoding="utf-8")
-                            )
-                            break
+                            raw_process_group = process_group_path.read_text(
+                                encoding="utf-8"
+                            ).strip()
+                            if raw_process_group:
+                                process_group = int(raw_process_group)
+                                break
                         if process.poll() is not None:
                             break
                         time.sleep(0.02)
@@ -3939,10 +4025,6 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                     if process.poll() is None:
                         process.kill()
                         process.communicate(timeout=5)
-                    if process_group is not None and module._process_group_exists(
-                        process_group
-                    ):
-                        os.killpg(process_group, signal.SIGKILL)
 
     def test_rejects_passed_review_for_dirty_or_unproven_state(self) -> None:
         run_dir = self._prepare()

@@ -228,6 +228,30 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("compatibility/diagnostic dependency", readme)
         self.assertNotIn("review transport/runtime dependency", readme)
 
+    def test_documents_directional_schema_migration_contract(self) -> None:
+        require_canonical_documentation(self)
+        dependencies = " ".join(DEPENDENCIES_PATH.read_text(encoding="utf-8").split())
+        contract_phrases = (
+            "schema `3` `preparing` reservation",
+            "Adapter index schema `3` reads schemas `1` and `2`",
+            "upgrades them one way on the next successful index commit",
+            "A schema `2` adapter must reject schema `3` before any mutation",
+            "must not downgrade the document or rewrite a `cleanup_complete` fence",
+            "runner state schema `5` records the same transaction UUID",
+            "Runner state schema `5` reads schemas `1` through `4`",
+            "upgrades them one way on the next successful state publish",
+            "migration requires exact identity: unchanged values are allowed, while "
+            "changed values are rejected",
+            "Schema `4` recovery is directional",
+            "a schema `5` runner may recover and upgrade it",
+            "a schema `4` runner must reject schema `5`",
+            "every future schema fails closed",
+        )
+
+        for phrase in contract_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, dependencies)
+
     def test_documents_reference_only_downstream_retirement(self) -> None:
         require_canonical_documentation(self)
         dependencies = " ".join(DEPENDENCIES_PATH.read_text(encoding="utf-8").split())
