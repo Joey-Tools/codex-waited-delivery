@@ -38,10 +38,26 @@ kind, byte length, and SHA-256: filesystem-encodable paths bind exact
 or otherwise rejected by the filesystem codec use an explicitly labeled,
 stable `utf8-surrogatepass` identity.
 
-State updates serialize completely before atomic publication. A serialized
-state of exactly `4 MiB` is accepted; any larger payload is rejected before a
+State updates serialize completely before atomic publication. The hard ceiling
+accepts a fully serialized terminal state of exactly `4 MiB`; any current state
+or required terminal projection above that ceiling is rejected before a
 temporary name is allocated or a file is created or replaced, leaving the
-previous descriptor-bound state unchanged and recoverable.
+previous descriptor-bound state unchanged and recoverable. Every nonterminal
+state update reserves enough space for that worst-case terminal projection: an
+interrupted child, decision-point closure of every open phase, mandatory
+terminal timestamps, and the derived overall status. Child finish and parent
+reconciliation construct one timestamped terminal candidate and validate its
+encoded size before publishing a summary or terminal state. Prompt refresh
+likewise binds its canonical prompt paths into a candidate and validates the
+candidate before replacing either prompt.
+
+`prepare-active-run` similarly reserves its explicit or generated run ID in a
+prospective hook-index snapshot and serializes that exact snapshot with one
+transaction timestamp before invoking the bridge. An over-limit snapshot
+therefore leaves the index unchanged, creates no run directory, and emits no
+success payload. The final index commit still revalidates the locked index
+version and descriptor-bound storage before atomic replacement, so
+out-of-band concurrent drift is rejected rather than overwritten.
 
 See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for the optional review
 compatibility/diagnostic dependency used by external lane-readiness smoke.

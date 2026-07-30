@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import datetime as dt
 import fcntl
@@ -217,6 +218,11 @@ class AdapterIndex(TypedDict):
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _validate_component_name(name: str, *, label: str) -> None:
+    if not name or name in {".", ".."} or pathlib.PurePath(name).name != name:
+        raise UserError(f"{label} must be one path component: {name!r}")
 
 
 def _shell_command(args: list[str]) -> str:
@@ -968,6 +974,27 @@ def _canonical_index_snapshot(index: AdapterIndex) -> str:
     return json.dumps(index, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _serialize_index_for_commit(
+    index: AdapterIndex,
+    *,
+    transaction_time: str,
+    context: str,
+) -> bytes:
+    candidate = copy.deepcopy(index)
+    candidate["updated_at"] = transaction_time
+    content = (
+        json.dumps(candidate, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(content) > INDEX_MAX_BYTES:
+        raise RunSafetyError(
+            f"{context} exceeds the adapter index byte limit before index "
+            f"publication ({len(content)} > {INDEX_MAX_BYTES} bytes); "
+            "the existing index remains unchanged. Remove or shorten stale session "
+            "metadata and retry."
+        )
+    return content
+
+
 def _open_or_create_directory_at(
     parent_fd: int,
     name: str,
@@ -1269,17 +1296,21 @@ def _atomic_save_index_at(
     adapter_fd: int,
     index: AdapterIndex,
     expected_version: IndexFileVersion | None,
+    *,
+    transaction_time: str | None = None,
+    context: str = "adapter index update",
 ) -> IndexFileVersion:
     current = _read_index_bytes_at(adapter_fd)
     current_version = None if current is None else current[1]
     if current_version != expected_version:
         raise RunSafetyError("adapter index changed outside the locked transaction")
-    index["updated_at"] = _utc_now()
-    content = (
-        json.dumps(index, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
-    ).encode("utf-8")
-    if len(content) > INDEX_MAX_BYTES:
-        raise RunSafetyError("adapter index exceeds byte limit")
+    commit_time = transaction_time or _utc_now()
+    content = _serialize_index_for_commit(
+        index,
+        transaction_time=commit_time,
+        context=context,
+    )
+    index["updated_at"] = commit_time
     temporary_name = f".{INDEX_FILE_NAME}.{uuid.uuid4().hex}.tmp"
     temporary_fd: int | None = None
     temporary_visible = False
@@ -1364,6 +1395,8 @@ def _index_transaction(
     repo_root: pathlib.Path,
     *,
     write: bool,
+    commit_time: str | None = None,
+    context: str = "adapter index update",
 ) -> Iterator[AdapterIndex]:
     repo_fd: int | None = None
     codex_tmp_fd: int | None = None
@@ -1389,7 +1422,13 @@ def _index_transaction(
         if write and _canonical_index_snapshot(index) != original_snapshot:
             _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
             _revalidate_index_lock(adapter_fd, lock_fd)
-            _atomic_save_index_at(adapter_fd, index, expected_version)
+            _atomic_save_index_at(
+                adapter_fd,
+                index,
+                expected_version,
+                transaction_time=commit_time,
+                context=context,
+            )
             _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
             _revalidate_index_lock(adapter_fd, lock_fd)
     finally:
@@ -2972,7 +3011,21 @@ def _stop_hook(_: argparse.Namespace) -> int:
 def _prepare_active_run(args: argparse.Namespace) -> int:
     repo_root = _resolve_repo_root(args.repo, strict=True)
     assert repo_root is not None
-    with _index_transaction(repo_root, write=True) as index:
+    transaction_time = _utc_now()
+    run_id = (
+        args.run_id
+        or f"{dt.datetime.fromisoformat(transaction_time):%Y%m%dT%H%M%SZ}-"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+    _validate_component_name(run_id, label="run id")
+    prospective_run_dir = repo_root / ".codex-tmp" / RUNS_DIR_NAME / run_id
+    index_context = "prepare-active-run prospective index (no run created)"
+    with _index_transaction(
+        repo_root,
+        write=True,
+        commit_time=transaction_time,
+        context=index_context,
+    ) as index:
         record = _resolve_session_record(
             index,
             repo_root=repo_root,
@@ -2988,6 +3041,15 @@ def _prepare_active_run(args: argparse.Namespace) -> int:
                     f"session {record['session_id']} already has an active "
                     f"waited-delivery run: {record['run_dir']}"
                 )
+        record["run_dir"] = str(prospective_run_dir)
+        record["status"] = "active"
+        record["updated_at"] = transaction_time
+        index["latest_session_id"] = record["session_id"]
+        _serialize_index_for_commit(
+            index,
+            transaction_time=transaction_time,
+            context=index_context,
+        )
         bridge_args = [
             "prepare-live",
             "--repo",
@@ -2996,13 +3058,13 @@ def _prepare_active_run(args: argparse.Namespace) -> int:
             args.goal,
             "--parent-session-id",
             record["session_id"],
+            "--run-id",
+            run_id,
         ]
         if record["transcript_path"]:
             bridge_args.extend(["--parent-transcript-path", record["transcript_path"]])
         if record["permission_mode"]:
             bridge_args.extend(["--permission-mode", record["permission_mode"]])
-        if args.run_id:
-            bridge_args.extend(["--run-id", args.run_id])
         for phase in args.phase:
             bridge_args.extend(["--phase", phase])
         for changed_file in args.changed_file:
@@ -3017,12 +3079,10 @@ def _prepare_active_run(args: argparse.Namespace) -> int:
             bridge_args.append("--no-fallback-smoke")
         payload = _run_bridge_json(*bridge_args)
         run_dir = payload.get("run_dir")
-        if not isinstance(run_dir, str) or not run_dir:
-            raise UserError("prepare-live did not return run_dir")
-        record["run_dir"] = run_dir
-        record["status"] = "active"
-        record["updated_at"] = _utc_now()
-        index["latest_session_id"] = record["session_id"]
+        if run_dir != str(prospective_run_dir):
+            raise UserError(
+                "prepare-live returned an unexpected run_dir for the reserved run id"
+            )
     print(json.dumps(payload))
     return 0
 

@@ -237,6 +237,30 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
         return pathlib.Path(json.loads(prepared.stdout)["run_dir"])
 
+    def _prepare_active_args(
+        self,
+        module,
+        *,
+        session_id: str,
+        run_id: str,
+    ) -> argparse.Namespace:
+        return module._build_parser().parse_args(
+            [
+                "prepare-active-run",
+                "--repo",
+                str(self.repo),
+                "--goal",
+                f"Prepare {session_id}",
+                "--session-id",
+                session_id,
+                "--run-id",
+                run_id,
+                "--external-helper",
+                str(self.fake_helper),
+                "--no-fallback-smoke",
+            ]
+        )
+
     def _stop_payload_for(self, session_id: str) -> dict[str, object]:
         return {
             "session_id": session_id,
@@ -1175,6 +1199,186 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             orchestration["parent_transcript_path"], "/tmp/transcript-1.jsonl"
         )
         self.assertEqual(orchestration["permission_mode"], "acceptEdits")
+
+    def test_prepare_active_run_accepts_exact_prospective_index_limit(self) -> None:
+        session_id = "session-prepare-exact-limit"
+        run_id = "prepare-exact-limit"
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        fixed_now = "2026-07-30T04:05:06+00:00"
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        prospective_run_dir = (
+            self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        )
+        prospective_index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        record = prospective_index["sessions"][session_id]
+        record["run_dir"] = str(prospective_run_dir)
+        record["status"] = "active"
+        record["updated_at"] = fixed_now
+        prospective_index["latest_session_id"] = session_id
+        prospective_content = module._serialize_index_for_commit(
+            prospective_index,
+            transaction_time=fixed_now,
+            context="test prospective index",
+        )
+        captured_stdout = io.StringIO()
+
+        def create_run(*bridge_args: str) -> dict[str, object]:
+            run_id_index = bridge_args.index("--run-id") + 1
+            self.assertEqual(bridge_args[run_id_index], run_id)
+            prospective_run_dir.mkdir(parents=True)
+            return {"run_dir": str(prospective_run_dir)}
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "INDEX_MAX_BYTES",
+                len(prospective_content),
+            ),
+            mock.patch.object(module, "_run_bridge_json", side_effect=create_run),
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+        ):
+            self.assertEqual(module._prepare_active_run(args), 0)
+
+        self.assertTrue(prospective_run_dir.is_dir())
+        self.assertEqual(self._index_path().read_bytes(), prospective_content)
+        self.assertEqual(
+            json.loads(captured_stdout.getvalue())["run_dir"],
+            str(prospective_run_dir),
+        )
+
+    def test_prepare_active_run_capacity_preflight_has_no_side_effects(
+        self,
+    ) -> None:
+        session_id = "session-prepare-over-limit"
+        run_id = "prepare-over-limit"
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        fixed_now = "2026-07-30T05:06:07+00:00"
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        prospective_run_dir = (
+            self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        )
+        prospective_index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        record = prospective_index["sessions"][session_id]
+        record["run_dir"] = str(prospective_run_dir)
+        record["status"] = "active"
+        record["updated_at"] = fixed_now
+        prospective_index["latest_session_id"] = session_id
+        prospective_content = module._serialize_index_for_commit(
+            prospective_index,
+            transaction_time=fixed_now,
+            context="test prospective index",
+        )
+        original_index = self._index_path().read_bytes()
+        self.assertLess(len(original_index), len(prospective_content))
+        captured_stdout = io.StringIO()
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "INDEX_MAX_BYTES",
+                len(prospective_content) - 1,
+            ),
+            mock.patch.object(module, "_run_bridge_json") as bridge_mock,
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "prepare-active-run prospective index .* exceeds the adapter "
+                "index byte limit before index publication",
+            ),
+        ):
+            module._prepare_active_run(args)
+
+        bridge_mock.assert_not_called()
+        self.assertFalse(prospective_run_dir.exists())
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertEqual(self._index_path().read_bytes(), original_index)
+
+    def test_prepare_active_run_rejects_concurrent_index_drift_without_output(
+        self,
+    ) -> None:
+        session_id = "session-prepare-index-drift"
+        run_id = "prepare-index-drift"
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        fixed_now = "2026-07-30T06:07:08+00:00"
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        prospective_run_dir = (
+            self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        )
+        replacement_index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        replacement_index["sessions"][session_id]["last_prompt"] = (
+            "out-of-band concurrent update"
+        )
+        replacement_index["updated_at"] = "2026-07-30T06:07:09+00:00"
+        replacement_content = (
+            json.dumps(
+                replacement_index,
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        captured_stdout = io.StringIO()
+
+        def create_run_then_drift(*_: str) -> dict[str, object]:
+            prospective_run_dir.mkdir(parents=True)
+            replacement_path = self._index_path().with_name(
+                ".index.concurrent-replacement"
+            )
+            replacement_path.write_bytes(replacement_content)
+            replacement_path.chmod(0o600)
+            os.replace(replacement_path, self._index_path())
+            return {"run_dir": str(prospective_run_dir)}
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=create_run_then_drift,
+            ),
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "adapter index changed outside the locked transaction",
+            ),
+        ):
+            module._prepare_active_run(args)
+
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertEqual(self._index_path().read_bytes(), replacement_content)
+        self.assertTrue(prospective_run_dir.is_dir())
+        committed = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertIsNone(committed["sessions"][session_id]["run_dir"])
 
     def test_prepare_active_run_rejects_ambiguous_sessions_without_selector(
         self,

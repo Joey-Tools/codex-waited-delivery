@@ -1048,16 +1048,88 @@ def _load_state_from_fd(
     return state, artifact.version
 
 
+def _state_requires_terminal_capacity(state: WaitedDeliveryState) -> bool:
+    orchestration = state["orchestration"]
+    if orchestration["child_status"] not in CHILD_TERMINAL_STATUSES:
+        return True
+    if _non_terminal_phase_names(state):
+        return True
+    return state["overall_status"] != _overall_status(state["phases"])
+
+
+def _terminal_capacity_projection(
+    state: WaitedDeliveryState,
+    *,
+    transaction_time: str,
+) -> WaitedDeliveryState:
+    projected = copy.deepcopy(state)
+    orchestration = projected["orchestration"]
+    if orchestration["child_status"] not in CHILD_TERMINAL_STATUSES:
+        orchestration["child_status"] = "interrupted"
+    if not orchestration["child_finished_at"]:
+        orchestration["child_finished_at"] = transaction_time
+    orchestration["updated_at"] = transaction_time
+    for phase_name in projected["phases_order"]:
+        phase = projected["phases"][phase_name]
+        if phase["status"] not in TERMINAL_PHASE_STATUSES:
+            phase["status"] = "decision_point"
+            phase["updated_at"] = transaction_time
+    projected["overall_status"] = _overall_status(projected["phases"])
+    projected["updated_at"] = transaction_time
+    return projected
+
+
+def _serialize_state_for_save(
+    state: WaitedDeliveryState,
+    *,
+    transaction_time: str,
+    context: str,
+) -> str:
+    state["updated_at"] = transaction_time
+    state_json = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    encoded_size = len(state_json.encode("utf-8"))
+    if encoded_size > STATE_MAX_BYTES:
+        raise UserError(
+            f"{context} exceeds the state byte limit before artifact publication "
+            f"({encoded_size} > {STATE_MAX_BYTES} bytes); the existing state and "
+            "terminal artifacts remain unchanged. Reduce nonessential summaries, "
+            "findings, evidence, smoke output, or blocker text and retry."
+        )
+    if _state_requires_terminal_capacity(state):
+        projected = _terminal_capacity_projection(
+            state,
+            transaction_time=transaction_time,
+        )
+        projected_size = len(
+            (json.dumps(projected, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        )
+        if projected_size > STATE_MAX_BYTES:
+            raise UserError(
+                f"{context} would consume reserved terminal capacity "
+                f"({projected_size} > {STATE_MAX_BYTES} projected bytes); the "
+                "existing state and terminal artifacts remain unchanged. Reduce "
+                "nonessential summaries, findings, evidence, smoke output, or "
+                "blocker text and retry."
+            )
+    return state_json
+
+
 def _save_state(
     run_dir: pathlib.Path,
     repo_root: pathlib.Path,
     run_fd: int,
     state: WaitedDeliveryState,
     expected_state_version: FileVersion,
+    *,
+    transaction_time: str | None = None,
+    context: str = "state update",
 ) -> FileVersion:
     _verify_run_directory_identity(run_dir, repo_root, run_fd)
-    state["updated_at"] = _utc_now()
-    state_json = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    state_json = _serialize_state_for_save(
+        state,
+        transaction_time=transaction_time or _utc_now(),
+        context=context,
+    )
     written_version = _atomic_write_regular(
         run_fd,
         STATE_FILE_NAME,
@@ -1454,14 +1526,15 @@ def _prepare(args: argparse.Namespace) -> int:
     parent_prompt_path = run_dir / "parent-prompt.md"
     smoke_prompt_path = run_dir / FALLBACK_SMOKE_PROMPT_NAME
     smoke_command_path = run_dir / "fallback-smoke.command.txt"
+    initial_transaction_time = _utc_now()
 
     state: WaitedDeliveryState = {
         "schema_version": 3,
         "run_id": run_id,
         "repo_root": str(repo_root),
         "goal": args.goal,
-        "created_at": _utc_now(),
-        "updated_at": _utc_now(),
+        "created_at": initial_transaction_time,
+        "updated_at": initial_transaction_time,
         "known_blockers": list(args.known_blocker),
         "changed_files": changed_files,
         "phases_order": phases_order,
@@ -1502,6 +1575,11 @@ def _prepare(args: argparse.Namespace) -> int:
         "overall_status": "pending",
     }
     state["fallback_readiness_smoke"]["command"] = _smoke_command_argv(state)
+    initial_state_json = _serialize_state_for_save(
+        state,
+        transaction_time=initial_transaction_time,
+        context="initial state",
+    )
     try:
         with _run_lock(run_fd):
             _atomic_write_regular(
@@ -1531,7 +1609,7 @@ def _prepare(args: argparse.Namespace) -> int:
             _atomic_write_regular(
                 run_fd,
                 state_path.name,
-                json.dumps(state, indent=2, sort_keys=True) + "\n",
+                initial_state_json,
                 expected_version=None,
                 max_content_bytes=STATE_MAX_BYTES,
             )
@@ -1632,6 +1710,15 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
             raise UserError(
                 "bound compatibility runner source content changed before writes"
             )
+        transaction_time = _utc_now()
+        candidate = copy.deepcopy(state)
+        candidate["artifacts"]["child_prompt"] = str(run_dir / "child-prompt.md")
+        candidate["artifacts"]["parent_prompt"] = str(run_dir / "parent-prompt.md")
+        _serialize_state_for_save(
+            candidate,
+            transaction_time=transaction_time,
+            context="prompt refresh state",
+        )
         (
             child_prompt_path,
             child_prompt_version,
@@ -1640,7 +1727,7 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
         ) = _write_current_prompts(
             run_dir,
             run_fd,
-            state,
+            candidate,
             require_existing=True,
             runner_path=runner_path,
         )
@@ -1648,8 +1735,10 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
             run_dir,
             repo_root,
             run_fd,
-            state,
+            candidate,
             state_version,
+            transaction_time=transaction_time,
+            context="prompt refresh state",
         )
     if args.json:
         print(
@@ -1873,6 +1962,7 @@ def _transition_child_terminal(
     *,
     child_status: str,
     child_session_id: str | None,
+    transaction_time: str,
 ) -> None:
     if child_status not in CHILD_TERMINAL_STATUSES:
         raise UserError(f"unsupported child status: {child_status}")
@@ -1894,14 +1984,17 @@ def _transition_child_terminal(
     current_status = orchestration["child_status"]
     if current_status == "running":
         orchestration["child_status"] = child_status
-        orchestration["child_finished_at"] = _utc_now()
-        orchestration["updated_at"] = _utc_now()
+        orchestration["child_finished_at"] = transaction_time
+        orchestration["updated_at"] = transaction_time
     elif current_status in CHILD_TERMINAL_STATUSES:
         if current_status != child_status:
             raise UserError(
                 "child terminal status does not match the recorded status: "
                 f"expected {current_status}, got {child_status}"
             )
+        if not orchestration["child_finished_at"]:
+            orchestration["child_finished_at"] = transaction_time
+            orchestration["updated_at"] = transaction_time
     else:
         raise UserError(
             "cannot finish child before attach-child transitions it to running"
@@ -1916,12 +2009,28 @@ def _finish_child(args: argparse.Namespace) -> int:
         state,
         state_version,
     ):
+        transaction_time = _utc_now()
+        candidate = copy.deepcopy(state)
         _transition_child_terminal(
-            state,
+            candidate,
             child_status=args.child_status,
             child_session_id=args.child_session_id,
+            transaction_time=transaction_time,
         )
-        _save_state(run_dir, repo_root, run_fd, state, state_version)
+        _serialize_state_for_save(
+            candidate,
+            transaction_time=transaction_time,
+            context="child terminal transition",
+        )
+        _save_state(
+            run_dir,
+            repo_root,
+            run_fd,
+            candidate,
+            state_version,
+            transaction_time=transaction_time,
+            context="child terminal transition",
+        )
     return 0
 
 
@@ -2783,13 +2892,11 @@ def _overall_status(phases: dict[str, PhaseState]) -> str:
     return "pending"
 
 
-def _write_summary(
-    run_dir: pathlib.Path,
-    run_fd: int,
+def _build_summary(
     state: WaitedDeliveryState,
     *,
     require_terminal: bool,
-) -> pathlib.Path:
+) -> str:
     non_terminal = _non_terminal_phase_names(state)
     if require_terminal and non_terminal:
         raise UserError(
@@ -2850,6 +2957,14 @@ def _write_summary(
     )
     if smoke["sample"]:
         lines.append(f"- Sample: `{smoke['sample']}`")
+    return "\n".join(lines) + "\n"
+
+
+def _publish_summary(
+    run_dir: pathlib.Path,
+    run_fd: int,
+    content: str,
+) -> pathlib.Path:
     summary_path = run_dir / "summary.md"
     summary_version = _expected_artifact_version(
         run_fd,
@@ -2859,7 +2974,7 @@ def _write_summary(
     _atomic_write_regular(
         run_fd,
         summary_path.name,
-        "\n".join(lines) + "\n",
+        content,
         expected_version=summary_version,
     )
     return summary_path
@@ -2873,13 +2988,27 @@ def _finalize(args: argparse.Namespace) -> int:
         state,
         state_version,
     ):
-        summary_path = _write_summary(
-            run_dir,
-            run_fd,
-            state,
+        transaction_time = _utc_now()
+        candidate = copy.deepcopy(state)
+        summary_content = _build_summary(
+            candidate,
             require_terminal=args.require_terminal,
         )
-        _save_state(run_dir, repo_root, run_fd, state, state_version)
+        _serialize_state_for_save(
+            candidate,
+            transaction_time=transaction_time,
+            context="finalized state",
+        )
+        summary_path = _publish_summary(run_dir, run_fd, summary_content)
+        _save_state(
+            run_dir,
+            repo_root,
+            run_fd,
+            candidate,
+            state_version,
+            transaction_time=transaction_time,
+            context="finalized state",
+        )
     print(summary_path)
     return 0
 
@@ -2892,19 +3021,35 @@ def _reconcile_parent(args: argparse.Namespace) -> int:
         state,
         state_version,
     ):
+        transaction_time = _utc_now()
+        candidate = copy.deepcopy(state)
         _transition_child_terminal(
-            state,
+            candidate,
             child_status=args.child_status,
             child_session_id=args.child_session_id,
+            transaction_time=transaction_time,
         )
-        orchestration = state["orchestration"]
-        summary_path = _write_summary(
-            run_dir,
-            run_fd,
-            state,
+        orchestration = candidate["orchestration"]
+        summary_content = _build_summary(
+            candidate,
             require_terminal=True,
         )
-        _save_state(run_dir, repo_root, run_fd, state, state_version)
+        _serialize_state_for_save(
+            candidate,
+            transaction_time=transaction_time,
+            context="terminal reconciliation",
+        )
+        summary_path = _publish_summary(run_dir, run_fd, summary_content)
+        _save_state(
+            run_dir,
+            repo_root,
+            run_fd,
+            candidate,
+            state_version,
+            transaction_time=transaction_time,
+            context="terminal reconciliation",
+        )
+        state = candidate
     if args.json:
         print(
             json.dumps(

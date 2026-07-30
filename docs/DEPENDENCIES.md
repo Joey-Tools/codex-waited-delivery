@@ -34,7 +34,21 @@ filesystem-encodable paths, or explicitly labeled, stable
 filesystem-codec failures. JSON state publication also has a strict `4 MiB`
 encoded-size ceiling checked after serialization but before temporary file
 allocation or replacement, so a rejected growth transition preserves the
-previous recoverable state.
+previous recoverable state. Nonterminal saves additionally project an
+interrupted child, decision-point closure of open phases, mandatory timestamps,
+and derived overall status; a save that would consume this terminal reserve is
+rejected while the old state is still recoverable. Finish and reconciliation
+use one deterministic transaction timestamp and validate the full terminal
+candidate before summary publication. Prompt refresh validates the candidate
+state with its canonical prompt paths before replacing either prompt.
+
+The hook adapter applies the same pre-publication rule to
+`prepare-active-run`: it chooses and validates the run ID, builds the exact
+prospective session/index record with one transaction timestamp, and enforces
+the index byte ceiling before invoking the bridge. Capacity rejection cannot
+create a run directory or publish stdout, while the later atomic commit retains
+its index-version and descriptor-identity revalidation against concurrent
+out-of-band replacement.
 
 Operators can avoid that layout dependency by passing `--external-helper` to
 the runner or bridge commands, or disable the readiness smoke when it is not

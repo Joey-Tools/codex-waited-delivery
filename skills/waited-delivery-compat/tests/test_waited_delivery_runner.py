@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import importlib.util
 import os
@@ -286,6 +288,43 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def _direct_refresh_args(
+        self,
+        module,
+        run_dir: pathlib.Path,
+    ) -> argparse.Namespace:
+        bridge_stat = BRIDGE_PATH.stat()
+        runner_stat = SCRIPT_PATH.stat()
+        runner_source = SCRIPT_PATH.read_bytes()
+        module._WAITED_DELIVERY_BOUND_RUNNER_SOURCE = runner_source
+        return argparse.Namespace(
+            run_dir=str(run_dir),
+            expected_repo_root=None,
+            expected_run_dev=None,
+            expected_run_ino=None,
+            expected_run_uid=None,
+            expected_run_gid=None,
+            expected_run_mode=None,
+            compiled_bridge_path=str(BRIDGE_PATH),
+            compiled_runner_path=str(SCRIPT_PATH),
+            published_runner_path=str(SCRIPT_PATH),
+            expected_bridge_dev=bridge_stat.st_dev,
+            expected_bridge_ino=bridge_stat.st_ino,
+            expected_bridge_uid=bridge_stat.st_uid,
+            expected_bridge_gid=bridge_stat.st_gid,
+            expected_bridge_mode=bridge_stat.st_mode & 0o7777,
+            expected_bridge_size=bridge_stat.st_size,
+            expected_bridge_sha256=hashlib.sha256(BRIDGE_PATH.read_bytes()).hexdigest(),
+            expected_runner_dev=runner_stat.st_dev,
+            expected_runner_ino=runner_stat.st_ino,
+            expected_runner_uid=runner_stat.st_uid,
+            expected_runner_gid=runner_stat.st_gid,
+            expected_runner_mode=runner_stat.st_mode & 0o7777,
+            expected_runner_size=runner_stat.st_size,
+            expected_runner_sha256=hashlib.sha256(runner_source).hexdigest(),
+            json=True,
+        )
+
     def _commit_implementation(self) -> None:
         self.assertEqual(git(self.repo, "add", "tracked.txt", "notes.md").returncode, 0)
         git_commit(self.repo, "freeze implementation")
@@ -311,6 +350,32 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             child_session_id,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def _seed_running_child_with_terminal_phases(
+        self,
+        run_dir: pathlib.Path,
+        child_session_id: str,
+        *,
+        updated_at: str,
+    ) -> dict[str, object]:
+        self._attach_child(run_dir, child_session_id)
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for phase in state["phases"].values():
+            phase["status"] = "blocked"
+            phase["summary"] = "capacity boundary"
+            phase["updated_at"] = updated_at
+        orchestration = state["orchestration"]
+        orchestration["child_status"] = "running"
+        orchestration["child_finished_at"] = None
+        orchestration["updated_at"] = updated_at
+        state["overall_status"] = "blocked"
+        state["updated_at"] = updated_at
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return state
 
     def test_prepare_writes_state_contract_prompt_and_smoke_command(self) -> None:
         run_dir = self._prepare(
@@ -760,6 +825,90 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         for name, old_inode in before_inodes.items():
             self.assertNotEqual((run_dir / name).stat().st_ino, old_inode)
 
+    def test_refresh_prompts_preflights_state_before_prompt_publication(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        args = self._direct_refresh_args(module, run_dir)
+        fixed_now = "2026-07-30T07:08:09+00:00"
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for phase in state["phases"].values():
+            phase["status"] = "blocked"
+            phase["updated_at"] = fixed_now
+        orchestration = state["orchestration"]
+        orchestration["child_session_id"] = "child-prompt-capacity"
+        orchestration["child_status"] = "completed"
+        orchestration["child_finished_at"] = fixed_now
+        orchestration["updated_at"] = fixed_now
+        state["overall_status"] = "blocked"
+        state["updated_at"] = ""
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        original_state = state_path.read_bytes()
+        sentinel = "prompt must not change before state preflight\n"
+        prompt_paths = tuple(
+            run_dir / name for name in ("child-prompt.md", "parent-prompt.md")
+        )
+        for prompt_path in prompt_paths:
+            prompt_path.write_text(sentinel, encoding="utf-8")
+
+        candidate = copy.deepcopy(state)
+        candidate["artifacts"]["child_prompt"] = str(run_dir / "child-prompt.md")
+        candidate["artifacts"]["parent_prompt"] = str(run_dir / "parent-prompt.md")
+        candidate["updated_at"] = fixed_now
+        candidate_content = (
+            json.dumps(candidate, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        self.assertLess(len(original_state), len(candidate_content))
+        captured_stdout = io.StringIO()
+
+        with (
+            mock.patch.object(module, "_require_isolated_python"),
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "STATE_MAX_BYTES",
+                len(candidate_content) - 1,
+            ),
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+            self.assertRaisesRegex(
+                module.UserError,
+                "prompt refresh state exceeds the state byte limit",
+            ),
+        ):
+            module._refresh_prompts(args)
+
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertEqual(state_path.read_bytes(), original_state)
+        for prompt_path in prompt_paths:
+            self.assertEqual(prompt_path.read_text(encoding="utf-8"), sentinel)
+
+        captured_stdout = io.StringIO()
+        with (
+            mock.patch.object(module, "_require_isolated_python"),
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "STATE_MAX_BYTES",
+                len(candidate_content),
+            ),
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+        ):
+            self.assertEqual(module._refresh_prompts(args), 0)
+
+        self.assertEqual(state_path.read_bytes(), candidate_content)
+        for prompt_path in prompt_paths:
+            prompt = prompt_path.read_text(encoding="utf-8")
+            self.assertNotEqual(prompt, sentinel)
+            self.assertIn(str(SCRIPT_PATH), prompt)
+        payload = json.loads(captured_stdout.getvalue())
+        self.assertEqual(payload["child_prompt"], str(prompt_paths[0]))
+        self.assertEqual(payload["parent_prompt"], str(prompt_paths[1]))
+
     def test_refresh_prompts_rejects_runner_mismatch_before_writes(self) -> None:
         run_dir = self._prepare("--no-fallback-smoke")
         watched_paths = tuple(
@@ -1101,6 +1250,14 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 repo_root,
                 run_fd,
             )
+            state["orchestration"]["child_session_id"] = "child-size-boundary"
+            state["orchestration"]["child_status"] = "completed"
+            state["orchestration"]["child_finished_at"] = fixed_now
+            state["orchestration"]["updated_at"] = fixed_now
+            for phase in state["phases"].values():
+                phase["status"] = "blocked"
+                phase["updated_at"] = fixed_now
+            state["overall_status"] = module._overall_status(state["phases"])
             state["updated_at"] = fixed_now
             exact_content = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode(
                 "utf-8"
@@ -1173,6 +1330,237 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             )
         finally:
             module.os.close(run_fd)
+
+    def test_nonterminal_save_reserves_exact_terminal_capacity(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        fixed_now = "2026-07-30T01:02:03+00:00"
+        state = self._seed_running_child_with_terminal_phases(
+            run_dir,
+            "child-reserved-capacity",
+            updated_at=fixed_now,
+        )
+        state_path = run_dir / "state.json"
+        original_content = state_path.read_bytes()
+        projected = module._terminal_capacity_projection(
+            state,
+            transaction_time=fixed_now,
+        )
+        projected_content = (
+            json.dumps(projected, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        self.assertLess(len(original_content), len(projected_content))
+
+        opened_run_dir, repo_root, run_fd = module._open_run_directory(run_dir)
+        try:
+            loaded, state_version = module._load_state_from_fd(
+                opened_run_dir,
+                repo_root,
+                run_fd,
+            )
+            with (
+                mock.patch.object(module, "_utc_now", return_value=fixed_now),
+                mock.patch.object(
+                    module,
+                    "STATE_MAX_BYTES",
+                    len(projected_content) - 1,
+                ),
+                mock.patch.object(module.uuid, "uuid4") as uuid_mock,
+                mock.patch.object(module.os, "replace") as replace_mock,
+            ):
+                with self.assertRaisesRegex(
+                    module.UserError,
+                    "would consume reserved terminal capacity",
+                ):
+                    module._save_state(
+                        opened_run_dir,
+                        repo_root,
+                        run_fd,
+                        loaded,
+                        state_version,
+                    )
+                uuid_mock.assert_not_called()
+                replace_mock.assert_not_called()
+            self.assertEqual(state_path.read_bytes(), original_content)
+
+            with (
+                mock.patch.object(module, "_utc_now", return_value=fixed_now),
+                mock.patch.object(
+                    module,
+                    "STATE_MAX_BYTES",
+                    len(projected_content),
+                ),
+            ):
+                module._save_state(
+                    opened_run_dir,
+                    repo_root,
+                    run_fd,
+                    loaded,
+                    state_version,
+                )
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8"))["orchestration"][
+                    "child_status"
+                ],
+                "running",
+            )
+        finally:
+            module.os.close(run_fd)
+
+    def test_finish_child_preflights_terminal_state_and_retries_at_exact_limit(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        child_session_id = "child-finish-capacity"
+        fixed_now = "2026-07-30T02:03:04+00:00"
+        state = self._seed_running_child_with_terminal_phases(
+            run_dir,
+            child_session_id,
+            updated_at=fixed_now,
+        )
+        state_path = run_dir / "state.json"
+        summary_path = run_dir / "summary.md"
+        sentinel_summary = "existing summary must survive\n"
+        summary_path.write_text(sentinel_summary, encoding="utf-8")
+        original_content = state_path.read_bytes()
+
+        candidate = copy.deepcopy(state)
+        module._transition_child_terminal(
+            candidate,
+            child_status="completed",
+            child_session_id=child_session_id,
+            transaction_time=fixed_now,
+        )
+        candidate["updated_at"] = fixed_now
+        candidate_content = (
+            json.dumps(candidate, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        self.assertLess(len(original_content), len(candidate_content))
+        args = argparse.Namespace(
+            run_dir=str(run_dir),
+            child_status="completed",
+            child_session_id=child_session_id,
+        )
+
+        captured_stdout = io.StringIO()
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "STATE_MAX_BYTES",
+                len(candidate_content) - 1,
+            ),
+            contextlib.redirect_stdout(captured_stdout),
+        ):
+            with self.assertRaisesRegex(
+                module.UserError,
+                "child terminal transition exceeds the state byte limit",
+            ):
+                module._finish_child(args)
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertEqual(state_path.read_bytes(), original_content)
+        self.assertEqual(summary_path.read_text(encoding="utf-8"), sentinel_summary)
+        recovered = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(recovered["orchestration"]["child_status"], "running")
+        self.assertIsNone(recovered["orchestration"]["child_finished_at"])
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "STATE_MAX_BYTES",
+                len(candidate_content),
+            ),
+        ):
+            self.assertEqual(module._finish_child(args), 0)
+        self.assertEqual(state_path.read_bytes(), candidate_content)
+        self.assertEqual(summary_path.read_text(encoding="utf-8"), sentinel_summary)
+        finished = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            finished["orchestration"]["child_finished_at"],
+            fixed_now,
+        )
+        self.assertEqual(finished["orchestration"]["updated_at"], fixed_now)
+        self.assertEqual(finished["updated_at"], fixed_now)
+
+    def test_reconcile_preflights_before_summary_and_retries_at_exact_limit(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        child_session_id = "child-reconcile-capacity"
+        fixed_now = "2026-07-30T03:04:05+00:00"
+        state = self._seed_running_child_with_terminal_phases(
+            run_dir,
+            child_session_id,
+            updated_at=fixed_now,
+        )
+        state_path = run_dir / "state.json"
+        summary_path = run_dir / "summary.md"
+        sentinel_summary = "preexisting summary must not drift\n"
+        summary_path.write_text(sentinel_summary, encoding="utf-8")
+        original_content = state_path.read_bytes()
+
+        candidate = copy.deepcopy(state)
+        module._transition_child_terminal(
+            candidate,
+            child_status="completed",
+            child_session_id=child_session_id,
+            transaction_time=fixed_now,
+        )
+        expected_summary = module._build_summary(candidate, require_terminal=True)
+        candidate["updated_at"] = fixed_now
+        candidate_content = (
+            json.dumps(candidate, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        self.assertLess(len(original_content), len(candidate_content))
+        args = argparse.Namespace(
+            run_dir=str(run_dir),
+            child_status="completed",
+            child_session_id=child_session_id,
+            json=True,
+        )
+
+        captured_stdout = io.StringIO()
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "STATE_MAX_BYTES",
+                len(candidate_content) - 1,
+            ),
+            contextlib.redirect_stdout(captured_stdout),
+        ):
+            with self.assertRaisesRegex(
+                module.UserError,
+                "terminal reconciliation exceeds the state byte limit",
+            ):
+                module._reconcile_parent(args)
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertEqual(state_path.read_bytes(), original_content)
+        self.assertEqual(summary_path.read_text(encoding="utf-8"), sentinel_summary)
+        recovered = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(recovered["orchestration"]["child_status"], "running")
+        self.assertIsNone(recovered["orchestration"]["child_finished_at"])
+
+        captured_stdout = io.StringIO()
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "STATE_MAX_BYTES",
+                len(candidate_content),
+            ),
+            contextlib.redirect_stdout(captured_stdout),
+        ):
+            self.assertEqual(module._reconcile_parent(args), 0)
+        self.assertEqual(state_path.read_bytes(), candidate_content)
+        self.assertEqual(summary_path.read_text(encoding="utf-8"), expected_summary)
+        payload = json.loads(captured_stdout.getvalue())
+        self.assertEqual(payload["overall_status"], "blocked")
+        self.assertEqual(payload["child_status"], "completed")
+        self.assertEqual(payload["child_session_id"], child_session_id)
 
     def test_atomic_write_binds_published_temp_file_identity(self) -> None:
         module = self._load_runner_module()
