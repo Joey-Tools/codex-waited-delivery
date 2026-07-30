@@ -1150,9 +1150,10 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             content = b"fallback prompt\\n"
             with module._anonymous_smoke_prompt_pipe() as (
                 execution_path,
-                read_fd,
+                read_stream,
                 write_stream,
             ):
+                read_fd = read_stream.fileno()
                 write_fd = write_stream.fileno()
                 if not stat.S_ISFIFO(os.fstat(read_fd).st_mode):
                     raise RuntimeError("read descriptor is not an anonymous pipe")
@@ -1200,13 +1201,15 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 import os
                 import subprocess
                 import sys
+                import time
 
-                os.close(int(sys.argv[1]))
                 subprocess.Popen(
                     [sys.executable, "-c", "import time; time.sleep(60)"],
                     stdin=subprocess.DEVNULL,
                 )
                 print(os.getpgrp(), flush=True)
+                os.close(int(sys.argv[1]))
+                time.sleep(60)
                 """
             ),
             encoding="utf-8",
@@ -1214,25 +1217,120 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
 
         with module._anonymous_smoke_prompt_pipe() as (
             _execution_path,
-            read_fd,
+            read_stream,
             write_stream,
         ):
+            read_fd = read_stream.fileno()
             completed = module._run_bounded_smoke_process(
                 [sys.executable, str(helper), str(read_fd)],
                 cwd=self.repo,
-                pass_fds=(read_fd,),
+                child_read_streams=(read_stream,),
                 input_stream=write_stream,
                 input_bytes=b"x" * module.STATE_MAX_BYTES,
                 timeout=5,
                 cleanup_timeout=3,
             )
 
+        self.assertTrue(read_stream.closed)
+        self.assertTrue(write_stream.closed)
         self.assertEqual(completed.returncode, 126, completed.stderr)
         self.assertIn(
             "rejected its prompt stream before complete delivery",
             completed.stderr,
         )
         process_group = int(completed.stdout.strip().splitlines()[0])
+        self.assertFalse(module._process_group_exists(process_group))
+
+    def test_smoke_small_prompt_reader_rejection_fails_closed(self) -> None:
+        module = self._load_runner_module()
+        helper = self.root / "ignore-small-smoke-prompt.py"
+        process_group_path = self.root / "ignore-small-smoke-prompt-pgid.txt"
+        helper.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    stdin=subprocess.DEVNULL,
+                )
+                prompt_path = pathlib.Path(sys.argv[1])
+                os.close(int(prompt_path.name))
+                pathlib.Path(sys.argv[2]).write_text(
+                    str(os.getpgrp()),
+                    encoding="utf-8",
+                )
+                print("READY", flush=True)
+                time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+        prompt = module.FALLBACK_SMOKE_PROMPT.encode("utf-8")
+        self.assertLess(len(prompt), 4096)
+        real_popen = module.subprocess.Popen
+
+        def wait_for_reader_close(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    if process_group_path.read_text(encoding="utf-8").strip():
+                        return process
+                except FileNotFoundError:
+                    pass
+                if process.poll() is not None:
+                    break
+                time.sleep(0.01)
+            process.kill()
+            process.communicate(timeout=5)
+            self.fail("smoke helper did not close its prompt reader")
+
+        with module._anonymous_smoke_prompt_pipe() as (
+            execution_path,
+            read_stream,
+            write_stream,
+        ):
+            with mock.patch.object(
+                module.subprocess,
+                "Popen",
+                side_effect=wait_for_reader_close,
+            ):
+                completed = module._run_bounded_smoke_process(
+                    [
+                        sys.executable,
+                        str(helper),
+                        str(execution_path),
+                        str(process_group_path),
+                    ],
+                    cwd=self.repo,
+                    child_read_streams=(read_stream,),
+                    input_stream=write_stream,
+                    input_bytes=prompt,
+                    timeout=5,
+                    cleanup_timeout=3,
+                )
+
+        self.assertTrue(read_stream.closed)
+        self.assertTrue(write_stream.closed)
+        self.assertEqual(completed.returncode, 126, completed.stderr)
+        self.assertIn("READY", completed.stdout)
+        self.assertIn(
+            "rejected its prompt stream before complete delivery",
+            completed.stderr,
+        )
+        status, sample = module._classify_smoke(
+            completed.stdout,
+            completed.stderr,
+            completed.returncode,
+        )
+        self.assertEqual(status, "blocked")
+        self.assertNotEqual(sample, "READY")
+        process_group = int(process_group_path.read_text(encoding="utf-8"))
         self.assertFalse(module._process_group_exists(process_group))
 
     def test_run_fallback_smoke_binds_prompt_pipe_under_lock(self) -> None:
@@ -1277,13 +1375,13 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             command: list[str],
             *,
             cwd: pathlib.Path,
-            pass_fds: tuple[int, ...],
+            child_read_streams: tuple,
             input_stream,
             input_bytes: bytes,
         ) -> subprocess.CompletedProcess[str]:
             self.assertEqual(cwd, self.repo.resolve())
-            self.assertEqual(len(pass_fds), 1)
-            read_fd = pass_fds[0]
+            self.assertEqual(len(child_read_streams), 1)
+            read_fd = child_read_streams[0].fileno()
             input_fd = input_stream.fileno()
             captured_pipe_fds.extend((read_fd, input_fd))
             prompt_index = command.index("--prompt-file") + 1
@@ -1357,16 +1455,17 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             command: list[str],
             *,
             cwd: pathlib.Path,
-            pass_fds: tuple[int, ...],
+            child_read_streams: tuple,
             input_stream,
             input_bytes: bytes,
         ) -> subprocess.CompletedProcess[str]:
             self.assertTrue(command)
             self.assertEqual(cwd, self.repo.resolve())
-            self.assertEqual(len(pass_fds), 1)
+            self.assertEqual(len(child_read_streams), 1)
+            read_fd = child_read_streams[0].fileno()
             self.assertGreater(len(input_bytes), 0)
             input_fd = input_stream.fileno()
-            self.assertNotIn(input_fd, pass_fds)
+            self.assertNotEqual(input_fd, read_fd)
             smoke_started.set()
             if not release_smoke.wait(5):
                 raise RuntimeError("timed out waiting to release smoke")

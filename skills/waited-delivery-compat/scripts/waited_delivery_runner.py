@@ -776,16 +776,18 @@ def _fd_execution_path(file_fd: int, name: str) -> pathlib.Path:
 
 
 @contextlib.contextmanager
-def _anonymous_smoke_prompt_pipe() -> Iterator[tuple[pathlib.Path, int, BinaryIO]]:
+def _anonymous_smoke_prompt_pipe() -> Iterator[tuple[pathlib.Path, BinaryIO, BinaryIO]]:
     read_fd, write_fd = os.pipe()
+    read_stream: BinaryIO | None = None
     write_stream: BinaryIO | None = None
     try:
+        read_stream = os.fdopen(read_fd, "rb", buffering=0)
         write_stream = os.fdopen(write_fd, "wb", buffering=0)
         execution_path = _fd_execution_path(
-            read_fd,
+            read_stream.fileno(),
             "fallback-smoke.prompt.md",
         )
-        yield execution_path, read_fd, write_stream
+        yield execution_path, read_stream, write_stream
     finally:
         if write_stream is None:
             try:
@@ -797,10 +799,16 @@ def _anonymous_smoke_prompt_pipe() -> Iterator[tuple[pathlib.Path, int, BinaryIO
                 write_stream.close()
             except OSError:
                 pass
-        try:
-            os.close(read_fd)
-        except OSError:
-            pass
+        if read_stream is None:
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
+        else:
+            try:
+                read_stream.close()
+            except OSError:
+                pass
 
 
 def _require_isolated_python() -> None:
@@ -2218,7 +2226,7 @@ def _run_bounded_smoke_process(
     command: list[str],
     *,
     cwd: pathlib.Path,
-    pass_fds: tuple[int, ...] = (),
+    child_read_streams: tuple[BinaryIO, ...] = (),
     input_stream: BinaryIO | None = None,
     input_bytes: bytes | None = None,
     timeout: float = SMOKE_TIMEOUT_SECONDS,
@@ -2227,10 +2235,32 @@ def _run_bounded_smoke_process(
 ) -> subprocess.CompletedProcess[str]:
     if not command or not all(isinstance(argument, str) for argument in command):
         raise UserError("fallback readiness smoke command must be a nonempty argv")
-    if any(not isinstance(file_fd, int) or file_fd < 0 for file_fd in pass_fds):
-        raise UserError(
-            "fallback readiness smoke pass_fds must be nonnegative integers"
-        )
+    child_read_fds: list[int] = []
+    for child_read_stream in child_read_streams:
+        try:
+            child_read_fd = child_read_stream.fileno()
+        except (AttributeError, OSError, ValueError) as error:
+            raise UserError(
+                "fallback readiness smoke child reader must be an open file object"
+            ) from error
+        try:
+            child_read_metadata = os.fstat(child_read_fd)
+            child_read_access = fcntl.fcntl(child_read_fd, fcntl.F_GETFL) & os.O_ACCMODE
+        except OSError as error:
+            raise UserError(
+                "fallback readiness smoke child reader cannot be verified"
+            ) from error
+        if (
+            not stat.S_ISFIFO(child_read_metadata.st_mode)
+            or child_read_access != os.O_RDONLY
+        ):
+            raise UserError(
+                "fallback readiness smoke child reader must be an anonymous-pipe reader"
+            )
+        child_read_fds.append(child_read_fd)
+    if len(child_read_fds) != len(set(child_read_fds)):
+        raise UserError("fallback readiness smoke child readers must be distinct")
+    pass_fds = tuple(child_read_fds)
     if (input_stream is None) != (input_bytes is None):
         raise UserError(
             "fallback readiness smoke input_stream and input_bytes must be supplied "
@@ -2273,6 +2303,7 @@ def _run_bounded_smoke_process(
             command,
             cwd=cwd,
             pass_fds=pass_fds,
+            child_read_streams=child_read_streams,
             input_stream=input_stream,
             input_bytes=input_bytes,
             timeout=timeout,
@@ -2301,6 +2332,7 @@ def _run_bounded_smoke_process_supervised(
     *,
     cwd: pathlib.Path,
     pass_fds: tuple[int, ...],
+    child_read_streams: tuple[BinaryIO, ...],
     input_stream: BinaryIO | None,
     input_bytes: bytes | None,
     timeout: float,
@@ -2337,6 +2369,14 @@ def _run_bounded_smoke_process_supervised(
                 f"cannot start fallback readiness smoke: {error}"
             ) from error
         try:
+            for child_read_stream in child_read_streams:
+                try:
+                    child_read_stream.close()
+                except OSError as error:
+                    raise UserError(
+                        "cannot close parent fallback-smoke prompt reader after "
+                        "process launch"
+                    ) from error
             if process.stdout is None or process.stderr is None:
                 raise UserError("smoke process pipes were not created")
             for name, stream in (
@@ -2552,16 +2592,18 @@ def _run_fallback_smoke(args: argparse.Namespace) -> int:
                         FALLBACK_SMOKE_PROMPT_NAME,
                         max_bytes=STATE_MAX_BYTES,
                     )
-                    prompt_execution_path, prompt_read_fd, prompt_write_stream = (
-                        smoke_pipe_stack.enter_context(_anonymous_smoke_prompt_pipe())
-                    )
+                    (
+                        prompt_execution_path,
+                        prompt_read_stream,
+                        prompt_write_stream,
+                    ) = smoke_pipe_stack.enter_context(_anonymous_smoke_prompt_pipe())
                     command[prompt_indexes[0] + 1] = str(prompt_execution_path)
                     smoke_cwd = pathlib.Path(state["repo_root"])
 
                 completed = _run_bounded_smoke_process(
                     command,
                     cwd=smoke_cwd,
-                    pass_fds=(prompt_read_fd,),
+                    child_read_streams=(prompt_read_stream,),
                     input_stream=prompt_write_stream,
                     input_bytes=prompt_artifact.content,
                 )
