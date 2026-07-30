@@ -7,7 +7,9 @@ from __future__ import annotations
 import argparse
 import copy
 import contextlib
+import ctypes
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -22,7 +24,7 @@ import sys
 import time
 import unicodedata
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import BinaryIO, Literal, NamedTuple, TypedDict, cast
 
 
@@ -65,9 +67,49 @@ STATE_FILE_NAME = "state.json"
 FALLBACK_SMOKE_PROMPT_NAME = "fallback-smoke.prompt.md"
 RUNS_DIR_NAME = "waited-delivery"
 STATE_MAX_BYTES = 4 * 1024 * 1024
+STATE_SCHEMA_VERSION = 5
 FILESYSTEM_PATH_DISPLAY_MAX_BYTES = 512
 FILE_MODE = 0o600
 DIRECTORY_MODE = 0o700
+LEGACY_DIRECTORY_MODE = 0o755
+UNTRUSTED_WRITE_MASK = stat.S_IWGRP | stat.S_IWOTH
+CHILD_SESSION_ID_MAX_UTF8_BYTES = 1024
+CHILD_SESSION_ID_MAX_JSON_BYTES = 6 * CHILD_SESSION_ID_MAX_UTF8_BYTES + 2
+PARENT_METADATA_MAX_UTF8_BYTES = 4096
+PARENT_METADATA_MAX_JSON_BYTES = 6 * PARENT_METADATA_MAX_UTF8_BYTES + 2
+TIMESTAMP_CAPACITY_CHARS = 64
+BOUNDED_ORCHESTRATION_FIELDS = (
+    (
+        "child_session_id",
+        CHILD_SESSION_ID_MAX_UTF8_BYTES,
+        CHILD_SESSION_ID_MAX_JSON_BYTES,
+        True,
+    ),
+    (
+        "parent_session_id",
+        PARENT_METADATA_MAX_UTF8_BYTES,
+        PARENT_METADATA_MAX_JSON_BYTES,
+        False,
+    ),
+    (
+        "parent_turn_id",
+        PARENT_METADATA_MAX_UTF8_BYTES,
+        PARENT_METADATA_MAX_JSON_BYTES,
+        False,
+    ),
+    (
+        "parent_transcript_path",
+        PARENT_METADATA_MAX_UTF8_BYTES,
+        PARENT_METADATA_MAX_JSON_BYTES,
+        False,
+    ),
+    (
+        "permission_mode",
+        PARENT_METADATA_MAX_UTF8_BYTES,
+        PARENT_METADATA_MAX_JSON_BYTES,
+        False,
+    ),
+)
 SMOKE_TIMEOUT_SECONDS = 30.0
 SMOKE_CLEANUP_TIMEOUT_SECONDS = 3.0
 SMOKE_CAPTURE_MAX_BYTES = 256 * 1024
@@ -175,6 +217,12 @@ class OrchestrationState(TypedDict):
     updated_at: str | None
 
 
+class LegacyBoundedTextIdentity(TypedDict):
+    utf8_bytes: int
+    json_bytes: int
+    sha256: str
+
+
 class WaitedDeliveryState(TypedDict):
     schema_version: int
     run_id: str
@@ -190,12 +238,92 @@ class WaitedDeliveryState(TypedDict):
     review_policy: ReviewPolicy
     fallback_readiness_smoke: FallbackReadinessSmoke
     orchestration: OrchestrationState
+    legacy_bounded_text: dict[str, LegacyBoundedTextIdentity]
     artifacts: Artifacts
     overall_status: str
 
 
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _json_value_size(value: str) -> int:
+    return len(json.dumps(value, ensure_ascii=True).encode("utf-8"))
+
+
+def _bounded_text_identity(
+    value: str,
+    *,
+    label: str,
+    require_nonblank: bool,
+) -> LegacyBoundedTextIdentity:
+    if not isinstance(value, str):
+        raise UserError(f"{label} must be a string")
+    if require_nonblank and not value.strip():
+        raise UserError(f"{label} requires a nonblank value")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise UserError(f"{label} must be valid UTF-8") from error
+    return {
+        "utf8_bytes": len(encoded),
+        "json_bytes": _json_value_size(value),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _validate_bounded_text(
+    value: str,
+    *,
+    label: str,
+    max_utf8_bytes: int,
+    max_json_bytes: int,
+    require_nonblank: bool,
+) -> None:
+    identity = _bounded_text_identity(
+        value,
+        label=label,
+        require_nonblank=require_nonblank,
+    )
+    if identity["utf8_bytes"] > max_utf8_bytes:
+        raise UserError(
+            f"{label} exceeds its UTF-8 byte limit "
+            f"({identity['utf8_bytes']} > {max_utf8_bytes} bytes)"
+        )
+    if identity["json_bytes"] > max_json_bytes:
+        raise UserError(
+            f"{label} exceeds its JSON-encoded byte limit "
+            f"({identity['json_bytes']} > {max_json_bytes} bytes)"
+        )
+
+
+def _validate_child_session_id(value: str, *, label: str) -> None:
+    _validate_bounded_text(
+        value,
+        label=label,
+        max_utf8_bytes=CHILD_SESSION_ID_MAX_UTF8_BYTES,
+        max_json_bytes=CHILD_SESSION_ID_MAX_JSON_BYTES,
+        require_nonblank=True,
+    )
+
+
+def _validate_parent_metadata_args(args: argparse.Namespace) -> None:
+    for field in (
+        "parent_session_id",
+        "parent_turn_id",
+        "parent_transcript_path",
+        "permission_mode",
+    ):
+        value = getattr(args, field, None)
+        if value is None:
+            continue
+        _validate_bounded_text(
+            value,
+            label=field.replace("_", "-"),
+            max_utf8_bytes=PARENT_METADATA_MAX_UTF8_BYTES,
+            max_json_bytes=PARENT_METADATA_MAX_JSON_BYTES,
+            require_nonblank=False,
+        )
 
 
 def _run_json(cmd: list[str], *, cwd: pathlib.Path | None = None) -> str:
@@ -286,6 +414,15 @@ def _ensure_relative_paths(paths: list[str]) -> list[str]:
     return result
 
 
+def _pair_path_display_tokens(
+    tokens: list[str],
+    encoded_lengths: list[int],
+) -> Iterator[tuple[str, int]]:
+    if len(tokens) != len(encoded_lengths):
+        raise AssertionError("path display token accounting length mismatch")
+    return zip(tokens, encoded_lengths)
+
+
 def _display_filesystem_path(path: str) -> str:
     has_non_surrogateescape_surrogate = any(
         unicodedata.category(character) == "Cs"
@@ -354,7 +491,7 @@ def _display_filesystem_path(path: str) -> str:
     available_bytes = FILESYSTEM_PATH_DISPLAY_MAX_BYTES - suffix_bytes
     displayed_tokens: list[str] = []
     displayed_bytes = 0
-    for token, token_bytes in zip(tokens, encoded_lengths, strict=True):
+    for token, token_bytes in _pair_path_display_tokens(tokens, encoded_lengths):
         if displayed_bytes + token_bytes > available_bytes:
             break
         displayed_tokens.append(token)
@@ -456,6 +593,182 @@ def _open_directory_at(parent_fd: int, name: str) -> int:
     return os.open(name, _directory_open_flags(), dir_fd=parent_fd)
 
 
+def _descriptor_has_extended_acl(file_fd: int, *, label: str) -> bool:
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        acl_get_fd_np = libc.acl_get_fd_np
+        acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        acl_get_fd_np.restype = ctypes.c_void_p
+        acl_free = libc.acl_free
+        acl_free.argtypes = [ctypes.c_void_p]
+        acl_free.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        acl = acl_get_fd_np(file_fd, 0x00000100)
+        if not acl:
+            error_number = ctypes.get_errno()
+            # Darwin libc can expose ENOTSUP and EOPNOTSUPP as distinct values.
+            if error_number in {
+                errno.ENOENT,
+                getattr(errno, "ENODATA", errno.ENOENT),
+                errno.ENOTSUP,
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+            }:
+                return False
+            raise UserError(f"{label} extended ACL cannot be inspected safely")
+        free_result = acl_free(acl)
+        if free_result != 0:
+            raise UserError(f"{label} extended ACL inspection cleanup failed")
+        return True
+    if sys.platform.startswith("linux"):
+        getxattr = getattr(os, "getxattr", None)
+        if getxattr is None:
+            raise UserError(
+                f"{label} POSIX ACL inspection is unavailable on this runtime"
+            )
+        for attribute in (
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+        ):
+            try:
+                getxattr(file_fd, attribute)
+            except OSError as error:
+                if error.errno in {
+                    getattr(errno, "ENODATA", -1),
+                    getattr(errno, "ENOATTR", -1),
+                    errno.ENOTSUP,
+                    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+                }:
+                    continue
+                raise UserError(
+                    f"{label} POSIX ACL cannot be inspected safely"
+                ) from error
+            except (TypeError, ValueError) as error:
+                raise UserError(
+                    f"{label} POSIX ACL cannot be inspected descriptor-relatively"
+                ) from error
+            return True
+        return False
+    raise UserError(f"{label} ACL inspection is unsupported on platform {sys.platform}")
+
+
+def _require_no_extended_acl(file_fd: int, *, label: str) -> None:
+    if _descriptor_has_extended_acl(file_fd, label=label):
+        raise UserError(f"{label} must not carry a named or extended ACL")
+
+
+def _require_owned_nonwritable_directory(
+    directory_stat: os.stat_result,
+    *,
+    label: str,
+    directory_fd: int | None = None,
+) -> DirectoryIdentity:
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise UserError(f"{label} must be a directory")
+    identity = _directory_identity(directory_stat)
+    if identity.uid != os.geteuid():
+        raise UserError(f"{label} must be owned by the current user")
+    if identity.mode & UNTRUSTED_WRITE_MASK:
+        raise UserError(f"{label} must not be writable by group or other users")
+    if directory_fd is not None:
+        _require_no_extended_acl(directory_fd, label=label)
+    return identity
+
+
+def _bound_owned_directory_identity(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    *,
+    label: str,
+) -> DirectoryIdentity:
+    try:
+        descriptor_stat = os.fstat(directory_fd)
+        named_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise UserError(f"{label} binding cannot be restated safely") from error
+    descriptor_identity = _require_owned_nonwritable_directory(
+        descriptor_stat,
+        label=label,
+        directory_fd=directory_fd,
+    )
+    named_identity = _require_owned_nonwritable_directory(
+        named_stat,
+        label=f"named {label}",
+    )
+    if (
+        not _same_object(descriptor_stat, named_stat)
+        or descriptor_identity != named_identity
+    ):
+        raise UserError(f"{label} identity or access policy changed")
+    return descriptor_identity
+
+
+def _open_owned_directory_at(parent_fd: int, name: str, *, label: str) -> int:
+    try:
+        directory_fd = _open_directory_at(parent_fd, name)
+    except OSError as error:
+        raise UserError(f"{label} cannot be opened without following links") from error
+    try:
+        _bound_owned_directory_identity(
+            parent_fd,
+            name,
+            directory_fd,
+            label=label,
+        )
+    except Exception:
+        os.close(directory_fd)
+        raise
+    return directory_fd
+
+
+def _harden_run_directory(
+    runs_fd: int,
+    run_name: str,
+    run_fd: int,
+    *,
+    allow_legacy: bool,
+) -> DirectoryIdentity:
+    identity = _bound_owned_directory_identity(
+        runs_fd,
+        run_name,
+        run_fd,
+        label="run directory",
+    )
+    if identity.mode == DIRECTORY_MODE:
+        return identity
+    if not allow_legacy or identity.mode != LEGACY_DIRECTORY_MODE:
+        raise UserError(
+            "run directory must use mode 0700 or current-user legacy mode 0755"
+        )
+    try:
+        os.fchmod(run_fd, DIRECTORY_MODE)
+    except OSError as error:
+        raise UserError(
+            "cannot tighten current-user legacy run directory to mode 0700"
+        ) from error
+    hardened = _bound_owned_directory_identity(
+        runs_fd,
+        run_name,
+        run_fd,
+        label="run directory",
+    )
+    if (
+        hardened.device,
+        hardened.inode,
+        hardened.uid,
+        hardened.gid,
+    ) != (
+        identity.device,
+        identity.inode,
+        identity.uid,
+        identity.gid,
+    ) or hardened.mode != DIRECTORY_MODE:
+        raise UserError(
+            "run directory object or access policy changed while tightening legacy mode"
+        )
+    return hardened
+
+
 def _ensure_directory_at(parent_fd: int, name: str) -> int:
     _validate_component_name(name, label="directory name")
     try:
@@ -472,6 +785,12 @@ def _ensure_directory_at(parent_fd: int, name: str) -> int:
             or not _same_object(descriptor_stat, named_stat)
         ):
             raise UserError(f"run parent directory identity mismatch: {name}")
+        _bound_owned_directory_identity(
+            parent_fd,
+            name,
+            directory_fd,
+            label=f"run parent directory {name}",
+        )
         os.fsync(parent_fd)
         named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISDIR(named_after.st_mode) or not _same_object(
@@ -480,6 +799,12 @@ def _ensure_directory_at(parent_fd: int, name: str) -> int:
             raise UserError(
                 f"run parent directory changed while persisting its entry: {name}"
             )
+        _bound_owned_directory_identity(
+            parent_fd,
+            name,
+            directory_fd,
+            label=f"run parent directory {name}",
+        )
         return directory_fd
     except Exception:
         os.close(directory_fd)
@@ -511,14 +836,43 @@ def _run_layout(
     return run_dir, repo_root, run_name
 
 
-def _open_run_directory_path(repo_root: pathlib.Path, run_name: str) -> int:
+def _open_run_directory_path(
+    repo_root: pathlib.Path,
+    run_name: str,
+    *,
+    allow_legacy_run_mode: bool = False,
+) -> int:
     repo_fd = _open_absolute_directory(repo_root)
     codex_tmp_fd: int | None = None
     runs_fd: int | None = None
     try:
-        codex_tmp_fd = _open_directory_at(repo_fd, ".codex-tmp")
-        runs_fd = _open_directory_at(codex_tmp_fd, RUNS_DIR_NAME)
-        return _open_directory_at(runs_fd, run_name)
+        _require_owned_nonwritable_directory(
+            os.fstat(repo_fd),
+            label="repository root",
+            directory_fd=repo_fd,
+        )
+        codex_tmp_fd = _open_owned_directory_at(
+            repo_fd,
+            ".codex-tmp",
+            label="run .codex-tmp parent",
+        )
+        runs_fd = _open_owned_directory_at(
+            codex_tmp_fd,
+            RUNS_DIR_NAME,
+            label="waited-delivery parent",
+        )
+        run_fd = _open_directory_at(runs_fd, run_name)
+        try:
+            _harden_run_directory(
+                runs_fd,
+                run_name,
+                run_fd,
+                allow_legacy=allow_legacy_run_mode,
+            )
+        except Exception:
+            os.close(run_fd)
+            raise
+        return run_fd
     finally:
         if runs_fd is not None:
             os.close(runs_fd)
@@ -586,7 +940,11 @@ def _open_run_directory(
         expected_repo_root=expected_repo_root,
     )
     try:
-        run_fd = _open_run_directory_path(repo_root, run_name)
+        run_fd = _open_run_directory_path(
+            repo_root,
+            run_name,
+            allow_legacy_run_mode=expected_run_identity is None,
+        )
     except OSError as error:
         raise UserError(f"unsafe or unavailable run directory: {run_dir}") from error
     try:
@@ -623,6 +981,11 @@ def _create_run_directory(
     codex_tmp_fd: int | None = None
     runs_fd: int | None = None
     try:
+        _require_owned_nonwritable_directory(
+            os.fstat(repo_fd),
+            label="repository root",
+            directory_fd=repo_fd,
+        )
         codex_tmp_fd = _ensure_directory_at(repo_fd, ".codex-tmp")
         runs_fd = _ensure_directory_at(codex_tmp_fd, RUNS_DIR_NAME)
         try:
@@ -632,6 +995,12 @@ def _create_run_directory(
                 f"run directory already exists for run id: {run_id}"
             ) from error
         run_fd = _open_directory_at(runs_fd, run_id)
+        _harden_run_directory(
+            runs_fd,
+            run_id,
+            run_fd,
+            allow_legacy=False,
+        )
         _verify_run_directory_identity(run_dir, repo_root, run_fd)
         os.fsync(runs_fd)
         _verify_run_directory_identity(run_dir, repo_root, run_fd)
@@ -666,9 +1035,42 @@ def _regular_file_stat(
         if required:
             raise UserError(f"required run artifact is missing: {name}")
         return None
-    if not stat.S_ISREG(file_stat.st_mode):
-        raise UserError(f"run artifact must be a regular file: {name}")
-    return file_stat
+    try:
+        file_fd = os.open(name, _regular_open_flags(), dir_fd=run_fd)
+    except OSError as error:
+        raise UserError(
+            f"run artifact cannot be opened without following links: {name}"
+        ) from error
+    try:
+        descriptor_stat = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or not stat.S_ISREG(descriptor_stat.st_mode)
+            or not _same_object(file_stat, descriptor_stat)
+        ):
+            raise UserError(f"run artifact must be a regular file: {name}")
+        named_access = (
+            file_stat.st_uid,
+            file_stat.st_gid,
+            stat.S_IMODE(file_stat.st_mode),
+        )
+        descriptor_access = (
+            descriptor_stat.st_uid,
+            descriptor_stat.st_gid,
+            stat.S_IMODE(descriptor_stat.st_mode),
+        )
+        if named_access != descriptor_access:
+            raise UserError(f"run artifact identity or access policy changed: {name}")
+        if descriptor_stat.st_uid != os.geteuid():
+            raise UserError(f"run artifact must be owned by the current user: {name}")
+        if stat.S_IMODE(descriptor_stat.st_mode) & UNTRUSTED_WRITE_MASK:
+            raise UserError(
+                f"run artifact must not be writable by group or other users: {name}"
+            )
+        _require_no_extended_acl(file_fd, label=f"run artifact {name}")
+        return descriptor_stat
+    finally:
+        os.close(file_fd)
 
 
 def _read_fd_bounded(file_fd: int, name: str, *, max_bytes: int) -> bytes:
@@ -720,6 +1122,18 @@ def _read_regular_artifact(
             raise ArtifactUnreadableError(
                 f"run artifact must be a regular file: {name}"
             )
+        if before.st_uid != os.geteuid() or named_before.st_uid != os.geteuid():
+            raise ArtifactUnreadableError(
+                f"run artifact must be owned by the current user: {name}"
+            )
+        if (
+            stat.S_IMODE(before.st_mode) & UNTRUSTED_WRITE_MASK
+            or stat.S_IMODE(named_before.st_mode) & UNTRUSTED_WRITE_MASK
+        ):
+            raise ArtifactUnreadableError(
+                f"run artifact must not be writable by group or other users: {name}"
+            )
+        _require_no_extended_acl(file_fd, label=f"run artifact {name}")
         if before.st_size > max_bytes:
             raise ArtifactUnreadableError(f"run artifact exceeds byte limit: {name}")
         expected_access = (
@@ -766,6 +1180,7 @@ def _read_regular_artifact(
                 f"run artifact identity, access, size, or content changed "
                 f"while it was read: {name}"
             )
+        _require_no_extended_acl(file_fd, label=f"run artifact {name}")
         return ArtifactRead(
             content=second_content,
             version=FileVersion(
@@ -1027,6 +1442,15 @@ def _atomic_write_regular(
             offset += written_bytes
         os.fsync(temp_fd)
         temp_identity = _directory_identity(os.fstat(temp_fd))
+        if (
+            temp_identity.uid != os.geteuid()
+            or temp_identity.mode & UNTRUSTED_WRITE_MASK
+        ):
+            raise UserError(f"temporary run artifact access policy is unsafe: {name}")
+        _require_no_extended_acl(
+            temp_fd,
+            label=f"temporary run artifact {name}",
+        )
         os.close(temp_fd)
         temp_fd = None
         _validate_expected_artifact(
@@ -1088,6 +1512,170 @@ def _atomic_write_regular(
             pass
 
 
+def _bounded_text_is_oversized(
+    identity: LegacyBoundedTextIdentity,
+    *,
+    max_utf8_bytes: int,
+    max_json_bytes: int,
+) -> bool:
+    return (
+        identity["utf8_bytes"] > max_utf8_bytes
+        or identity["json_bytes"] > max_json_bytes
+    )
+
+
+def _validate_legacy_bounded_text_marker(
+    field: str,
+    raw_marker: object,
+) -> LegacyBoundedTextIdentity:
+    if not isinstance(raw_marker, dict) or set(raw_marker) != {
+        "utf8_bytes",
+        "json_bytes",
+        "sha256",
+    }:
+        raise UserError(
+            f"invalid legacy bounded-text identity for orchestration.{field}"
+        )
+    utf8_bytes = raw_marker.get("utf8_bytes")
+    json_bytes = raw_marker.get("json_bytes")
+    sha256 = raw_marker.get("sha256")
+    if (
+        not isinstance(utf8_bytes, int)
+        or isinstance(utf8_bytes, bool)
+        or utf8_bytes < 0
+        or not isinstance(json_bytes, int)
+        or isinstance(json_bytes, bool)
+        or json_bytes < 0
+        or not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+    ):
+        raise UserError(
+            f"invalid legacy bounded-text identity for orchestration.{field}"
+        )
+    return {
+        "utf8_bytes": utf8_bytes,
+        "json_bytes": json_bytes,
+        "sha256": sha256,
+    }
+
+
+def _migrate_legacy_bounded_text(
+    state: WaitedDeliveryState,
+    *,
+    source_schema_version: int,
+) -> None:
+    orchestration = state.get("orchestration")
+    if not isinstance(orchestration, dict):
+        raise UserError("state orchestration must be an object")
+    supported_fields = {field for field, *_limits in BOUNDED_ORCHESTRATION_FIELDS}
+    raw_markers = state.get("legacy_bounded_text")
+    if source_schema_version == STATE_SCHEMA_VERSION:
+        if not isinstance(raw_markers, dict):
+            raise UserError("state legacy_bounded_text must be an object")
+        unknown_fields = set(raw_markers) - supported_fields
+        if unknown_fields:
+            raise UserError(
+                "state legacy_bounded_text contains unsupported fields: "
+                + ", ".join(sorted(unknown_fields))
+            )
+        markers = {
+            field: _validate_legacy_bounded_text_marker(field, raw_marker)
+            for field, raw_marker in raw_markers.items()
+        }
+    else:
+        markers: dict[str, LegacyBoundedTextIdentity] = {}
+
+    for (
+        field,
+        max_utf8_bytes,
+        max_json_bytes,
+        _require_nonblank,
+    ) in BOUNDED_ORCHESTRATION_FIELDS:
+        value = orchestration.get(field)
+        if value is None:
+            markers.pop(field, None)
+            continue
+        identity = _bounded_text_identity(
+            cast(str, value),
+            label=field.replace("_", "-"),
+            require_nonblank=False,
+        )
+        if not _bounded_text_is_oversized(
+            identity,
+            max_utf8_bytes=max_utf8_bytes,
+            max_json_bytes=max_json_bytes,
+        ):
+            markers.pop(field, None)
+            continue
+        if source_schema_version < STATE_SCHEMA_VERSION:
+            markers[field] = identity
+        elif markers.get(field) != identity:
+            raise UserError(
+                f"oversized orchestration.{field} changed outside its "
+                "grandfathered legacy identity"
+            )
+
+    state["schema_version"] = STATE_SCHEMA_VERSION
+    state["legacy_bounded_text"] = markers
+
+
+def _validate_bounded_text_for_save(state: WaitedDeliveryState) -> None:
+    if state.get("schema_version") != STATE_SCHEMA_VERSION:
+        raise UserError(
+            f"state must use schema {STATE_SCHEMA_VERSION} before publication"
+        )
+    markers = state.get("legacy_bounded_text")
+    if not isinstance(markers, dict):
+        raise UserError("state legacy_bounded_text must be an object")
+    supported_fields = {field for field, *_limits in BOUNDED_ORCHESTRATION_FIELDS}
+    unknown_fields = set(markers) - supported_fields
+    if unknown_fields:
+        raise UserError(
+            "state legacy_bounded_text contains unsupported fields: "
+            + ", ".join(sorted(unknown_fields))
+        )
+    orchestration = state["orchestration"]
+    for (
+        field,
+        max_utf8_bytes,
+        max_json_bytes,
+        require_nonblank,
+    ) in BOUNDED_ORCHESTRATION_FIELDS:
+        value = orchestration[field]
+        if value is None:
+            markers.pop(field, None)
+            continue
+        label = field.replace("_", "-")
+        identity = _bounded_text_identity(
+            value,
+            label=label,
+            require_nonblank=require_nonblank,
+        )
+        if not _bounded_text_is_oversized(
+            identity,
+            max_utf8_bytes=max_utf8_bytes,
+            max_json_bytes=max_json_bytes,
+        ):
+            markers.pop(field, None)
+            continue
+        raw_marker = markers.get(field)
+        marker = (
+            _validate_legacy_bounded_text_marker(field, raw_marker)
+            if raw_marker is not None
+            else None
+        )
+        if marker == identity:
+            continue
+        _validate_bounded_text(
+            value,
+            label=label,
+            max_utf8_bytes=max_utf8_bytes,
+            max_json_bytes=max_json_bytes,
+            require_nonblank=require_nonblank,
+        )
+
+
 def _load_state_from_fd(
     run_dir: pathlib.Path,
     repo_root: pathlib.Path,
@@ -1107,6 +1695,14 @@ def _load_state_from_fd(
     if not isinstance(payload, dict):
         raise UserError(f"invalid state payload: {run_dir / STATE_FILE_NAME}")
     state = cast(WaitedDeliveryState, payload)
+    schema_version = state.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version < 1
+        or schema_version > STATE_SCHEMA_VERSION
+    ):
+        raise UserError(f"unsupported state schema: {run_dir / STATE_FILE_NAME}")
     state.setdefault("preparation_id", None)
     if state.get("repo_root") != str(repo_root):
         raise UserError(
@@ -1117,6 +1713,10 @@ def _load_state_from_fd(
     orchestration.setdefault("parent_turn_id", None)
     orchestration.setdefault("parent_transcript_path", None)
     orchestration.setdefault("permission_mode", None)
+    _migrate_legacy_bounded_text(
+        state,
+        source_schema_version=schema_version,
+    )
     return state, artifact.version
 
 
@@ -1129,6 +1729,17 @@ def _state_requires_terminal_capacity(state: WaitedDeliveryState) -> bool:
     return state["overall_status"] != _overall_status(state["phases"])
 
 
+def _larger_json_capacity_value(
+    current: str | None,
+    reserved: str,
+) -> str:
+    if isinstance(current, str) and _json_value_size(current) > _json_value_size(
+        reserved
+    ):
+        return current
+    return reserved
+
+
 def _terminal_capacity_projection(
     state: WaitedDeliveryState,
     *,
@@ -1136,18 +1747,44 @@ def _terminal_capacity_projection(
 ) -> WaitedDeliveryState:
     projected = copy.deepcopy(state)
     orchestration = projected["orchestration"]
+    maximum_id = "\x01" * CHILD_SESSION_ID_MAX_UTF8_BYTES
+    maximum_parent_metadata = "\x01" * PARENT_METADATA_MAX_UTF8_BYTES
+    maximum_timestamp = "0" * TIMESTAMP_CAPACITY_CHARS
+    if not orchestration["child_session_id"]:
+        orchestration["child_session_id"] = maximum_id
+    if not orchestration["child_started_at"]:
+        orchestration["child_started_at"] = maximum_timestamp
+    for field in (
+        "parent_session_id",
+        "parent_turn_id",
+        "parent_transcript_path",
+        "permission_mode",
+    ):
+        orchestration[field] = _larger_json_capacity_value(
+            orchestration[field],
+            maximum_parent_metadata,
+        )
     if orchestration["child_status"] not in CHILD_TERMINAL_STATUSES:
         orchestration["child_status"] = "interrupted"
     if not orchestration["child_finished_at"]:
-        orchestration["child_finished_at"] = transaction_time
-    orchestration["updated_at"] = transaction_time
+        orchestration["child_finished_at"] = maximum_timestamp
+    orchestration["updated_at"] = _larger_json_capacity_value(
+        transaction_time,
+        maximum_timestamp,
+    )
     for phase_name in projected["phases_order"]:
         phase = projected["phases"][phase_name]
         if phase["status"] not in TERMINAL_PHASE_STATUSES:
             phase["status"] = "decision_point"
-            phase["updated_at"] = transaction_time
+            phase["updated_at"] = _larger_json_capacity_value(
+                transaction_time,
+                maximum_timestamp,
+            )
     projected["overall_status"] = _overall_status(projected["phases"])
-    projected["updated_at"] = transaction_time
+    projected["updated_at"] = _larger_json_capacity_value(
+        transaction_time,
+        maximum_timestamp,
+    )
     return projected
 
 
@@ -1157,6 +1794,7 @@ def _serialize_state_for_save(
     transaction_time: str,
     context: str,
 ) -> str:
+    _validate_bounded_text_for_save(state)
     state["updated_at"] = transaction_time
     state_json = json.dumps(state, indent=2, sort_keys=True) + "\n"
     encoded_size = len(state_json.encode("utf-8"))
@@ -1234,6 +1872,11 @@ def _open_run_lock_descriptor(
         lock_stat = os.fstat(lock_fd)
         if not stat.S_ISREG(lock_stat.st_mode):
             raise UserError("run lock must be a regular file")
+        if lock_stat.st_uid != os.geteuid():
+            raise UserError("run lock must be owned by the current user")
+        if stat.S_IMODE(lock_stat.st_mode) & UNTRUSTED_WRITE_MASK:
+            raise UserError("run lock must not be writable by group or other users")
+        _require_no_extended_acl(lock_fd, label="run lock")
         yield lock_fd, _directory_identity(lock_stat)
     finally:
         os.close(lock_fd)
@@ -1307,6 +1950,12 @@ def _locked_run_state(
                 repo_root,
                 run_fd,
             )
+            for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                _read_regular_artifact(
+                    run_fd,
+                    prompt_name,
+                    max_bytes=STATE_MAX_BYTES,
+                )
             yield run_dir, repo_root, run_fd, state, state_version
             _verify_run_directory_identity(
                 run_dir,
@@ -1577,6 +2226,7 @@ def _non_terminal_phase_names(state: WaitedDeliveryState) -> list[str]:
 
 
 def _prepare(args: argparse.Namespace) -> int:
+    _validate_parent_metadata_args(args)
     repo_root = _resolve_repo_root(args.repo)
     changed_files = (
         _ensure_relative_paths(args.changed_file)
@@ -1624,7 +2274,7 @@ def _prepare(args: argparse.Namespace) -> int:
     smoke_prompt_path = run_dir / FALLBACK_SMOKE_PROMPT_NAME
     smoke_command_path = run_dir / "fallback-smoke.command.txt"
     state: WaitedDeliveryState = {
-        "schema_version": 4,
+        "schema_version": STATE_SCHEMA_VERSION,
         "run_id": run_id,
         "preparation_id": preparation_id,
         "repo_root": str(repo_root),
@@ -1660,6 +2310,7 @@ def _prepare(args: argparse.Namespace) -> int:
             parent_transcript_path=args.parent_transcript_path,
             permission_mode=args.permission_mode,
         ),
+        "legacy_bounded_text": {},
         "artifacts": {
             "state_json": str(state_path),
             "child_contract": str(contract_path),
@@ -1894,6 +2545,13 @@ def _refresh_prompts(args: argparse.Namespace) -> int:
 
 
 def _attach_child(args: argparse.Namespace) -> int:
+    if not args.child_session_id.strip():
+        raise UserError("attach-child requires a nonblank child session id")
+    _validate_child_session_id(
+        args.child_session_id,
+        label="attach-child child-session-id",
+    )
+    _validate_parent_metadata_args(args)
     with _locked_run_state(args.run_dir) as (
         run_dir,
         repo_root,
@@ -1901,8 +2559,6 @@ def _attach_child(args: argparse.Namespace) -> int:
         state,
         state_version,
     ):
-        if not args.child_session_id.strip():
-            raise UserError("attach-child requires a nonblank child session id")
         orchestration = state["orchestration"]
         if (
             orchestration["child_status"] != "pending"
@@ -1911,10 +2567,11 @@ def _attach_child(args: argparse.Namespace) -> int:
             raise UserError(
                 "cannot attach child after child orchestration has already started"
             )
+        transaction_time = _utc_now()
         orchestration["child_session_id"] = args.child_session_id
         orchestration["child_status"] = "running"
-        orchestration["child_started_at"] = _utc_now()
-        orchestration["updated_at"] = _utc_now()
+        orchestration["child_started_at"] = transaction_time
+        orchestration["updated_at"] = transaction_time
         if args.parent_session_id:
             orchestration["parent_session_id"] = args.parent_session_id
         if args.parent_turn_id:
@@ -1923,11 +2580,20 @@ def _attach_child(args: argparse.Namespace) -> int:
             orchestration["parent_transcript_path"] = args.parent_transcript_path
         if args.permission_mode:
             orchestration["permission_mode"] = args.permission_mode
-        _save_state(run_dir, repo_root, run_fd, state, state_version)
+        _save_state(
+            run_dir,
+            repo_root,
+            run_fd,
+            state,
+            state_version,
+            transaction_time=transaction_time,
+            context="child attachment",
+        )
     return 0
 
 
 def _bind_parent(args: argparse.Namespace) -> int:
+    _validate_parent_metadata_args(args)
     with _locked_run_state(args.run_dir) as (
         run_dir,
         repo_root,
@@ -2084,15 +2750,15 @@ def _transition_child_terminal(
 ) -> None:
     if child_status not in CHILD_TERMINAL_STATUSES:
         raise UserError(f"unsupported child status: {child_status}")
+    if not child_session_id or not child_session_id.strip():
+        raise UserError(
+            "child terminal transition requires a nonblank child session id"
+        )
     orchestration = state["orchestration"]
     attached_id = orchestration["child_session_id"]
     if not attached_id:
         raise UserError(
             "cannot finish child before attach-child records its session id"
-        )
-    if not child_session_id or not child_session_id.strip():
-        raise UserError(
-            "child terminal transition requires a nonblank child session id"
         )
     if child_session_id != attached_id:
         raise UserError(
@@ -2565,6 +3231,7 @@ def _run_bounded_smoke_process(
     timeout: float = SMOKE_TIMEOUT_SECONDS,
     cleanup_timeout: float = SMOKE_CLEANUP_TIMEOUT_SECONDS,
     max_capture_bytes: int = SMOKE_CAPTURE_MAX_BYTES,
+    pre_spawn_check: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if not command or not all(isinstance(argument, str) for argument in command):
         raise UserError("fallback readiness smoke command must be a nonempty argv")
@@ -2643,6 +3310,7 @@ def _run_bounded_smoke_process(
             cleanup_timeout=cleanup_timeout,
             max_capture_bytes=max_capture_bytes,
             signal_transaction=signal_transaction,
+            pre_spawn_check=pre_spawn_check,
         )
     if signal_transaction.pending_signal is not None:
         signum = signal_transaction.pending_signal
@@ -2672,6 +3340,7 @@ def _run_bounded_smoke_process_supervised(
     cleanup_timeout: float,
     max_capture_bytes: int,
     signal_transaction: _SmokeSignalTransaction,
+    pre_spawn_check: Callable[[], None] | None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         selector = selectors.DefaultSelector()
@@ -2685,6 +3354,9 @@ def _run_bounded_smoke_process_supervised(
     input_offset = 0
     input_rejected = False
     try:
+        signal_transaction.raise_if_pending()
+        if pre_spawn_check is not None:
+            pre_spawn_check()
         signal_transaction.raise_if_pending()
         try:
             process = subprocess.Popen(
@@ -2890,6 +3562,27 @@ def _run_fallback_smoke(args: argparse.Namespace) -> int:
                         repo_root,
                         run_fd,
                     )
+                    protected_artifact_versions = {
+                        STATE_FILE_NAME: snapshot_state_version,
+                    }
+                    for artifact_field, artifact_name in (
+                        ("child_prompt", "child-prompt.md"),
+                        ("parent_prompt", "parent-prompt.md"),
+                    ):
+                        if state["artifacts"][artifact_field] != str(
+                            run_dir / artifact_name
+                        ):
+                            raise UserError(
+                                f"{artifact_name} path does not match the "
+                                "descriptor-bound run artifact"
+                            )
+                        protected_artifact_versions[artifact_name] = (
+                            _read_regular_artifact(
+                                run_fd,
+                                artifact_name,
+                                max_bytes=STATE_MAX_BYTES,
+                            ).version
+                        )
                     snapshot_smoke = copy.deepcopy(state["fallback_readiness_smoke"])
                     if not snapshot_smoke["enabled"]:
                         raise UserError(
@@ -2925,6 +3618,9 @@ def _run_fallback_smoke(args: argparse.Namespace) -> int:
                         FALLBACK_SMOKE_PROMPT_NAME,
                         max_bytes=STATE_MAX_BYTES,
                     )
+                    protected_artifact_versions[FALLBACK_SMOKE_PROMPT_NAME] = (
+                        prompt_artifact.version
+                    )
                     (
                         prompt_execution_path,
                         prompt_read_stream,
@@ -2933,12 +3629,45 @@ def _run_fallback_smoke(args: argparse.Namespace) -> int:
                     command[prompt_indexes[0] + 1] = str(prompt_execution_path)
                     smoke_cwd = pathlib.Path(state["repo_root"])
 
+                def pre_spawn_check() -> None:
+                    _verify_run_directory_identity(
+                        run_dir,
+                        repo_root,
+                        run_fd,
+                        expected_identity=run_identity,
+                    )
+                    current_lock = _regular_file_stat(
+                        run_fd,
+                        RUN_LOCK_NAME,
+                        required=True,
+                    )
+                    if (
+                        current_lock is None
+                        or _directory_identity(current_lock) != lock_identity
+                        or _directory_identity(os.fstat(lock_fd)) != lock_identity
+                    ):
+                        raise UserError(
+                            "run lock identity or access policy changed before "
+                            "fallback process start"
+                        )
+                    for (
+                        artifact_name,
+                        artifact_version,
+                    ) in protected_artifact_versions.items():
+                        _validate_expected_artifact(
+                            run_fd,
+                            artifact_name,
+                            artifact_version,
+                            max_bytes=STATE_MAX_BYTES,
+                        )
+
                 completed = _run_bounded_smoke_process(
                     command,
                     cwd=smoke_cwd,
                     child_read_streams=(prompt_read_stream,),
                     input_stream=prompt_write_stream,
                     input_bytes=prompt_artifact.content,
+                    pre_spawn_check=pre_spawn_check,
                 )
                 status, sample = _classify_smoke(
                     stdout=completed.stdout,

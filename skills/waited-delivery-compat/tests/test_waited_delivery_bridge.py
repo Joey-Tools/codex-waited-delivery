@@ -394,7 +394,7 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(state["schema_version"], 5)
         self.assertEqual(state["preparation_id"], preparation_id)
         self.assertEqual(
             state["orchestration"]["parent_session_id"],

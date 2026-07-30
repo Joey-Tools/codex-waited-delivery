@@ -29,7 +29,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 
 BRIDGE_PATH = pathlib.Path(__file__).resolve().with_name("waited_delivery_bridge.py")
 RUNNER_PATH = BRIDGE_PATH.with_name("waited_delivery_runner.py")
-INDEX_SCHEMA_VERSION = 2
+INDEX_SCHEMA_VERSION = 3
 INDEX_FILE_NAME = "index.json"
 INDEX_LOCK_FILE_NAME = "index.lock"
 INDEX_MAX_BYTES = 4 * 1024 * 1024
@@ -63,12 +63,19 @@ TERMINAL_PHASE_STATUSES = {
     "decision_point",
 }
 CHILD_TERMINAL_STATUSES = {"completed", "failed", "interrupted"}
-PREPARATION_STATUSES = {"preparing", "recovery_required"}
+RECOVERABLE_PREPARATION_STATUSES = {"preparing", "recovery_required"}
+CLEANUP_PENDING_STATUS = "cleanup_pending"
+CLEANUP_COMPLETE_STATUS = "cleanup_complete"
+PREPARATION_STATUSES = RECOVERABLE_PREPARATION_STATUSES | {
+    CLEANUP_PENDING_STATUS,
+    CLEANUP_COMPLETE_STATUS,
+}
 PREPARATION_REASON_MAX_CHARS = 512
 RUNS_DIR_NAME = "waited-delivery"
 RUN_DIRECTORY_MODE = 0o700
 LEGACY_RUN_DIRECTORY_MODE = 0o755
 STATE_MAX_BYTES = 4 * 1024 * 1024
+RUNNER_PREPARATION_SCHEMA_VERSIONS = {4, 5}
 PROMPT_REFRESH_SCHEMA_VERSION = 3
 SOURCE_FRAME_MAGIC = b"WDLPIPE1"
 SOURCE_FRAME_HEADER_BYTES = 8 + 8 + 32 + 8 + 32
@@ -141,6 +148,7 @@ LinuxRefreshProcessGroupState = Literal[
     "unknown",
 ]
 RunEntryPresence = Literal["absent", "present"]
+LeaseEntryPresence = Literal["absent", "present"]
 
 
 class UserError(RuntimeError):
@@ -989,7 +997,7 @@ def _decode_index(content: bytes, path: pathlib.Path) -> AdapterIndex:
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version not in {1, INDEX_SCHEMA_VERSION}
+        or schema_version not in {1, 2, INDEX_SCHEMA_VERSION}
     ):
         raise UserError(f"unsupported adapter index schema: {path}")
     payload["schema_version"] = INDEX_SCHEMA_VERSION
@@ -2822,19 +2830,17 @@ def _require_exact_reservation(
         )
 
 
-def _clear_preparation_reservation(
+def _mark_preparation_cleanup_complete(
     record: SessionRecord,
     *,
     updated_at: str,
 ) -> None:
-    record["run_dir"] = None
-    record["status"] = "observed"
+    record["status"] = CLEANUP_COMPLETE_STATUS
     record["updated_at"] = updated_at
-    record["preparation_id"] = None
-    record["preparation_run_id"] = None
-    record["preparation_lease_path"] = None
-    record["preparation_started_at"] = None
-    record["preparation_reason"] = None
+    record["preparation_reason"] = (
+        "descriptor-proven run and lease absence committed; this exact cleanup "
+        "tombstone may be retried or superseded by a new preparation"
+    )
 
 
 def _mark_preparation_recovery(
@@ -2843,7 +2849,23 @@ def _mark_preparation_recovery(
     reason: str,
     updated_at: str,
 ) -> None:
+    if record["status"] in {
+        CLEANUP_PENDING_STATUS,
+        CLEANUP_COMPLETE_STATUS,
+    }:
+        raise RunSafetyError("cleanup reservation cannot return to recovery_required")
     record["status"] = "recovery_required"
+    record["updated_at"] = updated_at
+    record["preparation_reason"] = _bounded_preparation_reason(reason)
+
+
+def _mark_preparation_cleanup_pending(
+    record: SessionRecord,
+    *,
+    reason: str,
+    updated_at: str,
+) -> None:
+    record["status"] = CLEANUP_PENDING_STATUS
     record["updated_at"] = updated_at
     record["preparation_reason"] = _bounded_preparation_reason(reason)
 
@@ -2853,6 +2875,8 @@ def _activate_preparation(
     *,
     updated_at: str,
 ) -> None:
+    if record["status"] not in RECOVERABLE_PREPARATION_STATUSES | {"active"}:
+        raise RunSafetyError("cleanup reservation cannot be activated")
     record["status"] = "active"
     record["updated_at"] = updated_at
     record["preparation_reason"] = None
@@ -3129,6 +3153,127 @@ def _remove_preparation_lease(
             os.close(repo_fd)
 
 
+def _preparation_lease_entry_presence(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> LeaseEntryPresence:
+    expected_path = _preparation_lease_path(
+        repo_root,
+        reservation.preparation_id,
+    )
+    if pathlib.Path(reservation.lease_path) != expected_path:
+        raise RunSafetyError(
+            "preparation reservation lease path does not match its transaction id"
+        )
+    repo_fd: int | None = None
+    codex_tmp_fd: int | None = None
+    adapter_fd: int | None = None
+    try:
+        repo_fd, codex_tmp_fd, adapter_fd = _open_index_directories(repo_root)
+        _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+        try:
+            os.stat(
+                _preparation_lease_name(reservation.preparation_id),
+                dir_fd=adapter_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            presence: LeaseEntryPresence = "absent"
+        except OSError as error:
+            raise RunSafetyError(
+                "preparation lease presence cannot be inspected safely"
+            ) from error
+        else:
+            presence = "present"
+        _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+        return presence
+    finally:
+        if adapter_fd is not None:
+            os.close(adapter_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        if repo_fd is not None:
+            os.close(repo_fd)
+
+
+def _fsync_preparation_lease_absence(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> None:
+    expected_path = _preparation_lease_path(
+        repo_root,
+        reservation.preparation_id,
+    )
+    if pathlib.Path(reservation.lease_path) != expected_path:
+        raise RunSafetyError(
+            "preparation reservation lease path does not match its transaction id"
+        )
+    repo_fd: int | None = None
+    codex_tmp_fd: int | None = None
+    adapter_fd: int | None = None
+    lease_name = _preparation_lease_name(reservation.preparation_id)
+    try:
+        repo_fd, codex_tmp_fd, adapter_fd = _open_index_directories(repo_root)
+        _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+        try:
+            os.stat(
+                lease_name,
+                dir_fd=adapter_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise RunSafetyError(
+                "preparation lease absence cannot be inspected safely"
+            ) from error
+        else:
+            raise RunSafetyError(
+                "preparation lease is still present before cleanup final CAS"
+            )
+        os.fsync(adapter_fd)
+        try:
+            os.stat(
+                lease_name,
+                dir_fd=adapter_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise RunSafetyError(
+                "preparation lease absence cannot be revalidated safely"
+            ) from error
+        else:
+            raise RunSafetyError(
+                "preparation lease reappeared before cleanup final CAS"
+            )
+        _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+    except OSError as error:
+        raise RunSafetyError(
+            "preparation lease parent durability cannot be established"
+        ) from error
+    finally:
+        if adapter_fd is not None:
+            os.close(adapter_fd)
+        if codex_tmp_fd is not None:
+            os.close(codex_tmp_fd)
+        if repo_fd is not None:
+            os.close(repo_fd)
+
+
+def _require_cleanup_complete_absence(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+) -> None:
+    _fsync_preparation_lease_absence(repo_root, reservation)
+    if _expected_run_entry_presence(repo_root, reservation) != "absent":
+        raise RunSafetyError(
+            "cleanup-complete tombstone no longer has a descriptor-proven "
+            "absent reserved run entry"
+        )
+
+
 def _retire_inherited_preparation_lease(lease_fd: int) -> None:
     """Close one local inherited-lease reference without retrying ambiguity."""
 
@@ -3265,7 +3410,7 @@ def _require_reserved_state_attestation(
 ) -> None:
     if run_dir != pathlib.Path(reservation.run_dir):
         raise RunSafetyError("reserved run resolved to an unexpected repository path")
-    if state.get("schema_version") != 4:
+    if state.get("schema_version") not in RUNNER_PREPARATION_SCHEMA_VERSIONS:
         raise RunSafetyError(
             "reserved run state does not use the preparation-aware schema"
         )
@@ -3727,7 +3872,11 @@ def _stop_hook(_: argparse.Namespace) -> int:
             return _success_hook_response()
         with _index_transaction(repo_root, write=True) as index:
             record = index["sessions"].get(session_id)
-            if record is None or not record["run_dir"]:
+            if (
+                record is None
+                or not record["run_dir"]
+                or record["status"] == CLEANUP_COMPLETE_STATUS
+            ):
                 stop_result = 0
             elif record["status"] in PREPARATION_STATUSES:
                 if payload.get("stop_hook_active"):
@@ -3819,6 +3968,86 @@ def _build_prepare_bridge_args(
     return bridge_args
 
 
+def _cas_preparation_cleanup_pending(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+    *,
+    expected_record: SessionRecord,
+    reason: str,
+) -> SessionRecord:
+    transaction_time = _utc_now()
+    pending_snapshot: SessionRecord | None = None
+    with _index_transaction(
+        repo_root,
+        write=True,
+        commit_time=transaction_time,
+        context="preparation cleanup-pending reservation CAS",
+    ) as index:
+        record = index["sessions"].get(reservation.session_id)
+        if record is None:
+            raise RunSafetyError(
+                "preparation reservation disappeared before cleanup-pending CAS"
+            )
+        if record != expected_record:
+            raise RunSafetyError(
+                "preparation reservation changed before cleanup-pending CAS"
+            )
+        _require_exact_reservation(record, reservation, allow_active=False)
+        if record["status"] == CLEANUP_PENDING_STATUS:
+            pending_snapshot = copy.deepcopy(record)
+        else:
+            if record["status"] not in RECOVERABLE_PREPARATION_STATUSES:
+                raise RunSafetyError(
+                    "only a recoverable preparation can enter cleanup_pending"
+                )
+            if _expected_run_entry_presence(repo_root, reservation) != "absent":
+                raise UserError(
+                    "reserved run entry is present; retain the recovery fence"
+                )
+            _mark_preparation_cleanup_pending(
+                record,
+                reason=reason,
+                updated_at=transaction_time,
+            )
+            index["latest_session_id"] = reservation.session_id
+            pending_snapshot = copy.deepcopy(record)
+    assert pending_snapshot is not None
+    return pending_snapshot
+
+
+def _cas_clear_cleanup_pending(
+    repo_root: pathlib.Path,
+    reservation: PreparationReservation,
+    *,
+    expected_record: SessionRecord,
+) -> None:
+    transaction_time = _utc_now()
+    with _index_transaction(
+        repo_root,
+        write=True,
+        commit_time=transaction_time,
+        context="preparation cleanup-pending final CAS",
+    ) as index:
+        record = index["sessions"].get(reservation.session_id)
+        if record is None:
+            raise RunSafetyError(
+                "preparation reservation disappeared before cleanup final CAS"
+            )
+        if record != expected_record:
+            raise RunSafetyError("cleanup-pending reservation changed before final CAS")
+        _require_exact_reservation(record, reservation, allow_active=False)
+        if record["status"] != CLEANUP_PENDING_STATUS:
+            raise RunSafetyError(
+                "preparation reservation is not cleanup_pending at final CAS"
+            )
+        _fsync_preparation_lease_absence(repo_root, reservation)
+        _mark_preparation_cleanup_complete(
+            record,
+            updated_at=transaction_time,
+        )
+        index["latest_session_id"] = reservation.session_id
+
+
 def _fence_preparation(
     repo_root: pathlib.Path,
     reservation: PreparationReservation,
@@ -3838,6 +4067,11 @@ def _fence_preparation(
                 "preparation reservation disappeared before recovery fencing"
             )
         _require_exact_reservation(record, reservation, allow_active=True)
+        if record["status"] in {
+            CLEANUP_PENDING_STATUS,
+            CLEANUP_COMPLETE_STATUS,
+        }:
+            return
         if record["status"] != "active":
             _mark_preparation_recovery(
                 record,
@@ -3876,17 +4110,10 @@ def _settle_failed_bridge(
     inherited_lease_fd: int,
     reason: str,
 ) -> Literal["active", "cleared", "fenced"]:
-    transaction_time = _utc_now()
-    outcome: Literal["active", "cleared", "fenced"] = "fenced"
     recovery_lease_fd: int | None = None
     inherited_lease_open = True
     try:
-        with _index_transaction(
-            repo_root,
-            write=True,
-            commit_time=transaction_time,
-            context="prepare-active-run bridge failure recovery",
-        ) as index:
+        with _index_transaction(repo_root, write=False) as index:
             record = index["sessions"].get(reservation.session_id)
             if record is None:
                 raise RunSafetyError(
@@ -3894,71 +4121,84 @@ def _settle_failed_bridge(
                 )
             _require_exact_reservation(record, reservation, allow_active=True)
             if record["status"] == "active":
-                outcome = "active"
-                return outcome
+                return "active"
 
-            inherited_lease_open = False
-            try:
-                _retire_inherited_preparation_lease(inherited_lease_fd)
-            except OSError as error:
-                _mark_preparation_recovery(
-                    record,
-                    reason=(
-                        f"{reason}; inherited lease ownership could not be "
-                        f"retired exactly once, so writer quiescence is "
-                        f"unproven: {error}"
-                    ),
-                    updated_at=transaction_time,
+        inherited_lease_open = False
+        try:
+            _retire_inherited_preparation_lease(inherited_lease_fd)
+        except OSError as error:
+            _fence_preparation(
+                repo_root,
+                reservation,
+                reason=(
+                    f"{reason}; inherited lease ownership could not be retired "
+                    f"exactly once, so writer quiescence is unproven: {error}"
+                ),
+            )
+            return "fenced"
+
+        try:
+            recovery_lease_fd = _acquire_preparation_lease(
+                repo_root,
+                reservation,
+            )
+        except RunSafetyError as error:
+            _fence_preparation(
+                repo_root,
+                reservation,
+                reason=(
+                    f"{reason}; inherited-writer quiescence could not be proved: "
+                    f"{error}"
+                ),
+            )
+            return "fenced"
+
+        with _index_transaction(repo_root, write=False) as index:
+            record = index["sessions"].get(reservation.session_id)
+            if record is None:
+                raise RunSafetyError(
+                    "preparation reservation disappeared before cleanup-pending CAS"
                 )
-            else:
-                try:
-                    recovery_lease_fd = _acquire_preparation_lease(
-                        repo_root,
-                        reservation,
-                    )
-                except RunSafetyError as error:
-                    _mark_preparation_recovery(
-                        record,
-                        reason=(
-                            f"{reason}; inherited-writer quiescence could not be "
-                            f"proved: {error}"
-                        ),
-                        updated_at=transaction_time,
-                    )
-                else:
-                    try:
-                        presence = _expected_run_entry_presence(
-                            repo_root,
-                            reservation,
-                        )
-                    except RunSafetyError as error:
-                        _mark_preparation_recovery(
-                            record,
-                            reason=f"{reason}; run-entry validation failed: {error}",
-                            updated_at=transaction_time,
-                        )
-                    else:
-                        if presence == "absent":
-                            _clear_preparation_reservation(
-                                record,
-                                updated_at=transaction_time,
-                            )
-                            outcome = "cleared"
-                        else:
-                            _mark_preparation_recovery(
-                                record,
-                                reason=f"{reason}; the reserved run entry may exist",
-                                updated_at=transaction_time,
-                            )
-            index["latest_session_id"] = reservation.session_id
-        if outcome == "cleared":
-            assert recovery_lease_fd is not None
+            _require_exact_reservation(record, reservation, allow_active=True)
+            if record["status"] == "active":
+                return "active"
+            record_snapshot = copy.deepcopy(record)
+
+        try:
+            pending_snapshot = _cas_preparation_cleanup_pending(
+                repo_root,
+                reservation,
+                expected_record=record_snapshot,
+                reason=(
+                    f"{reason}; writer quiescence and reserved run absence were "
+                    "proved; exact lease removal is pending"
+                ),
+            )
+        except Exception as error:
+            _fence_preparation(
+                repo_root,
+                reservation,
+                reason=f"{reason}; cleanup-pending CAS failed: {error}",
+            )
+            return "fenced"
+
+        try:
             _remove_preparation_lease(
                 repo_root,
                 reservation,
                 recovery_lease_fd,
             )
-        return outcome
+        except Exception:
+            return "fenced"
+        try:
+            _cas_clear_cleanup_pending(
+                repo_root,
+                reservation,
+                expected_record=pending_snapshot,
+            )
+        except Exception:
+            return "fenced"
+        return "cleared"
     finally:
         if inherited_lease_open:
             os.close(inherited_lease_fd)
@@ -4051,7 +4291,14 @@ def _prepare_active_run(args: argparse.Namespace) -> int:
                 prompt_text=args.prompt_text,
                 host_session_id=_current_thread_session_id(),
             )
-            if record["status"] in PREPARATION_STATUSES:
+            cleanup_complete = record["status"] == CLEANUP_COMPLETE_STATUS
+            if cleanup_complete:
+                completed_reservation = _reservation_from_record(record)
+                _require_cleanup_complete_absence(
+                    repo_root,
+                    completed_reservation,
+                )
+            elif record["status"] in PREPARATION_STATUSES:
                 existing_reservation = _reservation_from_record(record)
                 raise UserError(
                     _preparation_recovery_message(
@@ -4063,7 +4310,7 @@ def _prepare_active_run(args: argparse.Namespace) -> int:
                         ),
                     )
                 )
-            if record["run_dir"]:
+            if record["run_dir"] and not cleanup_complete:
                 try:
                     (
                         _existing_run_dir,
@@ -4367,6 +4614,85 @@ def _preparation_doctor_payload(
         "index_status": record["status"],
         "recorded_reason": record.get("preparation_reason"),
     }
+    if record["status"] == CLEANUP_COMPLETE_STATUS:
+        try:
+            _require_cleanup_complete_absence(repo_root, reservation)
+        except RunSafetyError as error:
+            result.update(
+                {
+                    "status": "cleanup_complete_unverified",
+                    "detail": _bounded_preparation_reason(str(error)),
+                }
+            )
+        else:
+            result.update(
+                {
+                    "status": "cleanup_complete",
+                    "lease_presence": "absent",
+                    "entry_presence": "absent",
+                    "detail": (
+                        "the exact cleanup tombstone retains its reservation "
+                        "identity and both reserved entries remain absent"
+                    ),
+                }
+            )
+        return result
+    if record["status"] == CLEANUP_PENDING_STATUS:
+        try:
+            lease_presence = _preparation_lease_entry_presence(
+                repo_root,
+                reservation,
+            )
+        except RunSafetyError as error:
+            result.update(
+                {
+                    "status": "cleanup_pending_lease_unverified",
+                    "detail": _bounded_preparation_reason(str(error)),
+                }
+            )
+            return result
+        result["lease_presence"] = lease_presence
+        if lease_presence == "absent":
+            result.update(
+                {
+                    "status": "cleanup_pending_final_cas",
+                    "detail": (
+                        "the descriptor-bound lease entry is absent; only the "
+                        "final cleanup-pending index CAS remains"
+                    ),
+                }
+            )
+            return result
+        try:
+            lease_fd = _acquire_preparation_lease(repo_root, reservation)
+        except RunSafetyError as error:
+            result.update(
+                {
+                    "status": "cleanup_pending_lease_present",
+                    "detail": _bounded_preparation_reason(str(error)),
+                }
+            )
+            return result
+        try:
+            try:
+                presence = _expected_run_entry_presence(repo_root, reservation)
+            except RunSafetyError as error:
+                result.update(
+                    {
+                        "status": "cleanup_pending_presence_unproven",
+                        "detail": _bounded_preparation_reason(str(error)),
+                    }
+                )
+            else:
+                result["entry_presence"] = presence
+                result["status"] = (
+                    "cleanup_pending_lease_present"
+                    if presence == "absent"
+                    else "cleanup_pending_entry_present"
+                )
+            return result
+        finally:
+            os.close(lease_fd)
     if record["status"] == "active":
         try:
             _run_dir, _state, _identity, run_fd = _validate_reserved_run_state(
@@ -4465,6 +4791,14 @@ def _recover_active_run(args: argparse.Namespace) -> int:
         return 0
 
     if args.action == "resume":
+        if record_snapshot["status"] in {
+            CLEANUP_PENDING_STATUS,
+            CLEANUP_COMPLETE_STATUS,
+        }:
+            raise UserError(
+                f"{record_snapshot['status']} is an absent-run cleanup; use "
+                "clear-absent to finish or confirm its idempotent cleanup"
+            )
         if record_snapshot["status"] == "active":
             _run_dir, _state, _identity, run_fd = _validate_reserved_run_state(
                 repo_root,
@@ -4540,34 +4874,70 @@ def _recover_active_run(args: argparse.Namespace) -> int:
 
     if record_snapshot["status"] == "active":
         raise UserError("an active preparation cannot be cleared as absent")
-    lease_fd = _acquire_preparation_lease(repo_root, reservation)
+    if record_snapshot["status"] == CLEANUP_COMPLETE_STATUS:
+        _require_cleanup_complete_absence(repo_root, reservation)
+        print(
+            json.dumps(
+                {
+                    "preparation_id": reservation.preparation_id,
+                    "run_dir": reservation.run_dir,
+                    "status": "cleared",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    lease_presence = _preparation_lease_entry_presence(repo_root, reservation)
+    lease_fd: int | None = None
     try:
-        transaction_time = _utc_now()
-        with _index_transaction(
-            repo_root,
-            write=True,
-            commit_time=transaction_time,
-            context="recover-active-run clear absent reservation",
-        ) as index:
-            record = index["sessions"].get(reservation.session_id)
-            if record is None:
-                raise RunSafetyError(
-                    "preparation reservation disappeared before absent clear"
-                )
-            _require_exact_reservation(record, reservation, allow_active=False)
+        if lease_presence == "present":
+            lease_fd = _acquire_preparation_lease(repo_root, reservation)
             if _expected_run_entry_presence(repo_root, reservation) != "absent":
                 raise UserError(
                     "reserved run entry is present; use doctor and resume a complete "
                     "matching run, or retain the recovery fence"
                 )
-            _clear_preparation_reservation(
-                record,
-                updated_at=transaction_time,
+        elif record_snapshot["status"] != CLEANUP_PENDING_STATUS:
+            raise RunSafetyError(
+                "preparation lease is absent before cleanup_pending was committed"
             )
-            index["latest_session_id"] = reservation.session_id
-        _remove_preparation_lease(repo_root, reservation, lease_fd)
+
+        if record_snapshot["status"] == CLEANUP_PENDING_STATUS:
+            pending_snapshot = _cas_preparation_cleanup_pending(
+                repo_root,
+                reservation,
+                expected_record=record_snapshot,
+                reason=cast(
+                    str,
+                    record_snapshot.get("preparation_reason")
+                    or "cleanup_pending recovery",
+                ),
+            )
+        else:
+            if lease_fd is None:
+                raise RunSafetyError(
+                    "preparation lease must remain present through cleanup-pending CAS"
+                )
+            pending_snapshot = _cas_preparation_cleanup_pending(
+                repo_root,
+                reservation,
+                expected_record=record_snapshot,
+                reason=(
+                    "clear-absent proved writer quiescence and reserved run "
+                    "absence; exact lease removal is pending"
+                ),
+            )
+
+        if lease_fd is not None:
+            _remove_preparation_lease(repo_root, reservation, lease_fd)
+        _cas_clear_cleanup_pending(
+            repo_root,
+            reservation,
+            expected_record=pending_snapshot,
+        )
     finally:
-        os.close(lease_fd)
+        if lease_fd is not None:
+            os.close(lease_fd)
     print(
         json.dumps(
             {

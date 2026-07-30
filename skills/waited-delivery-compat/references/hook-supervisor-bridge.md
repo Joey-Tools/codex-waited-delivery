@@ -29,11 +29,11 @@ The current outer adapter already follows this rule: it may observe product-spec
   - wraps `waited_delivery_runner.py prepare --json`
   - injects parent metadata from args or env
   - for an adapter reservation, requires `--preparation-id` together with an inherited open `--preparation-lease-fd`, keeps that descriptor across its own process, forwards both the descriptor and stable transaction ID to the runner, and returns the runner's lease-inheritance attestation
-  - lets the runner publish schema `4` state with the same preparation ID; it does not select, clear, or activate the adapter reservation itself
+  - lets the runner publish schema `5` state with the same preparation ID; preparation-aware schema `4` remains recovery-readable, and the bridge does not select, clear, or activate the adapter reservation itself
 - `bind-parent-live`
-  - patches parent metadata into an existing run when the ids or other outer-adapter metadata become known later
+  - patches bounded parent metadata into an existing run when the ids or other outer-adapter metadata become known later; over-limit metadata is rejected before a state write, while an unchanged oversized value loaded from schema `1` through `4` remains usable only through its schema-`5` exact identity marker
 - `attach-child-live`
-  - wraps `attach-child`, rejects a blank child id before state mutation, and also propagates parent metadata from args or env
+  - wraps `attach-child`, rejects a blank, invalid-UTF-8, or encoded-over-limit child id before state open/mutation, and also propagates bounded parent metadata from args or env
 - `refresh-prompts-live`
   - is an internal anonymous-pipe-bound target for the outer adapter; it refuses an ordinary source-path launch
   - requires framed bridge and runner source bytes, their complete device/inode, uid/gid/mode, size, and SHA-256 provenance versions, and the separate canonical filenames to publish or use for compilation diagnostics
@@ -42,6 +42,7 @@ The current outer adapter already follows this rule: it may observe product-spec
   - validates and returns refresh schema `3` with exact bridge/runner source versions, `anonymous-pipe-memory` transport, non-reopenability, canonical compile filenames, isolated-execution attestation, and regenerated run-local child/parent versions
   - accepts `--expected-repo-root` from the outer adapter so the runner can enforce exact repo containment again under the run-level state lock
   - accepts `--expected-run-dev`, `--expected-run-ino`, `--expected-run-uid`, `--expected-run-gid`, and `--expected-run-mode` only as one complete set, forwards them to the runner, and returns the refreshed identity so the outer adapter can bind one exact directory object and POSIX access identity across the bridge call
+  - still passes through the ordinary runner reopen gate: current-user ownership, no group/other write, and no Darwin extended or Linux POSIX ACL on repository-side parents, run, state, prompts, smoke prompt, and lock; current-user exact legacy `0755` is tightened through the held run descriptor before artifact reads
   - never falls back to the bridge's or runner's mutable source path; the outer adapter owns stable source binding, prelaunch source-version revalidation, framed delivery, and process-group cleanup
 - `finish-child-live`
   - requires the exact attached `child_session_id` and wraps `finish-child` so the bridge can persist the child's matching terminal status after `wait` and before parent-owned review

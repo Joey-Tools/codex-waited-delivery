@@ -44,6 +44,9 @@ RUNNER_PATH = (
     / "scripts"
     / "waited_delivery_runner.py"
 )
+SCHEMA_V2_CLIENT_PATH = (
+    pathlib.Path(__file__).resolve().parent / "fixtures" / "adapter_index_v2_client.py"
+)
 
 
 def run(
@@ -262,6 +265,82 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 "--no-fallback-smoke",
             ]
         )
+
+    def _seed_interrupted_preparation(
+        self,
+        module,
+        *,
+        session_id: str,
+        run_id: str,
+        preparation_id: str,
+    ):
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=KeyboardInterrupt,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            module._prepare_active_run(args)
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "preparing")
+        return module._reservation_from_record(record)
+
+    def _seed_cleanup_pending_without_lease(
+        self,
+        module,
+        *,
+        session_id: str,
+        run_id: str,
+        preparation_id: str,
+    ):
+        reservation = self._seed_interrupted_preparation(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+            preparation_id=preparation_id,
+        )
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        pending = module._cas_preparation_cleanup_pending(
+            self.repo.resolve(),
+            reservation,
+            expected_record=record,
+            reason="test cleanup pending before lease unlink",
+        )
+        lease_fd = module._acquire_preparation_lease(
+            self.repo.resolve(),
+            reservation,
+        )
+        try:
+            module._remove_preparation_lease(
+                self.repo.resolve(),
+                reservation,
+                lease_fd,
+            )
+        finally:
+            os.close(lease_fd)
+        self.assertFalse(pathlib.Path(reservation.lease_path).exists())
+        return reservation, pending
 
     def _stop_payload_for(self, session_id: str) -> dict[str, object]:
         return {
@@ -707,6 +786,132 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(record["permission_mode"], "acceptEdits")
         self.assertEqual(record["status"], "observed")
         self.assertIsNone(record["run_dir"])
+
+    def test_schema_v2_client_fails_closed_on_schema_v3_cleanup_pending(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-v2-client-fail-closed"
+        preparation_id = "d1" * 16
+        reservation = self._seed_interrupted_preparation(
+            module,
+            session_id=session_id,
+            run_id="v2-client-fail-closed",
+            preparation_id=preparation_id,
+        )
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        module._cas_preparation_cleanup_pending(
+            self.repo.resolve(),
+            reservation,
+            expected_record=record,
+            reason="schema-v3 compatibility fixture",
+        )
+        before = self._index_path().read_bytes()
+
+        completed = run(
+            [
+                sys.executable,
+                str(SCHEMA_V2_CLIENT_PATH),
+                "observe",
+                "--index",
+                str(self._index_path()),
+                "--session-id",
+                session_id,
+                "--cwd",
+                str(self.repo),
+                "--started-at",
+                "2026-07-30T00:00:00+00:00",
+                "--prompt",
+                "must not rewrite cleanup_pending as active",
+            ]
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("unsupported adapter index schema", completed.stderr)
+        self.assertEqual(self._index_path().read_bytes(), before)
+        durable = json.loads(before)["sessions"][session_id]
+        self.assertEqual(durable["status"], module.CLEANUP_PENDING_STATUS)
+        self.assertEqual(durable["run_dir"], reservation.run_dir)
+        self.assertEqual(durable["preparation_id"], preparation_id)
+
+    def test_schema_v3_reader_recovers_frozen_schema_v2_preparation(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-v2-preparation"
+        preparation_id = "d2" * 16
+        run_id = "v2-preparation"
+        run_dir = self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        lease_path = module._preparation_lease_path(
+            self.repo.resolve(),
+            preparation_id,
+        )
+        started_at = "2026-07-30T00:00:00+00:00"
+        seeded = run(
+            [
+                sys.executable,
+                str(SCHEMA_V2_CLIENT_PATH),
+                "seed-preparing",
+                "--index",
+                str(self._index_path()),
+                "--session-id",
+                session_id,
+                "--cwd",
+                str(self.repo),
+                "--started-at",
+                started_at,
+                "--run-dir",
+                str(run_dir),
+                "--run-id",
+                run_id,
+                "--preparation-id",
+                preparation_id,
+                "--lease-path",
+                str(lease_path),
+            ]
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        legacy = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(legacy["schema_version"], 2)
+        reservation = module.PreparationReservation(
+            session_id=session_id,
+            preparation_id=preparation_id,
+            run_id=run_id,
+            run_dir=str(run_dir),
+            lease_path=str(lease_path),
+            started_at=started_at,
+        )
+        lease_fd = module._create_preparation_lease(
+            self.repo.resolve(),
+            reservation,
+        )
+        os.close(lease_fd)
+        clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+
+        with mock.patch.object(module.sys, "stdout", io.StringIO()):
+            self.assertEqual(module._recover_active_run(clear_args), 0)
+
+        migrated = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(migrated["schema_version"], module.INDEX_SCHEMA_VERSION)
+        record = migrated["sessions"][session_id]
+        self.assertEqual(record["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertEqual(record["run_dir"], str(run_dir))
+        self.assertFalse(lease_path.exists())
 
     def test_user_prompt_submit_hook_does_not_follow_index_symlink(self) -> None:
         adapter_dir = self._index_path().parent
@@ -1310,7 +1515,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         state = json.loads(
             (prospective_run_dir / "state.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(state["schema_version"], 5)
         self.assertEqual(state["preparation_id"], preparation_id)
         self.assertEqual(
             json.loads(captured_stdout.getvalue())["run_dir"],
@@ -1632,9 +1837,12 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
             session_id
         ]
-        self.assertEqual(record["status"], "observed")
-        self.assertIsNone(record["run_dir"])
-        self.assertIsNone(record["preparation_id"])
+        self.assertEqual(record["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(
+            record["run_dir"],
+            str(self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id),
+        )
+        self.assertEqual(record["preparation_id"], preparation_id)
         self.assertFalse(
             module._preparation_lease_path(
                 self.repo.resolve(),
@@ -2070,14 +2278,608 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         cleared = json.loads(self._index_path().read_text(encoding="utf-8"))[
             "sessions"
         ][session_id]
-        self.assertEqual(cleared["status"], "observed")
-        self.assertIsNone(cleared["run_dir"])
+        self.assertEqual(cleared["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(cleared["run_dir"], record["run_dir"])
+        self.assertEqual(cleared["preparation_id"], preparation_id)
         self.assertFalse(
             module._preparation_lease_path(
                 self.repo.resolve(),
                 preparation_id,
             ).exists()
         )
+
+    def test_clear_absent_recovers_both_cleanup_pending_crash_points(self) -> None:
+        cases = (
+            (
+                "before-lease-unlink",
+                "a8" * 16,
+                "cleanup_pending_lease_present",
+                True,
+            ),
+            (
+                "before-final-cas",
+                "b9" * 16,
+                "cleanup_pending_final_cas",
+                False,
+            ),
+        )
+        for label, preparation_id, doctor_status, lease_present in cases:
+            with self.subTest(case=label):
+                module = self._load_adapter_module()
+                session_id = f"session-{label}"
+                run_id = f"run-{label}"
+                reservation = self._seed_interrupted_preparation(
+                    module,
+                    session_id=session_id,
+                    run_id=run_id,
+                    preparation_id=preparation_id,
+                )
+                original_record = json.loads(
+                    self._index_path().read_text(encoding="utf-8")
+                )["sessions"][session_id]
+                clear_args = module._build_parser().parse_args(
+                    [
+                        "recover-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--session-id",
+                        session_id,
+                        "--preparation-id",
+                        preparation_id,
+                        "--action",
+                        "clear-absent",
+                    ]
+                )
+                if label == "before-lease-unlink":
+                    patch_target = "_remove_preparation_lease"
+                    failure_message = "simulated failure before lease unlink"
+                else:
+                    patch_target = "_cas_clear_cleanup_pending"
+                    failure_message = "simulated failure before final CAS"
+                with (
+                    mock.patch.object(
+                        module,
+                        patch_target,
+                        side_effect=module.RunSafetyError(failure_message),
+                    ),
+                    self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        failure_message,
+                    ),
+                ):
+                    module._recover_active_run(clear_args)
+
+                pending = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(
+                    pending["status"],
+                    module.CLEANUP_PENDING_STATUS,
+                )
+                for field in (
+                    "run_dir",
+                    "preparation_id",
+                    "preparation_run_id",
+                    "preparation_lease_path",
+                    "preparation_started_at",
+                ):
+                    self.assertEqual(pending[field], original_record[field])
+                self.assertEqual(
+                    pathlib.Path(reservation.lease_path).exists(),
+                    lease_present,
+                )
+
+                doctor_args = module._build_parser().parse_args(
+                    [
+                        "recover-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--session-id",
+                        session_id,
+                        "--preparation-id",
+                        preparation_id,
+                    ]
+                )
+                doctor_stdout = io.StringIO()
+                with mock.patch.object(module.sys, "stdout", doctor_stdout):
+                    self.assertEqual(module._recover_active_run(doctor_args), 0)
+                self.assertEqual(
+                    json.loads(doctor_stdout.getvalue())["status"],
+                    doctor_status,
+                )
+
+                clear_stdout = io.StringIO()
+                with mock.patch.object(module.sys, "stdout", clear_stdout):
+                    self.assertEqual(module._recover_active_run(clear_args), 0)
+                self.assertEqual(
+                    json.loads(clear_stdout.getvalue())["status"],
+                    "cleared",
+                )
+                cleared = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(
+                    cleared["status"],
+                    module.CLEANUP_COMPLETE_STATUS,
+                )
+                self.assertEqual(cleared["run_dir"], reservation.run_dir)
+                self.assertEqual(cleared["preparation_id"], preparation_id)
+                self.assertFalse(pathlib.Path(reservation.lease_path).exists())
+
+    def test_absent_lease_parent_is_fsynced_before_cleanup_final_cas(self) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-cleanup-parent-fsync"
+        preparation_id = "bf" * 16
+        self._seed_interrupted_preparation(
+            module,
+            session_id=session_id,
+            run_id="cleanup-parent-fsync",
+            preparation_id=preparation_id,
+        )
+        clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+        with (
+            mock.patch.object(
+                module,
+                "_cas_clear_cleanup_pending",
+                side_effect=module.RunSafetyError(
+                    "simulated crash before cleanup final CAS"
+                ),
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "simulated crash before cleanup final CAS",
+            ),
+        ):
+            module._recover_active_run(clear_args)
+
+        events: list[str] = []
+        real_fsync_absence = module._fsync_preparation_lease_absence
+        real_complete = module._mark_preparation_cleanup_complete
+
+        def fsync_absence(*args, **kwargs):
+            real_fsync_absence(*args, **kwargs)
+            events.append("lease-parent-fsynced")
+
+        def complete_reservation(*args, **kwargs):
+            events.append("cleanup-tombstone-committed")
+            return real_complete(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                module,
+                "_fsync_preparation_lease_absence",
+                side_effect=fsync_absence,
+            ),
+            mock.patch.object(
+                module,
+                "_mark_preparation_cleanup_complete",
+                side_effect=complete_reservation,
+            ),
+            mock.patch.object(module.sys, "stdout", io.StringIO()),
+        ):
+            self.assertEqual(module._recover_active_run(clear_args), 0)
+
+        self.assertEqual(
+            events,
+            ["lease-parent-fsynced", "cleanup-tombstone-committed"],
+        )
+
+    def test_cleanup_pending_final_cas_rejects_observation_race(self) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-cleanup-final-cas-race"
+        preparation_id = "ca" * 16
+        reservation = self._seed_interrupted_preparation(
+            module,
+            session_id=session_id,
+            run_id="cleanup-final-cas-race",
+            preparation_id=preparation_id,
+        )
+        clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+        real_remove = module._remove_preparation_lease
+
+        def remove_then_observe(*args, **kwargs):
+            real_remove(*args, **kwargs)
+            observed = self._run_adapter(
+                "user-prompt-submit-hook",
+                input_payload=self._session_payload(
+                    session_id=session_id,
+                    prompt="observation racing the final cleanup CAS",
+                    transcript_path="/tmp/cleanup-final-cas-race.jsonl",
+                ),
+            )
+            self.assertEqual(observed.returncode, 0, observed.stderr)
+
+        with (
+            mock.patch.object(
+                module,
+                "_remove_preparation_lease",
+                side_effect=remove_then_observe,
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "changed before final CAS",
+            ),
+        ):
+            module._recover_active_run(clear_args)
+
+        pending = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(pending["status"], module.CLEANUP_PENDING_STATUS)
+        self.assertEqual(
+            pending["transcript_path"],
+            "/tmp/cleanup-final-cas-race.jsonl",
+        )
+        self.assertEqual(pending["preparation_id"], preparation_id)
+        self.assertFalse(pathlib.Path(reservation.lease_path).exists())
+
+        doctor_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+            ]
+        )
+        doctor_stdout = io.StringIO()
+        with mock.patch.object(module.sys, "stdout", doctor_stdout):
+            self.assertEqual(module._recover_active_run(doctor_args), 0)
+        self.assertEqual(
+            json.loads(doctor_stdout.getvalue())["status"],
+            "cleanup_pending_final_cas",
+        )
+
+        with mock.patch.object(module.sys, "stdout", io.StringIO()):
+            self.assertEqual(module._recover_active_run(clear_args), 0)
+        cleared = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(cleared["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(cleared["preparation_id"], preparation_id)
+
+    def test_cleanup_tombstone_survives_each_final_commit_uncertainty(
+        self,
+    ) -> None:
+        cases = (
+            "after-replace",
+            "final-fsync",
+            "readback",
+            "post-commit-revalidation",
+        )
+        for case_number, case in enumerate(cases, start=1):
+            with self.subTest(case=case):
+                module = self._load_adapter_module()
+                session_id = f"session-cleanup-uncertain-{case}"
+                preparation_id = f"{case_number + 10:02x}" * 16
+                reservation, _pending = self._seed_cleanup_pending_without_lease(
+                    module,
+                    session_id=session_id,
+                    run_id=f"cleanup-uncertain-{case}",
+                    preparation_id=preparation_id,
+                )
+                clear_args = module._build_parser().parse_args(
+                    [
+                        "recover-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--session-id",
+                        session_id,
+                        "--preparation-id",
+                        preparation_id,
+                        "--action",
+                        "clear-absent",
+                    ]
+                )
+                if case == "after-replace":
+                    real_replace = module.os.replace
+
+                    def fail_after_replace(*replace_args, **replace_kwargs):
+                        real_replace(*replace_args, **replace_kwargs)
+                        raise OSError("simulated failure after index replacement")
+
+                    patcher = mock.patch.object(
+                        module.os,
+                        "replace",
+                        side_effect=fail_after_replace,
+                    )
+                elif case == "final-fsync":
+                    real_fsync = module.os.fsync
+                    raised = False
+
+                    def fail_after_final_fsync(file_descriptor):
+                        nonlocal raised
+                        real_fsync(file_descriptor)
+                        if raised or not self._index_path().exists():
+                            return
+                        durable = json.loads(
+                            self._index_path().read_text(encoding="utf-8")
+                        )["sessions"][session_id]
+                        if durable["status"] == module.CLEANUP_COMPLETE_STATUS:
+                            raised = True
+                            raise OSError(
+                                "simulated failure after final directory fsync"
+                            )
+
+                    patcher = mock.patch.object(
+                        module.os,
+                        "fsync",
+                        side_effect=fail_after_final_fsync,
+                    )
+                elif case == "readback":
+                    real_read = module._read_index_bytes_at
+
+                    def fail_tombstone_readback(adapter_fd):
+                        result = real_read(adapter_fd)
+                        if result is not None:
+                            durable = json.loads(result[0])["sessions"][session_id]
+                            if durable["status"] == module.CLEANUP_COMPLETE_STATUS:
+                                raise module.RunSafetyError(
+                                    "simulated cleanup tombstone readback failure"
+                                )
+                        return result
+
+                    patcher = mock.patch.object(
+                        module,
+                        "_read_index_bytes_at",
+                        side_effect=fail_tombstone_readback,
+                    )
+                else:
+                    real_revalidate = module._revalidate_index_directories
+
+                    def fail_post_commit_revalidation(*revalidate_args):
+                        real_revalidate(*revalidate_args)
+                        if not self._index_path().exists():
+                            return
+                        durable = json.loads(
+                            self._index_path().read_text(encoding="utf-8")
+                        )["sessions"][session_id]
+                        if durable["status"] == module.CLEANUP_COMPLETE_STATUS:
+                            raise module.RunSafetyError(
+                                "simulated post-commit directory revalidation failure"
+                            )
+
+                    patcher = mock.patch.object(
+                        module,
+                        "_revalidate_index_directories",
+                        side_effect=fail_post_commit_revalidation,
+                    )
+
+                with (
+                    patcher,
+                    self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        "simulated",
+                    ),
+                ):
+                    module._recover_active_run(clear_args)
+
+                durable = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(
+                    durable["status"],
+                    module.CLEANUP_COMPLETE_STATUS,
+                )
+                self.assertEqual(durable["run_dir"], reservation.run_dir)
+                self.assertEqual(durable["preparation_id"], preparation_id)
+                self.assertEqual(
+                    durable["preparation_lease_path"],
+                    reservation.lease_path,
+                )
+                retry_stdout = io.StringIO()
+                with mock.patch.object(module.sys, "stdout", retry_stdout):
+                    self.assertEqual(module._recover_active_run(clear_args), 0)
+                self.assertEqual(
+                    json.loads(retry_stdout.getvalue())["status"],
+                    "cleared",
+                )
+                retried = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(
+                    retried["status"],
+                    module.CLEANUP_COMPLETE_STATUS,
+                )
+                self.assertEqual(retried["preparation_id"], preparation_id)
+
+    def test_old_cleanup_retry_never_clears_a_new_reservation(self) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-cleanup-new-reservation"
+        old_preparation_id = "e1" * 16
+        reservation, _pending = self._seed_cleanup_pending_without_lease(
+            module,
+            session_id=session_id,
+            run_id="cleanup-old-reservation",
+            preparation_id=old_preparation_id,
+        )
+        old_clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                old_preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+        real_replace = module.os.replace
+
+        def fail_after_replace(*replace_args, **replace_kwargs):
+            real_replace(*replace_args, **replace_kwargs)
+            raise OSError("simulated old cleanup replacement ambiguity")
+
+        with (
+            mock.patch.object(
+                module.os,
+                "replace",
+                side_effect=fail_after_replace,
+            ),
+            self.assertRaisesRegex(module.RunSafetyError, "simulated"),
+        ):
+            module._recover_active_run(old_clear_args)
+        tombstone = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(tombstone["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(tombstone["run_dir"], reservation.run_dir)
+
+        new_preparation_id = "e2" * 16
+        new_args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id="cleanup-new-reservation",
+        )
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=new_preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=KeyboardInterrupt,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            module._prepare_active_run(new_args)
+        new_record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(new_record["status"], "preparing")
+        self.assertEqual(new_record["preparation_id"], new_preparation_id)
+
+        with self.assertRaisesRegex(
+            module.RunSafetyError,
+            "requested preparation id does not match",
+        ):
+            module._recover_active_run(old_clear_args)
+        preserved = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(preserved["status"], "preparing")
+        self.assertEqual(preserved["preparation_id"], new_preparation_id)
+
+    def test_bridge_failure_cleanup_orders_pending_unlink_and_final_cas(
+        self,
+    ) -> None:
+        session_id = "session-bridge-cleanup-order"
+        run_id = "bridge-cleanup-order"
+        preparation_id = "cb" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        events: list[str] = []
+        real_pending = module._cas_preparation_cleanup_pending
+        real_remove = module._remove_preparation_lease
+        real_clear = module._cas_clear_cleanup_pending
+
+        def record_pending(*pending_args, **pending_kwargs):
+            result = real_pending(*pending_args, **pending_kwargs)
+            events.append("cleanup_pending")
+            return result
+
+        def record_remove(*remove_args, **remove_kwargs):
+            record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                "sessions"
+            ][session_id]
+            self.assertEqual(record["status"], module.CLEANUP_PENDING_STATUS)
+            result = real_remove(*remove_args, **remove_kwargs)
+            events.append("lease_unlinked_and_parent_fsynced")
+            return result
+
+        def record_clear(*clear_args, **clear_kwargs):
+            self.assertFalse(
+                module._preparation_lease_path(
+                    self.repo.resolve(),
+                    preparation_id,
+                ).exists()
+            )
+            result = real_clear(*clear_args, **clear_kwargs)
+            events.append("final_index_cas")
+            return result
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=module.UserError("simulated bridge failure"),
+            ),
+            mock.patch.object(
+                module,
+                "_cas_preparation_cleanup_pending",
+                side_effect=record_pending,
+            ),
+            mock.patch.object(
+                module,
+                "_remove_preparation_lease",
+                side_effect=record_remove,
+            ),
+            mock.patch.object(
+                module,
+                "_cas_clear_cleanup_pending",
+                side_effect=record_clear,
+            ),
+            self.assertRaisesRegex(module.UserError, "cleared safely"),
+        ):
+            module._prepare_active_run(args)
+
+        self.assertEqual(
+            events,
+            [
+                "cleanup_pending",
+                "lease_unlinked_and_parent_fsynced",
+                "final_index_cas",
+            ],
+        )
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(record["preparation_id"], preparation_id)
 
     def test_complete_failed_bridge_can_be_doctored_and_resumed(self) -> None:
         session_id = "session-complete-failed-bridge"

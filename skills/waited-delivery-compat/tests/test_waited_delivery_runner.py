@@ -390,7 +390,8 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         )
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(state["schema_version"], 5)
+        self.assertEqual(state["legacy_bounded_text"], {})
         self.assertIsNone(state["preparation_id"])
         self.assertEqual(state["goal"], "Wrap current repo changes")
         self.assertEqual(state["overall_status"], "pending")
@@ -654,6 +655,20 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertTrue(displayed.endswith(expected_suffix))
         self.assertNotIn("`", displayed)
 
+    def test_filesystem_path_display_pairing_is_python39_compatible_and_exact(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        self.assertEqual(
+            list(module._pair_path_display_tokens(["a", "é"], [1, 2])),
+            [("a", 1), ("é", 2)],
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "path display token accounting length mismatch",
+        ):
+            list(module._pair_path_display_tokens(["a"], []))
+
     def test_filesystem_path_display_uses_explicit_surrogate_fallback_identity(
         self,
     ) -> None:
@@ -812,7 +827,39 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         projected_size = len(
             (json.dumps(projected, indent=2, sort_keys=True) + "\n").encode("utf-8")
         )
+        legacy_projected = copy.deepcopy(state)
+        legacy_orchestration = legacy_projected["orchestration"]
+        legacy_orchestration["child_status"] = "interrupted"
+        legacy_orchestration["child_finished_at"] = fixed_now
+        legacy_orchestration["updated_at"] = fixed_now
+        for phase_name in legacy_projected["phases_order"]:
+            legacy_phase = legacy_projected["phases"][phase_name]
+            legacy_phase["status"] = "decision_point"
+            legacy_phase["updated_at"] = fixed_now
+        legacy_projected["overall_status"] = module._overall_status(
+            legacy_projected["phases"]
+        )
+        legacy_projected["updated_at"] = fixed_now
+        legacy_projected_size = len(
+            (json.dumps(legacy_projected, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
+        )
+        self.assertLess(legacy_projected_size, projected_size)
         shutil.rmtree(self.repo / ".codex-tmp")
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(module, "STATE_MAX_BYTES", legacy_projected_size),
+            mock.patch.object(module, "_create_run_directory") as creator,
+            self.assertRaisesRegex(
+                module.UserError,
+                "initial state would consume reserved terminal capacity",
+            ),
+        ):
+            module._prepare(args)
+        creator.assert_not_called()
+        self.assertFalse((self.repo / ".codex-tmp").exists())
+
         exact_stdout = io.StringIO()
         with (
             mock.patch.object(module, "_utc_now", return_value=fixed_now),
@@ -952,6 +999,350 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             module._prepare(args)
         self.assertEqual(exact_stdout.getvalue(), "")
         self.assertTrue(unavailable_parent.is_file())
+
+    def test_worst_case_attachment_capacity_reaches_terminal_finalize(self) -> None:
+        module = self._load_runner_module()
+        fixed_now = "2026-07-30T09:10:11+00:00"
+        run_id = "worst-case-attachment-capacity"
+        args = module._build_parser().parse_args(
+            [
+                "prepare",
+                "--repo",
+                str(self.repo),
+                "--goal",
+                "Reserve attachment and terminal capacity",
+                "--run-id",
+                run_id,
+                "--external-helper",
+                str(self.fake_helper),
+                "--no-fallback-smoke",
+            ]
+        )
+        captured_state: dict[str, object] = {}
+        real_serialize = module._serialize_state_for_save
+
+        class PlannedCreation(RuntimeError):
+            pass
+
+        def capture_serialize(state, **kwargs):
+            content = real_serialize(state, **kwargs)
+            captured_state["state"] = copy.deepcopy(state)
+            return content
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module,
+                "_serialize_state_for_save",
+                side_effect=capture_serialize,
+            ),
+            mock.patch.object(
+                module,
+                "_create_run_directory",
+                side_effect=PlannedCreation,
+            ),
+            self.assertRaises(PlannedCreation),
+        ):
+            module._prepare(args)
+
+        projected = module._terminal_capacity_projection(
+            captured_state["state"],
+            transaction_time=fixed_now,
+        )
+        exact_limit = len(
+            (json.dumps(projected, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        )
+        maximum_id = "\x01" * module.CHILD_SESSION_ID_MAX_UTF8_BYTES
+        maximum_parent_metadata = "\x01" * module.PARENT_METADATA_MAX_UTF8_BYTES
+        self.assertEqual(
+            module._json_value_size(maximum_id),
+            module.CHILD_SESSION_ID_MAX_JSON_BYTES,
+        )
+        self.assertEqual(
+            module._json_value_size(maximum_parent_metadata),
+            module.PARENT_METADATA_MAX_JSON_BYTES,
+        )
+
+        shutil.rmtree(self.repo / ".codex-tmp")
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(module, "STATE_MAX_BYTES", exact_limit),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(module._prepare(args), 0)
+            run_dir = module._prospective_run_directory(
+                self.repo.resolve(),
+                run_id,
+            )
+            self.assertEqual(
+                module._attach_child(
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        child_session_id=maximum_id,
+                        parent_session_id=maximum_parent_metadata,
+                        parent_turn_id=maximum_parent_metadata,
+                        parent_transcript_path=maximum_parent_metadata,
+                        permission_mode=maximum_parent_metadata,
+                    )
+                ),
+                0,
+            )
+            self.assertEqual(
+                module._close_open_phases(
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        status="blocked",
+                        summary="",
+                        finding=[],
+                        evidence=[],
+                    )
+                ),
+                0,
+            )
+            self.assertEqual(
+                module._finish_child(
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        child_status="completed",
+                        child_session_id=maximum_id,
+                    )
+                ),
+                0,
+            )
+            self.assertEqual(
+                module._finalize(
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        require_terminal=True,
+                    )
+                ),
+                0,
+            )
+
+        final_state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(final_state["orchestration"]["child_session_id"], maximum_id)
+        self.assertEqual(final_state["orchestration"]["child_status"], "completed")
+        self.assertEqual(final_state["overall_status"], "blocked")
+        self.assertTrue((run_dir / "summary.md").is_file())
+
+    def test_attach_rejects_utf8_limit_plus_one_before_state_open(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        state_path = run_dir / "state.json"
+        before_content = state_path.read_bytes()
+        before_stat = state_path.stat()
+        oversized_id = "é" * (module.CHILD_SESSION_ID_MAX_UTF8_BYTES // 2) + "a"
+        self.assertEqual(
+            len(oversized_id.encode("utf-8")),
+            module.CHILD_SESSION_ID_MAX_UTF8_BYTES + 1,
+        )
+        args = argparse.Namespace(
+            run_dir=str(run_dir),
+            child_session_id=oversized_id,
+            parent_session_id=None,
+            parent_turn_id=None,
+            parent_transcript_path=None,
+            permission_mode=None,
+        )
+
+        with (
+            mock.patch.object(module, "_open_run_directory") as open_run,
+            self.assertRaisesRegex(
+                module.UserError,
+                "exceeds its UTF-8 byte limit",
+            ),
+        ):
+            module._attach_child(args)
+
+        open_run.assert_not_called()
+        after_stat = state_path.stat()
+        self.assertEqual(state_path.read_bytes(), before_content)
+        self.assertEqual(
+            (after_stat.st_dev, after_stat.st_ino, after_stat.st_mtime_ns),
+            (before_stat.st_dev, before_stat.st_ino, before_stat.st_mtime_ns),
+        )
+
+    def test_bind_parent_rejects_exact_utf8_limit_plus_one_before_state_open(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        state_path = run_dir / "state.json"
+        before_content = state_path.read_bytes()
+        before_stat = state_path.stat()
+        oversized_parent = "é" * (module.PARENT_METADATA_MAX_UTF8_BYTES // 2) + "a"
+        self.assertEqual(
+            len(oversized_parent.encode("utf-8")),
+            module.PARENT_METADATA_MAX_UTF8_BYTES + 1,
+        )
+        args = argparse.Namespace(
+            run_dir=str(run_dir),
+            parent_session_id=oversized_parent,
+            parent_turn_id=None,
+            parent_transcript_path=None,
+            permission_mode=None,
+        )
+
+        with (
+            mock.patch.object(module, "_open_run_directory") as open_run,
+            self.assertRaisesRegex(
+                module.UserError,
+                "exceeds its UTF-8 byte limit",
+            ),
+        ):
+            module._bind_parent(args)
+
+        open_run.assert_not_called()
+        after_stat = state_path.stat()
+        self.assertEqual(state_path.read_bytes(), before_content)
+        self.assertEqual(
+            (after_stat.st_dev, after_stat.st_ino, after_stat.st_mtime_ns),
+            (before_stat.st_dev, before_stat.st_ino, before_stat.st_mtime_ns),
+        )
+
+    def test_legacy_oversized_bounded_text_is_grandfathered_by_exact_identity(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        state_path = run_dir / "state.json"
+        legacy_child = "é" * (module.CHILD_SESSION_ID_MAX_UTF8_BYTES // 2) + "a"
+        legacy_parent = "é" * (module.PARENT_METADATA_MAX_UTF8_BYTES // 2) + "a"
+        self.assertEqual(
+            len(legacy_child.encode("utf-8")),
+            module.CHILD_SESSION_ID_MAX_UTF8_BYTES + 1,
+        )
+        self.assertEqual(
+            len(legacy_parent.encode("utf-8")),
+            module.PARENT_METADATA_MAX_UTF8_BYTES + 1,
+        )
+        legacy = json.loads(state_path.read_text(encoding="utf-8"))
+        legacy["schema_version"] = 4
+        legacy.pop("legacy_bounded_text")
+        orchestration = legacy["orchestration"]
+        orchestration["child_session_id"] = legacy_child
+        orchestration["child_status"] = "running"
+        orchestration["child_started_at"] = "2026-07-30T00:00:00+00:00"
+        orchestration["parent_session_id"] = legacy_parent
+        state_path.write_text(
+            json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        begun = self._run_runner(
+            "begin-phase",
+            "--run-dir",
+            str(run_dir),
+            "--phase",
+            "tests",
+            "--summary",
+            "migrate unchanged legacy state",
+        )
+        self.assertEqual(begun.returncode, 0, begun.stderr)
+        migrated = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["schema_version"], module.STATE_SCHEMA_VERSION)
+        markers = migrated["legacy_bounded_text"]
+        self.assertEqual(markers["child_session_id"]["utf8_bytes"], 1025)
+        self.assertEqual(markers["parent_session_id"]["utf8_bytes"], 4097)
+        self.assertEqual(
+            markers["child_session_id"]["sha256"],
+            hashlib.sha256(legacy_child.encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(
+            markers["parent_session_id"]["sha256"],
+            hashlib.sha256(legacy_parent.encode("utf-8")).hexdigest(),
+        )
+
+        closed = self._run_runner(
+            "close-open-phases",
+            "--run-dir",
+            str(run_dir),
+            "--status",
+            "blocked",
+            "--summary",
+            "legacy compatibility terminal",
+        )
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        finished = self._run_runner(
+            "finish-child",
+            "--run-dir",
+            str(run_dir),
+            "--child-status",
+            "completed",
+            "--child-session-id",
+            legacy_child,
+        )
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        finalized = self._run_runner(
+            "finalize",
+            "--run-dir",
+            str(run_dir),
+            "--require-terminal",
+        )
+        self.assertEqual(finalized.returncode, 0, finalized.stderr)
+        terminal = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            terminal["orchestration"]["child_session_id"],
+            legacy_child,
+        )
+        self.assertEqual(
+            terminal["orchestration"]["parent_session_id"],
+            legacy_parent,
+        )
+        self.assertEqual(terminal["orchestration"]["child_status"], "completed")
+        self.assertEqual(
+            terminal["legacy_bounded_text"],
+            markers,
+        )
+
+    def test_changed_legacy_oversized_identity_fails_closed_on_load(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        state_path = run_dir / "state.json"
+        legacy_child = "x" * (module.CHILD_SESSION_ID_MAX_UTF8_BYTES + 1)
+        legacy = json.loads(state_path.read_text(encoding="utf-8"))
+        legacy["schema_version"] = 4
+        legacy.pop("legacy_bounded_text")
+        legacy["orchestration"]["child_session_id"] = legacy_child
+        legacy["orchestration"]["child_status"] = "running"
+        legacy["orchestration"]["child_started_at"] = "2026-07-30T00:00:00+00:00"
+        state_path.write_text(
+            json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        migrated = self._run_runner(
+            "begin-phase",
+            "--run-dir",
+            str(run_dir),
+            "--phase",
+            "tests",
+        )
+        self.assertEqual(migrated.returncode, 0, migrated.stderr)
+        durable = json.loads(state_path.read_text(encoding="utf-8"))
+        durable["orchestration"]["child_session_id"] = "y" * (
+            module.CHILD_SESSION_ID_MAX_UTF8_BYTES + 1
+        )
+        state_path.write_text(
+            json.dumps(durable, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        before = state_path.read_bytes()
+
+        rejected = self._run_runner(
+            "begin-phase",
+            "--run-dir",
+            str(run_dir),
+            "--phase",
+            "docs_sync",
+        )
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(
+            "changed outside its grandfathered legacy identity",
+            rejected.stderr,
+        )
+        self.assertEqual(state_path.read_bytes(), before)
 
     def test_prepare_rejects_empty_oversized_and_non_utf8_inputs_before_creation(
         self,
@@ -1469,6 +1860,305 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 (run_dir / prompt_name).read_text(encoding="utf-8"),
                 sentinel,
             )
+
+    def test_runner_hardens_current_user_legacy_run_before_artifact_reads(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        run_dir.chmod(module.LEGACY_DIRECTORY_MODE)
+        observed_modes: list[int] = []
+        real_read = module._read_regular_artifact
+
+        def read_after_hardening(*args, **kwargs):
+            observed_modes.append(run_dir.stat().st_mode & 0o7777)
+            return real_read(*args, **kwargs)
+
+        with mock.patch.object(
+            module,
+            "_read_regular_artifact",
+            side_effect=read_after_hardening,
+        ):
+            self.assertEqual(
+                module._attach_child(
+                    argparse.Namespace(
+                        run_dir=str(run_dir),
+                        child_session_id="child-legacy-mode",
+                        parent_session_id=None,
+                        parent_turn_id=None,
+                        parent_transcript_path=None,
+                        permission_mode=None,
+                    )
+                ),
+                0,
+            )
+
+        self.assertTrue(observed_modes)
+        self.assertEqual(set(observed_modes), {module.DIRECTORY_MODE})
+        self.assertEqual(run_dir.stat().st_mode & 0o7777, module.DIRECTORY_MODE)
+
+    def test_runner_rejects_unsafe_parent_run_and_core_artifact_modes(self) -> None:
+        cases = (
+            ("waited-delivery-parent", "parent", 0o770),
+            ("run-directory", "run", 0o710),
+            ("state", "state.json", 0o620),
+            ("child-prompt", "child-prompt.md", 0o602),
+            ("parent-prompt", "parent-prompt.md", 0o620),
+            ("lock", ".state.lock", 0o602),
+        )
+        for label, target, unsafe_mode in cases:
+            with self.subTest(case=label):
+                run_dir = self._prepare("--no-fallback-smoke")
+                state_path = run_dir / "state.json"
+                before_content = state_path.read_bytes()
+                before_stat = state_path.stat()
+                target_path = (
+                    run_dir.parent
+                    if target == "parent"
+                    else run_dir
+                    if target == "run"
+                    else run_dir / target
+                )
+                original_mode = target_path.stat().st_mode & 0o7777
+                target_path.chmod(unsafe_mode)
+                try:
+                    completed = self._run_runner(
+                        "attach-child",
+                        "--run-dir",
+                        str(run_dir),
+                        "--child-session-id",
+                        f"child-{label}",
+                    )
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertTrue(
+                        "writable by group or other users" in completed.stderr
+                        or "mode 0700" in completed.stderr,
+                        completed.stderr,
+                    )
+                    after_stat = state_path.stat()
+                    self.assertEqual(state_path.read_bytes(), before_content)
+                    self.assertEqual(
+                        (after_stat.st_dev, after_stat.st_ino, after_stat.st_mtime_ns),
+                        (
+                            before_stat.st_dev,
+                            before_stat.st_ino,
+                            before_stat.st_mtime_ns,
+                        ),
+                    )
+                finally:
+                    target_path.chmod(original_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin extended ACLs")
+    def test_runner_rejects_darwin_named_write_acl_with_private_mode(self) -> None:
+        run_dir = self._prepare("--no-fallback-smoke")
+        state_path = run_dir / "state.json"
+        acl_result = run(
+            [
+                "/bin/chmod",
+                "+a",
+                "everyone allow write",
+                str(state_path),
+            ]
+        )
+        self.assertEqual(acl_result.returncode, 0, acl_result.stderr)
+        self.assertEqual(state_path.stat().st_mode & 0o7777, 0o600)
+        before_content = state_path.read_bytes()
+        before_stat = state_path.stat()
+        try:
+            completed = self._run_runner(
+                "attach-child",
+                "--run-dir",
+                str(run_dir),
+                "--child-session-id",
+                "child-darwin-acl",
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("named or extended ACL", completed.stderr)
+            after_stat = state_path.stat()
+            self.assertEqual(state_path.read_bytes(), before_content)
+            self.assertEqual(
+                (after_stat.st_dev, after_stat.st_ino, after_stat.st_mtime_ns),
+                (before_stat.st_dev, before_stat.st_ino, before_stat.st_mtime_ns),
+            )
+        finally:
+            remove_acl = run(["/bin/chmod", "-N", str(state_path)])
+            self.assertEqual(remove_acl.returncode, 0, remove_acl.stderr)
+
+    def test_darwin_acl_probe_accepts_only_exact_unsupported_errnos(self) -> None:
+        module = self._load_runner_module()
+        libc = mock.Mock()
+        libc.acl_get_fd_np = mock.Mock(return_value=None)
+        libc.acl_free = mock.Mock(return_value=0)
+
+        with (
+            mock.patch.object(module.sys, "platform", "darwin"),
+            mock.patch.object(module.ctypes, "CDLL", return_value=libc),
+            mock.patch.object(module.ctypes, "set_errno"),
+            mock.patch.object(module.errno, "ENOENT", 2),
+            mock.patch.object(module.errno, "EACCES", 13),
+            mock.patch.object(module.errno, "EBADF", 9),
+            mock.patch.object(module.errno, "ENOMEM", 12),
+            mock.patch.object(module.errno, "EINVAL", 22),
+            mock.patch.object(module.errno, "ENOTSUP", 45),
+            mock.patch.object(module.errno, "ENOATTR", 93, create=True),
+            mock.patch.object(module.errno, "ENODATA", 96, create=True),
+            mock.patch.object(module.errno, "EOPNOTSUPP", 102, create=True),
+        ):
+            for error_number in (45, 102):
+                with (
+                    self.subTest(error_number=error_number),
+                    mock.patch.object(
+                        module.ctypes,
+                        "get_errno",
+                        return_value=error_number,
+                    ),
+                ):
+                    self.assertFalse(
+                        module._descriptor_has_extended_acl(
+                            123,
+                            label="synthetic Darwin state",
+                        )
+                    )
+
+            rejected_errors = {
+                "bad-file-descriptor": module.errno.EBADF,
+                "permission-denied": module.errno.EACCES,
+                "invalid-acl-type": module.errno.EINVAL,
+                "out-of-memory": module.errno.ENOMEM,
+                "no-attribute": module.errno.ENOATTR,
+                "enotsup-adjacent": module.errno.ENOTSUP + 1,
+                "eopnotsupp-adjacent": module.errno.EOPNOTSUPP + 1,
+            }
+            for case, error_number in rejected_errors.items():
+                with (
+                    self.subTest(case=case, error_number=error_number),
+                    mock.patch.object(
+                        module.ctypes,
+                        "get_errno",
+                        return_value=error_number,
+                    ),
+                    self.assertRaisesRegex(
+                        module.UserError,
+                        "extended ACL cannot be inspected safely",
+                    ),
+                ):
+                    module._descriptor_has_extended_acl(
+                        123,
+                        label="synthetic Darwin state",
+                    )
+
+    def test_linux_posix_acl_xattr_is_rejected_fail_closed(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        state_fd = os.open(run_dir / "state.json", os.O_RDONLY)
+        try:
+            with (
+                mock.patch.object(module.sys, "platform", "linux"),
+                mock.patch.object(
+                    module.os,
+                    "getxattr",
+                    create=True,
+                    return_value=b"synthetic-posix-acl",
+                ),
+                self.assertRaisesRegex(
+                    module.UserError,
+                    "named or extended ACL",
+                ),
+            ):
+                module._require_no_extended_acl(
+                    state_fd,
+                    label="synthetic Linux state",
+                )
+            with (
+                mock.patch.object(module.sys, "platform", "linux"),
+                mock.patch.object(
+                    module.os,
+                    "getxattr",
+                    create=True,
+                    side_effect=OSError(
+                        getattr(module.errno, "ENODATA", module.errno.ENOENT),
+                        "no POSIX ACL",
+                    ),
+                ),
+            ):
+                module._require_no_extended_acl(
+                    state_fd,
+                    label="synthetic Linux state",
+                )
+
+            def default_acl_only(_file_fd, attribute):
+                if attribute == "system.posix_acl_access":
+                    raise OSError(
+                        getattr(module.errno, "ENODATA", module.errno.ENOENT),
+                        "no POSIX access ACL",
+                    )
+                return b"synthetic-posix-default-acl"
+
+            with (
+                mock.patch.object(module.sys, "platform", "linux"),
+                mock.patch.object(
+                    module.os,
+                    "getxattr",
+                    create=True,
+                    side_effect=default_acl_only,
+                ),
+                self.assertRaisesRegex(
+                    module.UserError,
+                    "named or extended ACL",
+                ),
+            ):
+                module._require_no_extended_acl(
+                    state_fd,
+                    label="synthetic Linux default ACL",
+                )
+        finally:
+            os.close(state_fd)
+
+    def test_runner_rejects_non_owner_tree_before_state_read(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare("--no-fallback-smoke")
+        with (
+            mock.patch.object(module.os, "geteuid", return_value=os.geteuid() + 1),
+            mock.patch.object(module, "_read_regular_artifact") as read_artifact,
+            self.assertRaisesRegex(
+                module.UserError,
+                "must be owned by the current user",
+            ),
+        ):
+            module._open_run_directory(run_dir)
+        read_artifact.assert_not_called()
+
+    def test_fallback_revalidates_bound_tree_immediately_before_popen(self) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare()
+        parent_prompt = run_dir / "parent-prompt.md"
+        state_path = run_dir / "state.json"
+        before_state = state_path.read_bytes()
+        real_supervised = module._run_bounded_smoke_process_supervised
+
+        def mutate_before_supervision(*args, **kwargs):
+            parent_prompt.write_text(
+                "changed after snapshot but before process start\n",
+                encoding="utf-8",
+            )
+            return real_supervised(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bounded_smoke_process_supervised",
+                side_effect=mutate_before_supervision,
+            ),
+            mock.patch.object(module.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                module.UserError,
+                "content changed before update",
+            ),
+        ):
+            module._run_fallback_smoke(argparse.Namespace(run_dir=str(run_dir)))
+
+        popen.assert_not_called()
+        self.assertEqual(state_path.read_bytes(), before_state)
 
     def test_state_save_uses_loaded_identity_and_digest_version(self) -> None:
         mutations = {
@@ -2368,7 +3058,10 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         def tracked_read_regular_artifact(*args, **kwargs):
             nonlocal prompt_read_under_lock
             artifact = real_read_regular_artifact(*args, **kwargs)
-            if args[1] == module.FALLBACK_SMOKE_PROMPT_NAME:
+            if (
+                args[1] == module.FALLBACK_SMOKE_PROMPT_NAME
+                and not prompt_read_under_lock
+            ):
                 self.assertGreater(lock_depth, 0)
                 prompt_read_under_lock = True
             return artifact
@@ -2380,7 +3073,9 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             child_read_streams: tuple,
             input_stream,
             input_bytes: bytes,
+            pre_spawn_check,
         ) -> subprocess.CompletedProcess[str]:
+            pre_spawn_check()
             self.assertEqual(cwd, self.repo.resolve())
             self.assertEqual(len(child_read_streams), 1)
             read_fd = child_read_streams[0].fileno()
@@ -2460,7 +3155,9 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             child_read_streams: tuple,
             input_stream,
             input_bytes: bytes,
+            pre_spawn_check,
         ) -> subprocess.CompletedProcess[str]:
+            pre_spawn_check()
             self.assertTrue(command)
             self.assertEqual(cwd, self.repo.resolve())
             self.assertEqual(len(child_read_streams), 1)
