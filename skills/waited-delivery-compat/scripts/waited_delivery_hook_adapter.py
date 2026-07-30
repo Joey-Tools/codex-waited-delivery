@@ -24,7 +24,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Iterator
-from typing import NamedTuple, TypedDict, cast
+from typing import Literal, NamedTuple, TypedDict, cast
 
 
 BRIDGE_PATH = pathlib.Path(__file__).resolve().with_name("waited_delivery_bridge.py")
@@ -63,6 +63,8 @@ TERMINAL_PHASE_STATUSES = {
 }
 CHILD_TERMINAL_STATUSES = {"completed", "failed", "interrupted"}
 RUNS_DIR_NAME = "waited-delivery"
+RUN_DIRECTORY_MODE = 0o700
+LEGACY_RUN_DIRECTORY_MODE = 0o755
 STATE_MAX_BYTES = 4 * 1024 * 1024
 PROMPT_REFRESH_SCHEMA_VERSION = 2
 LAUNCH_SNAPSHOT_DIRECTORY_MODE = 0o700
@@ -72,6 +74,15 @@ REFRESH_CLEANUP_TIMEOUT_SECONDS = 2.0
 REFRESH_CAPTURE_MAX_BYTES = 256 * 1024
 REFRESH_DRAIN_CHUNK_BYTES = 64 * 1024
 REFRESH_POLL_INTERVAL_SECONDS = 0.02
+REFRESH_PROC_GROUP_SCAN_MAX_ENTRIES = 131_072
+REFRESH_PROC_GROUP_SCAN_TIMEOUT_SECONDS = 0.25
+
+LinuxRefreshProcessGroupState = Literal[
+    "live",
+    "zombie-only",
+    "no-members",
+    "unknown",
+]
 
 
 class UserError(RuntimeError):
@@ -190,7 +201,7 @@ class _DeferredRefreshTermination(BaseException):
 
 
 class _RefreshSignalTransaction:
-    """Defer one terminal signal until the refresh process group is gone."""
+    """Defer one terminal signal until refresh has no live group members."""
 
     def __init__(self) -> None:
         self._entry_mask: set[int] = set()
@@ -352,7 +363,90 @@ class _RefreshSignalTransaction:
         return isinstance(exc, _DeferredRefreshTermination)
 
 
-def _refresh_process_group_is_addressable(pgid: int) -> bool:
+def _parse_linux_proc_stat(raw: bytes) -> tuple[str, int] | None:
+    closing_parenthesis = raw.rfind(b")")
+    if closing_parenthesis <= 0:
+        return None
+    fields = raw[closing_parenthesis + 1 :].split()
+    if len(fields) < 3 or len(fields[0]) != 1:
+        return None
+    try:
+        process_group = int(fields[2])
+    except ValueError:
+        return None
+    state_value = fields[0][0]
+    if state_value > 0x7F:
+        return None
+    return chr(state_value), process_group
+
+
+def _linux_refresh_process_group_state(
+    pgid: int,
+    *,
+    proc_root: pathlib.Path = pathlib.Path("/proc"),
+    deadline: float | None = None,
+    max_entries: int = REFRESH_PROC_GROUP_SCAN_MAX_ENTRIES,
+) -> LinuxRefreshProcessGroupState:
+    if deadline is None:
+        deadline = time.monotonic() + REFRESH_PROC_GROUP_SCAN_TIMEOUT_SECONDS
+    if max_entries <= 0:
+        return "unknown"
+    saw_zombie = False
+    entry_count = 0
+    try:
+        with os.scandir(proc_root) as entries:
+            for entry in entries:
+                entry_count += 1
+                if entry_count > max_entries or time.monotonic() >= deadline:
+                    return "unknown"
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    raw = (pathlib.Path(entry.path) / "stat").read_bytes()
+                except FileNotFoundError:
+                    continue
+                parsed = _parse_linux_proc_stat(raw)
+                if parsed is None:
+                    return "unknown"
+                state, process_group = parsed
+                if process_group != pgid:
+                    continue
+                if state != "Z":
+                    return "live"
+                saw_zombie = True
+    except OSError:
+        return "unknown"
+    if saw_zombie:
+        return "zombie-only"
+    return "no-members"
+
+
+def _refresh_process_group_has_live_members(
+    pgid: int,
+    *,
+    proc_root: pathlib.Path = pathlib.Path("/proc"),
+    platform: str = sys.platform,
+    deadline: float | None = None,
+) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    if not platform.startswith("linux"):
+        return True
+    state = _linux_refresh_process_group_state(
+        pgid,
+        proc_root=proc_root,
+        deadline=deadline,
+    )
+    if state == "zombie-only":
+        return False
+    if state != "no-members":
+        return True
+    # The group may have disappeared during the scan. Only a second ESRCH proves
+    # absence; unreadable, ambiguous, or still-addressable states remain live.
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -415,15 +509,18 @@ def _cleanup_refresh_process(
         returncode = process.poll()
         if (
             returncode is not None
-            and not _refresh_process_group_is_addressable(process.pid)
+            and not _refresh_process_group_has_live_members(
+                process.pid,
+                deadline=deadline,
+            )
             and not selector.get_map()
         ):
             return
     reasons: list[str] = []
     if process.poll() is None:
         reasons.append("failed to reap prompt refresh process")
-    if _refresh_process_group_is_addressable(process.pid):
-        reasons.append("failed to prove prompt refresh process-group disappearance")
+    if _refresh_process_group_has_live_members(process.pid):
+        reasons.append("failed to eliminate live prompt refresh process-group members")
     if selector.get_map():
         reasons.append("failed to drain prompt refresh process pipes")
     raise UserError("; ".join(reasons) or "prompt refresh cleanup timed out")
@@ -542,7 +639,10 @@ def _run_bounded_refresh_process_supervised(
                 returncode = process.poll()
                 if returncode is None:
                     continue
-                if _refresh_process_group_is_addressable(process.pid):
+                if _refresh_process_group_has_live_members(
+                    process.pid,
+                    deadline=deadline,
+                ):
                     failure = (
                         126,
                         "BLOCKED: prompt refresh left a live descendant in its "
@@ -1407,6 +1507,43 @@ def _run_directory_identity(file_stat: os.stat_result) -> RunDirectoryIdentity:
     )
 
 
+def _harden_legacy_run_directory(
+    run_fd: int,
+    identity: RunDirectoryIdentity,
+) -> RunDirectoryIdentity:
+    if identity.uid != os.geteuid():
+        raise RunSafetyError("active run directory must be owned by the current user")
+    if identity.mode == RUN_DIRECTORY_MODE:
+        return identity
+    if identity.mode != LEGACY_RUN_DIRECTORY_MODE:
+        raise RunSafetyError(
+            "active run directory must use mode 0700 or owned legacy mode 0755"
+        )
+    try:
+        os.fchmod(run_fd, RUN_DIRECTORY_MODE)
+        hardened = _run_directory_identity(os.fstat(run_fd))
+    except OSError as error:
+        raise RunSafetyError(
+            "cannot tighten owned legacy active run directory to mode 0700"
+        ) from error
+    if (
+        hardened.device,
+        hardened.inode,
+        hardened.uid,
+        hardened.gid,
+    ) != (
+        identity.device,
+        identity.inode,
+        identity.uid,
+        identity.gid,
+    ) or hardened.mode != RUN_DIRECTORY_MODE:
+        raise RunSafetyError(
+            "active run directory object or access identity changed while "
+            "tightening legacy mode"
+        )
+    return hardened
+
+
 def _open_stop_run_directory(repo_root: pathlib.Path, run_name: str) -> int:
     try:
         repo_fd = _open_absolute_directory(repo_root)
@@ -2059,7 +2196,12 @@ def _validate_stop_run_state_descriptor(
             raise RunSafetyError(
                 "active run directory access identity changed during validation"
             )
-    if pinned_identity.uid != os.geteuid() or pinned_identity.mode != 0o700:
+    else:
+        pinned_identity = _harden_legacy_run_directory(run_fd, pinned_identity)
+    if (
+        pinned_identity.uid != os.geteuid()
+        or pinned_identity.mode != RUN_DIRECTORY_MODE
+    ):
         raise RunSafetyError(
             "active run directory must be owned by the current user with mode 0700"
         )

@@ -243,13 +243,17 @@ class SkillContractTest(unittest.TestCase):
             dependencies,
         )
         self.assertIn(
-            "Aggregate and private-overlay packaging must preserve the same bytes",
+            "Aggregate and private-overlay packaging must preserve both legacy "
+            "files and the compatibility runner",
             dependencies,
         )
         self.assertIn(
-            "`removed_links` may retire it only after the effective hook list is empty",
+            "`removed_links` may retire the target only after the effective hook "
+            "list is empty and active legacy runs have drained",
             dependencies,
         )
+        self.assertIn("fixed executable redirect", dependencies)
+        self.assertIn("no active run still persists a command", dependencies)
 
 
 if __name__ == "__main__":

@@ -279,6 +279,21 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             mode=run_stat.st_mode & 0o7777,
         )
 
+    def _write_proc_stat(
+        self,
+        proc_root: pathlib.Path,
+        *,
+        pid: int,
+        state: str,
+        process_group: int,
+    ) -> None:
+        process_dir = proc_root / str(pid)
+        process_dir.mkdir(parents=True)
+        (process_dir / "stat").write_text(
+            f"{pid} (fixture ) name) {state} 1 {process_group} 1 0\n",
+            encoding="utf-8",
+        )
+
     def test_hook_commands_are_inert_without_explicit_compatibility_flag(
         self,
     ) -> None:
@@ -886,6 +901,167 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         finally:
             os.close(read_fd)
 
+    def test_linux_refresh_scan_accepts_zombie_only_process_group(self) -> None:
+        module = self._load_adapter_module()
+        proc_root = self.root / "proc-zombie-only"
+        self._write_proc_stat(
+            proc_root,
+            pid=201,
+            state="Z",
+            process_group=77,
+        )
+        self._write_proc_stat(
+            proc_root,
+            pid=202,
+            state="Z",
+            process_group=77,
+        )
+        self._write_proc_stat(
+            proc_root,
+            pid=203,
+            state="S",
+            process_group=88,
+        )
+
+        self.assertEqual(
+            module._linux_refresh_process_group_state(77, proc_root=proc_root),
+            "zombie-only",
+        )
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertFalse(
+                module._refresh_process_group_has_live_members(
+                    77,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+    def test_linux_refresh_scan_keeps_live_process_group_member(self) -> None:
+        module = self._load_adapter_module()
+        proc_root = self.root / "proc-live-member"
+        self._write_proc_stat(
+            proc_root,
+            pid=301,
+            state="Z",
+            process_group=91,
+        )
+        self._write_proc_stat(
+            proc_root,
+            pid=302,
+            state="S",
+            process_group=91,
+        )
+
+        self.assertEqual(
+            module._linux_refresh_process_group_state(91, proc_root=proc_root),
+            "live",
+        )
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertTrue(
+                module._refresh_process_group_has_live_members(
+                    91,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+    def test_linux_refresh_scan_handles_non_utf8_process_name_as_bytes(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        proc_root = self.root / "proc-non-utf8-name"
+        process_dir = proc_root / "501"
+        process_dir.mkdir(parents=True)
+        (process_dir / "stat").write_bytes(b"501 (fixture \xff name) Z 1 109 1 0\n")
+
+        self.assertEqual(
+            module._linux_refresh_process_group_state(109, proc_root=proc_root),
+            "zombie-only",
+        )
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertFalse(
+                module._refresh_process_group_has_live_members(
+                    109,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+    def test_linux_refresh_scan_ambiguity_fails_closed(self) -> None:
+        module = self._load_adapter_module()
+        proc_root = self.root / "proc-ambiguous"
+        self._write_proc_stat(
+            proc_root,
+            pid=401,
+            state="Z",
+            process_group=101,
+        )
+        self.assertEqual(
+            module._linux_refresh_process_group_state(
+                101,
+                proc_root=proc_root,
+                deadline=time.monotonic() - 1,
+            ),
+            "unknown",
+        )
+
+        stat_path = proc_root / "401" / "stat"
+        stat_path.write_text("ambiguous\n", encoding="utf-8")
+        self.assertEqual(
+            module._linux_refresh_process_group_state(101, proc_root=proc_root),
+            "unknown",
+        )
+
+        stat_path.unlink()
+        stat_path.mkdir()
+        self.assertEqual(
+            module._linux_refresh_process_group_state(101, proc_root=proc_root),
+            "unknown",
+        )
+        stat_path.rmdir()
+        stat_path.write_bytes(b"401 (fixture) \xff 1 101 1 0\n")
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertTrue(
+                module._refresh_process_group_has_live_members(
+                    101,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+    def test_linux_refresh_scan_iteration_error_fails_closed(self) -> None:
+        module = self._load_adapter_module()
+
+        class FailingProcEntries:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError("injected proc iteration failure")
+
+        with mock.patch.object(
+            module.os,
+            "scandir",
+            side_effect=lambda _root: FailingProcEntries(),
+        ):
+            self.assertEqual(
+                module._linux_refresh_process_group_state(113),
+                "unknown",
+            )
+            with mock.patch.object(module.os, "killpg", return_value=None):
+                self.assertTrue(
+                    module._refresh_process_group_has_live_members(
+                        113,
+                        platform="linux",
+                    )
+                )
+
     def test_refresh_signal_cleans_process_group_before_redelivery(self) -> None:
         module = self._load_adapter_module()
         script = self.root / "refresh-signal-tree.py"
@@ -1363,6 +1539,58 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             self.assertIn(str(RUNNER_PATH), prompt)
             self.assertNotIn(str(legacy_runner), prompt)
             self.assertNotIn("legacy prompt sentinel", prompt)
+
+    def test_stop_hook_tightens_owned_legacy_run_directory_mode(self) -> None:
+        session_id = "session-legacy-directory-mode"
+        run_dir = self._prepare_indexed_run(session_id, "legacy-directory-mode")
+        run_dir.chmod(0o755)
+        legacy_identity = run_dir.stat()
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload=self._stop_payload_for(session_id),
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("Do not finish", completed.stderr)
+        hardened_identity = run_dir.stat()
+        self.assertEqual(
+            (
+                hardened_identity.st_dev,
+                hardened_identity.st_ino,
+                hardened_identity.st_uid,
+                hardened_identity.st_gid,
+            ),
+            (
+                legacy_identity.st_dev,
+                legacy_identity.st_ino,
+                legacy_identity.st_uid,
+                legacy_identity.st_gid,
+            ),
+        )
+        self.assertEqual(hardened_identity.st_mode & 0o7777, 0o700)
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            self.assertIn(
+                str(RUNNER_PATH),
+                (run_dir / prompt_name).read_text(encoding="utf-8"),
+            )
+
+    def test_stop_hook_rejects_nonlegacy_open_run_directory_mode(self) -> None:
+        session_id = "session-open-directory-mode"
+        run_dir = self._prepare_indexed_run(session_id, "open-directory-mode")
+        parent_prompt = run_dir / "parent-prompt.md"
+        original_prompt = parent_prompt.read_bytes()
+        run_dir.chmod(0o777)
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload=self._stop_payload_for(session_id),
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("failed repository/path safety validation", completed.stderr)
+        self.assertEqual(run_dir.stat().st_mode & 0o7777, 0o777)
+        self.assertEqual(parent_prompt.read_bytes(), original_prompt)
 
     def test_stop_hook_refreshes_prompt_for_active_legacy_child(self) -> None:
         session_id = "session-legacy-active"

@@ -3,7 +3,7 @@
 ## Current State
 
 - This repository retains waited-delivery only as explicit compatibility and recovery infrastructure.
-- The historical hook target remains an inert, non-discoverable shim during the two-phase host migration.
+- The historical target remains non-discoverable during the two-phase host migration: its hook adapter is inert, while its fixed runner redirect remains available until active pre-rename runs drain.
 - Per-workstream state and validation evidence live under `docs/project_journal/`.
 
 ## Recovery Pointers
