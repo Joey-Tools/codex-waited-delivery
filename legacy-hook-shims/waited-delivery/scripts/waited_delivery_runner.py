@@ -69,6 +69,10 @@ def _object_access_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
 def _runner_version(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         *_object_access_identity(metadata),
@@ -116,6 +120,34 @@ def _stable_runner_source(path: Path) -> bytes:
         os.close(runner_fd)
 
 
+def _harden_snapshot_directory(snapshot_dir: Path) -> os.stat_result:
+    initial = os.lstat(snapshot_dir)
+    if not stat.S_ISDIR(initial.st_mode) or initial.st_uid != os.geteuid():
+        raise RuntimeError("runner snapshot directory is not a current-user directory")
+    try:
+        os.chmod(
+            snapshot_dir,
+            SNAPSHOT_DIRECTORY_MODE,
+            follow_symlinks=False,
+        )
+    except (NotImplementedError, OSError) as error:
+        raise RuntimeError(
+            "runner snapshot directory cannot be hardened without following links"
+        ) from error
+    hardened = os.lstat(snapshot_dir)
+    if (
+        not stat.S_ISDIR(hardened.st_mode)
+        or not _same_object(initial, hardened)
+        or (hardened.st_uid, hardened.st_gid) != (initial.st_uid, initial.st_gid)
+        or hardened.st_uid != os.geteuid()
+        or stat.S_IMODE(hardened.st_mode) != SNAPSHOT_DIRECTORY_MODE
+    ):
+        raise RuntimeError(
+            "runner snapshot directory identity or access policy changed"
+        )
+    return hardened
+
+
 def _private_runner_snapshot(content: bytes) -> int:
     snapshot_dir = Path(tempfile.mkdtemp(prefix="waited-delivery-runner-redirect-"))
     snapshot_name = "waited_delivery_runner.snapshot"
@@ -124,7 +156,7 @@ def _private_runner_snapshot(content: bytes) -> int:
     snapshot_fd: int | None = None
     name_exists = False
     try:
-        named_directory = os.lstat(snapshot_dir)
+        named_directory = _harden_snapshot_directory(snapshot_dir)
         directory_fd = os.open(
             snapshot_dir,
             os.O_RDONLY
@@ -134,8 +166,7 @@ def _private_runner_snapshot(content: bytes) -> int:
         )
         opened_directory = os.fstat(directory_fd)
         if (
-            not stat.S_ISDIR(named_directory.st_mode)
-            or not stat.S_ISDIR(opened_directory.st_mode)
+            not stat.S_ISDIR(opened_directory.st_mode)
             or _object_access_identity(opened_directory)
             != _object_access_identity(named_directory)
             or opened_directory.st_uid != os.geteuid()

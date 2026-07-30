@@ -49,6 +49,7 @@ def run(
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
     input_text: str | None = None,
+    umask: int = -1,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
@@ -58,6 +59,7 @@ def run(
         input=input_text,
         capture_output=True,
         check=False,
+        umask=umask,
     )
 
 
@@ -117,6 +119,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         *args: str,
         input_payload: dict[str, object] | None = None,
         env_overrides: Mapping[str, str | None] | None = None,
+        umask: int = -1,
     ) -> subprocess.CompletedProcess[str]:
         input_text = None
         if input_payload is not None:
@@ -139,6 +142,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             [sys.executable, str(ADAPTER_PATH), *adapter_args],
             env=env,
             input_text=input_text,
+            umask=umask,
         )
 
     def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -2259,6 +2263,108 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 )
                 self.assertEqual(entry["error_type"], "RunSafetyError")
                 self.assertIn(expected_error, entry["error_message"])
+
+    def test_refresh_snapshot_survives_owner_bit_masking_umask(self) -> None:
+        probe = textwrap.dedent(
+            """\
+            import fcntl
+            import importlib.util
+            import os
+            import pathlib
+            import sys
+
+            adapter_path = pathlib.Path(sys.argv[1])
+            spec = importlib.util.spec_from_file_location(
+                "waited_delivery_refresh_snapshot_umask_probe",
+                adapter_path,
+            )
+            if spec is None or spec.loader is None:
+                raise RuntimeError("cannot load hook adapter")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            with module._verified_refresh_launch_snapshots() as snapshots:
+                for snapshot in (snapshots.bridge, snapshots.runner):
+                    metadata = os.fstat(snapshot.snapshot_fd)
+                    if metadata.st_mode & 0o7777 != 0o600:
+                        raise RuntimeError("snapshot access mismatch")
+                    if metadata.st_nlink != 0:
+                        raise RuntimeError("snapshot name remains linked")
+                    if fcntl.fcntl(snapshot.snapshot_fd, fcntl.F_GETFL) & os.O_ACCMODE:
+                        raise RuntimeError("snapshot is not read-only")
+            """
+        )
+        completed = run(
+            [sys.executable, "-c", probe, str(ADAPTER_PATH)],
+            env={
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            umask=0o777,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+
+    def test_refresh_snapshot_rejects_directory_drift(self) -> None:
+        module = self._load_adapter_module()
+        expected_errors = {
+            "replacement": "identity or access policy changed",
+            "unsafe-access": "identity or access policy changed",
+            "unreadable": "cannot be hardened without following links",
+        }
+        for mutation, expected_error in expected_errors.items():
+            with self.subTest(mutation=mutation):
+                real_chmod = os.chmod
+                displaced: list[pathlib.Path] = []
+
+                def mutate_directory(
+                    path: str | os.PathLike[str],
+                    _mode: int,
+                    *,
+                    follow_symlinks: bool,
+                ) -> None:
+                    snapshot_dir = pathlib.Path(path)
+                    if mutation == "replacement":
+                        displaced_dir = snapshot_dir.with_name(
+                            f"{snapshot_dir.name}.displaced"
+                        )
+                        snapshot_dir.rename(displaced_dir)
+                        displaced.append(displaced_dir)
+                        snapshot_dir.mkdir(mode=0o700)
+                        real_chmod(
+                            snapshot_dir,
+                            0o700,
+                            follow_symlinks=follow_symlinks,
+                        )
+                    elif mutation == "unsafe-access":
+                        real_chmod(
+                            snapshot_dir,
+                            0o755,
+                            follow_symlinks=follow_symlinks,
+                        )
+                    else:
+                        raise PermissionError(
+                            "injected snapshot directory access failure"
+                        )
+
+                try:
+                    with mock.patch.object(
+                        module.os,
+                        "chmod",
+                        side_effect=mutate_directory,
+                    ):
+                        with self.assertRaisesRegex(
+                            module.RunSafetyError,
+                            expected_error,
+                        ):
+                            with module._verified_refresh_launch_snapshots():
+                                self.fail(
+                                    "unsafe launch snapshot directory was accepted"
+                                )
+                finally:
+                    for displaced_dir in displaced:
+                        shutil.rmtree(displaced_dir)
 
     def test_launch_snapshot_closes_fd_when_execution_path_resolution_fails(
         self,

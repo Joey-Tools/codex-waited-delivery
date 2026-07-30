@@ -36,6 +36,7 @@ def run(
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
     pass_fds: tuple[int, ...] = (),
+    umask: int = -1,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
@@ -45,6 +46,7 @@ def run(
         capture_output=True,
         check=False,
         pass_fds=pass_fds,
+        umask=umask,
     )
 
 
@@ -1109,6 +1111,113 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         smoke = state["fallback_readiness_smoke"]
         self.assertEqual(smoke["status"], "passed")
         self.assertEqual(smoke["sample"], "READY")
+
+    def test_fallback_snapshot_survives_owner_bit_masking_umask(self) -> None:
+        probe = textwrap.dedent(
+            """\
+            import fcntl
+            import importlib.util
+            import os
+            import pathlib
+            import sys
+
+            runner_path = pathlib.Path(sys.argv[1])
+            spec = importlib.util.spec_from_file_location(
+                "waited_delivery_fallback_snapshot_umask_probe",
+                runner_path,
+            )
+            if spec is None or spec.loader is None:
+                raise RuntimeError("cannot load compatibility runner")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            content = b"fallback prompt\\n"
+            with module._immutable_smoke_prompt_snapshot(content) as (
+                execution_path,
+                snapshot_fd,
+            ):
+                metadata = os.fstat(snapshot_fd)
+                if metadata.st_mode & 0o7777 != 0o600:
+                    raise RuntimeError("snapshot access mismatch")
+                if metadata.st_nlink != 0:
+                    raise RuntimeError("snapshot name remains linked")
+                if fcntl.fcntl(snapshot_fd, fcntl.F_GETFL) & os.O_ACCMODE:
+                    raise RuntimeError("snapshot is not read-only")
+                if execution_path.read_bytes() != content:
+                    raise RuntimeError("snapshot content mismatch")
+            """
+        )
+        completed = run(
+            [sys.executable, "-c", probe, str(SCRIPT_PATH)],
+            env={
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            umask=0o777,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+
+    def test_fallback_snapshot_rejects_directory_drift(self) -> None:
+        module = self._load_runner_module()
+        expected_errors = {
+            "replacement": "identity or access policy changed",
+            "unsafe-access": "identity or access policy changed",
+            "unreadable": "cannot be hardened without following links",
+        }
+        for mutation, expected_error in expected_errors.items():
+            with self.subTest(mutation=mutation):
+                real_chmod = os.chmod
+                displaced: list[pathlib.Path] = []
+
+                def mutate_directory(
+                    path: str | os.PathLike[str],
+                    _mode: int,
+                    *,
+                    follow_symlinks: bool,
+                ) -> None:
+                    snapshot_dir = pathlib.Path(path)
+                    if mutation == "replacement":
+                        displaced_dir = snapshot_dir.with_name(
+                            f"{snapshot_dir.name}.displaced"
+                        )
+                        snapshot_dir.rename(displaced_dir)
+                        displaced.append(displaced_dir)
+                        snapshot_dir.mkdir(mode=0o700)
+                        real_chmod(
+                            snapshot_dir,
+                            0o700,
+                            follow_symlinks=follow_symlinks,
+                        )
+                    elif mutation == "unsafe-access":
+                        real_chmod(
+                            snapshot_dir,
+                            0o755,
+                            follow_symlinks=follow_symlinks,
+                        )
+                    else:
+                        raise PermissionError(
+                            "injected snapshot directory access failure"
+                        )
+
+                try:
+                    with mock.patch.object(
+                        module.os,
+                        "chmod",
+                        side_effect=mutate_directory,
+                    ):
+                        with self.assertRaisesRegex(
+                            module.UserError,
+                            expected_error,
+                        ):
+                            with module._immutable_smoke_prompt_snapshot(
+                                b"fallback prompt\n"
+                            ):
+                                self.fail("unsafe snapshot directory was accepted")
+                finally:
+                    for displaced_dir in displaced:
+                        shutil.rmtree(displaced_dir)
 
     def test_run_fallback_smoke_binds_prompt_snapshot_under_lock(self) -> None:
         module = self._load_runner_module()

@@ -88,6 +88,7 @@ class LegacyHookShimTests(unittest.TestCase):
         runner: Path,
         *args: str,
         root: Path,
+        umask: int = -1,
     ) -> subprocess.CompletedProcess[str]:
         environment = {
             "HOME": str(root),
@@ -103,6 +104,7 @@ class LegacyHookShimTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=5,
+            umask=umask,
         )
 
     def test_legacy_paths_are_identical_and_not_discoverable_skills(self) -> None:
@@ -143,6 +145,83 @@ class LegacyHookShimTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, expected.returncode)
                     self.assertEqual(completed.stdout, expected.stdout)
                     self.assertEqual(completed.stderr, expected.stderr)
+
+    def test_legacy_runner_snapshot_survives_owner_bit_masking_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            expected = self._invoke_runner(COMPAT_RUNNER, "--help", root=root)
+            self.assertEqual(expected.returncode, 0, expected.stderr)
+            for runner in (LEGACY_RUNNER, HISTORICAL_TARGET_RUNNER):
+                with self.subTest(runner=runner):
+                    completed = self._invoke_runner(
+                        runner,
+                        "--help",
+                        root=root,
+                        umask=0o777,
+                    )
+                    self.assertEqual(completed.returncode, expected.returncode)
+                    self.assertEqual(completed.stdout, expected.stdout)
+                    self.assertEqual(completed.stderr, expected.stderr)
+
+    def test_legacy_runner_snapshot_rejects_directory_drift(self) -> None:
+        for runner in (LEGACY_RUNNER, HISTORICAL_TARGET_RUNNER):
+            expected_errors = {
+                "replacement": "identity or access policy changed",
+                "unsafe-access": "identity or access policy changed",
+                "unreadable": "cannot be hardened without following links",
+            }
+            for mutation, expected_error in expected_errors.items():
+                with self.subTest(runner=runner, mutation=mutation):
+                    module = self._load_redirect_module(runner)
+                    real_chmod = os.chmod
+                    displaced: list[Path] = []
+
+                    def mutate_directory(
+                        path: str | os.PathLike[str],
+                        _mode: int,
+                        *,
+                        follow_symlinks: bool,
+                    ) -> None:
+                        snapshot_dir = Path(path)
+                        if mutation == "replacement":
+                            displaced_dir = snapshot_dir.with_name(
+                                f"{snapshot_dir.name}.displaced"
+                            )
+                            snapshot_dir.rename(displaced_dir)
+                            displaced.append(displaced_dir)
+                            snapshot_dir.mkdir(mode=0o700)
+                            real_chmod(
+                                snapshot_dir,
+                                0o700,
+                                follow_symlinks=follow_symlinks,
+                            )
+                        elif mutation == "unsafe-access":
+                            real_chmod(
+                                snapshot_dir,
+                                0o755,
+                                follow_symlinks=follow_symlinks,
+                            )
+                        else:
+                            raise PermissionError(
+                                "injected snapshot directory access failure"
+                            )
+
+                    try:
+                        with mock.patch.object(
+                            module.os,
+                            "chmod",
+                            side_effect=mutate_directory,
+                        ):
+                            with self.assertRaisesRegex(
+                                RuntimeError,
+                                expected_error,
+                            ):
+                                module._private_runner_snapshot(
+                                    b"raise SystemExit(0)\n"
+                                )
+                    finally:
+                        for displaced_dir in displaced:
+                            shutil.rmtree(displaced_dir)
 
     def test_legacy_runner_executes_snapshot_after_target_symlink_replacement(
         self,

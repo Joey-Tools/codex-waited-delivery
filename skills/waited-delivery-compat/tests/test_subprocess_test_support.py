@@ -29,12 +29,19 @@ class SubprocessTestSupportTests(unittest.TestCase):
         pid: int,
         state: str,
         process_group: int,
+        comm: bytes = b"fixture ) name",
     ) -> None:
         process_dir = proc_root / str(pid)
         process_dir.mkdir(parents=True)
-        (process_dir / "stat").write_text(
-            f"{pid} (fixture ) name) {state} 1 {process_group} 1 0\n",
-            encoding="utf-8",
+        (process_dir / "stat").write_bytes(
+            str(pid).encode("ascii")
+            + b" ("
+            + comm
+            + b") "
+            + state.encode("ascii")
+            + b" 1 "
+            + str(process_group).encode("ascii")
+            + b" 1 0\n"
         )
 
     def test_linux_proc_scan_classifies_zombie_only_group(self) -> None:
@@ -101,6 +108,40 @@ class SubprocessTestSupportTests(unittest.TestCase):
                     )
                 )
 
+    def test_linux_proc_scan_handles_non_utf8_process_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_root = Path(temp_dir)
+            self._write_proc_stat(
+                proc_root,
+                pid=351,
+                state="Z",
+                process_group=95,
+                comm=b"same \xff zombie",
+            )
+            self._write_proc_stat(
+                proc_root,
+                pid=352,
+                state="S",
+                process_group=96,
+                comm=b"unrelated \xfe live",
+            )
+
+            self.assertEqual(
+                support._linux_process_group_state(95, proc_root=proc_root),
+                "zombie-only",
+            )
+            self._write_proc_stat(
+                proc_root,
+                pid=353,
+                state="S",
+                process_group=95,
+                comm=b"same \xfd live",
+            )
+            self.assertEqual(
+                support._linux_process_group_state(95, proc_root=proc_root),
+                "live",
+            )
+
     def test_linux_proc_scan_deadline_unreadable_and_ambiguity_fail_closed(
         self,
     ) -> None:
@@ -129,10 +170,12 @@ class SubprocessTestSupportTests(unittest.TestCase):
                 "unknown",
             )
             stat_path.rmdir()
-            stat_path.write_text(
-                "ambiguous\n",
-                encoding="utf-8",
+            stat_path.write_bytes(b"ambiguous\n")
+            self.assertEqual(
+                support._linux_process_group_state(101, proc_root=proc_root),
+                "unknown",
             )
+            stat_path.write_bytes(b"401 (fixture) \xff 1 101 1 0\n")
             self.assertEqual(
                 support._linux_process_group_state(101, proc_root=proc_root),
                 "unknown",
@@ -142,6 +185,37 @@ class SubprocessTestSupportTests(unittest.TestCase):
                     support._process_group_exists(
                         101,
                         proc_root=proc_root,
+                        platform="linux",
+                    )
+                )
+
+    def test_linux_proc_scan_iteration_error_fails_closed(self) -> None:
+        class FailingProcEntries:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError("injected proc iteration failure")
+
+        with mock.patch.object(
+            support.os,
+            "scandir",
+            side_effect=lambda _root: FailingProcEntries(),
+        ):
+            self.assertEqual(
+                support._linux_process_group_state(111),
+                "unknown",
+            )
+            with mock.patch.object(support.os, "killpg", return_value=None):
+                self.assertTrue(
+                    support._process_group_exists(
+                        111,
                         platform="linux",
                     )
                 )
@@ -337,6 +411,82 @@ class SubprocessTestSupportTests(unittest.TestCase):
             process_group = int(process_group_path.read_text(encoding="utf-8"))
             self.assertFalse(support._process_group_exists(process_group))
             self.assertLess(time.monotonic() - started_at, 3.5)
+
+    def test_cleanup_reaps_child_when_proc_iteration_fails(self) -> None:
+        class FailingProcEntries:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError("injected cleanup proc iteration failure")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            child_pid_path = root / "child.pid"
+            child = root / "sleep-after-pid.py"
+            child.write_text(
+                textwrap.dedent(
+                    """\
+                    import os
+                    import pathlib
+                    import sys
+                    import time
+
+                    pathlib.Path(sys.argv[1]).write_text(
+                        str(os.getpid()),
+                        encoding="utf-8",
+                    )
+                    time.sleep(60)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            real_killpg = os.killpg
+            zero_probes = 0
+
+            def controlled_killpg(process_group: int, sig: int) -> None:
+                nonlocal zero_probes
+                if sig == 0:
+                    zero_probes += 1
+                    if zero_probes == 1:
+                        return
+                    raise ProcessLookupError
+                real_killpg(process_group, sig)
+
+            with (
+                mock.patch.object(
+                    support.os,
+                    "scandir",
+                    side_effect=lambda _root: FailingProcEntries(),
+                ),
+                mock.patch.object(
+                    support.os,
+                    "killpg",
+                    side_effect=controlled_killpg,
+                ),
+                self.assertRaisesRegex(
+                    AssertionError,
+                    "did not exit while the stdin writer remained open",
+                ),
+            ):
+                run_before_stdin_eof(
+                    [sys.executable, str(child), str(child_pid_path)],
+                    cwd=root,
+                    env=self._environment(root),
+                    input_text="",
+                    timeout=1.5,
+                )
+
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            self.assertGreaterEqual(zero_probes, 2)
 
 
 if __name__ == "__main__":

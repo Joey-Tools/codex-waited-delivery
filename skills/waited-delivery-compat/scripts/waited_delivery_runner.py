@@ -888,6 +888,36 @@ def _fd_execution_path(file_fd: int, name: str) -> pathlib.Path:
     raise UserError(f"cannot expose descriptor-bound compatibility artifact: {name}")
 
 
+def _harden_smoke_snapshot_directory(
+    snapshot_dir: pathlib.Path,
+) -> os.stat_result:
+    initial = os.lstat(snapshot_dir)
+    if not stat.S_ISDIR(initial.st_mode) or initial.st_uid != os.geteuid():
+        raise UserError("smoke prompt snapshot is not a current-user directory")
+    try:
+        os.chmod(
+            snapshot_dir,
+            DIRECTORY_MODE,
+            follow_symlinks=False,
+        )
+    except (NotImplementedError, OSError) as error:
+        raise UserError(
+            "smoke prompt snapshot directory cannot be hardened without following links"
+        ) from error
+    hardened = os.lstat(snapshot_dir)
+    if (
+        not stat.S_ISDIR(hardened.st_mode)
+        or not _same_object(initial, hardened)
+        or (hardened.st_uid, hardened.st_gid) != (initial.st_uid, initial.st_gid)
+        or hardened.st_uid != os.geteuid()
+        or stat.S_IMODE(hardened.st_mode) != DIRECTORY_MODE
+    ):
+        raise UserError(
+            "smoke prompt snapshot directory identity or access policy changed"
+        )
+    return hardened
+
+
 @contextlib.contextmanager
 def _immutable_smoke_prompt_snapshot(
     content: bytes,
@@ -902,7 +932,7 @@ def _immutable_smoke_prompt_snapshot(
         snapshot_fd: int | None = None
         try:
             try:
-                named_directory = os.lstat(snapshot_dir)
+                named_directory = _harden_smoke_snapshot_directory(snapshot_dir)
                 snapshot_dir_fd = os.open(
                     snapshot_dir,
                     _directory_open_flags(),
@@ -912,6 +942,16 @@ def _immutable_smoke_prompt_snapshot(
                     not stat.S_ISDIR(named_directory.st_mode)
                     or not stat.S_ISDIR(opened_directory.st_mode)
                     or not _same_object(named_directory, opened_directory)
+                    or (
+                        opened_directory.st_uid,
+                        opened_directory.st_gid,
+                        stat.S_IMODE(opened_directory.st_mode),
+                    )
+                    != (
+                        named_directory.st_uid,
+                        named_directory.st_gid,
+                        stat.S_IMODE(named_directory.st_mode),
+                    )
                     or opened_directory.st_uid != os.geteuid()
                     or stat.S_IMODE(opened_directory.st_mode) != DIRECTORY_MODE
                 ):
