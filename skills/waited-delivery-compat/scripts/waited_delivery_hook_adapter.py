@@ -26,7 +26,7 @@ import sys
 import time
 import traceback
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Literal, NamedTuple, TypedDict, cast
 
 
@@ -76,10 +76,12 @@ PREPARATION_STATUSES = RECOVERABLE_PREPARATION_STATUSES | {
 }
 PREPARATION_REASON_MAX_CHARS = 512
 RUNS_DIR_NAME = "waited-delivery"
+RUN_LOCK_NAME = ".state.lock"
 RUN_DIRECTORY_MODE = 0o700
 LEGACY_RUN_DIRECTORY_MODE = 0o755
 STATE_MAX_BYTES = 4 * 1024 * 1024
 RUNNER_PREPARATION_SCHEMA_VERSIONS = {4, 5}
+RUNNER_STOP_SCHEMA_VERSIONS = {1, 2, 3, 4, 5}
 PROMPT_REFRESH_SCHEMA_VERSION = 3
 SOURCE_FRAME_MAGIC = b"WDLPIPE1"
 SOURCE_FRAME_HEADER_BYTES = 8 + 8 + 32 + 8 + 32
@@ -144,6 +146,14 @@ REFRESH_DRAIN_CHUNK_BYTES = 64 * 1024
 REFRESH_POLL_INTERVAL_SECONDS = 0.02
 REFRESH_PROC_GROUP_SCAN_MAX_ENTRIES = 131_072
 REFRESH_PROC_GROUP_SCAN_TIMEOUT_SECONDS = 0.25
+DARWIN_SA_NOCLDWAIT = 0x0020
+LINUX_SA_NOCLDWAIT = 0x00000002
+LINUX_SIGSET_BYTES = 128
+LINUX_SIGACTION_REVIEWED_MULTIARCH = {
+    "aarch64": frozenset({"aarch64-linux-gnu"}),
+    "x86_64": frozenset({"x86_64-linux-gnu"}),
+}
+IDENTITY_LOST_RETURN_CODE = sys.maxsize
 
 LinuxRefreshProcessGroupState = Literal[
     "live",
@@ -151,12 +161,21 @@ LinuxRefreshProcessGroupState = Literal[
     "no-members",
     "unknown",
 ]
+_UNREAPED_REFRESH_RECOVERY_PROCESSES: list[subprocess.Popen[bytes]] = []
 RunEntryPresence = Literal["absent", "present"]
 LeaseEntryPresence = Literal["absent", "present"]
 
 
 class UserError(RuntimeError):
     pass
+
+
+class _ProcessIdentityLost(UserError):
+    """The direct-child PID/PGID fence can no longer be trusted."""
+
+
+class _WaitableSigchldUnavailable(UserError):
+    """The process cannot preserve an unreaped direct-child identity fence."""
 
 
 class RunSafetyError(UserError):
@@ -450,35 +469,258 @@ class _RefreshSignalTransaction:
         return isinstance(exc, _DeferredRefreshTermination)
 
 
+class _DarwinSigaction(ctypes.Structure):
+    """Darwin's public struct sigaction layout."""
+
+    _fields_ = (
+        ("handler", ctypes.c_void_p),
+        ("mask", ctypes.c_uint32),
+        ("flags", ctypes.c_int),
+    )
+
+
+class _LinuxSigset(ctypes.Structure):
+    """The 1024-bit libc sigset_t used by supported Linux ABIs."""
+
+    _fields_ = (
+        (
+            "bits",
+            ctypes.c_ulong * (LINUX_SIGSET_BYTES // ctypes.sizeof(ctypes.c_ulong)),
+        ),
+    )
+
+
+class _LinuxSigaction(ctypes.Structure):
+    """The glibc struct sigaction layout for supported 64-bit Linux ABIs."""
+
+    _fields_ = (
+        ("handler", ctypes.c_void_p),
+        ("mask", _LinuxSigset),
+        ("flags", ctypes.c_int),
+        ("restorer", ctypes.c_void_p),
+    )
+
+
+def _darwin_sigchld_action() -> tuple[int, int]:
+    previous_errno = ctypes.get_errno()
+    try:
+        try:
+            library = ctypes.CDLL(None, use_errno=True)
+            sigaction = library.sigaction
+        except (AttributeError, OSError) as error:
+            raise _WaitableSigchldUnavailable(
+                "Darwin SIGCHLD disposition inspection is unavailable"
+            ) from error
+        sigaction.argtypes = (
+            ctypes.c_int,
+            ctypes.POINTER(_DarwinSigaction),
+            ctypes.POINTER(_DarwinSigaction),
+        )
+        sigaction.restype = ctypes.c_int
+        action = _DarwinSigaction()
+        ctypes.set_errno(0)
+        if sigaction(int(signal.SIGCHLD), None, ctypes.byref(action)) != 0:
+            error_number = ctypes.get_errno() or errno.EINVAL
+            raise _WaitableSigchldUnavailable(
+                "failed to inspect Darwin SIGCHLD disposition: "
+                f"{os.strerror(error_number)}"
+            )
+        return int(action.handler or 0), int(action.flags)
+    finally:
+        ctypes.set_errno(previous_errno)
+
+
+def _linux_sigchld_action() -> tuple[int, int]:
+    try:
+        machine = os.uname().machine.lower()
+    except (AttributeError, OSError) as error:
+        raise _WaitableSigchldUnavailable(
+            "Linux SIGCHLD disposition inspection cannot identify the libc ABI"
+        ) from error
+    multiarch = getattr(sys.implementation, "_multiarch", None)
+    reviewed_multiarch = LINUX_SIGACTION_REVIEWED_MULTIARCH.get(machine)
+    if (
+        ctypes.sizeof(ctypes.c_void_p) != 8
+        or ctypes.sizeof(ctypes.c_ulong) != 8
+        or reviewed_multiarch is None
+        or multiarch not in reviewed_multiarch
+    ):
+        raise _WaitableSigchldUnavailable(
+            "Linux SIGCHLD disposition inspection has no reviewed sigaction "
+            f"layout for machine {machine!r} and multiarch {multiarch!r}"
+        )
+    previous_errno = ctypes.get_errno()
+    try:
+        try:
+            library = ctypes.CDLL(None, use_errno=True)
+            sigaction = library.sigaction
+        except (AttributeError, OSError) as error:
+            raise _WaitableSigchldUnavailable(
+                "Linux SIGCHLD disposition inspection is unavailable"
+            ) from error
+        sigaction.argtypes = (
+            ctypes.c_int,
+            ctypes.POINTER(_LinuxSigaction),
+            ctypes.POINTER(_LinuxSigaction),
+        )
+        sigaction.restype = ctypes.c_int
+        action = _LinuxSigaction()
+        ctypes.set_errno(0)
+        if sigaction(int(signal.SIGCHLD), None, ctypes.byref(action)) != 0:
+            error_number = ctypes.get_errno() or errno.EINVAL
+            raise _WaitableSigchldUnavailable(
+                "failed to inspect Linux SIGCHLD disposition: "
+                f"{os.strerror(error_number)}"
+            )
+        return int(action.handler or 0), int(action.flags)
+    finally:
+        ctypes.set_errno(previous_errno)
+
+
+def _waitable_sigchld_failure(*, platform: str | None = None) -> str | None:
+    """Attest the process-global SIGCHLD contract used as the PID/PGID fence.
+
+    The disposition is process-global, so cooperating code must not mutate it
+    during a supervised transaction. Callers re-attest immediately before
+    spawn and before every operation that consumes the numeric child identity;
+    a failed re-attestation permanently abandons PID/PGID operations.
+    """
+
+    selected_platform = sys.platform if platform is None else platform
+    signum = getattr(signal, "SIGCHLD", None)
+    if not isinstance(signum, int):
+        return "SIGCHLD is unavailable"
+    try:
+        handler = signal.getsignal(signum)
+    except (OSError, ValueError) as error:
+        return f"SIGCHLD disposition inspection failed: {error}"
+    if handler == signal.SIG_IGN:
+        return (
+            "process supervision requires the default SIGCHLD disposition; "
+            "SIGCHLD is ignored and direct children may be auto-reaped"
+        )
+    if handler != signal.SIG_DFL:
+        return (
+            "process supervision requires the default SIGCHLD disposition; "
+            "SIGCHLD has a custom handler that may reap direct children"
+        )
+    if selected_platform == "darwin":
+        try:
+            raw_handler, flags = _darwin_sigchld_action()
+        except _WaitableSigchldUnavailable as error:
+            return str(error)
+        platform_name = "Darwin"
+        no_cldwait_flag = DARWIN_SA_NOCLDWAIT
+    elif selected_platform.startswith("linux"):
+        try:
+            raw_handler, flags = _linux_sigchld_action()
+        except _WaitableSigchldUnavailable as error:
+            return str(error)
+        platform_name = "Linux"
+        no_cldwait_flag = LINUX_SA_NOCLDWAIT
+    else:
+        return (
+            "native SIGCHLD disposition inspection is unavailable on "
+            f"{selected_platform}"
+        )
+    if raw_handler != 0:
+        return (
+            f"{platform_name} SIGCHLD has a non-default native handler that may "
+            "reap direct children"
+        )
+    if flags & no_cldwait_flag:
+        return (
+            f"{platform_name} SIGCHLD has SA_NOCLDWAIT and direct children may "
+            "be auto-reaped"
+        )
+    return None
+
+
+def _require_waitable_sigchld_semantics(
+    *,
+    after_spawn: bool = False,
+    platform: str | None = None,
+) -> None:
+    try:
+        failure = _waitable_sigchld_failure(platform=platform)
+    except BaseException as query_error:
+        if after_spawn:
+            raise _ProcessIdentityLost(
+                "waitable SIGCHLD re-attestation failed after process launch: "
+                f"{type(query_error).__name__}"
+            ) from query_error
+        raise _WaitableSigchldUnavailable(
+            "waitable SIGCHLD attestation failed before process launch: "
+            f"{type(query_error).__name__}"
+        ) from query_error
+    if failure is None:
+        return
+    if after_spawn:
+        raise _ProcessIdentityLost(
+            "waitable SIGCHLD semantics changed after process launch: " + failure
+        )
+    raise _WaitableSigchldUnavailable(
+        "waitable SIGCHLD semantics are required before process launch: " + failure
+    )
+
+
+def _preflight_unreaped_leader_observer(
+    *,
+    platform: str | None = None,
+    after_spawn: bool = False,
+) -> str:
+    if sys.implementation.name != "cpython":
+        raise UserError(
+            "process supervision requires reviewed CPython Popen finalizer semantics"
+        )
+    selected_platform = sys.platform if platform is None else platform
+    if selected_platform == "darwin":
+        required = (
+            "kqueue",
+            "kevent",
+            "KQ_FILTER_PROC",
+            "KQ_NOTE_EXIT",
+            "KQ_EV_ADD",
+            "KQ_EV_ENABLE",
+            "KQ_EV_ONESHOT",
+        )
+        if any(not hasattr(select, name) for name in required):
+            raise UserError("Darwin process supervision requires kqueue NOTE_EXIT")
+    elif selected_platform.startswith("linux"):
+        required = ("P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+        if not callable(getattr(os, "waitid", None)) or any(
+            not hasattr(os, name) for name in required
+        ):
+            raise UserError(
+                "Linux process supervision requires waitid with "
+                "P_PID/WEXITED/WNOHANG/WNOWAIT"
+            )
+    else:
+        raise UserError(
+            f"process supervision is unsupported on platform {selected_platform}"
+        )
+    _require_waitable_sigchld_semantics(
+        after_spawn=after_spawn,
+        platform=selected_platform,
+    )
+    return selected_platform
+
+
 class _UnreapedLeaderObserver:
     """Observe one session leader without releasing its PID/PGID identity."""
 
     def __init__(self, pid: int, *, platform: str | None = None) -> None:
         if pid <= 0:
             raise UserError("process leader pid must be positive")
-        if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
-            raise UserError(
-                "process supervision requires the default SIGCHLD disposition"
-            )
         self.pid = pid
-        self.platform = sys.platform if platform is None else platform
+        self.platform = _preflight_unreaped_leader_observer(
+            platform=platform,
+            after_spawn=True,
+        )
         self._exited = False
         self._reaped = False
         self._kqueue: object | None = None
         if self.platform == "darwin":
-            required = (
-                "kqueue",
-                "kevent",
-                "KQ_FILTER_PROC",
-                "KQ_NOTE_EXIT",
-                "KQ_EV_ADD",
-                "KQ_EV_ENABLE",
-                "KQ_EV_ONESHOT",
-            )
-            if any(not hasattr(select, name) for name in required):
-                raise UserError(
-                    "Darwin process supervision requires kqueue NOTE_EXIT"
-                )
             kqueue: object | None = None
             try:
                 kqueue = select.kqueue()
@@ -486,46 +728,57 @@ class _UnreapedLeaderObserver:
                     pid,
                     filter=select.KQ_FILTER_PROC,
                     flags=(
-                        select.KQ_EV_ADD
-                        | select.KQ_EV_ENABLE
-                        | select.KQ_EV_ONESHOT
+                        select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_ONESHOT
                     ),
                     fflags=select.KQ_NOTE_EXIT,
                 )
+                _require_waitable_sigchld_semantics(
+                    after_spawn=True,
+                )
                 observed = kqueue.control([event], 1, 0)
-            except OSError as error:
+            except BaseException as error:
                 if kqueue is not None:
                     try:
                         kqueue.close()  # type: ignore[attr-defined]
-                    except OSError:
+                    except BaseException:
                         pass
-                raise UserError(
-                    "cannot bind Darwin process-exit observation"
-                ) from error
+                if isinstance(error, OSError):
+                    raise UserError(
+                        "cannot bind Darwin process-exit observation"
+                    ) from error
+                raise
             self._kqueue = kqueue
-            self._accept_kqueue_events(observed)
-        elif self.platform.startswith("linux"):
-            if not callable(getattr(os, "waitid", None)):
-                raise UserError("Linux process supervision requires waitid")
-        else:
-            raise UserError(
-                f"process supervision is unsupported on platform {self.platform}"
-            )
+            try:
+                self._accept_kqueue_events(observed)
+                _require_waitable_sigchld_semantics(
+                    after_spawn=True,
+                )
+            except BaseException:
+                try:
+                    self.close()
+                except BaseException:
+                    pass
+                raise
 
     def _accept_kqueue_events(self, events: list[object]) -> None:
         for event in events:
-            if (
-                getattr(event, "ident", None) != self.pid
-                or not (getattr(event, "fflags", 0) & select.KQ_NOTE_EXIT)
+            if getattr(event, "ident", None) != self.pid or not (
+                getattr(event, "fflags", 0) & select.KQ_NOTE_EXIT
             ):
                 raise UserError(
                     "Darwin process-exit observation returned an unrelated event"
                 )
+            _require_waitable_sigchld_semantics(
+                after_spawn=True,
+            )
             self._exited = True
 
     def exited(self) -> bool:
         if self._reaped:
             raise UserError("process leader was already reaped")
+        _require_waitable_sigchld_semantics(
+            after_spawn=True,
+        )
         if self._exited:
             return True
         if self.platform == "darwin":
@@ -546,8 +799,8 @@ class _UnreapedLeaderObserver:
                 os.WEXITED | os.WNOHANG | os.WNOWAIT,
             )
         except ChildProcessError as error:
-            raise UserError(
-                "process leader was reaped outside its supervisor"
+            raise _ProcessIdentityLost(
+                "process leader identity was lost before supervisor reap"
             ) from error
         except OSError as error:
             raise UserError("cannot observe process leader without reaping") from error
@@ -561,17 +814,30 @@ class _UnreapedLeaderObserver:
     def signal_group(self, signum: int) -> None:
         if self._reaped:
             raise UserError("refusing to signal a process group after leader reap")
+        _require_waitable_sigchld_semantics(
+            after_spawn=True,
+        )
         try:
             os.killpg(self.pid, signum)
         except ProcessLookupError:
             pass
 
-    def reap(self, process: subprocess.Popen[bytes]) -> int:
+    def reap(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        timeout: float,
+    ) -> int:
         if process.pid != self.pid:
             raise UserError("process leader identity changed before reap")
-        if not self.exited():
+        if not self._exited:
             raise UserError("cannot reap a process leader before observed exit")
-        returncode = process.wait()
+        if timeout <= 0:
+            raise UserError("bounded reap timeout must be positive")
+        _require_waitable_sigchld_semantics(
+            after_spawn=True,
+        )
+        returncode = process.wait(timeout=timeout)
         self._reaped = True
         self.close()
         return returncode
@@ -583,8 +849,20 @@ class _UnreapedLeaderObserver:
         self._kqueue = None
         try:
             kqueue.close()  # type: ignore[attr-defined]
-        except OSError:
+        except (OSError, ValueError):
             pass
+
+
+def _best_effort_close_refresh_resource(resource: object | None) -> None:
+    if resource is None:
+        return
+    close = getattr(resource, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except BaseException:
+        pass
 
 
 class _DarwinProcBSDInfo(ctypes.Structure):
@@ -614,12 +892,18 @@ class _DarwinProcBSDInfo(ctypes.Structure):
     ]
 
 
-def _darwin_refresh_process_group_state(
+def _darwin_refresh_process_group_state_impl(
     pgid: int,
     *,
+    known_exited_leader_pid: int | None = None,
+    deadline: float | None = None,
     max_entries: int = REFRESH_PROC_GROUP_SCAN_MAX_ENTRIES,
 ) -> LinuxRefreshProcessGroupState:
-    if max_entries <= 0:
+    if deadline is None:
+        deadline = time.monotonic() + REFRESH_PROC_GROUP_SCAN_TIMEOUT_SECONDS
+    if max_entries <= 0 or time.monotonic() >= deadline:
+        return "unknown"
+    if known_exited_leader_pid is not None and known_exited_leader_pid != pgid:
         return "unknown"
     try:
         libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
@@ -636,6 +920,9 @@ def _darwin_refresh_process_group_state(
         ]
         pid_info.restype = ctypes.c_int
         pid_array = (ctypes.c_int * max_entries)()
+        if time.monotonic() >= deadline:
+            return "unknown"
+        ctypes.set_errno(0)
         count = list_group(
             pgid,
             pid_array,
@@ -643,37 +930,79 @@ def _darwin_refresh_process_group_state(
         )
     except (AttributeError, OSError, ValueError):
         return "unknown"
+    if time.monotonic() >= deadline:
+        return "unknown"
     if count < 0 or count >= max_entries:
+        return "unknown"
+    if count == 0 and ctypes.get_errno() != 0:
         return "unknown"
     saw_zombie = False
     for pid in pid_array[:count]:
-        if pid <= 0:
+        if pid <= 0 or time.monotonic() >= deadline:
             return "unknown"
         info = _DarwinProcBSDInfo()
         try:
+            ctypes.set_errno(0)
             size = pid_info(
                 pid,
                 3,
-                0,
+                1,
                 ctypes.byref(info),
                 ctypes.sizeof(info),
             )
         except (OSError, ValueError):
             return "unknown"
-        if size == 0:
-            continue
-        if (
-            size != ctypes.sizeof(info)
-            or info.pbi_pid != pid
-            or info.pbi_pgid != pgid
-        ):
+        if time.monotonic() >= deadline:
             return "unknown"
+        if size == 0:
+            process_error = ctypes.get_errno()
+            if (
+                process_error == errno.ESRCH
+                and known_exited_leader_pid is not None
+                and pid == known_exited_leader_pid
+                and pid == pgid
+            ):
+                saw_zombie = True
+                continue
+            # A disappearing non-leader must be observed by a later whole-group
+            # scan. Every other libproc failure is likewise unknown.
+            return "unknown"
+        if size != ctypes.sizeof(info) or info.pbi_pid != pid or info.pbi_pgid != pgid:
+            return "unknown"
+        if (
+            known_exited_leader_pid is not None
+            and pid == known_exited_leader_pid
+            and pid == pgid
+        ):
+            # NOTE_EXIT already bound this still-unreaped leader as exited.
+            # libproc may briefly retain its pre-zombie status after that event.
+            saw_zombie = True
+            continue
         if info.pbi_status != 5:
             return "live"
         saw_zombie = True
     if saw_zombie:
         return "zombie-only"
     return "no-members"
+
+
+def _darwin_refresh_process_group_state(
+    pgid: int,
+    *,
+    known_exited_leader_pid: int | None = None,
+    deadline: float | None = None,
+    max_entries: int = REFRESH_PROC_GROUP_SCAN_MAX_ENTRIES,
+) -> LinuxRefreshProcessGroupState:
+    saved_errno = ctypes.get_errno()
+    try:
+        return _darwin_refresh_process_group_state_impl(
+            pgid,
+            known_exited_leader_pid=known_exited_leader_pid,
+            deadline=deadline,
+            max_entries=max_entries,
+        )
+    finally:
+        ctypes.set_errno(saved_errno)
 
 
 def _parse_linux_proc_stat(raw: bytes) -> tuple[str, int] | None:
@@ -734,44 +1063,71 @@ def _linux_refresh_process_group_state(
     return "no-members"
 
 
-def _refresh_process_group_has_live_members(
+def _refresh_process_group_state(
     pgid: int,
     *,
     proc_root: pathlib.Path = pathlib.Path("/proc"),
     platform: str = sys.platform,
     deadline: float | None = None,
-) -> bool:
+    known_exited_leader_pid: int | None = None,
+) -> LinuxRefreshProcessGroupState:
+    if deadline is not None and time.monotonic() >= deadline:
+        return "unknown"
+    _require_waitable_sigchld_semantics(after_spawn=True)
     if platform == "darwin":
-        return _darwin_refresh_process_group_state(pgid) not in {
-            "zombie-only",
-            "no-members",
-        }
+        return _darwin_refresh_process_group_state(
+            pgid,
+            known_exited_leader_pid=known_exited_leader_pid,
+            deadline=deadline,
+        )
+    _require_waitable_sigchld_semantics(after_spawn=True)
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
-        return False
+        return "no-members"
     except PermissionError:
-        return True
+        return "unknown"
     if not platform.startswith("linux"):
-        return True
+        return "unknown"
+    _require_waitable_sigchld_semantics(after_spawn=True)
     state = _linux_refresh_process_group_state(
         pgid,
         proc_root=proc_root,
         deadline=deadline,
     )
     if state == "zombie-only":
-        return False
+        return state
     if state != "no-members":
-        return True
+        return state
+    if deadline is not None and time.monotonic() >= deadline:
+        return "unknown"
     # The group may have disappeared during the scan. Only a second ESRCH proves
     # absence; unreadable, ambiguous, or still-addressable states remain live.
+    _require_waitable_sigchld_semantics(after_spawn=True)
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
-        return False
+        return "no-members"
     except PermissionError:
-        return True
-    return True
+        return "unknown"
+    return "unknown"
+
+
+def _refresh_process_group_has_live_members(
+    pgid: int,
+    *,
+    proc_root: pathlib.Path = pathlib.Path("/proc"),
+    platform: str = sys.platform,
+    deadline: float | None = None,
+    known_exited_leader_pid: int | None = None,
+) -> bool:
+    return _refresh_process_group_state(
+        pgid,
+        proc_root=proc_root,
+        platform=platform,
+        deadline=deadline,
+        known_exited_leader_pid=known_exited_leader_pid,
+    ) not in {"zombie-only", "no-members"}
 
 
 def _kill_refresh_process_group(observer: _UnreapedLeaderObserver) -> None:
@@ -859,13 +1215,341 @@ def _close_refresh_input(
     if callable(fileno):
         try:
             selector.unregister(fileno())
-        except (KeyError, ValueError, OSError):
+        except BaseException:
             pass
     if callable(close):
         try:
             close()
-        except OSError:
+        except BaseException:
             pass
+
+
+def _retain_unreaped_refresh_process(process: subprocess.Popen[bytes]) -> None:
+    if not any(
+        candidate is process for candidate in _UNREAPED_REFRESH_RECOVERY_PROCESSES
+    ):
+        _UNREAPED_REFRESH_RECOVERY_PROCESSES.append(process)
+
+
+def _disarm_refresh_process_after_identity_loss(
+    process: subprocess.Popen[bytes],
+) -> None:
+    """Prevent every future Popen poll, wait, and finalizer waitpid."""
+
+    object.__setattr__(process, "returncode", IDENTITY_LOST_RETURN_CODE)
+    object.__setattr__(process, "_child_created", False)
+    if (
+        object.__getattribute__(process, "returncode") != IDENTITY_LOST_RETURN_CODE
+        or object.__getattribute__(process, "_child_created") is not False
+    ):
+        raise UserError("could not disarm identity-lost Popen finalization")
+
+
+def _permanently_pin_refresh_process_after_identity_loss(
+    process: subprocess.Popen[bytes],
+) -> None:
+    """Leak one CPython reference so interpreter teardown cannot run __del__."""
+
+    py_incref = ctypes.pythonapi.Py_IncRef
+    py_incref.argtypes = (ctypes.py_object,)
+    py_incref.restype = None
+    py_incref(process)
+
+
+def _settle_refresh_direct_child_after_identity_loss(
+    process: subprocess.Popen[bytes],
+) -> str:
+    """Close owned pipes without consuming any reused numeric child identity."""
+
+    close_issues: list[str] = []
+    for stream_name in ("stdin", "stdout", "stderr"):
+        resource = getattr(process, stream_name, None)
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except BaseException as error:
+            close_issues.append(f"{stream_name}:{type(error).__name__}")
+    settlement = (
+        "direct-child wait, poll, and reap were skipped after identity loss; "
+        "the numeric PID may have been reused and status is unavailable"
+    )
+    if close_issues:
+        settlement += "; pipe-close issues=" + ",".join(close_issues)
+    return settlement
+
+
+def _refresh_identity_loss_cleanup_error(
+    process: subprocess.Popen[bytes],
+    error: _ProcessIdentityLost,
+    *,
+    context: str,
+) -> UserError:
+    safety_issues: list[str] = []
+    try:
+        object.__setattr__(process, "returncode", IDENTITY_LOST_RETURN_CODE)
+    except BaseException as sentinel_error:
+        safety_issues.append(f"sentinel:{type(sentinel_error).__name__}")
+    try:
+        _retain_unreaped_refresh_process(process)
+    except BaseException as retain_error:
+        safety_issues.append(f"retain:{type(retain_error).__name__}")
+    for _attempt in range(2):
+        try:
+            _disarm_refresh_process_after_identity_loss(process)
+            break
+        except BaseException as disarm_error:
+            safety_issues.append(f"disarm:{type(disarm_error).__name__}")
+    try:
+        core_disarmed = (
+            object.__getattribute__(process, "returncode") == IDENTITY_LOST_RETURN_CODE
+        )
+    except BaseException as verify_error:
+        safety_issues.append(f"verify-sentinel:{type(verify_error).__name__}")
+        core_disarmed = False
+    permanently_pinned = False
+    if not core_disarmed:
+        for _attempt in range(2):
+            try:
+                _permanently_pin_refresh_process_after_identity_loss(process)
+                permanently_pinned = True
+                break
+            except BaseException as pin_error:
+                safety_issues.append(f"pin:{type(pin_error).__name__}")
+        if not permanently_pinned:
+            os._exit(70)
+    try:
+        _retain_unreaped_refresh_process(process)
+    except BaseException as retain_error:
+        safety_issues.append(f"retain-retry:{type(retain_error).__name__}")
+    try:
+        retained = any(
+            candidate is process for candidate in _UNREAPED_REFRESH_RECOVERY_PROCESSES
+        )
+    except BaseException as verify_error:
+        safety_issues.append(f"verify-retain:{type(verify_error).__name__}")
+        retained = False
+    settlement = _settle_refresh_direct_child_after_identity_loss(process)
+    if core_disarmed:
+        finalizer_state = "Popen numeric-child polling disarmed"
+    else:
+        finalizer_state = "Popen permanently pinned after sentinel failure"
+    if safety_issues:
+        finalizer_state += " after safety retries=" + ",".join(safety_issues)
+    evidence_state = (
+        "strong process identity is retained as recovery evidence"
+        if retained
+        else "recovery-list retention failed after numeric-identity safety was secured"
+    )
+    cleanup_error = UserError(
+        f"{error}; {context} cleanup-incomplete: numeric PID/PGID signalling "
+        f"and probing were skipped after leader identity loss; {settlement}; "
+        f"leader_pid={process.pid}; {finalizer_state}; {evidence_state}"
+    )
+    if error.__cause__ is not None:
+        cleanup_error.__cause__ = error.__cause__
+    return cleanup_error
+
+
+def _register_refresh_cleanup_output(
+    selector: selectors.BaseSelector,
+    process: subprocess.Popen[bytes],
+) -> None:
+    if process.stdout is None or process.stderr is None:
+        raise UserError("prompt refresh process pipes were not created")
+    for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+        os.set_blocking(stream.fileno(), False)
+        try:
+            selector.get_key(stream.fileno())
+        except KeyError:
+            selector.register(stream.fileno(), selectors.EVENT_READ, name)
+
+
+def _emergency_cleanup_refresh_process_impl(
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector,
+    captures: dict[str, bytearray],
+    *,
+    cleanup_timeout: float,
+    max_capture_bytes: int,
+) -> None:
+    deadline = time.monotonic() + cleanup_timeout
+    signal_error: str | None = None
+    _require_waitable_sigchld_semantics(after_spawn=True)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as error:
+        signal_error = f"{type(error).__name__}: {error}"
+    _close_refresh_input(selector, process.stdin)
+    try:
+        _register_refresh_cleanup_output(selector, process)
+    except (OSError, UserError) as error:
+        _retain_unreaped_refresh_process(process)
+        raise UserError(
+            "prompt refresh observer binding failed and emergency cleanup could "
+            f"not initialize nonblocking pipe drain; leader_pid={process.pid}; "
+            f"signal_error={signal_error or 'none'}; leader remains unreaped and "
+            "retained for recovery"
+        ) from error
+
+    last_group_state: LinuxRefreshProcessGroupState = "unknown"
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        _drain_refresh_output_once(
+            selector,
+            captures,
+            timeout=min(REFRESH_POLL_INTERVAL_SECONDS, max(0.0, remaining)),
+            capture=False,
+            max_capture_bytes=max_capture_bytes,
+        )
+        if time.monotonic() >= deadline:
+            break
+        _require_waitable_sigchld_semantics(after_spawn=True)
+        last_group_state = _refresh_process_group_state(
+            process.pid,
+            deadline=deadline,
+        )
+        if last_group_state in {"zombie-only", "no-members"} and not selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _require_waitable_sigchld_semantics(after_spawn=True)
+            try:
+                process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                break
+            except BaseException as error:
+                _retain_unreaped_refresh_process(process)
+                raise UserError(
+                    "prompt refresh observer binding failed and bounded emergency "
+                    f"reap failed; leader_pid={process.pid} is retained for "
+                    "recovery"
+                ) from error
+            # No signal or process-group probe is permitted after this reap.
+            return
+
+    _retain_unreaped_refresh_process(process)
+    open_pipes = sorted(
+        str(key.data)
+        for key in selector.get_map().values()
+        if key.data in {"stdout", "stderr"}
+    )
+    raise UserError(
+        "prompt refresh observer binding failed and emergency cleanup did not "
+        f"complete before its hard deadline; leader_pid={process.pid}; "
+        f"pgid={process.pid}; group_state={last_group_state}; "
+        f"open_pipes={open_pipes}; signal_error={signal_error or 'none'}; "
+        "leader remains unreaped and retained for recovery"
+    )
+
+
+def _emergency_cleanup_refresh_process(
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector,
+    captures: dict[str, bytearray],
+    *,
+    cleanup_timeout: float,
+    max_capture_bytes: int,
+) -> None:
+    try:
+        _emergency_cleanup_refresh_process_impl(
+            process,
+            selector,
+            captures,
+            cleanup_timeout=cleanup_timeout,
+            max_capture_bytes=max_capture_bytes,
+        )
+    except _ProcessIdentityLost as error:
+        raise _refresh_identity_loss_cleanup_error(
+            process,
+            error,
+            context="prompt refresh observer-binding emergency",
+        ) from error
+    except BaseException:
+        _retain_unreaped_refresh_process(process)
+        raise
+
+
+def _cleanup_refresh_process_impl(
+    process: subprocess.Popen[bytes],
+    observer: _UnreapedLeaderObserver,
+    selector: selectors.BaseSelector,
+    captures: dict[str, bytearray],
+    *,
+    cleanup_timeout: float,
+    max_capture_bytes: int,
+) -> None:
+    deadline = time.monotonic() + cleanup_timeout
+    signal_error: str | None = None
+    try:
+        _kill_refresh_process_group(observer)
+    except OSError as error:
+        signal_error = f"{type(error).__name__}: {error}"
+    last_leader_exited = False
+    last_group_state: LinuxRefreshProcessGroupState = "unknown"
+    last_open_pipes = sorted(str(key.data) for key in selector.get_map().values())
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        _drain_refresh_output_once(
+            selector,
+            captures,
+            timeout=min(REFRESH_POLL_INTERVAL_SECONDS, max(0.0, remaining)),
+            capture=False,
+            max_capture_bytes=max_capture_bytes,
+        )
+        last_open_pipes = sorted(str(key.data) for key in selector.get_map().values())
+        if time.monotonic() >= deadline:
+            break
+        last_leader_exited = observer.exited()
+        if last_leader_exited:
+            if time.monotonic() >= deadline:
+                break
+            _require_waitable_sigchld_semantics(
+                after_spawn=True,
+            )
+            last_group_state = _refresh_process_group_state(
+                process.pid,
+                deadline=deadline,
+                known_exited_leader_pid=process.pid,
+            )
+            if (
+                last_group_state in {"zombie-only", "no-members"}
+                and not last_open_pipes
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    observer.reap(process, timeout=remaining)
+                except subprocess.TimeoutExpired as error:
+                    _retain_unreaped_refresh_process(process)
+                    raise UserError(
+                        "prompt refresh leader did not complete bounded reap after "
+                        "live-group absence and pipe drain; "
+                        f"leader_pid={process.pid} remains unreaped and retained "
+                        "for recovery"
+                    ) from error
+                # No signal or process-group probe is permitted after this reap.
+                return
+    _retain_unreaped_refresh_process(process)
+    reasons: list[str] = []
+    if not last_leader_exited:
+        reasons.append("prompt refresh leader exit was not observed")
+    if last_group_state not in {"zombie-only", "no-members"}:
+        reasons.append(
+            f"prompt refresh process-group state remained {last_group_state}"
+        )
+    if last_open_pipes:
+        reasons.append("failed to drain prompt refresh process pipes")
+    if signal_error is not None:
+        reasons.append(f"process-group SIGKILL failed: {signal_error}")
+    reasons.append(
+        f"leader_pid={process.pid} remains unreaped and retained for recovery"
+    )
+    raise UserError("; ".join(reasons))
 
 
 def _cleanup_refresh_process(
@@ -877,39 +1561,25 @@ def _cleanup_refresh_process(
     cleanup_timeout: float,
     max_capture_bytes: int,
 ) -> None:
-    _kill_refresh_process_group(observer)
-    deadline = time.monotonic() + cleanup_timeout
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        _drain_refresh_output_once(
+    try:
+        _cleanup_refresh_process_impl(
+            process,
+            observer,
             selector,
             captures,
-            timeout=min(REFRESH_POLL_INTERVAL_SECONDS, max(0.0, remaining)),
-            capture=False,
+            cleanup_timeout=cleanup_timeout,
             max_capture_bytes=max_capture_bytes,
         )
-        if (
-            observer.exited()
-            and not _refresh_process_group_has_live_members(
-                process.pid,
-                deadline=deadline,
-            )
-            and not selector.get_map()
-        ):
-            observer.reap(process)
-            return
-    reasons: list[str] = []
-    leader_exited = observer.exited()
-    group_has_live_members = _refresh_process_group_has_live_members(process.pid)
-    if not leader_exited:
-        reasons.append("failed to reap prompt refresh process")
-    if group_has_live_members:
-        reasons.append("failed to eliminate live prompt refresh process-group members")
-    if selector.get_map():
-        reasons.append("failed to drain prompt refresh process pipes")
-    if leader_exited:
-        observer.reap(process)
-    raise UserError("; ".join(reasons) or "prompt refresh cleanup timed out")
+    except _ProcessIdentityLost as error:
+        raise _refresh_identity_loss_cleanup_error(
+            process,
+            error,
+            context="prompt refresh",
+        ) from error
+    except BaseException:
+        if not getattr(observer, "_reaped", False):
+            _retain_unreaped_refresh_process(process)
+        raise
 
 
 def _run_bounded_refresh_process(
@@ -974,6 +1644,8 @@ def _run_bounded_refresh_process_supervised(
     max_capture_bytes: int,
     signal_transaction: _RefreshSignalTransaction,
 ) -> subprocess.CompletedProcess[str]:
+    signal_transaction.raise_if_pending()
+    observer_platform = _preflight_unreaped_leader_observer()
     try:
         selector = selectors.DefaultSelector()
     except OSError as error:
@@ -982,9 +1654,11 @@ def _run_bounded_refresh_process_supervised(
         ) from error
     captures = {"stdout": bytearray(), "stderr": bytearray()}
     failure: tuple[int, str] | None = None
+    cleanup_attempted = False
     cleanup_complete = False
     try:
         signal_transaction.raise_if_pending()
+        _require_waitable_sigchld_semantics()
         try:
             process = subprocess.Popen(
                 command,
@@ -1001,13 +1675,35 @@ def _run_bounded_refresh_process_supervised(
         except OSError as error:
             raise UserError(f"cannot start prompt refresh: {error}") from error
         try:
-            observer = _UnreapedLeaderObserver(process.pid)
-        except BaseException:
+            observer = _UnreapedLeaderObserver(
+                process.pid,
+                platform=observer_platform,
+            )
+        except BaseException as observer_error:
+            cleanup_error: BaseException | None = None
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+                if isinstance(observer_error, _ProcessIdentityLost):
+                    cleanup_error = _refresh_identity_loss_cleanup_error(
+                        process,
+                        observer_error,
+                        context="prompt refresh observer binding",
+                    )
+                else:
+                    _emergency_cleanup_refresh_process(
+                        process,
+                        selector,
+                        captures,
+                        cleanup_timeout=cleanup_timeout,
+                        max_capture_bytes=max_capture_bytes,
+                    )
+            except BaseException as error:
+                cleanup_error = error
+            finally:
+                _close_refresh_input(selector, process.stdin)
+                _best_effort_close_refresh_resource(process.stdout)
+                _best_effort_close_refresh_resource(process.stderr)
+            if cleanup_error is not None:
+                raise observer_error from cleanup_error
             raise
         try:
             if process.stdout is None or process.stderr is None:
@@ -1066,8 +1762,20 @@ def _run_bounded_refresh_process_supervised(
                     )
                     break
                 signal_transaction.raise_if_pending()
+                if time.monotonic() >= deadline:
+                    failure = (
+                        124,
+                        f"BLOCKED: prompt refresh exceeded {timeout:g} second hard timeout",
+                    )
+                    break
                 if not observer.exited():
                     continue
+                if time.monotonic() >= deadline:
+                    failure = (
+                        124,
+                        f"BLOCKED: prompt refresh exceeded {timeout:g} second hard timeout",
+                    )
+                    break
                 if input_bytes is not None and input_offset != len(input_bytes):
                     failure = (
                         126,
@@ -1075,9 +1783,13 @@ def _run_bounded_refresh_process_supervised(
                         "the complete payload was delivered",
                     )
                     break
+                _require_waitable_sigchld_semantics(
+                    after_spawn=True,
+                )
                 if _refresh_process_group_has_live_members(
                     process.pid,
                     deadline=deadline,
+                    known_exited_leader_pid=process.pid,
                 ):
                     failure = (
                         126,
@@ -1095,6 +1807,7 @@ def _run_bounded_refresh_process_supervised(
 
             if failure is not None:
                 _close_refresh_input(selector, process.stdin)
+                cleanup_attempted = True
                 _cleanup_refresh_process(
                     process,
                     observer,
@@ -1116,7 +1829,12 @@ def _run_bounded_refresh_process_supervised(
                     stderr=stderr,
                 )
 
-            returncode = observer.reap(process)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UserError(
+                    "prompt refresh completed at the hard deadline before bounded reap"
+                )
+            returncode = observer.reap(process, timeout=remaining)
             cleanup_complete = True
             return subprocess.CompletedProcess(
                 command,
@@ -1124,27 +1842,37 @@ def _run_bounded_refresh_process_supervised(
                 stdout=captures["stdout"].decode("utf-8", errors="replace"),
                 stderr=captures["stderr"].decode("utf-8", errors="replace"),
             )
-        except BaseException:
-            if not cleanup_complete:
-                _close_refresh_input(selector, process.stdin)
-                _cleanup_refresh_process(
-                    process,
-                    observer,
-                    selector,
-                    captures,
-                    cleanup_timeout=cleanup_timeout,
-                    max_capture_bytes=max_capture_bytes,
-                )
+        except BaseException as original_error:
+            if not cleanup_complete and not cleanup_attempted:
+                cleanup_attempted = True
+                if isinstance(original_error, _ProcessIdentityLost):
+                    cleanup_evidence = _refresh_identity_loss_cleanup_error(
+                        process,
+                        original_error,
+                        context="prompt refresh",
+                    )
+                    _close_refresh_input(selector, process.stdin)
+                    raise original_error from cleanup_evidence
+                try:
+                    _close_refresh_input(selector, process.stdin)
+                    _cleanup_refresh_process(
+                        process,
+                        observer,
+                        selector,
+                        captures,
+                        cleanup_timeout=cleanup_timeout,
+                        max_capture_bytes=max_capture_bytes,
+                    )
+                except BaseException as cleanup_error:
+                    raise original_error from cleanup_error
             raise
         finally:
-            observer.close()
+            _best_effort_close_refresh_resource(observer)
             _close_refresh_input(selector, process.stdin)
-            if process.stdout is not None:
-                process.stdout.close()
-            if process.stderr is not None:
-                process.stderr.close()
+            _best_effort_close_refresh_resource(process.stdout)
+            _best_effort_close_refresh_resource(process.stderr)
     finally:
-        selector.close()
+        _best_effort_close_refresh_resource(selector)
 
 
 def _bridge_json_payload(
@@ -1683,6 +2411,139 @@ def _write_all(file_fd: int, content: bytes) -> None:
         offset += written
 
 
+def _invoke_index_commit_guard(
+    commit_guard: Callable[[], None],
+    *,
+    stage: str,
+) -> None:
+    try:
+        commit_guard()
+    except RunSafetyError:
+        raise
+    except Exception as error:
+        raise RunSafetyError(
+            f"adapter index {stage} commit guard could not be verified"
+        ) from error
+
+
+def _restore_index_after_failed_commit_guard(
+    adapter_fd: int,
+    *,
+    previous_content: bytes | None,
+    published_content: bytes,
+    published_version: IndexFileVersion,
+) -> None:
+    current = _read_index_bytes_at(adapter_fd)
+    if (
+        current is None
+        or current[0] != published_content
+        or current[1] != published_version
+    ):
+        raise RunSafetyError(
+            "adapter index post-commit recovery cannot bind the published index"
+        )
+    if previous_content is None:
+        try:
+            os.unlink(INDEX_FILE_NAME, dir_fd=adapter_fd)
+            os.fsync(adapter_fd)
+        except OSError as error:
+            raise RunSafetyError(
+                "adapter index post-commit recovery could not remove the first "
+                "publication"
+            ) from error
+        if _read_index_bytes_at(adapter_fd) is not None:
+            raise RunSafetyError(
+                "adapter index post-commit recovery could not verify restored absence"
+            )
+        return
+
+    recovery_name = f".{INDEX_FILE_NAME}.{uuid.uuid4().hex}.recovery"
+    recovery_fd: int | None = None
+    recovery_visible = False
+    replaced = False
+    try:
+        recovery_fd = os.open(
+            recovery_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            INDEX_FILE_MODE,
+            dir_fd=adapter_fd,
+        )
+        recovery_visible = True
+        os.fchmod(recovery_fd, INDEX_FILE_MODE)
+        _write_all(recovery_fd, previous_content)
+        os.fsync(recovery_fd)
+        recovery_stat = os.fstat(recovery_fd)
+        named_recovery = os.stat(
+            recovery_name,
+            dir_fd=adapter_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(recovery_stat.st_mode)
+            or not stat.S_ISREG(named_recovery.st_mode)
+            or not _same_object(recovery_stat, named_recovery)
+            or recovery_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(recovery_stat.st_mode) != INDEX_FILE_MODE
+            or recovery_stat.st_size != len(previous_content)
+            or _pread_index_bytes(recovery_fd) != previous_content
+        ):
+            raise RunSafetyError(
+                "adapter index post-commit recovery temporary file failed "
+                "identity, access, or content validation"
+            )
+        _require_no_extended_acl(
+            recovery_fd,
+            label="adapter index post-commit recovery temporary file",
+        )
+        current = _read_index_bytes_at(adapter_fd)
+        if (
+            current is None
+            or current[0] != published_content
+            or current[1] != published_version
+        ):
+            raise RunSafetyError(
+                "adapter index changed before post-commit recovery replacement"
+            )
+        os.replace(
+            recovery_name,
+            INDEX_FILE_NAME,
+            src_dir_fd=adapter_fd,
+            dst_dir_fd=adapter_fd,
+        )
+        recovery_visible = False
+        replaced = True
+        os.fsync(adapter_fd)
+        restored = _read_index_bytes_at(adapter_fd)
+        if (
+            restored is None
+            or restored[0] != previous_content
+            or restored[1].uid != os.geteuid()
+            or restored[1].mode != INDEX_FILE_MODE
+        ):
+            raise RunSafetyError(
+                "adapter index post-commit recovery could not be verified"
+            )
+    except RunSafetyError:
+        raise
+    except OSError as error:
+        operation = "publish" if replaced else "prepare"
+        raise RunSafetyError(
+            f"adapter index post-commit recovery {operation} failed"
+        ) from error
+    finally:
+        if recovery_fd is not None:
+            os.close(recovery_fd)
+        if recovery_visible:
+            try:
+                os.unlink(recovery_name, dir_fd=adapter_fd)
+            except FileNotFoundError:
+                pass
+
+
 def _atomic_save_index_at(
     adapter_fd: int,
     index: AdapterIndex,
@@ -1690,11 +2551,13 @@ def _atomic_save_index_at(
     *,
     transaction_time: str | None = None,
     context: str = "adapter index update",
+    commit_guard: Callable[[], None] | None = None,
 ) -> IndexFileVersion:
     current = _read_index_bytes_at(adapter_fd)
     current_version = None if current is None else current[1]
     if current_version != expected_version:
         raise RunSafetyError("adapter index changed outside the locked transaction")
+    previous_content = None if current is None else current[0]
     commit_time = transaction_time or _utc_now()
     content = _serialize_index_for_commit(
         index,
@@ -1748,6 +2611,11 @@ def _atomic_save_index_at(
         current_version = None if current is None else current[1]
         if current_version != expected_version:
             raise RunSafetyError("adapter index changed before atomic replacement")
+        if commit_guard is not None:
+            _invoke_index_commit_guard(
+                commit_guard,
+                stage="pre-publication",
+            )
         os.replace(
             temporary_name,
             INDEX_FILE_NAME,
@@ -1767,6 +2635,28 @@ def _atomic_save_index_at(
             raise RunSafetyError(
                 "adapter index atomic replacement could not be verified"
             )
+        if commit_guard is not None:
+            try:
+                _invoke_index_commit_guard(
+                    commit_guard,
+                    stage="post-publication",
+                )
+            except BaseException as guard_error:
+                try:
+                    _restore_index_after_failed_commit_guard(
+                        adapter_fd,
+                        previous_content=previous_content,
+                        published_content=content,
+                        published_version=saved[1],
+                    )
+                except BaseException as recovery_error:
+                    raise RunSafetyError(
+                        "adapter index post-publication guard failed and exact "
+                        "previous-index recovery could not be verified; manual "
+                        f"recovery is required (guard={guard_error}; "
+                        f"recovery={recovery_error})"
+                    ) from recovery_error
+                raise
         return saved[1]
     except RunSafetyError:
         raise
@@ -1792,6 +2682,7 @@ def _index_transaction(
     write: bool,
     commit_time: str | None = None,
     context: str = "adapter index update",
+    commit_guard: Callable[[], None] | None = None,
 ) -> Iterator[AdapterIndex]:
     repo_fd: int | None = None
     codex_tmp_fd: int | None = None
@@ -1823,6 +2714,7 @@ def _index_transaction(
                 expected_version,
                 transaction_time=commit_time,
                 context=context,
+                commit_guard=commit_guard,
             )
             _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
             _revalidate_index_lock(adapter_fd, lock_fd)
@@ -2167,9 +3059,7 @@ def _require_owned_nonwritable_directory(
     if identity.uid != os.geteuid():
         raise RunSafetyError(f"{label} must be owned by the current user")
     if identity.mode & UNTRUSTED_WRITE_MASK:
-        raise RunSafetyError(
-            f"{label} must not be writable by group or other users"
-        )
+        raise RunSafetyError(f"{label} must not be writable by group or other users")
     _require_no_extended_acl(directory_fd, label=label)
     return identity
 
@@ -2697,6 +3587,27 @@ def _stop_artifact_version_from_payload(
     )
 
 
+def _run_directory_identity_from_payload(
+    payload: dict[str, object],
+) -> RunDirectoryIdentity:
+    fields = ("run_dev", "run_ino", "run_uid", "run_gid", "run_mode")
+    values = tuple(payload.get(field) for field in fields)
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in values
+    ):
+        raise RunSafetyError(
+            "reconcile-live returned an invalid run directory identity"
+        )
+    return RunDirectoryIdentity(
+        device=cast(int, values[0]),
+        inode=cast(int, values[1]),
+        uid=cast(int, values[2]),
+        gid=cast(int, values[3]),
+        mode=cast(int, values[4]),
+    )
+
+
 def _validate_expected_stop_artifact(
     name: str,
     actual: StopArtifactVersion,
@@ -2726,8 +3637,9 @@ def _validate_stop_run_state_descriptor(
     run_fd: int,
     *,
     expected_identity: RunDirectoryIdentity | None = None,
+    expected_state_version: StopArtifactVersion | None = None,
     expected_prompt_versions: dict[str, StopArtifactVersion] | None = None,
-) -> tuple[dict[str, object], RunDirectoryIdentity]:
+) -> tuple[dict[str, object], RunDirectoryIdentity, StopArtifactVersion]:
     pinned = os.fstat(run_fd)
     if not stat.S_ISDIR(pinned.st_mode):
         raise RunSafetyError("active run path must end in a directory")
@@ -2757,18 +3669,30 @@ def _validate_stop_run_state_descriptor(
         raise RunSafetyError(
             "active run directory must be owned by the current user with mode 0700"
         )
+    state_artifact = _read_stop_regular_artifact(
+        run_fd,
+        "state.json",
+        max_bytes=STATE_MAX_BYTES,
+    )
     try:
-        payload = json.loads(
-            _read_stop_regular_file(
-                run_fd,
-                "state.json",
-                max_bytes=STATE_MAX_BYTES,
-            ).decode("utf-8")
-        )
+        payload = json.loads(state_artifact.content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RunSafetyError("active run state.json is invalid") from error
     if not isinstance(payload, dict):
         raise RunSafetyError("active run state.json must contain an object")
+    schema_version = payload.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in RUNNER_STOP_SCHEMA_VERSIONS
+    ):
+        raise RunSafetyError("active run state.json uses an unsupported schema")
+    if expected_state_version is not None:
+        _validate_expected_stop_artifact(
+            "state.json",
+            state_artifact.version,
+            expected_state_version,
+        )
     if payload.get("repo_root") != str(repo_root):
         raise RunSafetyError(
             "active run state repo_root does not exactly match the current repository"
@@ -2804,7 +3728,11 @@ def _validate_stop_run_state_descriptor(
     finally:
         os.close(current_fd)
     _require_no_extended_acl(run_fd, label="active run directory")
-    return cast(dict[str, object], payload), pinned_identity
+    return (
+        cast(dict[str, object], payload),
+        pinned_identity,
+        state_artifact.version,
+    )
 
 
 def _load_stop_run_state(
@@ -2814,6 +3742,7 @@ def _load_stop_run_state(
     pathlib.Path,
     dict[str, object],
     RunDirectoryIdentity,
+    StopArtifactVersion,
     int,
 ]:
     run_dir = pathlib.Path(run_dir_str)
@@ -2831,7 +3760,7 @@ def _load_stop_run_state(
         )
     run_fd = _open_stop_run_directory(repo_root, run_dir.name)
     try:
-        state, run_identity = _validate_stop_run_state_descriptor(
+        state, run_identity, state_version = _validate_stop_run_state_descriptor(
             repo_root,
             run_dir,
             run_fd,
@@ -2839,7 +3768,128 @@ def _load_stop_run_state(
     except Exception:
         os.close(run_fd)
         raise
-    return run_dir, state, run_identity, run_fd
+    return run_dir, state, run_identity, state_version, run_fd
+
+
+def _stop_run_lock_identity(lock_fd: int) -> RunDirectoryIdentity:
+    try:
+        lock_stat = os.fstat(lock_fd)
+    except OSError as error:
+        raise RunSafetyError("active run lock cannot be inspected safely") from error
+    if not stat.S_ISREG(lock_stat.st_mode):
+        raise RunSafetyError("active run lock must be a regular file")
+    identity = _run_directory_identity(lock_stat)
+    if identity.uid != os.geteuid():
+        raise RunSafetyError("active run lock must be owned by the current user")
+    if identity.mode & UNTRUSTED_WRITE_MASK:
+        raise RunSafetyError(
+            "active run lock must not be writable by group or other users"
+        )
+    _require_no_extended_acl(lock_fd, label="active run lock")
+    return identity
+
+
+def _revalidate_stop_run_lock(
+    run_fd: int,
+    lock_fd: int,
+    expected_identity: RunDirectoryIdentity,
+) -> None:
+    descriptor_identity = _stop_run_lock_identity(lock_fd)
+    try:
+        named_lock = os.stat(
+            RUN_LOCK_NAME,
+            dir_fd=run_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise RunSafetyError(
+            "active run lock cannot be restated without following links"
+        ) from error
+    if (
+        not stat.S_ISREG(named_lock.st_mode)
+        or _run_directory_identity(named_lock) != expected_identity
+        or descriptor_identity != expected_identity
+    ):
+        raise RunSafetyError(
+            "active run lock was replaced or its access policy changed"
+        )
+
+
+@contextlib.contextmanager
+def _open_stop_run_lock_descriptor(
+    run_fd: int,
+) -> Iterator[tuple[int, RunDirectoryIdentity]]:
+    try:
+        lock_fd = os.open(
+            RUN_LOCK_NAME,
+            os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=run_fd,
+        )
+    except OSError as error:
+        raise RunSafetyError(
+            "active run lock cannot be opened without following links"
+        ) from error
+    primary_error: BaseException | None = None
+    try:
+        lock_identity = _stop_run_lock_identity(lock_fd)
+        yield lock_fd, lock_identity
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError as error:
+            if primary_error is None:
+                raise RunSafetyError(
+                    "active run lock descriptor cannot be closed safely"
+                ) from error
+
+
+@contextlib.contextmanager
+def _acquired_stop_run_lock(
+    run_fd: int,
+    lock_fd: int,
+    expected_identity: RunDirectoryIdentity,
+) -> Iterator[None]:
+    locked = False
+    primary_error: BaseException | None = None
+    try:
+        if _stop_run_lock_identity(lock_fd) != expected_identity:
+            raise RunSafetyError(
+                "active run lock descriptor identity changed before acquisition"
+            )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as error:
+            raise RunSafetyError("active run lock cannot be acquired safely") from error
+        locked = True
+        _revalidate_stop_run_lock(
+            run_fd,
+            lock_fd,
+            expected_identity,
+        )
+        yield
+        _revalidate_stop_run_lock(
+            run_fd,
+            lock_fd,
+            expected_identity,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if locked:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError as error:
+                if primary_error is None:
+                    raise RunSafetyError(
+                        "active run lock cannot be released safely"
+                    ) from error
 
 
 def _refresh_recovery_prompts(
@@ -2962,6 +4012,62 @@ def _state_orchestration(state: dict[str, object]) -> dict[str, object]:
     if isinstance(orchestration, dict):
         return cast(dict[str, object], orchestration)
     return {}
+
+
+def _require_reconcile_state_binding(
+    state: dict[str, object],
+    *,
+    run_dir: pathlib.Path,
+    record: SessionRecord,
+    child_session_id: str,
+    child_status: str,
+    terminal: bool,
+) -> None:
+    if state.get("run_id") != run_dir.name:
+        raise RunSafetyError("active run state does not match the indexed run identity")
+    if record["run_dir"] != str(run_dir):
+        raise RunSafetyError(
+            "active session record does not match the reconciled run directory"
+        )
+    orchestration = _state_orchestration(state)
+    if orchestration.get("parent_session_id") != record["session_id"]:
+        raise RunSafetyError(
+            "active run state does not match the indexed parent session"
+        )
+    if orchestration.get("child_session_id") != child_session_id:
+        raise RunSafetyError(
+            "active run state does not match the requested child session"
+        )
+    recorded_child_status = orchestration.get("child_status")
+    if terminal:
+        if recorded_child_status != child_status:
+            raise RunSafetyError(
+                "terminal run state does not match the requested child status"
+            )
+    elif recorded_child_status not in {"running", child_status}:
+        raise RunSafetyError(
+            "active run state is not reconcilable to the requested child status"
+        )
+
+    preparation_fields = (
+        record.get("preparation_id"),
+        record.get("preparation_run_id"),
+        record.get("preparation_lease_path"),
+        record.get("preparation_started_at"),
+    )
+    state_preparation_id = state.get("preparation_id")
+    if any(value is not None for value in preparation_fields) or (
+        state_preparation_id is not None
+    ):
+        reservation = _reservation_from_record(record)
+        if (
+            reservation.run_id != run_dir.name
+            or reservation.run_dir != str(run_dir)
+            or state_preparation_id != reservation.preparation_id
+        ):
+            raise RunSafetyError(
+                "active run state does not match the indexed preparation identity"
+            )
 
 
 def _state_phase_statuses(state: dict[str, object]) -> list[str]:
@@ -3876,7 +4982,7 @@ def _validate_reserved_run_state(
     int,
 ]:
     run_dir = _reservation_run_path(repo_root, reservation)
-    loaded_run_dir, state, run_identity, run_fd = _load_stop_run_state(
+    loaded_run_dir, state, run_identity, _state_version, run_fd = _load_stop_run_state(
         repo_root,
         reservation.run_dir,
     )
@@ -4225,15 +5331,17 @@ def _handle_pinned_stop_run(
             repo_root,
             run_identity,
         )
-        state, refreshed_identity = _validate_stop_run_state_descriptor(
-            repo_root,
-            run_dir,
-            run_fd,
-            expected_identity=run_identity,
-            expected_prompt_versions={
-                "child-prompt.md": refreshed_prompts.child_version,
-                "parent-prompt.md": refreshed_prompts.parent_version,
-            },
+        state, refreshed_identity, _refreshed_state_version = (
+            _validate_stop_run_state_descriptor(
+                repo_root,
+                run_dir,
+                run_fd,
+                expected_identity=run_identity,
+                expected_prompt_versions={
+                    "child-prompt.md": refreshed_prompts.child_version,
+                    "parent-prompt.md": refreshed_prompts.parent_version,
+                },
+            )
         )
         if refreshed_identity != run_identity:
             raise RunSafetyError("active run directory changed during prompt refresh")
@@ -4251,11 +5359,13 @@ def _handle_pinned_stop_run(
         setattr(error, "hook_payload", payload)
         _record_hook_failure(error)
         try:
-            state, fallback_identity = _validate_stop_run_state_descriptor(
-                repo_root,
-                run_dir,
-                run_fd,
-                expected_identity=run_identity,
+            state, fallback_identity, _fallback_state_version = (
+                _validate_stop_run_state_descriptor(
+                    repo_root,
+                    run_dir,
+                    run_fd,
+                    expected_identity=run_identity,
+                )
             )
             if fallback_identity != run_identity:
                 raise RunSafetyError(
@@ -4333,7 +5443,13 @@ def _stop_hook(_: argparse.Namespace) -> int:
                 )
             else:
                 try:
-                    run_dir, state, run_identity, run_fd = _load_stop_run_state(
+                    (
+                        run_dir,
+                        state,
+                        run_identity,
+                        _state_version,
+                        run_fd,
+                    ) = _load_stop_run_state(
                         repo_root,
                         record["run_dir"],
                     )
@@ -4665,11 +5781,13 @@ def _activate_reserved_preparation(
                     "preparation reservation disappeared before activation"
                 )
             _require_exact_reservation(record, reservation, allow_active=True)
-            current_state, current_identity = _validate_stop_run_state_descriptor(
-                repo_root,
-                run_dir,
-                run_fd,
-                expected_identity=run_identity,
+            current_state, current_identity, _current_state_version = (
+                _validate_stop_run_state_descriptor(
+                    repo_root,
+                    run_dir,
+                    run_fd,
+                    expected_identity=run_identity,
+                )
             )
             if current_identity != run_identity:
                 raise RunSafetyError("reserved run identity changed before activation")
@@ -4681,11 +5799,13 @@ def _activate_reserved_preparation(
             if record["status"] != "active":
                 _activate_preparation(record, updated_at=transaction_time)
             index["latest_session_id"] = reservation.session_id
-        final_state, final_identity = _validate_stop_run_state_descriptor(
-            repo_root,
-            run_dir,
-            run_fd,
-            expected_identity=run_identity,
+        final_state, final_identity, _final_state_version = (
+            _validate_stop_run_state_descriptor(
+                repo_root,
+                run_dir,
+                run_fd,
+                expected_identity=run_identity,
+            )
         )
         if final_identity != run_identity:
             raise RunSafetyError("reserved run identity changed after activation")
@@ -4753,6 +5873,7 @@ def _prepare_active_run(args: argparse.Namespace) -> int:
                         _existing_run_dir,
                         existing_state,
                         _existing_identity,
+                        _existing_state_version,
                         existing_run_fd,
                     ) = _load_stop_run_state(
                         repo_root,
@@ -5008,36 +6129,197 @@ def _finish_child_active_run(args: argparse.Namespace) -> int:
 def _reconcile_active_run(args: argparse.Namespace) -> int:
     repo_root = _resolve_repo_root(args.repo, strict=True)
     assert repo_root is not None
-    with _index_transaction(repo_root, write=True) as index:
-        record = _resolve_session_record(
-            index,
-            repo_root=repo_root,
-            session_id=args.session_id,
-            run_dir=args.run_dir,
-        )
-        _require_active_record(record)
-        bridge_args = [
-            "reconcile-live",
-            "--run-dir",
-            args.run_dir,
-            "--child-status",
-            args.child_status,
-            "--child-session-id",
-            args.child_session_id,
-        ]
-        payload = _run_bridge_json(*bridge_args)
-        _run_dir, state, _run_identity, run_fd = _load_stop_run_state(
+    payload: dict[str, object]
+    reconcile_commit_guard: Callable[[], None] | None = None
+
+    def require_reconcile_commit_guard() -> None:
+        if reconcile_commit_guard is None:
+            raise RunSafetyError(
+                "terminal reconciliation did not install its index commit guard"
+            )
+        reconcile_commit_guard()
+
+    with contextlib.ExitStack() as run_resources:
+        with _index_transaction(
             repo_root,
-            args.run_dir,
-        )
-        os.close(run_fd)
-        if _run_is_terminal(state):
-            _complete_session_record(record, updated_at=_utc_now())
-        else:
-            record["run_dir"] = args.run_dir
-            record["status"] = "active"
-            record["updated_at"] = _utc_now()
-        index["latest_session_id"] = record["session_id"]
+            write=True,
+            context="terminal reconciliation index update",
+            commit_guard=require_reconcile_commit_guard,
+        ) as index:
+            record = _resolve_session_record(
+                index,
+                repo_root=repo_root,
+                session_id=args.session_id,
+                run_dir=args.run_dir,
+            )
+            _require_active_record(record)
+            (
+                run_dir,
+                initial_state,
+                initial_run_identity,
+                initial_state_version,
+                run_fd,
+            ) = _load_stop_run_state(
+                repo_root,
+                args.run_dir,
+            )
+            run_resources.callback(os.close, run_fd)
+            lock_fd, lock_identity = run_resources.enter_context(
+                _open_stop_run_lock_descriptor(run_fd)
+            )
+            _require_reconcile_state_binding(
+                initial_state,
+                run_dir=run_dir,
+                record=record,
+                child_session_id=args.child_session_id,
+                child_status=args.child_status,
+                terminal=False,
+            )
+            bridge_args = [
+                "reconcile-live",
+                "--run-dir",
+                args.run_dir,
+                "--child-status",
+                args.child_status,
+                "--child-session-id",
+                args.child_session_id,
+            ]
+            payload = _run_bridge_json(*bridge_args)
+            run_resources.enter_context(
+                _acquired_stop_run_lock(
+                    run_fd,
+                    lock_fd,
+                    lock_identity,
+                )
+            )
+            state, post_run_identity, post_state_version = (
+                _validate_stop_run_state_descriptor(
+                    repo_root,
+                    run_dir,
+                    run_fd,
+                    expected_identity=initial_run_identity,
+                )
+            )
+            if post_run_identity != initial_run_identity:
+                raise RunSafetyError(
+                    "active run directory changed during terminal reconciliation"
+                )
+            returned_run_identity = _run_directory_identity_from_payload(payload)
+            if returned_run_identity != initial_run_identity:
+                raise RunSafetyError(
+                    "reconcile-live returned a different run directory identity"
+                )
+            returned_previous_state_version = _stop_artifact_version_from_payload(
+                payload,
+                "previous_state_version",
+            )
+            _validate_expected_stop_artifact(
+                "pre-reconcile state.json",
+                initial_state_version,
+                returned_previous_state_version,
+            )
+            returned_state_version = _stop_artifact_version_from_payload(
+                payload,
+                "state_version",
+            )
+            _validate_expected_stop_artifact(
+                "state.json",
+                post_state_version,
+                returned_state_version,
+            )
+            state, final_run_identity, final_state_version = (
+                _validate_stop_run_state_descriptor(
+                    repo_root,
+                    run_dir,
+                    run_fd,
+                    expected_identity=initial_run_identity,
+                    expected_state_version=returned_state_version,
+                )
+            )
+            if (
+                final_run_identity != initial_run_identity
+                or final_state_version != returned_state_version
+            ):
+                raise RunSafetyError(
+                    "terminal reconciliation state changed before index update"
+                )
+            _require_reconcile_state_binding(
+                state,
+                run_dir=run_dir,
+                record=record,
+                child_session_id=args.child_session_id,
+                child_status=args.child_status,
+                terminal=True,
+            )
+            orchestration = _state_orchestration(state)
+            if (
+                payload.get("overall_status") != state.get("overall_status")
+                or payload.get("child_status") != orchestration.get("child_status")
+                or payload.get("child_session_id")
+                != orchestration.get("child_session_id")
+            ):
+                raise RunSafetyError(
+                    "reconcile-live result does not match the exact terminal state"
+                )
+            binding_record = copy.deepcopy(record)
+
+            def guard_reconcile_index_publication() -> None:
+                _revalidate_stop_run_lock(
+                    run_fd,
+                    lock_fd,
+                    lock_identity,
+                )
+                (
+                    guarded_state,
+                    guarded_run_identity,
+                    guarded_state_version,
+                ) = _validate_stop_run_state_descriptor(
+                    repo_root,
+                    run_dir,
+                    run_fd,
+                    expected_identity=initial_run_identity,
+                    expected_state_version=returned_state_version,
+                )
+                if (
+                    guarded_run_identity != initial_run_identity
+                    or guarded_state_version != returned_state_version
+                ):
+                    raise RunSafetyError(
+                        "terminal reconciliation state changed at the index commit gate"
+                    )
+                _require_reconcile_state_binding(
+                    guarded_state,
+                    run_dir=run_dir,
+                    record=binding_record,
+                    child_session_id=args.child_session_id,
+                    child_status=args.child_status,
+                    terminal=True,
+                )
+                guarded_orchestration = _state_orchestration(guarded_state)
+                if (
+                    payload.get("overall_status") != guarded_state.get("overall_status")
+                    or payload.get("child_status")
+                    != guarded_orchestration.get("child_status")
+                    or payload.get("child_session_id")
+                    != guarded_orchestration.get("child_session_id")
+                ):
+                    raise RunSafetyError(
+                        "reconcile-live result changed at the index commit gate"
+                    )
+                _revalidate_stop_run_lock(
+                    run_fd,
+                    lock_fd,
+                    lock_identity,
+                )
+
+            reconcile_commit_guard = guard_reconcile_index_publication
+            if _run_is_terminal(state):
+                _complete_session_record(record, updated_at=_utc_now())
+            else:
+                record["run_dir"] = args.run_dir
+                record["status"] = "active"
+                record["updated_at"] = _utc_now()
+            index["latest_session_id"] = record["session_id"]
     print(json.dumps(payload))
     return 0
 

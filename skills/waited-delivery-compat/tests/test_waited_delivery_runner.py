@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import contextlib
+import errno
 import fcntl
 import hashlib
 import io
@@ -23,6 +24,8 @@ import threading
 import time
 import unittest
 from unittest import mock
+
+from _subprocess_test_support import run_native_no_cldwait_preflight_probe
 
 
 SCRIPT_PATH = (
@@ -2817,6 +2820,41 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(smoke["status"], "passed")
         self.assertEqual(smoke["sample"], "READY")
 
+    def test_run_fallback_smoke_sigchld_preflight_precedes_prompt_pipe(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        run_dir = self._prepare()
+        prompt_pipe = mock.Mock()
+        process_runner = mock.Mock()
+        with (
+            mock.patch.object(
+                module,
+                "_preflight_unreaped_leader_observer",
+                side_effect=module._WaitableSigchldUnavailable(
+                    "injected pre-resource SIGCHLD rejection"
+                ),
+            ),
+            mock.patch.object(
+                module,
+                "_anonymous_smoke_prompt_pipe",
+                prompt_pipe,
+            ),
+            mock.patch.object(
+                module,
+                "_run_bounded_smoke_process",
+                process_runner,
+            ),
+            self.assertRaisesRegex(
+                module._WaitableSigchldUnavailable,
+                "pre-resource SIGCHLD rejection",
+            ),
+        ):
+            module._run_fallback_smoke(argparse.Namespace(run_dir=str(run_dir)))
+
+        prompt_pipe.assert_not_called()
+        process_runner.assert_not_called()
+
     def test_fallback_prompt_uses_anonymous_pipe_under_restrictive_umask(
         self,
     ) -> None:
@@ -3300,10 +3338,12 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 events.append("observe-exit")
                 return True
 
-            def reap(self, process) -> int:
+            def reap(self, process, *, timeout: float | None = None) -> int:
                 if self.reaped:
                     raise AssertionError("leader was reaped twice")
                 self_outer.assertEqual(process.pid, 719)
+                self_outer.assertIsNotNone(timeout)
+                self_outer.assertGreater(timeout, 0)
                 events.append("reap")
                 self.reaped = True
                 return 0
@@ -3315,19 +3355,26 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self_outer = self
         observer = FakeObserver()
 
-        def group_exists(pgid: int) -> bool:
+        def group_state(
+            pgid: int,
+            *,
+            deadline: float,
+            known_exited_leader_pid: int,
+        ) -> str:
             if observer.reaped:
                 raise AssertionError("group probe occurred after leader reap")
             self.assertEqual(pgid, 719)
+            self.assertGreater(deadline, time.monotonic())
+            self.assertEqual(known_exited_leader_pid, 719)
             events.append("prove-group-absence")
-            return False
+            return "no-members"
 
         with (
             mock.patch.object(module, "_drain_process_output_once"),
             mock.patch.object(
                 module,
-                "_process_group_exists",
-                side_effect=group_exists,
+                "_process_group_state",
+                side_effect=group_state,
             ),
         ):
             module._cleanup_smoke_process(
@@ -3344,6 +3391,946 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             ["signal", "observe-exit", "prove-group-absence", "reap"],
         )
 
+    def test_smoke_observer_preflight_precedes_callback_and_process_launch(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        pre_spawn_check = mock.Mock()
+
+        with (
+            mock.patch.object(
+                module.signal,
+                "getsignal",
+                return_value=signal.SIG_IGN,
+            ),
+            mock.patch.object(module.selectors, "DefaultSelector") as selector,
+            mock.patch.object(module.subprocess, "Popen") as popen,
+            mock.patch.object(module.os, "killpg") as killpg,
+            self.assertRaisesRegex(
+                module.UserError,
+                "default SIGCHLD disposition",
+            ),
+        ):
+            module._run_bounded_smoke_process(
+                [sys.executable, "-c", "pass"],
+                cwd=self.repo,
+                pre_spawn_check=pre_spawn_check,
+            )
+
+        pre_spawn_check.assert_not_called()
+        selector.assert_not_called()
+        popen.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_smoke_non_cpython_preflight_precedes_process_launch(self) -> None:
+        module = self._load_runner_module()
+        implementation = mock.Mock()
+        implementation.name = "pypy"
+        pre_spawn_check = mock.Mock()
+        with (
+            mock.patch.object(module.sys, "implementation", implementation),
+            mock.patch.object(module.selectors, "DefaultSelector") as selector,
+            mock.patch.object(module.subprocess, "Popen") as popen,
+            mock.patch.object(module.os, "killpg") as killpg,
+            self.assertRaisesRegex(
+                module.UserError,
+                "reviewed CPython Popen finalizer semantics",
+            ),
+        ):
+            module._run_bounded_smoke_process(
+                [sys.executable, "-c", "pass"],
+                cwd=self.repo,
+                pre_spawn_check=pre_spawn_check,
+            )
+
+        pre_spawn_check.assert_not_called()
+        selector.assert_not_called()
+        popen.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_smoke_native_no_cldwait_precedes_all_supervision_resources(
+        self,
+    ) -> None:
+        payload = run_native_no_cldwait_preflight_probe(
+            SCRIPT_PATH,
+            entrypoint="runner",
+        )
+
+        self.assertTrue(payload["auto_reaped"])
+        self.assertTrue(payload["restored_waitable"])
+        self.assertIn("SA_NOCLDWAIT", payload["rejection"])
+        self.assertEqual(
+            payload["calls"],
+            {
+                "killpg": 0,
+                "kqueue": 0,
+                "pipe": 0,
+                "popen": 0,
+                "selector": 0,
+            },
+        )
+
+    def test_smoke_native_no_cldwait_flags_fail_closed_for_supported_layouts(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        if (
+            module.ctypes.sizeof(module.ctypes.c_void_p) == 8
+            and module.ctypes.sizeof(module.ctypes.c_ulong) == 8
+        ):
+            self.assertEqual(module.ctypes.sizeof(module._LinuxSigaction), 152)
+            self.assertEqual(module._LinuxSigaction.handler.offset, 0)
+            self.assertEqual(module._LinuxSigaction.mask.offset, 8)
+            self.assertEqual(module._LinuxSigaction.flags.offset, 136)
+            self.assertEqual(module._LinuxSigaction.restorer.offset, 144)
+        cases = (
+            ("darwin", "_darwin_sigchld_action", module.DARWIN_SA_NOCLDWAIT),
+            ("linux", "_linux_sigchld_action", module.LINUX_SA_NOCLDWAIT),
+        )
+        for platform_name, action_name, no_cldwait_flag in cases:
+            with self.subTest(platform=platform_name):
+                with (
+                    mock.patch.object(
+                        module.signal,
+                        "getsignal",
+                        return_value=signal.SIG_DFL,
+                    ),
+                    mock.patch.object(
+                        module,
+                        action_name,
+                        return_value=(0, no_cldwait_flag),
+                    ),
+                    self.assertRaisesRegex(
+                        module._WaitableSigchldUnavailable,
+                        "SA_NOCLDWAIT",
+                    ),
+                ):
+                    module._require_waitable_sigchld_semantics(
+                        platform=platform_name,
+                    )
+
+    def test_smoke_unreviewed_linux_sigaction_abi_fails_before_libc(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        rejected_abis = (
+            ("x86_64", "x86_64-linux-musl"),
+            ("aarch64", "aarch64-linux-musl"),
+            ("riscv64", "riscv64-linux-gnu"),
+        )
+        for machine, multiarch in rejected_abis:
+            with self.subTest(machine=machine, multiarch=multiarch):
+                implementation = mock.Mock(_multiarch=multiarch)
+                with (
+                    mock.patch.object(
+                        module.os,
+                        "uname",
+                        return_value=mock.Mock(machine=machine),
+                    ),
+                    mock.patch.object(
+                        module.sys,
+                        "implementation",
+                        implementation,
+                    ),
+                    mock.patch.object(module.ctypes, "CDLL") as cdll,
+                    self.assertRaisesRegex(
+                        module._WaitableSigchldUnavailable,
+                        "no reviewed sigaction layout",
+                    ),
+                ):
+                    module._linux_sigchld_action()
+                cdll.assert_not_called()
+
+    def test_smoke_native_sigaction_query_failure_restores_errno(self) -> None:
+        module = self._load_runner_module()
+
+        def fail_sigaction(*_args: object) -> int:
+            module.ctypes.set_errno(errno.EPERM)
+            return -1
+
+        fake_sigaction = mock.Mock(side_effect=fail_sigaction)
+        fake_library = mock.Mock(sigaction=fake_sigaction)
+        previous_errno = module.ctypes.get_errno()
+        try:
+            module.ctypes.set_errno(errno.EBUSY)
+            with (
+                mock.patch.object(
+                    module.ctypes,
+                    "CDLL",
+                    return_value=fake_library,
+                ),
+                self.assertRaisesRegex(
+                    module._WaitableSigchldUnavailable,
+                    "failed to inspect Darwin SIGCHLD disposition",
+                ),
+            ):
+                module._darwin_sigchld_action()
+            self.assertEqual(module.ctypes.get_errno(), errno.EBUSY)
+        finally:
+            module.ctypes.set_errno(previous_errno)
+
+    def test_smoke_unexpected_sigchld_query_failure_latches_after_spawn(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        for error_type in (RuntimeError, KeyboardInterrupt):
+            with self.subTest(error_type=error_type.__name__):
+                query_error = error_type("injected native-query failure")
+                with (
+                    mock.patch.object(
+                        module,
+                        "_waitable_sigchld_failure",
+                        side_effect=query_error,
+                    ),
+                    self.assertRaises(module._ProcessIdentityLost) as after_spawn,
+                ):
+                    module._require_waitable_sigchld_semantics(after_spawn=True)
+                self.assertIs(after_spawn.exception.__cause__, query_error)
+
+                pre_spawn_error = error_type("injected pre-spawn native-query failure")
+                with (
+                    mock.patch.object(
+                        module,
+                        "_waitable_sigchld_failure",
+                        side_effect=pre_spawn_error,
+                    ),
+                    self.assertRaises(
+                        module._WaitableSigchldUnavailable
+                    ) as before_spawn,
+                ):
+                    module._require_waitable_sigchld_semantics()
+                self.assertIs(before_spawn.exception.__cause__, pre_spawn_error)
+
+    def test_smoke_late_sigchld_loss_blocks_signal_and_group_probe(self) -> None:
+        module = self._load_runner_module()
+        observer = object.__new__(module._UnreapedLeaderObserver)
+        observer.pid = 724
+        observer.platform = sys.platform
+        observer._reaped = False
+        observer._exited = False
+        observer._kqueue = None
+
+        with (
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value="SIGCHLD gained SA_NOCLDWAIT after observer binding",
+            ),
+            mock.patch.object(module.os, "killpg") as killpg,
+        ):
+            with self.assertRaises(module._ProcessIdentityLost):
+                observer.signal_group(signal.SIGKILL)
+            with self.assertRaises(module._ProcessIdentityLost):
+                module._process_group_state(724)
+
+        killpg.assert_not_called()
+
+    def test_smoke_darwin_observer_ctor_closes_early_kqueue_failures(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        cases = (
+            (
+                "post-spawn-reattest",
+                module._ProcessIdentityLost("injected identity loss"),
+                False,
+            ),
+            (
+                "non-oserror-control",
+                RuntimeError("injected control failure"),
+                True,
+            ),
+        )
+        for name, expected_error, fail_control in cases:
+            with self.subTest(name=name):
+                queue = mock.Mock()
+                if fail_control:
+                    queue.control.side_effect = expected_error
+                    require = mock.Mock(return_value=None)
+                    queue.close.side_effect = RuntimeError(
+                        "injected close failure must not mask primary"
+                    )
+                else:
+                    require = mock.Mock(side_effect=expected_error)
+                with (
+                    mock.patch.object(
+                        module,
+                        "_preflight_unreaped_leader_observer",
+                        return_value="darwin",
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_require_waitable_sigchld_semantics",
+                        require,
+                    ),
+                    mock.patch.object(
+                        module.select,
+                        "kqueue",
+                        return_value=queue,
+                        create=True,
+                    ),
+                    mock.patch.object(
+                        module.select,
+                        "kevent",
+                        return_value=object(),
+                        create=True,
+                    ),
+                    mock.patch.object(module.select, "KQ_FILTER_PROC", 1, create=True),
+                    mock.patch.object(module.select, "KQ_EV_ADD", 2, create=True),
+                    mock.patch.object(module.select, "KQ_EV_ENABLE", 4, create=True),
+                    mock.patch.object(module.select, "KQ_EV_ONESHOT", 8, create=True),
+                    mock.patch.object(module.select, "KQ_NOTE_EXIT", 16, create=True),
+                    self.assertRaises(type(expected_error)) as raised,
+                ):
+                    module._UnreapedLeaderObserver(725, platform="darwin")
+
+                self.assertIs(raised.exception, expected_error)
+                queue.close.assert_called_once_with()
+                if fail_control:
+                    queue.control.assert_called_once()
+                else:
+                    queue.control.assert_not_called()
+
+        expected_error = module._ProcessIdentityLost(
+            "injected identity loss after ownership transfer"
+        )
+        queue = mock.Mock()
+        queue.control.return_value = []
+        queue.close.side_effect = RuntimeError(
+            "injected transferred-close failure must not mask primary"
+        )
+        require = mock.Mock(side_effect=[None, expected_error])
+        with (
+            mock.patch.object(
+                module,
+                "_preflight_unreaped_leader_observer",
+                return_value="darwin",
+            ),
+            mock.patch.object(
+                module,
+                "_require_waitable_sigchld_semantics",
+                require,
+            ),
+            mock.patch.object(
+                module.select,
+                "kqueue",
+                return_value=queue,
+                create=True,
+            ),
+            mock.patch.object(
+                module.select,
+                "kevent",
+                return_value=object(),
+                create=True,
+            ),
+            mock.patch.object(module.select, "KQ_FILTER_PROC", 1, create=True),
+            mock.patch.object(module.select, "KQ_EV_ADD", 2, create=True),
+            mock.patch.object(module.select, "KQ_EV_ENABLE", 4, create=True),
+            mock.patch.object(module.select, "KQ_EV_ONESHOT", 8, create=True),
+            mock.patch.object(module.select, "KQ_NOTE_EXIT", 16, create=True),
+            self.assertRaises(type(expected_error)) as raised,
+        ):
+            module._UnreapedLeaderObserver(726, platform="darwin")
+
+        self.assertIs(raised.exception, expected_error)
+        queue.control.assert_called_once()
+        queue.close.assert_called_once_with()
+
+    def test_smoke_post_spawn_sigchld_loss_never_uses_numeric_group(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+
+        class FakeProcess:
+            pid = 723
+            stdin = None
+
+            def __init__(self) -> None:
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.wait = mock.Mock(
+                    side_effect=AssertionError("identity loss must never wait")
+                )
+                self.poll = mock.Mock(
+                    side_effect=AssertionError("identity loss must never poll")
+                )
+
+        process = FakeProcess()
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+        waitability = mock.Mock(
+            side_effect=[
+                None,
+                None,
+                "SIGCHLD gained SA_NOCLDWAIT after process launch",
+            ]
+        )
+        with (
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            mock.patch.object(
+                module.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+            mock.patch.object(module.os, "killpg") as killpg,
+            mock.patch.object(module, "_process_group_state") as group_state,
+            self.assertRaisesRegex(
+                module._ProcessIdentityLost,
+                "changed after process launch",
+            ) as raised,
+        ):
+            module._run_bounded_smoke_process_supervised(
+                [sys.executable, "-c", "raise SystemExit(0)"],
+                cwd=self.repo,
+                pass_fds=(),
+                child_read_streams=(),
+                input_stream=None,
+                input_bytes=None,
+                timeout=1,
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+                signal_transaction=mock.Mock(),
+                pre_spawn_check=None,
+            )
+
+        popen.assert_called_once()
+        killpg.assert_not_called()
+        group_state.assert_not_called()
+        self.assertIsInstance(raised.exception.__cause__, module.UserError)
+        self.assertIn(
+            "cleanup-incomplete",
+            str(raised.exception.__cause__),
+        )
+        self.assertIn("status is unavailable", str(raised.exception.__cause__))
+        process.wait.assert_not_called()
+        process.poll.assert_not_called()
+        self.assertIn(
+            process,
+            module._UNREAPED_SMOKE_RECOVERY_PROCESSES,
+        )
+
+    def test_smoke_post_spawn_sigchld_query_failure_preserves_nested_cause(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+
+        class FakeProcess:
+            pid = 724
+            stdin = None
+
+            def __init__(self) -> None:
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.wait = mock.Mock(
+                    side_effect=AssertionError("identity loss must never wait")
+                )
+                self.poll = mock.Mock(
+                    side_effect=AssertionError("identity loss must never poll")
+                )
+
+        process = FakeProcess()
+        query_error = KeyboardInterrupt("injected SIGCHLD query interruption")
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+        waitability = mock.Mock(side_effect=[None, None, query_error])
+        with (
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            mock.patch.object(
+                module.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(module.os, "killpg") as killpg,
+            mock.patch.object(module, "_process_group_state") as group_state,
+            self.assertRaises(module._ProcessIdentityLost) as raised,
+        ):
+            module._run_bounded_smoke_process_supervised(
+                [sys.executable, "-c", "raise SystemExit(0)"],
+                cwd=self.repo,
+                pass_fds=(),
+                child_read_streams=(),
+                input_stream=None,
+                input_bytes=None,
+                timeout=1,
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+                signal_transaction=mock.Mock(),
+                pre_spawn_check=None,
+            )
+
+        cleanup_evidence = raised.exception.__cause__
+        self.assertIsInstance(cleanup_evidence, module.UserError)
+        self.assertIs(cleanup_evidence.__cause__, query_error)
+        killpg.assert_not_called()
+        group_state.assert_not_called()
+        process.wait.assert_not_called()
+        process.poll.assert_not_called()
+        self.assertIn(
+            process,
+            module._UNREAPED_SMOKE_RECOVERY_PROCESSES,
+        )
+
+    def test_smoke_identity_loss_disarms_real_popen_finalizer(self) -> None:
+        module = self._load_runner_module()
+        process = subprocess.Popen(
+            [sys.executable, "-c", "raise SystemExit(0)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        waited_pid, _status = os.waitpid(process.pid, 0)
+        self.assertEqual(waited_pid, process.pid)
+        self.assertIsNone(process.returncode)
+
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+        cleanup_error = module._smoke_identity_loss_cleanup_error(
+            process,
+            module._ProcessIdentityLost("injected identity loss"),
+            context="real-Popen finalizer regression",
+        )
+
+        self.assertIn("numeric-child polling disarmed", str(cleanup_error))
+        self.assertEqual(process.returncode, module.IDENTITY_LOST_RETURN_CODE)
+        self.assertIs(process._child_created, False)
+        self.assertIn(
+            process,
+            module._UNREAPED_SMOKE_RECOVERY_PROCESSES,
+        )
+
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+        object.__setattr__(process, "returncode", None)
+        object.__setattr__(process, "_child_created", True)
+        real_disarm = module._disarm_smoke_process_after_identity_loss
+        attempts = 0
+
+        def interrupt_first_disarm(candidate) -> None:
+            nonlocal attempts
+            attempts += 1
+            self.assertIn(
+                candidate,
+                module._UNREAPED_SMOKE_RECOVERY_PROCESSES,
+            )
+            if attempts == 1:
+                raise KeyboardInterrupt("injected disarm interruption")
+            real_disarm(candidate)
+
+        with mock.patch.object(
+            module,
+            "_disarm_smoke_process_after_identity_loss",
+            side_effect=interrupt_first_disarm,
+        ):
+            retry_error = module._smoke_identity_loss_cleanup_error(
+                process,
+                module._ProcessIdentityLost("injected retry identity loss"),
+                context="retention-before-disarm regression",
+            )
+
+        self.assertEqual(attempts, 2)
+        self.assertIn(
+            "safety retries=disarm:KeyboardInterrupt",
+            str(retry_error),
+        )
+        self.assertEqual(process.returncode, module.IDENTITY_LOST_RETURN_CODE)
+        self.assertIs(process._child_created, False)
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+        internal_poll = mock.Mock(
+            side_effect=AssertionError("disarmed finalizer must not poll")
+        )
+        object.__setattr__(process, "_internal_poll", internal_poll)
+        process.__del__()
+        internal_poll.assert_not_called()
+
+    def test_smoke_identity_loss_retain_interrupt_and_pin_fallback(self) -> None:
+        module = self._load_runner_module()
+
+        class FakeProcess:
+            pid = 727
+            stdin = None
+            stdout = None
+            stderr = None
+
+        process = FakeProcess()
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+        real_retain = module._retain_unreaped_smoke_process
+        retain_attempts = 0
+
+        def interrupt_first_retain(candidate) -> None:
+            nonlocal retain_attempts
+            retain_attempts += 1
+            self.assertEqual(
+                candidate.returncode,
+                module.IDENTITY_LOST_RETURN_CODE,
+            )
+            if retain_attempts == 1:
+                raise KeyboardInterrupt("injected retain interruption")
+            real_retain(candidate)
+
+        with mock.patch.object(
+            module,
+            "_retain_unreaped_smoke_process",
+            side_effect=interrupt_first_retain,
+        ):
+            cleanup_error = module._smoke_identity_loss_cleanup_error(
+                process,
+                module._ProcessIdentityLost("injected identity loss"),
+                context="sentinel-before-retain regression",
+            )
+
+        self.assertEqual(retain_attempts, 2)
+        self.assertIn("retain:KeyboardInterrupt", str(cleanup_error))
+        self.assertIn(
+            process,
+            module._UNREAPED_SMOKE_RECOVERY_PROCESSES,
+        )
+
+        class UndisarmableProcess:
+            __slots__ = ("pid", "stdin", "stdout", "stderr")
+
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+        undisarmable = UndisarmableProcess(728)
+        with (
+            mock.patch.object(
+                module,
+                "_disarm_smoke_process_after_identity_loss",
+                side_effect=RuntimeError("injected disarm failure"),
+            ),
+            mock.patch.object(
+                module,
+                "_permanently_pin_smoke_process_after_identity_loss",
+            ) as pin,
+        ):
+            pinned_error = module._smoke_identity_loss_cleanup_error(
+                undisarmable,
+                module._ProcessIdentityLost("injected identity loss"),
+                context="permanent-pin fallback",
+            )
+        pin.assert_called_once_with(undisarmable)
+        self.assertIn("permanently pinned", str(pinned_error))
+
+        fatal = UndisarmableProcess(729)
+        with (
+            mock.patch.object(
+                module,
+                "_disarm_smoke_process_after_identity_loss",
+                side_effect=RuntimeError("injected disarm failure"),
+            ),
+            mock.patch.object(
+                module,
+                "_permanently_pin_smoke_process_after_identity_loss",
+                side_effect=RuntimeError("injected pin failure"),
+            ) as pin,
+            mock.patch.object(
+                module.os,
+                "_exit",
+                side_effect=SystemExit(70),
+            ) as fatal_exit,
+            self.assertRaises(SystemExit),
+        ):
+            module._smoke_identity_loss_cleanup_error(
+                fatal,
+                module._ProcessIdentityLost("injected identity loss"),
+                context="fatal safety fallback",
+            )
+        self.assertEqual(pin.call_count, 2)
+        fatal_exit.assert_called_once_with(70)
+
+    def test_smoke_final_cleanup_cannot_mask_primary_baseexception(self) -> None:
+        module = self._load_runner_module()
+        resource = mock.Mock()
+        resource.close.side_effect = KeyboardInterrupt(
+            "injected final cleanup interruption"
+        )
+        primary = module._ProcessIdentityLost("identity-lost primary")
+
+        with self.assertRaises(type(primary)) as raised:
+            try:
+                raise primary
+            finally:
+                module._best_effort_close_smoke_resource(resource)
+
+        self.assertIs(raised.exception, primary)
+        resource.close.assert_called_once_with()
+
+    def test_smoke_observer_constructor_failure_preserves_cleanup_cause(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        events: list[str] = []
+        stdout_read_fd, stdout_write_fd = os.pipe()
+        stderr_read_fd, stderr_write_fd = os.pipe()
+
+        class FakeProcess:
+            pid = 722
+
+            def __init__(self) -> None:
+                self.stdout = os.fdopen(stdout_read_fd, "rb", buffering=0)
+                self.stderr = os.fdopen(stderr_read_fd, "rb", buffering=0)
+
+            def wait(self, *, timeout: float | None = None) -> int:
+                raise AssertionError(f"unexpected reap with timeout={timeout}")
+
+        primary = module.UserError("observer bind failed")
+        process = FakeProcess()
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+
+        def signal_group(pgid: int, signum: int) -> None:
+            self.assertEqual((pgid, signum), (722, signal.SIGKILL))
+            events.append("signal")
+
+        def drain_once(*_args, **_kwargs) -> None:
+            events.append("drain")
+
+        def group_state(
+            pgid: int,
+            *,
+            deadline: float,
+            known_exited_leader_pid: int | None = None,
+        ) -> str:
+            self.assertEqual(pgid, 722)
+            self.assertEqual(deadline, 0.25)
+            self.assertIsNone(known_exited_leader_pid)
+            events.append("probe-live-group")
+            return "live"
+
+        try:
+            with (
+                mock.patch.object(
+                    module,
+                    "_preflight_unreaped_leader_observer",
+                    return_value=sys.platform,
+                ),
+                mock.patch.object(
+                    module.subprocess,
+                    "Popen",
+                    return_value=process,
+                ),
+                mock.patch.object(
+                    module,
+                    "_UnreapedLeaderObserver",
+                    side_effect=primary,
+                ),
+                mock.patch.object(module.os, "killpg", side_effect=signal_group),
+                mock.patch.object(
+                    module,
+                    "_drain_process_output_once",
+                    side_effect=drain_once,
+                ),
+                mock.patch.object(
+                    module,
+                    "_process_group_state",
+                    side_effect=group_state,
+                ),
+                mock.patch.object(
+                    module.time,
+                    "monotonic",
+                    side_effect=(0.0, 0.05, 0.1, 0.15, 0.3),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    module.UserError,
+                    "observer bind failed",
+                ) as raised:
+                    module._run_bounded_smoke_process(
+                        [sys.executable, "-c", "pass"],
+                        cwd=self.repo,
+                        cleanup_timeout=0.25,
+                    )
+        finally:
+            os.close(stdout_write_fd)
+            os.close(stderr_write_fd)
+
+        self.assertIs(raised.exception, primary)
+        self.assertIsInstance(raised.exception.__cause__, module.UserError)
+        assert raised.exception.__cause__ is not None
+        self.assertIn("hard deadline", str(raised.exception.__cause__))
+        self.assertIn("group_state=live", str(raised.exception.__cause__))
+        self.assertIn(
+            "open_pipes=['stderr', 'stdout']", str(raised.exception.__cause__)
+        )
+        self.assertIn("retained for recovery", str(raised.exception.__cause__))
+        self.assertEqual(events, ["signal", "drain", "probe-live-group"])
+        self.assertTrue(
+            any(
+                candidate is process
+                for candidate in module._UNREAPED_SMOKE_RECOVERY_PROCESSES
+            )
+        )
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+
+    def test_smoke_emergency_cleanup_orders_kill_drain_probe_and_bounded_reap(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        events: list[str] = []
+
+        class FakeProcess:
+            pid = 723
+            stdout = None
+            stderr = None
+
+            def wait(self, *, timeout: float | None = None) -> int:
+                self_outer.assertIsNotNone(timeout)
+                self_outer.assertGreater(timeout, 0)
+                events.append("reap")
+                return 0
+
+        class FakeSelector:
+            def get_map(self):
+                return {}
+
+        self_outer = self
+
+        def signal_group(pgid: int, signum: int) -> None:
+            self.assertEqual((pgid, signum), (723, signal.SIGKILL))
+            events.append("signal")
+
+        def register_output(_selector, process) -> None:
+            self.assertEqual(process.pid, 723)
+            events.append("register-output")
+
+        def drain_once(*_args, **_kwargs) -> None:
+            events.append("drain")
+
+        def group_state(
+            pgid: int,
+            *,
+            deadline: float,
+            known_exited_leader_pid: int | None = None,
+        ) -> str:
+            self.assertEqual(pgid, 723)
+            self.assertIsNone(known_exited_leader_pid)
+            self.assertGreater(deadline, 100.0)
+            events.append("prove-group-absence")
+            return "zombie-only"
+
+        with (
+            mock.patch.object(module.os, "killpg", side_effect=signal_group),
+            mock.patch.object(
+                module,
+                "_register_smoke_cleanup_output",
+                side_effect=register_output,
+            ),
+            mock.patch.object(
+                module,
+                "_drain_process_output_once",
+                side_effect=drain_once,
+            ),
+            mock.patch.object(
+                module,
+                "_process_group_state",
+                side_effect=group_state,
+            ),
+            mock.patch.object(
+                module.time,
+                "monotonic",
+                side_effect=(100.0, 100.1, 100.2, 100.3, 100.4, 100.5),
+            ),
+        ):
+            module._emergency_cleanup_smoke_process(
+                FakeProcess(),
+                FakeSelector(),
+                {"stdout": bytearray(), "stderr": bytearray()},
+                child_read_streams=(),
+                input_stream=None,
+                cleanup_timeout=1.0,
+                max_capture_bytes=1024,
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "signal",
+                "register-output",
+                "drain",
+                "prove-group-absence",
+                "reap",
+            ],
+        )
+
+    def test_smoke_cleanup_never_reaps_incomplete_group_or_pipe_state(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+
+        class FakeProcess:
+            pid = 724
+
+        class FakeObserver:
+            def signal_group(self, signum: int) -> None:
+                self_outer.assertEqual(signum, signal.SIGKILL)
+
+            def exited(self) -> bool:
+                return True
+
+            def reap(self, _process, *, timeout: float | None = None) -> int:
+                raise AssertionError(f"unexpected reap with timeout={timeout}")
+
+        class FakeSelector:
+            def __init__(self, *, pipe_open: bool) -> None:
+                self.pipe_open = pipe_open
+
+            def get_map(self):
+                if not self.pipe_open:
+                    return {}
+                return {
+                    11: mock.Mock(data="stdout"),
+                }
+
+        self_outer = self
+        cases = (
+            ("live", False),
+            ("unknown", False),
+            ("no-members", True),
+        )
+        for group_state, pipe_open in cases:
+            with self.subTest(group_state=group_state, pipe_open=pipe_open):
+                process = FakeProcess()
+                module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+                with (
+                    mock.patch.object(module, "_drain_process_output_once"),
+                    mock.patch.object(
+                        module,
+                        "_process_group_state",
+                        return_value=group_state,
+                    ),
+                    mock.patch.object(
+                        module.time,
+                        "monotonic",
+                        side_effect=(0.0, 0.1, 0.2, 0.3, 1.1),
+                    ),
+                    self.assertRaisesRegex(
+                        module.UserError,
+                        "remains unreaped and retained for recovery",
+                    ),
+                ):
+                    module._cleanup_smoke_process(
+                        process,
+                        FakeObserver(),
+                        FakeSelector(pipe_open=pipe_open),
+                        {"stdout": bytearray(), "stderr": bytearray()},
+                        cleanup_timeout=1.0,
+                        max_capture_bytes=1024,
+                    )
+                self.assertTrue(
+                    any(
+                        candidate is process
+                        for candidate in module._UNREAPED_SMOKE_RECOVERY_PROCESSES
+                    )
+                )
+        module._UNREAPED_SMOKE_RECOVERY_PROCESSES.clear()
+
     def test_smoke_observer_refuses_group_signal_after_leader_reap(self) -> None:
         module = self._load_runner_module()
         observer = object.__new__(module._UnreapedLeaderObserver)
@@ -3352,14 +4339,15 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
 
         with (
             mock.patch.object(module.os, "killpg") as killpg,
-            self.assertRaisesRegex(
-                module.UserError,
-                "after leader reap",
-            ),
+            mock.patch.object(module.os, "waitid", create=True) as waitid,
         ):
-            observer.signal_group(signal.SIGKILL)
+            with self.assertRaisesRegex(module.UserError, "after leader reap"):
+                observer.signal_group(signal.SIGKILL)
+            with self.assertRaisesRegex(module.UserError, "already reaped"):
+                observer.exited()
 
         killpg.assert_not_called()
+        waitid.assert_not_called()
 
     def test_zombie_only_group_remains_addressable_for_cleanup(self) -> None:
         module = self._load_runner_module()
@@ -3379,6 +4367,314 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             self.assertTrue(module._process_group_is_addressable(77))
 
         self.assertEqual(killpg.call_args_list, [mock.call(77, 0), mock.call(77, 0)])
+
+    def test_darwin_group_scan_uses_pid_count_and_zombie_capable_pidinfo(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        calls: list[tuple[object, ...]] = []
+
+        class FakeCFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(pgid: int, pid_array, buffer_size: int) -> int:
+            self.assertEqual(module.ctypes.get_errno(), 0)
+            self.assertEqual(pgid, 727)
+            self.assertEqual(
+                buffer_size,
+                module.ctypes.sizeof(module.ctypes.c_int * 8),
+            )
+            pid_array[0] = pgid
+            calls.append(("list", pgid))
+            # libproc returns a PID count, not a byte count.
+            return 1
+
+        def pid_info(
+            pid: int,
+            flavor: int,
+            arg: int,
+            info_pointer,
+            info_size: int,
+        ) -> int:
+            self.assertEqual(module.ctypes.get_errno(), 0)
+            self.assertEqual((pid, flavor, arg), (727, 3, 1))
+            self.assertEqual(
+                info_size,
+                module.ctypes.sizeof(module._DarwinProcBSDInfo),
+            )
+            info = module.ctypes.cast(
+                info_pointer,
+                module.ctypes.POINTER(module._DarwinProcBSDInfo),
+            ).contents
+            info.pbi_status = 5
+            info.pbi_pid = pid
+            info.pbi_pgid = 727
+            calls.append(("pid-info", pid, flavor, arg))
+            return info_size
+
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeCFunction(list_group),
+            proc_pidinfo=FakeCFunction(pid_info),
+        )
+        previous_errno = module.ctypes.get_errno()
+        try:
+            module.ctypes.set_errno(errno.EPERM)
+            with mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ):
+                self.assertEqual(
+                    module._darwin_process_group_state(
+                        727,
+                        known_exited_leader_pid=727,
+                        max_entries=8,
+                    ),
+                    "zombie-only",
+                )
+        finally:
+            module.ctypes.set_errno(previous_errno)
+
+        self.assertEqual(
+            calls,
+            [
+                ("list", 727),
+                ("pid-info", 727, 3, 1),
+            ],
+        )
+
+    def test_darwin_group_scan_ignores_only_attested_leader_stale_status(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        pgid = 732
+        listed_pids = [pgid]
+
+        class FakeCFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(_pgid: int, pid_array, _buffer_size: int) -> int:
+            for index, pid in enumerate(listed_pids):
+                pid_array[index] = pid
+            return len(listed_pids)
+
+        def pid_info(
+            pid: int,
+            _flavor: int,
+            _arg: int,
+            info_pointer,
+            info_size: int,
+        ) -> int:
+            info = module.ctypes.cast(
+                info_pointer,
+                module.ctypes.POINTER(module._DarwinProcBSDInfo),
+            ).contents
+            info.pbi_pid = pid
+            info.pbi_pgid = pgid
+            info.pbi_status = 2
+            return info_size
+
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeCFunction(list_group),
+            proc_pidinfo=FakeCFunction(pid_info),
+        )
+        with mock.patch.object(
+            module.ctypes,
+            "CDLL",
+            return_value=fake_libproc,
+        ):
+            self.assertEqual(
+                module._darwin_process_group_state(
+                    pgid,
+                    max_entries=8,
+                ),
+                "live",
+            )
+            self.assertEqual(
+                module._darwin_process_group_state(
+                    pgid,
+                    known_exited_leader_pid=pgid,
+                    max_entries=8,
+                ),
+                "zombie-only",
+            )
+            listed_pids.append(pgid + 1)
+            self.assertEqual(
+                module._darwin_process_group_state(
+                    pgid,
+                    known_exited_leader_pid=pgid,
+                    max_entries=8,
+                ),
+                "live",
+            )
+
+    def test_darwin_group_scan_fails_closed_on_pidinfo_error_and_full_buffer(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+
+        class FakeCFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def one_pid(_pgid: int, pid_array, _buffer_size: int) -> int:
+            self.assertEqual(module.ctypes.get_errno(), 0)
+            pid_array[0] = 728
+            return 1
+
+        def permission_denied(
+            _pid: int,
+            flavor: int,
+            arg: int,
+            _info_pointer,
+            _info_size: int,
+        ) -> int:
+            self.assertEqual(module.ctypes.get_errno(), 0)
+            self.assertEqual((flavor, arg), (3, 1))
+            module.ctypes.set_errno(errno.EPERM)
+            return 0
+
+        permission_libproc = mock.Mock(
+            proc_listpgrppids=FakeCFunction(one_pid),
+            proc_pidinfo=FakeCFunction(permission_denied),
+        )
+        previous_errno = module.ctypes.get_errno()
+        try:
+            module.ctypes.set_errno(errno.ENOENT)
+            with mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=permission_libproc,
+            ):
+                self.assertEqual(
+                    module._darwin_process_group_state(
+                        728,
+                        known_exited_leader_pid=728,
+                        max_entries=8,
+                    ),
+                    "unknown",
+                )
+        finally:
+            module.ctypes.set_errno(previous_errno)
+
+        pid_info = mock.Mock()
+        full_libproc = mock.Mock(
+            proc_listpgrppids=FakeCFunction(lambda _pgid, _pid_array, _buffer_size: 2),
+            proc_pidinfo=FakeCFunction(pid_info),
+        )
+        with mock.patch.object(
+            module.ctypes,
+            "CDLL",
+            return_value=full_libproc,
+        ):
+            self.assertEqual(
+                module._darwin_process_group_state(
+                    729,
+                    known_exited_leader_pid=729,
+                    max_entries=2,
+                ),
+                "unknown",
+            )
+        pid_info.assert_not_called()
+
+    def test_darwin_group_scan_honors_and_receives_absolute_deadline(self) -> None:
+        module = self._load_runner_module()
+
+        with (
+            mock.patch.object(module.time, "monotonic", return_value=10.0),
+            mock.patch.object(module.ctypes, "CDLL") as load_libproc,
+        ):
+            self.assertEqual(
+                module._darwin_process_group_state(
+                    730,
+                    known_exited_leader_pid=730,
+                    deadline=10.0,
+                ),
+                "unknown",
+            )
+        load_libproc.assert_not_called()
+
+        with (
+            mock.patch.object(module.time, "monotonic", return_value=100.0),
+            mock.patch.object(
+                module,
+                "_darwin_process_group_state",
+                return_value="zombie-only",
+            ) as scan,
+        ):
+            self.assertEqual(
+                module._process_group_state(
+                    731,
+                    platform="darwin",
+                    deadline=123.5,
+                    known_exited_leader_pid=731,
+                ),
+                "zombie-only",
+            )
+        scan.assert_called_once_with(
+            731,
+            known_exited_leader_pid=731,
+            deadline=123.5,
+        )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin libproc and kqueue",
+    )
+    def test_darwin_group_scan_observes_real_unreaped_zombie(self) -> None:
+        module = self._load_runner_module()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(0.1)",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        observer = None
+        try:
+            observer = module._UnreapedLeaderObserver(
+                process.pid,
+                platform="darwin",
+            )
+            deadline = time.monotonic() + 5
+            while not observer.exited() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(observer.exited())
+            self.assertEqual(
+                module._darwin_process_group_state(
+                    process.pid,
+                    known_exited_leader_pid=process.pid,
+                ),
+                "zombie-only",
+            )
+        finally:
+            if observer is not None:
+                observer.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
     def test_linux_process_group_scan_handles_non_utf8_same_and_unrelated_members(
         self,
@@ -4308,6 +5604,18 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
+        state_path = run_dir / "state.json"
+        previous_state_metadata = state_path.stat()
+        previous_state_content = state_path.read_bytes()
+        expected_previous_state_version = {
+            "device": previous_state_metadata.st_dev,
+            "inode": previous_state_metadata.st_ino,
+            "uid": previous_state_metadata.st_uid,
+            "gid": previous_state_metadata.st_gid,
+            "mode": previous_state_metadata.st_mode & 0o7777,
+            "size": len(previous_state_content),
+            "sha256": hashlib.sha256(previous_state_content).hexdigest(),
+        }
         completed = self._run_runner(
             "reconcile-parent",
             "--run-dir",
@@ -4327,8 +5635,22 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(payload["overall_status"], "decision_point")
         self.assertEqual(payload["child_status"], "completed")
         self.assertEqual(payload["child_session_id"], "child-1")
+        self.assertEqual(
+            payload["previous_state_version"],
+            expected_previous_state_version,
+        )
+        self._assert_file_version_payload(
+            payload["state_version"],
+            state_path,
+        )
+        run_metadata = run_dir.stat()
+        self.assertEqual(payload["run_dev"], run_metadata.st_dev)
+        self.assertEqual(payload["run_ino"], run_metadata.st_ino)
+        self.assertEqual(payload["run_uid"], run_metadata.st_uid)
+        self.assertEqual(payload["run_gid"], run_metadata.st_gid)
+        self.assertEqual(payload["run_mode"], run_metadata.st_mode & 0o7777)
 
-        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["overall_status"], "decision_point")
         self.assertEqual(state["orchestration"]["child_session_id"], "child-1")
         self.assertEqual(state["orchestration"]["child_status"], "completed")
