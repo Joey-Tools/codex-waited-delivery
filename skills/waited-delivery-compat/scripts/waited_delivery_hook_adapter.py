@@ -27,7 +27,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable, Iterator
-from typing import Literal, NamedTuple, TypedDict, cast
+from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
 
 
 BRIDGE_PATH = pathlib.Path(__file__).resolve().with_name("waited_delivery_bridge.py")
@@ -208,6 +208,12 @@ class IndexFileVersion(NamedTuple):
     mode: int
     size: int
     sha256: str
+
+
+class IndexCommitReceipt(NamedTuple):
+    previous_content: bytes | None
+    published_content: bytes
+    published_version: IndexFileVersion
 
 
 class StopArtifactRead(NamedTuple):
@@ -920,8 +926,12 @@ def _darwin_refresh_process_group_state_impl(
         ]
         pid_info.restype = ctypes.c_int
         pid_array = (ctypes.c_int * max_entries)()
-        if time.monotonic() >= deadline:
-            return "unknown"
+    except (AttributeError, OSError, ValueError):
+        return "unknown"
+    if time.monotonic() >= deadline:
+        return "unknown"
+    _require_waitable_sigchld_semantics(after_spawn=True)
+    try:
         ctypes.set_errno(0)
         count = list_group(
             pgid,
@@ -941,6 +951,7 @@ def _darwin_refresh_process_group_state_impl(
         if pid <= 0 or time.monotonic() >= deadline:
             return "unknown"
         info = _DarwinProcBSDInfo()
+        _require_waitable_sigchld_semantics(after_spawn=True)
         try:
             ctypes.set_errno(0)
             size = pid_info(
@@ -955,17 +966,6 @@ def _darwin_refresh_process_group_state_impl(
         if time.monotonic() >= deadline:
             return "unknown"
         if size == 0:
-            process_error = ctypes.get_errno()
-            if (
-                process_error == errno.ESRCH
-                and known_exited_leader_pid is not None
-                and pid == known_exited_leader_pid
-                and pid == pgid
-            ):
-                saw_zombie = True
-                continue
-            # A disappearing non-leader must be observed by a later whole-group
-            # scan. Every other libproc failure is likewise unknown.
             return "unknown"
         if size != ctypes.sizeof(info) or info.pbi_pid != pid or info.pbi_pgid != pgid:
             return "unknown"
@@ -1043,6 +1043,7 @@ def _linux_refresh_process_group_state(
                     return "unknown"
                 if not entry.name.isdecimal():
                     continue
+                _require_waitable_sigchld_semantics(after_spawn=True)
                 try:
                     raw = (pathlib.Path(entry.path) / "stat").read_bytes()
                 except FileNotFoundError:
@@ -1056,6 +1057,8 @@ def _linux_refresh_process_group_state(
                 if state != "Z":
                     return "live"
                 saw_zombie = True
+    except _ProcessIdentityLost:
+        raise
     except OSError:
         return "unknown"
     if saw_zombie:
@@ -2426,7 +2429,7 @@ def _invoke_index_commit_guard(
         ) from error
 
 
-def _restore_index_after_failed_commit_guard(
+def _restore_index_after_failed_publication(
     adapter_fd: int,
     *,
     previous_content: bytes | None,
@@ -2440,7 +2443,7 @@ def _restore_index_after_failed_commit_guard(
         or current[1] != published_version
     ):
         raise RunSafetyError(
-            "adapter index post-commit recovery cannot bind the published index"
+            "adapter index publication recovery cannot bind the published index"
         )
     if previous_content is None:
         try:
@@ -2448,12 +2451,12 @@ def _restore_index_after_failed_commit_guard(
             os.fsync(adapter_fd)
         except OSError as error:
             raise RunSafetyError(
-                "adapter index post-commit recovery could not remove the first "
+                "adapter index publication recovery could not remove the first "
                 "publication"
             ) from error
         if _read_index_bytes_at(adapter_fd) is not None:
             raise RunSafetyError(
-                "adapter index post-commit recovery could not verify restored absence"
+                "adapter index publication recovery could not verify restored absence"
             )
         return
 
@@ -2492,12 +2495,21 @@ def _restore_index_after_failed_commit_guard(
             or _pread_index_bytes(recovery_fd) != previous_content
         ):
             raise RunSafetyError(
-                "adapter index post-commit recovery temporary file failed "
+                "adapter index publication recovery temporary file failed "
                 "identity, access, or content validation"
             )
         _require_no_extended_acl(
             recovery_fd,
-            label="adapter index post-commit recovery temporary file",
+            label="adapter index publication recovery temporary file",
+        )
+        recovery_version = IndexFileVersion(
+            device=recovery_stat.st_dev,
+            inode=recovery_stat.st_ino,
+            uid=recovery_stat.st_uid,
+            gid=recovery_stat.st_gid,
+            mode=stat.S_IMODE(recovery_stat.st_mode),
+            size=recovery_stat.st_size,
+            sha256=hashlib.sha256(previous_content).hexdigest(),
         )
         current = _read_index_bytes_at(adapter_fd)
         if (
@@ -2506,7 +2518,7 @@ def _restore_index_after_failed_commit_guard(
             or current[1] != published_version
         ):
             raise RunSafetyError(
-                "adapter index changed before post-commit recovery replacement"
+                "adapter index changed before publication recovery replacement"
             )
         os.replace(
             recovery_name,
@@ -2521,18 +2533,17 @@ def _restore_index_after_failed_commit_guard(
         if (
             restored is None
             or restored[0] != previous_content
-            or restored[1].uid != os.geteuid()
-            or restored[1].mode != INDEX_FILE_MODE
+            or restored[1] != recovery_version
         ):
             raise RunSafetyError(
-                "adapter index post-commit recovery could not be verified"
+                "adapter index publication recovery could not be verified"
             )
     except RunSafetyError:
         raise
     except OSError as error:
         operation = "publish" if replaced else "prepare"
         raise RunSafetyError(
-            f"adapter index post-commit recovery {operation} failed"
+            f"adapter index publication recovery {operation} failed"
         ) from error
     finally:
         if recovery_fd is not None:
@@ -2544,6 +2555,44 @@ def _restore_index_after_failed_commit_guard(
                 pass
 
 
+def _index_snapshot_evidence(content: bytes | None) -> str:
+    if content is None:
+        return "absent"
+    return f"bytes={len(content)},sha256={hashlib.sha256(content).hexdigest()}"
+
+
+def _matches_index_snapshot(
+    observed: tuple[bytes, IndexFileVersion] | None,
+    *,
+    content: bytes | None,
+    version: IndexFileVersion | None,
+) -> bool:
+    if content is None:
+        return observed is None and version is None
+    return observed is not None and observed[0] == content and observed[1] == version
+
+
+def _raise_manual_index_recovery(
+    *,
+    stage: str,
+    previous_content: bytes | None,
+    published_content: bytes,
+    published_version: IndexFileVersion,
+    primary_error: BaseException,
+    recovery_error: BaseException,
+) -> NoReturn:
+    raise RunSafetyError(
+        "adapter index publication failed and exact previous-index recovery "
+        "could not be verified; manual_recovery_required=true; "
+        f"stage={stage}; "
+        f"previous_snapshot={_index_snapshot_evidence(previous_content)}; "
+        f"published_snapshot={_index_snapshot_evidence(published_content)},"
+        f"device={published_version.device},inode={published_version.inode}; "
+        f"primary={type(primary_error).__name__}: {primary_error}; "
+        f"recovery={type(recovery_error).__name__}: {recovery_error}"
+    ) from recovery_error
+
+
 def _atomic_save_index_at(
     adapter_fd: int,
     index: AdapterIndex,
@@ -2552,7 +2601,7 @@ def _atomic_save_index_at(
     transaction_time: str | None = None,
     context: str = "adapter index update",
     commit_guard: Callable[[], None] | None = None,
-) -> IndexFileVersion:
+) -> IndexCommitReceipt:
     current = _read_index_bytes_at(adapter_fd)
     current_version = None if current is None else current[1]
     if current_version != expected_version:
@@ -2569,6 +2618,7 @@ def _atomic_save_index_at(
     temporary_fd: int | None = None
     temporary_visible = False
     replaced = False
+    replacement_attempted = False
     try:
         temporary_fd = os.open(
             temporary_name,
@@ -2607,6 +2657,15 @@ def _atomic_save_index_at(
             temporary_fd,
             label="adapter index temporary file",
         )
+        published_version = IndexFileVersion(
+            device=temporary_stat.st_dev,
+            inode=temporary_stat.st_ino,
+            uid=temporary_stat.st_uid,
+            gid=temporary_stat.st_gid,
+            mode=stat.S_IMODE(temporary_stat.st_mode),
+            size=temporary_stat.st_size,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
         current = _read_index_bytes_at(adapter_fd)
         current_version = None if current is None else current[1]
         if current_version != expected_version:
@@ -2616,52 +2675,76 @@ def _atomic_save_index_at(
                 commit_guard,
                 stage="pre-publication",
             )
-        os.replace(
-            temporary_name,
-            INDEX_FILE_NAME,
-            src_dir_fd=adapter_fd,
-            dst_dir_fd=adapter_fd,
-        )
-        temporary_visible = False
-        replaced = True
-        os.fsync(adapter_fd)
-        saved = _read_index_bytes_at(adapter_fd)
-        if (
-            saved is None
-            or saved[0] != content
-            or saved[1].uid != os.geteuid()
-            or saved[1].mode != INDEX_FILE_MODE
-        ):
-            raise RunSafetyError(
-                "adapter index atomic replacement could not be verified"
+        publication_stage = "atomic-replacement"
+        replacement_attempted = True
+        try:
+            os.replace(
+                temporary_name,
+                INDEX_FILE_NAME,
+                src_dir_fd=adapter_fd,
+                dst_dir_fd=adapter_fd,
             )
-        if commit_guard is not None:
-            try:
+            temporary_visible = False
+            replaced = True
+            publication_stage = "directory-fsync"
+            os.fsync(adapter_fd)
+            publication_stage = "published-readback"
+            saved = _read_index_bytes_at(adapter_fd)
+            if saved is None or saved[0] != content or saved[1] != published_version:
+                raise RunSafetyError(
+                    "adapter index atomic replacement could not be verified"
+                )
+            if commit_guard is not None:
+                publication_stage = "post-publication-guard"
                 _invoke_index_commit_guard(
                     commit_guard,
                     stage="post-publication",
                 )
-            except BaseException as guard_error:
-                try:
-                    _restore_index_after_failed_commit_guard(
+        except BaseException as publication_error:
+            try:
+                observed = _read_index_bytes_at(adapter_fd)
+                if _matches_index_snapshot(
+                    observed,
+                    content=previous_content,
+                    version=expected_version,
+                ):
+                    pass
+                elif _matches_index_snapshot(
+                    observed,
+                    content=content,
+                    version=published_version,
+                ):
+                    _restore_index_after_failed_publication(
                         adapter_fd,
                         previous_content=previous_content,
                         published_content=content,
-                        published_version=saved[1],
+                        published_version=published_version,
                     )
-                except BaseException as recovery_error:
+                else:
                     raise RunSafetyError(
-                        "adapter index post-publication guard failed and exact "
-                        "previous-index recovery could not be verified; manual "
-                        f"recovery is required (guard={guard_error}; "
-                        f"recovery={recovery_error})"
-                    ) from recovery_error
-                raise
-        return saved[1]
+                        "adapter index publication recovery cannot classify "
+                        "the visible index as the exact previous or published "
+                        "snapshot"
+                    )
+            except BaseException as recovery_error:
+                _raise_manual_index_recovery(
+                    stage=publication_stage,
+                    previous_content=previous_content,
+                    published_content=content,
+                    published_version=published_version,
+                    primary_error=publication_error,
+                    recovery_error=recovery_error,
+                )
+            raise
+        return IndexCommitReceipt(
+            previous_content=previous_content,
+            published_content=content,
+            published_version=published_version,
+        )
     except RunSafetyError:
         raise
     except OSError as error:
-        operation = "commit" if replaced else "prepare"
+        operation = "commit" if replacement_attempted or replaced else "prepare"
         raise RunSafetyError(
             f"adapter index atomic {operation} failed: {error}"
         ) from error
@@ -2708,7 +2791,7 @@ def _index_transaction(
         if write and _canonical_index_snapshot(index) != original_snapshot:
             _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
             _revalidate_index_lock(adapter_fd, lock_fd)
-            _atomic_save_index_at(
+            commit_receipt = _atomic_save_index_at(
                 adapter_fd,
                 index,
                 expected_version,
@@ -2716,8 +2799,35 @@ def _index_transaction(
                 context=context,
                 commit_guard=commit_guard,
             )
-            _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
-            _revalidate_index_lock(adapter_fd, lock_fd)
+            validation_stage = "final-directory-revalidation"
+            try:
+                _revalidate_index_directories(repo_fd, codex_tmp_fd, adapter_fd)
+                validation_stage = "final-lock-revalidation"
+                _revalidate_index_lock(adapter_fd, lock_fd)
+            except BaseException as validation_error:
+                try:
+                    _restore_index_after_failed_publication(
+                        adapter_fd,
+                        previous_content=commit_receipt.previous_content,
+                        published_content=commit_receipt.published_content,
+                        published_version=commit_receipt.published_version,
+                    )
+                    _revalidate_index_directories(
+                        repo_fd,
+                        codex_tmp_fd,
+                        adapter_fd,
+                    )
+                    _revalidate_index_lock(adapter_fd, lock_fd)
+                except BaseException as recovery_error:
+                    _raise_manual_index_recovery(
+                        stage=validation_stage,
+                        previous_content=commit_receipt.previous_content,
+                        published_content=commit_receipt.published_content,
+                        published_version=commit_receipt.published_version,
+                        primary_error=validation_error,
+                        recovery_error=recovery_error,
+                    )
+                raise
     finally:
         if lock_fd is not None:
             if locked:

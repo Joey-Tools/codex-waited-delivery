@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import ctypes
 import errno
@@ -2349,7 +2350,18 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         previous_errno = ctypes.get_errno()
         try:
             ctypes.set_errno(errno.EIO)
-            with mock.patch.object(module.ctypes, "CDLL", return_value=fake_libproc):
+            with (
+                mock.patch.object(
+                    module.ctypes,
+                    "CDLL",
+                    return_value=fake_libproc,
+                ),
+                mock.patch.object(
+                    module,
+                    "_waitable_sigchld_failure",
+                    return_value=None,
+                ),
+            ):
                 state = module._darwin_refresh_process_group_state(
                     pgid,
                     known_exited_leader_pid=pgid,
@@ -2411,7 +2423,18 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             proc_listpgrppids=FakeFunction(list_group),
             proc_pidinfo=FakeFunction(pid_info),
         )
-        with mock.patch.object(module.ctypes, "CDLL", return_value=fake_libproc):
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
+        ):
             self.assertEqual(
                 module._darwin_refresh_process_group_state(
                     pgid,
@@ -2472,7 +2495,18 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             proc_listpgrppids=FakeFunction(list_group),
             proc_pidinfo=FakeFunction(pid_info),
         )
-        with mock.patch.object(module.ctypes, "CDLL", return_value=fake_libproc):
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
+        ):
             self.assertEqual(
                 module._darwin_refresh_process_group_state(
                     pgid,
@@ -2507,7 +2541,18 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             proc_listpgrppids=FakeFunction(list_group),
             proc_pidinfo=pid_info,
         )
-        with mock.patch.object(module.ctypes, "CDLL", return_value=fake_libproc):
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
+        ):
             self.assertEqual(
                 module._darwin_refresh_process_group_state(
                     pgid,
@@ -2518,7 +2563,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             )
         pid_info.assert_not_called()
 
-    def test_darwin_refresh_scan_accepts_known_leader_esrch_fallback(self) -> None:
+    def test_darwin_refresh_scan_treats_known_leader_esrch_as_unknown(self) -> None:
         module = self._load_adapter_module()
         pgid = 739
 
@@ -2551,15 +2596,148 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             proc_listpgrppids=FakeFunction(list_group),
             proc_pidinfo=FakeFunction(pid_info),
         )
-        with mock.patch.object(module.ctypes, "CDLL", return_value=fake_libproc):
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
+        ):
             self.assertEqual(
                 module._darwin_refresh_process_group_state(
                     pgid,
                     known_exited_leader_pid=pgid,
                     max_entries=8,
                 ),
-                "zombie-only",
+                "unknown",
             )
+
+    def test_darwin_refresh_scan_latches_mid_scan_sigchld_fence_loss(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        pgid = 741
+        inspected: list[int] = []
+
+        class FakeFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(
+            _requested_pgid: int,
+            pid_array,
+            _buffer_size: int,
+        ) -> int:
+            pid_array[0] = pgid
+            pid_array[1] = pgid + 1
+            return 2
+
+        def pid_info(
+            pid: int,
+            _flavor: int,
+            _argument: int,
+            info_pointer,
+            info_size: int,
+        ) -> int:
+            inspected.append(pid)
+            info = ctypes.cast(
+                info_pointer,
+                ctypes.POINTER(module._DarwinProcBSDInfo),
+            ).contents
+            info.pbi_pid = pid
+            info.pbi_pgid = pgid
+            info.pbi_status = 5
+            return info_size
+
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeFunction(list_group),
+            proc_pidinfo=FakeFunction(pid_info),
+        )
+        waitability = mock.Mock(
+            side_effect=[
+                None,
+                None,
+                "transient SIGCHLD fence loss",
+                None,
+            ]
+        )
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            self.assertRaisesRegex(
+                module._ProcessIdentityLost,
+                "transient SIGCHLD fence loss",
+            ),
+        ):
+            module._darwin_refresh_process_group_state(
+                pgid,
+                known_exited_leader_pid=pgid,
+                max_entries=8,
+            )
+
+        self.assertEqual(inspected, [pgid])
+        self.assertEqual(waitability.call_count, 3)
+        self.assertIsNone(waitability())
+
+    def test_linux_refresh_scan_latches_mid_scan_sigchld_fence_loss(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        pgid = 743
+        proc_root = self.root / "proc-mid-scan-fence-loss"
+        self._write_proc_stat(
+            proc_root,
+            pid=743,
+            state="Z",
+            process_group=pgid,
+        )
+        self._write_proc_stat(
+            proc_root,
+            pid=744,
+            state="Z",
+            process_group=pgid,
+        )
+        waitability = mock.Mock(
+            side_effect=[
+                None,
+                "transient SIGCHLD fence loss",
+                None,
+            ]
+        )
+        with (
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            self.assertRaisesRegex(
+                module._ProcessIdentityLost,
+                "transient SIGCHLD fence loss",
+            ),
+        ):
+            module._linux_refresh_process_group_state(
+                pgid,
+                proc_root=proc_root,
+            )
+
+        self.assertEqual(waitability.call_count, 2)
+        self.assertIsNone(waitability())
 
     @unittest.skipUnless(sys.platform == "darwin", "requires Darwin libproc")
     def test_darwin_refresh_scan_observes_real_unreaped_zombie(self) -> None:
@@ -4071,7 +4249,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(cleared["status"], module.CLEANUP_COMPLETE_STATUS)
         self.assertEqual(cleared["preparation_id"], preparation_id)
 
-    def test_cleanup_tombstone_survives_each_final_commit_uncertainty(
+    def test_cleanup_transaction_restores_previous_snapshot_after_commit_uncertainty(
         self,
     ) -> None:
         cases = (
@@ -4141,12 +4319,15 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     )
                 elif case == "readback":
                     real_read = module._read_index_bytes_at
+                    raised = False
 
                     def fail_tombstone_readback(adapter_fd):
+                        nonlocal raised
                         result = real_read(adapter_fd)
-                        if result is not None:
+                        if not raised and result is not None:
                             durable = json.loads(result[0])["sessions"][session_id]
                             if durable["status"] == module.CLEANUP_COMPLETE_STATUS:
+                                raised = True
                                 raise module.RunSafetyError(
                                     "simulated cleanup tombstone readback failure"
                                 )
@@ -4192,7 +4373,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 ][session_id]
                 self.assertEqual(
                     durable["status"],
-                    module.CLEANUP_COMPLETE_STATUS,
+                    module.CLEANUP_PENDING_STATUS,
                 )
                 self.assertEqual(durable["run_dir"], reservation.run_dir)
                 self.assertEqual(durable["preparation_id"], preparation_id)
@@ -4257,8 +4438,16 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         tombstone = json.loads(self._index_path().read_text(encoding="utf-8"))[
             "sessions"
         ][session_id]
-        self.assertEqual(tombstone["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(tombstone["status"], module.CLEANUP_PENDING_STATUS)
         self.assertEqual(tombstone["run_dir"], reservation.run_dir)
+
+        with mock.patch.object(module.sys, "stdout", io.StringIO()):
+            self.assertEqual(module._recover_active_run(old_clear_args), 0)
+        completed = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(completed["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(completed["preparation_id"], old_preparation_id)
 
         new_preparation_id = "e2" * 16
         new_args = self._prepare_active_args(
@@ -7767,6 +7956,336 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 record = json.loads(index_before)["sessions"][session_id]
                 self.assertEqual(record["status"], "active")
                 self.assertEqual(record["run_dir"], str(run_dir))
+
+    def test_reconcile_restores_index_after_each_publication_fault(
+        self,
+    ) -> None:
+        cases = (
+            "directory-fsync",
+            "published-readback",
+            "final-directory-revalidation",
+            "final-lock-revalidation",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                session_id = f"session-reconcile-publication-{case}"
+                child_session_id = f"child-reconcile-publication-{case}"
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    f"reconcile-publication-{case}",
+                )
+                self._attach_child(
+                    run_dir,
+                    session_id,
+                    child_session_id,
+                )
+                module = self._load_adapter_module()
+                args = module._build_parser().parse_args(
+                    [
+                        "reconcile-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--run-dir",
+                        str(run_dir),
+                        "--child-status",
+                        "completed",
+                        "--child-session-id",
+                        child_session_id,
+                        "--session-id",
+                        session_id,
+                    ]
+                )
+                index_before = self._index_path().read_bytes()
+                injected = False
+                publication_returned = False
+                patchers: list[mock._patch] = []
+
+                if case == "directory-fsync":
+                    real_fsync = module.os.fsync
+
+                    def fail_directory_fsync(file_descriptor):
+                        nonlocal injected
+                        real_fsync(file_descriptor)
+                        if injected or not self._index_path().exists():
+                            return
+                        durable = json.loads(
+                            self._index_path().read_text(encoding="utf-8")
+                        )["sessions"][session_id]
+                        if durable["status"] == "completed":
+                            injected = True
+                            raise OSError(
+                                "simulated reconciliation directory fsync failure"
+                            )
+
+                    patchers.append(
+                        mock.patch.object(
+                            module.os,
+                            "fsync",
+                            side_effect=fail_directory_fsync,
+                        )
+                    )
+                elif case == "published-readback":
+                    real_read = module._read_index_bytes_at
+
+                    def fail_published_readback(adapter_fd):
+                        nonlocal injected
+                        result = real_read(adapter_fd)
+                        if not injected and result is not None:
+                            durable = json.loads(result[0])["sessions"][session_id]
+                            if durable["status"] == "completed":
+                                injected = True
+                                raise module.RunSafetyError(
+                                    "simulated reconciliation published readback "
+                                    "failure"
+                                )
+                        return result
+
+                    patchers.append(
+                        mock.patch.object(
+                            module,
+                            "_read_index_bytes_at",
+                            side_effect=fail_published_readback,
+                        )
+                    )
+                else:
+                    real_atomic_save = module._atomic_save_index_at
+
+                    def record_publication(*atomic_args, **atomic_kwargs):
+                        nonlocal publication_returned
+                        receipt = real_atomic_save(*atomic_args, **atomic_kwargs)
+                        publication_returned = True
+                        return receipt
+
+                    patchers.append(
+                        mock.patch.object(
+                            module,
+                            "_atomic_save_index_at",
+                            side_effect=record_publication,
+                        )
+                    )
+                    if case == "final-directory-revalidation":
+                        real_revalidate = module._revalidate_index_directories
+
+                        def fail_final_directory_revalidation(*revalidate_args):
+                            nonlocal injected
+                            real_revalidate(*revalidate_args)
+                            if publication_returned and not injected:
+                                injected = True
+                                raise module.RunSafetyError(
+                                    "simulated reconciliation final directory "
+                                    "revalidation failure"
+                                )
+
+                        patchers.append(
+                            mock.patch.object(
+                                module,
+                                "_revalidate_index_directories",
+                                side_effect=fail_final_directory_revalidation,
+                            )
+                        )
+                    else:
+                        real_revalidate = module._revalidate_index_lock
+
+                        def fail_final_lock_revalidation(*revalidate_args):
+                            nonlocal injected
+                            real_revalidate(*revalidate_args)
+                            if publication_returned and not injected:
+                                injected = True
+                                raise module.RunSafetyError(
+                                    "simulated reconciliation final lock "
+                                    "revalidation failure"
+                                )
+
+                        patchers.append(
+                            mock.patch.object(
+                                module,
+                                "_revalidate_index_lock",
+                                side_effect=fail_final_lock_revalidation,
+                            )
+                        )
+
+                stdout = io.StringIO()
+                with contextlib.ExitStack() as patches:
+                    patches.enter_context(
+                        mock.patch.object(
+                            module,
+                            "_run_bridge_json",
+                            side_effect=lambda *_args: (
+                                self._terminal_reconcile_payload(
+                                    run_dir,
+                                    child_session_id=child_session_id,
+                                )
+                            ),
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(module.sys, "stdout", stdout)
+                    )
+                    for patcher in patchers:
+                        patches.enter_context(patcher)
+                    with self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        "simulated reconciliation",
+                    ):
+                        module._reconcile_active_run(args)
+
+                self.assertTrue(injected)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(self._index_path().read_bytes(), index_before)
+                record = json.loads(index_before)["sessions"][session_id]
+                self.assertEqual(record["status"], "active")
+
+    def test_reconcile_reports_manual_recovery_when_restore_cannot_be_proved(
+        self,
+    ) -> None:
+        session_id = "session-reconcile-manual-recovery"
+        child_session_id = "child-reconcile-manual-recovery"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "reconcile-manual-recovery",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            child_session_id,
+        )
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                child_session_id,
+                "--session-id",
+                session_id,
+            ]
+        )
+        index_before = self._index_path().read_bytes()
+        previous_digest = hashlib.sha256(index_before).hexdigest()
+        real_fsync = module.os.fsync
+        injected = False
+
+        def fail_directory_fsync(file_descriptor):
+            nonlocal injected
+            real_fsync(file_descriptor)
+            if injected or not self._index_path().exists():
+                return
+            durable = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                "sessions"
+            ][session_id]
+            if durable["status"] == "completed":
+                injected = True
+                raise OSError("simulated reconciliation directory fsync failure")
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=lambda *_args: self._terminal_reconcile_payload(
+                    run_dir,
+                    child_session_id=child_session_id,
+                ),
+            ),
+            mock.patch.object(
+                module.os,
+                "fsync",
+                side_effect=fail_directory_fsync,
+            ),
+            mock.patch.object(
+                module,
+                "_restore_index_after_failed_publication",
+                side_effect=module.RunSafetyError("simulated recovery proof failure"),
+            ) as restore,
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaises(module.RunSafetyError) as raised,
+        ):
+            module._reconcile_active_run(args)
+
+        self.assertTrue(injected)
+        restore.assert_called_once()
+        self.assertEqual(stdout.getvalue(), "")
+        message = str(raised.exception)
+        self.assertIn("manual_recovery_required=true", message)
+        self.assertIn("stage=directory-fsync", message)
+        self.assertIn(f"sha256={previous_digest}", message)
+        self.assertIn("simulated recovery proof failure", message)
+        published = self._index_path().read_bytes()
+        self.assertIn(
+            f"sha256={hashlib.sha256(published).hexdigest()}",
+            message,
+        )
+        record = json.loads(published)["sessions"][session_id]
+        self.assertEqual(record["status"], "completed")
+
+    def test_index_recovery_requires_complete_published_recovery_version(
+        self,
+    ) -> None:
+        session_id = "session-recovery-version"
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        repo_fd = codex_tmp_fd = adapter_fd = None
+        try:
+            (
+                repo_fd,
+                codex_tmp_fd,
+                adapter_fd,
+            ) = module._open_index_directories(self.repo.resolve())
+            loaded = module._read_index_bytes_at(adapter_fd)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            previous_content, previous_version = loaded
+            index = module._decode_index(previous_content, self._index_path())
+            index["latest_session_id"] = None
+            receipt = module._atomic_save_index_at(
+                adapter_fd,
+                index,
+                previous_version,
+                context="recovery version test",
+            )
+            real_read = module._read_index_bytes_at
+
+            def report_replaced_recovery_identity(current_adapter_fd):
+                result = real_read(current_adapter_fd)
+                if result is not None and result[0] == previous_content:
+                    return (
+                        result[0],
+                        result[1]._replace(inode=result[1].inode + 1),
+                    )
+                return result
+
+            with (
+                mock.patch.object(
+                    module,
+                    "_read_index_bytes_at",
+                    side_effect=report_replaced_recovery_identity,
+                ),
+                self.assertRaisesRegex(
+                    module.RunSafetyError,
+                    "publication recovery could not be verified",
+                ),
+            ):
+                module._restore_index_after_failed_publication(
+                    adapter_fd,
+                    previous_content=receipt.previous_content,
+                    published_content=receipt.published_content,
+                    published_version=receipt.published_version,
+                )
+        finally:
+            for file_descriptor in (adapter_fd, codex_tmp_fd, repo_fd):
+                if file_descriptor is not None:
+                    os.close(file_descriptor)
+
+        self.assertEqual(self._index_path().read_bytes(), previous_content)
 
     def test_reconcile_run_lock_cleanup_preserves_primary_errors(self) -> None:
         module = self._load_adapter_module()

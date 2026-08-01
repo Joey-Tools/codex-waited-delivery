@@ -4425,10 +4425,17 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         previous_errno = module.ctypes.get_errno()
         try:
             module.ctypes.set_errno(errno.EPERM)
-            with mock.patch.object(
-                module.ctypes,
-                "CDLL",
-                return_value=fake_libproc,
+            with (
+                mock.patch.object(
+                    module.ctypes,
+                    "CDLL",
+                    return_value=fake_libproc,
+                ),
+                mock.patch.object(
+                    module,
+                    "_waitable_sigchld_failure",
+                    return_value=None,
+                ),
             ):
                 self.assertEqual(
                     module._darwin_process_group_state(
@@ -4490,10 +4497,17 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
             proc_listpgrppids=FakeCFunction(list_group),
             proc_pidinfo=FakeCFunction(pid_info),
         )
-        with mock.patch.object(
-            module.ctypes,
-            "CDLL",
-            return_value=fake_libproc,
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
         ):
             self.assertEqual(
                 module._darwin_process_group_state(
@@ -4558,10 +4572,17 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         previous_errno = module.ctypes.get_errno()
         try:
             module.ctypes.set_errno(errno.ENOENT)
-            with mock.patch.object(
-                module.ctypes,
-                "CDLL",
-                return_value=permission_libproc,
+            with (
+                mock.patch.object(
+                    module.ctypes,
+                    "CDLL",
+                    return_value=permission_libproc,
+                ),
+                mock.patch.object(
+                    module,
+                    "_waitable_sigchld_failure",
+                    return_value=None,
+                ),
             ):
                 self.assertEqual(
                     module._darwin_process_group_state(
@@ -4574,15 +4595,59 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         finally:
             module.ctypes.set_errno(previous_errno)
 
+        def leader_missing(
+            _pid: int,
+            flavor: int,
+            arg: int,
+            _info_pointer,
+            _info_size: int,
+        ) -> int:
+            self.assertEqual(module.ctypes.get_errno(), 0)
+            self.assertEqual((flavor, arg), (3, 1))
+            module.ctypes.set_errno(errno.ESRCH)
+            return 0
+
+        missing_libproc = mock.Mock(
+            proc_listpgrppids=FakeCFunction(one_pid),
+            proc_pidinfo=FakeCFunction(leader_missing),
+        )
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=missing_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
+        ):
+            self.assertEqual(
+                module._darwin_process_group_state(
+                    728,
+                    known_exited_leader_pid=728,
+                    max_entries=8,
+                ),
+                "unknown",
+            )
+
         pid_info = mock.Mock()
         full_libproc = mock.Mock(
             proc_listpgrppids=FakeCFunction(lambda _pgid, _pid_array, _buffer_size: 2),
             proc_pidinfo=FakeCFunction(pid_info),
         )
-        with mock.patch.object(
-            module.ctypes,
-            "CDLL",
-            return_value=full_libproc,
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=full_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
         ):
             self.assertEqual(
                 module._darwin_process_group_state(
@@ -4593,6 +4658,120 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 "unknown",
             )
         pid_info.assert_not_called()
+
+    def test_darwin_group_scan_latches_mid_scan_sigchld_fence_loss(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        pgid = 734
+        inspected: list[int] = []
+
+        class FakeCFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(_pgid: int, pid_array, _buffer_size: int) -> int:
+            pid_array[0] = pgid
+            pid_array[1] = pgid + 1
+            return 2
+
+        def pid_info(
+            pid: int,
+            _flavor: int,
+            _arg: int,
+            info_pointer,
+            info_size: int,
+        ) -> int:
+            inspected.append(pid)
+            info = module.ctypes.cast(
+                info_pointer,
+                module.ctypes.POINTER(module._DarwinProcBSDInfo),
+            ).contents
+            info.pbi_pid = pid
+            info.pbi_pgid = pgid
+            info.pbi_status = 5
+            return info_size
+
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeCFunction(list_group),
+            proc_pidinfo=FakeCFunction(pid_info),
+        )
+        waitability = mock.Mock(
+            side_effect=[
+                None,
+                None,
+                "transient SIGCHLD fence loss",
+                None,
+            ]
+        )
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            self.assertRaisesRegex(
+                module._ProcessIdentityLost,
+                "transient SIGCHLD fence loss",
+            ),
+        ):
+            module._darwin_process_group_state(
+                pgid,
+                known_exited_leader_pid=pgid,
+                max_entries=8,
+            )
+
+        self.assertEqual(inspected, [pgid])
+        self.assertEqual(waitability.call_count, 3)
+        self.assertIsNone(waitability())
+
+    def test_linux_group_scan_latches_mid_scan_sigchld_fence_loss(
+        self,
+    ) -> None:
+        module = self._load_runner_module()
+        pgid = 736
+        proc_root = self.root / "proc-mid-scan-fence-loss"
+        for pid in (736, 737):
+            process_dir = proc_root / str(pid)
+            process_dir.mkdir(parents=True)
+            (process_dir / "stat").write_bytes(
+                f"{pid} (fixture) Z 1 {pgid} 1 0\n".encode()
+            )
+        waitability = mock.Mock(
+            side_effect=[
+                None,
+                "transient SIGCHLD fence loss",
+                None,
+            ]
+        )
+        with (
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            self.assertRaisesRegex(
+                module._ProcessIdentityLost,
+                "transient SIGCHLD fence loss",
+            ),
+        ):
+            module._linux_process_group_state(
+                pgid,
+                proc_root=proc_root,
+            )
+
+        self.assertEqual(waitability.call_count, 2)
+        self.assertIsNone(waitability())
 
     def test_darwin_group_scan_honors_and_receives_absolute_deadline(self) -> None:
         module = self._load_runner_module()

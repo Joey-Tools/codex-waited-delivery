@@ -731,8 +731,12 @@ def _darwin_process_group_state_impl(
         ]
         pid_info.restype = ctypes.c_int
         pid_array = (ctypes.c_int * max_entries)()
-        if time.monotonic() >= deadline:
-            return "unknown"
+    except (AttributeError, OSError, ValueError):
+        return "unknown"
+    if time.monotonic() >= deadline:
+        return "unknown"
+    _require_waitable_sigchld_semantics(after_spawn=True)
+    try:
         ctypes.set_errno(0)
         count = list_group(pgid, pid_array, ctypes.sizeof(pid_array))
         if time.monotonic() >= deadline:
@@ -750,6 +754,7 @@ def _darwin_process_group_state_impl(
         if pid <= 0:
             return "unknown"
         info = _DarwinProcBSDInfo()
+        _require_waitable_sigchld_semantics(after_spawn=True)
         try:
             ctypes.set_errno(0)
             size = pid_info(
@@ -764,15 +769,6 @@ def _darwin_process_group_state_impl(
         except (OSError, ValueError):
             return "unknown"
         if size == 0:
-            process_error = ctypes.get_errno()
-            if (
-                process_error == errno.ESRCH
-                and known_exited_leader_pid is not None
-                and pid == known_exited_leader_pid
-                and pid == pgid
-            ):
-                saw_zombie = True
-                continue
             return "unknown"
         if size != ctypes.sizeof(info) or info.pbi_pid != pid or info.pbi_pgid != pgid:
             return "unknown"
@@ -850,6 +846,7 @@ def _linux_process_group_state(
                     return "unknown"
                 if not entry.name.isdecimal():
                     continue
+                _require_waitable_sigchld_semantics(after_spawn=True)
                 try:
                     raw = (pathlib.Path(entry.path) / "stat").read_bytes()
                 except FileNotFoundError:
@@ -864,6 +861,8 @@ def _linux_process_group_state(
                 if state != "Z":
                     return "live"
                 saw_zombie = True
+    except _ProcessIdentityLost:
+        raise
     except OSError:
         return "unknown"
     if saw_zombie:

@@ -94,10 +94,17 @@ class SubprocessTestSupportTests(unittest.TestCase):
             proc_listpgrppids = _FakeCFunction(list_group)
             proc_pidinfo = _FakeCFunction(pid_info)
 
-        with mock.patch.object(
-            support.ctypes,
-            "CDLL",
-            return_value=FakeLibproc(),
+        with (
+            mock.patch.object(
+                support.ctypes,
+                "CDLL",
+                return_value=FakeLibproc(),
+            ),
+            mock.patch.object(
+                support,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
         ):
             self.assertEqual(
                 support._darwin_process_group_state(
@@ -138,10 +145,17 @@ class SubprocessTestSupportTests(unittest.TestCase):
             proc_listpgrppids = _FakeCFunction(list_group)
             proc_pidinfo = _FakeCFunction(pid_info)
 
-        with mock.patch.object(
-            support.ctypes,
-            "CDLL",
-            return_value=FakeLibproc(),
+        with (
+            mock.patch.object(
+                support.ctypes,
+                "CDLL",
+                return_value=FakeLibproc(),
+            ),
+            mock.patch.object(
+                support,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
         ):
             self.assertEqual(
                 support._darwin_process_group_state(
@@ -183,10 +197,17 @@ class SubprocessTestSupportTests(unittest.TestCase):
                 lambda *_args: self.fail("pid info must not run")
             )
 
-        with mock.patch.object(
-            support.ctypes,
-            "CDLL",
-            return_value=ListDeniedLibproc(),
+        with (
+            mock.patch.object(
+                support.ctypes,
+                "CDLL",
+                return_value=ListDeniedLibproc(),
+            ),
+            mock.patch.object(
+                support,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
         ):
             self.assertEqual(
                 support._darwin_process_group_state(
@@ -209,10 +230,17 @@ class SubprocessTestSupportTests(unittest.TestCase):
             proc_listpgrppids = _FakeCFunction(list_leader)
             proc_pidinfo = _FakeCFunction(pid_info_denied)
 
-        with mock.patch.object(
-            support.ctypes,
-            "CDLL",
-            return_value=PidInfoDeniedLibproc(),
+        with (
+            mock.patch.object(
+                support.ctypes,
+                "CDLL",
+                return_value=PidInfoDeniedLibproc(),
+            ),
+            mock.patch.object(
+                support,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
         ):
             self.assertEqual(
                 support._darwin_process_group_state(
@@ -223,7 +251,7 @@ class SubprocessTestSupportTests(unittest.TestCase):
                 "unknown",
             )
 
-    def test_darwin_proc_scan_uses_only_known_leader_esrch_as_zombie(
+    def test_darwin_proc_scan_treats_every_esrch_as_unknown(
         self,
     ) -> None:
         process_group = 821
@@ -241,10 +269,17 @@ class SubprocessTestSupportTests(unittest.TestCase):
             proc_listpgrppids = _FakeCFunction(list_leader)
             proc_pidinfo = _FakeCFunction(missing_pid)
 
-        with mock.patch.object(
-            support.ctypes,
-            "CDLL",
-            return_value=MissingLeaderLibproc(),
+        with (
+            mock.patch.object(
+                support.ctypes,
+                "CDLL",
+                return_value=MissingLeaderLibproc(),
+            ),
+            mock.patch.object(
+                support,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
         ):
             self.assertEqual(
                 support._darwin_process_group_state(
@@ -259,7 +294,7 @@ class SubprocessTestSupportTests(unittest.TestCase):
                     known_exited_leader_pid=process_group,
                     max_entries=8,
                 ),
-                "zombie-only",
+                "unknown",
             )
 
         def list_descendant(_pgid, pid_array, _buffer_size):
@@ -270,10 +305,17 @@ class SubprocessTestSupportTests(unittest.TestCase):
             proc_listpgrppids = _FakeCFunction(list_descendant)
             proc_pidinfo = _FakeCFunction(missing_pid)
 
-        with mock.patch.object(
-            support.ctypes,
-            "CDLL",
-            return_value=MissingDescendantLibproc(),
+        with (
+            mock.patch.object(
+                support.ctypes,
+                "CDLL",
+                return_value=MissingDescendantLibproc(),
+            ),
+            mock.patch.object(
+                support,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
         ):
             self.assertEqual(
                 support._darwin_process_group_state(
@@ -283,6 +325,109 @@ class SubprocessTestSupportTests(unittest.TestCase):
                 ),
                 "unknown",
             )
+
+    def test_darwin_proc_scan_latches_mid_scan_sigchld_fence_loss(
+        self,
+    ) -> None:
+        process_group = 824
+        inspected: list[int] = []
+
+        def list_group(_pgid, pid_array, _buffer_size):
+            pid_array[0] = process_group
+            pid_array[1] = process_group + 1
+            return 2
+
+        def pid_info(pid, _flavor, _argument, info_pointer, info_size):
+            inspected.append(pid)
+            info = ctypes.cast(
+                info_pointer,
+                ctypes.POINTER(support._DarwinProcBSDInfo),
+            ).contents
+            info.pbi_pid = pid
+            info.pbi_pgid = process_group
+            info.pbi_status = 5
+            return info_size
+
+        class FakeLibproc:
+            proc_listpgrppids = _FakeCFunction(list_group)
+            proc_pidinfo = _FakeCFunction(pid_info)
+
+        waitability = mock.Mock(
+            side_effect=[
+                None,
+                None,
+                "transient SIGCHLD fence loss",
+                None,
+            ]
+        )
+        with (
+            mock.patch.object(
+                support.ctypes,
+                "CDLL",
+                return_value=FakeLibproc(),
+            ),
+            mock.patch.object(
+                support,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            self.assertRaisesRegex(
+                support._ProcessIdentityLost,
+                "transient SIGCHLD fence loss",
+            ),
+        ):
+            support._darwin_process_group_state(
+                process_group,
+                known_exited_leader_pid=process_group,
+                max_entries=8,
+            )
+
+        self.assertEqual(inspected, [process_group])
+        self.assertEqual(waitability.call_count, 3)
+        self.assertIsNone(waitability())
+
+    def test_linux_proc_scan_latches_mid_scan_sigchld_fence_loss(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_root = Path(temp_dir)
+            self._write_proc_stat(
+                proc_root,
+                pid=825,
+                state="Z",
+                process_group=824,
+            )
+            self._write_proc_stat(
+                proc_root,
+                pid=826,
+                state="Z",
+                process_group=824,
+            )
+            waitability = mock.Mock(
+                side_effect=[
+                    None,
+                    "transient SIGCHLD fence loss",
+                    None,
+                ]
+            )
+            with (
+                mock.patch.object(
+                    support,
+                    "_waitable_sigchld_failure",
+                    waitability,
+                ),
+                self.assertRaisesRegex(
+                    support._ProcessIdentityLost,
+                    "transient SIGCHLD fence loss",
+                ),
+            ):
+                support._linux_process_group_state(
+                    824,
+                    proc_root=proc_root,
+                )
+
+        self.assertEqual(waitability.call_count, 2)
+        self.assertIsNone(waitability())
 
     def test_darwin_proc_scan_treats_full_pid_buffer_as_unknown(self) -> None:
         process_group = 831
@@ -300,10 +445,17 @@ class SubprocessTestSupportTests(unittest.TestCase):
             proc_listpgrppids = _FakeCFunction(full_group)
             proc_pidinfo = pid_info
 
-        with mock.patch.object(
-            support.ctypes,
-            "CDLL",
-            return_value=FullGroupLibproc(),
+        with (
+            mock.patch.object(
+                support.ctypes,
+                "CDLL",
+                return_value=FullGroupLibproc(),
+            ),
+            mock.patch.object(
+                support,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
         ):
             self.assertEqual(
                 support._darwin_process_group_state(
@@ -339,6 +491,11 @@ class SubprocessTestSupportTests(unittest.TestCase):
                 support.time,
                 "monotonic",
                 side_effect=[0.0, 0.0, 2.0],
+            ),
+            mock.patch.object(
+                support,
+                "_waitable_sigchld_failure",
+                return_value=None,
             ),
         ):
             self.assertEqual(
