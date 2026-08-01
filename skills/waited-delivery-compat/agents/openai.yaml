@@ -1,0 +1,7 @@
+interface:
+  display_name: "Waited Delivery Compatibility"
+  short_description: "Explicit-only waited-delivery compatibility tooling"
+  default_prompt: "Use $waited-delivery-compat to inspect or recover a historical waited-delivery run without enabling hooks by default."
+
+policy:
+  allow_implicit_invocation: false

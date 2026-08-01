@@ -1,0 +1,9048 @@
+"""Compatibility tests for the historical waited-delivery hook adapter."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import copy
+import ctypes
+import errno
+import fcntl
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import pathlib
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import unittest
+import uuid
+import zlib
+from collections.abc import Mapping
+from unittest import mock
+
+from _subprocess_test_support import (
+    run_before_stdin_eof,
+    run_native_no_cldwait_preflight_probe,
+)
+
+
+ADAPTER_PATH = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "waited_delivery_hook_adapter.py"
+)
+BRIDGE_PATH = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "waited_delivery_bridge.py"
+)
+RUNNER_PATH = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "waited_delivery_runner.py"
+)
+SCHEMA_V2_CLIENT_PATH = (
+    pathlib.Path(__file__).resolve().parent / "fixtures" / "adapter_index_v2_client.py"
+)
+
+
+def run(
+    cmd: list[str],
+    *,
+    cwd: pathlib.Path | None = None,
+    env: dict[str, str] | None = None,
+    input_text: str | None = None,
+    umask: int = -1,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        text=True,
+        input=input_text,
+        capture_output=True,
+        check=False,
+        umask=umask,
+    )
+
+
+def git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", str(repo), *args])
+
+
+def git_commit(repo: pathlib.Path, message: str) -> None:
+    completed = run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            message,
+        ]
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr)
+
+
+class WaitedDeliveryHookAdapterTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory(prefix="waited-delivery-hook-")
+        self.root = pathlib.Path(self.tempdir.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.assertEqual(git(self.repo, "init").returncode, 0)
+        (self.repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        self.assertEqual(git(self.repo, "add", "tracked.txt").returncode, 0)
+        git_commit(self.repo, "init")
+        (self.repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+        self.fake_helper = self.root / "fake_external_helper.py"
+        self.fake_helper.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                print("READY")
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.fake_helper.chmod(0o755)
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def _run_adapter(
+        self,
+        *args: str,
+        input_payload: dict[str, object] | None = None,
+        env_overrides: Mapping[str, str | None] | None = None,
+        umask: int = -1,
+    ) -> subprocess.CompletedProcess[str]:
+        input_text = None
+        if input_payload is not None:
+            input_text = json.dumps(input_payload)
+        env = os.environ.copy()
+        env.pop("CODEX_THREAD_ID", None)
+        if env_overrides:
+            for key, value in env_overrides.items():
+                if value is None:
+                    env.pop(key, None)
+                else:
+                    env[key] = value
+        adapter_args = list(args)
+        if adapter_args and adapter_args[0] in {
+            "user-prompt-submit-hook",
+            "stop-hook",
+        }:
+            adapter_args.insert(1, "--enable-compat-hook")
+        return run(
+            [sys.executable, str(ADAPTER_PATH), *adapter_args],
+            env=env,
+            input_text=input_text,
+            umask=umask,
+        )
+
+    def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return run([sys.executable, str(RUNNER_PATH), *args])
+
+    def _commit_implementation(self) -> None:
+        self.assertEqual(git(self.repo, "add", "tracked.txt").returncode, 0)
+        git_commit(self.repo, "freeze implementation")
+
+    def _attach_child(
+        self,
+        run_dir: str | pathlib.Path,
+        session_id: str,
+        child_session_id: str,
+    ) -> None:
+        completed = self._run_adapter(
+            "attach-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            str(run_dir),
+            "--child-session-id",
+            child_session_id,
+            "--session-id",
+            session_id,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def _finish_child(
+        self, run_dir: str, session_id: str, child_session_id: str
+    ) -> None:
+        completed = self._run_adapter(
+            "finish-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dir,
+            "--child-status",
+            "completed",
+            "--child-session-id",
+            child_session_id,
+            "--session-id",
+            session_id,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        record = index["sessions"][session_id]
+        self.assertEqual(record["status"], "active")
+        self.assertEqual(record["run_dir"], run_dir)
+
+    def test_terminal_commands_require_child_session_id(self) -> None:
+        for command in ("finish-child-active-run", "reconcile-active-run"):
+            with self.subTest(command=command):
+                completed = self._run_adapter(
+                    command,
+                    "--repo",
+                    str(self.repo),
+                    "--run-dir",
+                    "/tmp/waited-delivery-run",
+                    "--child-status",
+                    "completed",
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("--child-session-id", completed.stderr)
+
+    def _session_payload(
+        self,
+        *,
+        session_id: str = "session-1",
+        prompt: str = "Please use waited delivery",
+        transcript_path: str = "/tmp/transcript-1.jsonl",
+        permission_mode: str = "acceptEdits",
+    ) -> dict[str, object]:
+        return {
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "cwd": str(self.repo),
+            "hook_event_name": "UserPromptSubmit",
+            "model": "gpt-5.5",
+            "permission_mode": permission_mode,
+            "prompt": prompt,
+        }
+
+    def _index_path(self) -> pathlib.Path:
+        return self.repo / ".codex-tmp" / "waited-delivery-hook-adapter" / "index.json"
+
+    def _prepare_indexed_run(self, session_id: str, run_id: str) -> pathlib.Path:
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                transcript_path=f"/tmp/{session_id}.jsonl",
+            ),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        prepared = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            f"Prepare {session_id}",
+            "--session-id",
+            session_id,
+            "--run-id",
+            run_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        return pathlib.Path(json.loads(prepared.stdout)["run_dir"])
+
+    def _prepare_active_args(
+        self,
+        module,
+        *,
+        session_id: str,
+        run_id: str,
+    ) -> argparse.Namespace:
+        return module._build_parser().parse_args(
+            [
+                "prepare-active-run",
+                "--repo",
+                str(self.repo),
+                "--goal",
+                f"Prepare {session_id}",
+                "--session-id",
+                session_id,
+                "--run-id",
+                run_id,
+                "--external-helper",
+                str(self.fake_helper),
+                "--no-fallback-smoke",
+            ]
+        )
+
+    def _seed_interrupted_preparation(
+        self,
+        module,
+        *,
+        session_id: str,
+        run_id: str,
+        preparation_id: str,
+    ):
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=KeyboardInterrupt,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            module._prepare_active_run(args)
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "preparing")
+        return module._reservation_from_record(record)
+
+    def _seed_cleanup_pending_without_lease(
+        self,
+        module,
+        *,
+        session_id: str,
+        run_id: str,
+        preparation_id: str,
+    ):
+        reservation = self._seed_interrupted_preparation(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+            preparation_id=preparation_id,
+        )
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        pending = module._cas_preparation_cleanup_pending(
+            self.repo.resolve(),
+            reservation,
+            expected_record=record,
+            reason="test cleanup pending before lease unlink",
+        )
+        lease_fd = module._acquire_preparation_lease(
+            self.repo.resolve(),
+            reservation,
+        )
+        try:
+            module._remove_preparation_lease(
+                self.repo.resolve(),
+                reservation,
+                lease_fd,
+            )
+        finally:
+            os.close(lease_fd)
+        self.assertFalse(pathlib.Path(reservation.lease_path).exists())
+        return reservation, pending
+
+    def _stop_payload_for(self, session_id: str) -> dict[str, object]:
+        return {
+            "session_id": session_id,
+            "transcript_path": f"/tmp/{session_id}.jsonl",
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "unsafe run probe",
+        }
+
+    def _home_log_dir(self, home: pathlib.Path) -> pathlib.Path:
+        return home / ".codex" / "log"
+
+    def _load_adapter_module(self, adapter_path: pathlib.Path = ADAPTER_PATH):
+        spec = importlib.util.spec_from_file_location(
+            "waited_delivery_hook_adapter_test_module", adapter_path
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("failed to load waited_delivery_hook_adapter module")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _private_launch_sources(
+        self,
+        label: str,
+    ) -> tuple[pathlib.Path, pathlib.Path]:
+        source_dir = self.root / f"launch-sources-{label}"
+        source_dir.mkdir()
+        bridge_path = source_dir / BRIDGE_PATH.name
+        runner_path = source_dir / RUNNER_PATH.name
+        shutil.copy2(BRIDGE_PATH, bridge_path)
+        shutil.copy2(RUNNER_PATH, runner_path)
+        return bridge_path.resolve(), runner_path.resolve()
+
+    def _run_identity(self, module, run_dir: pathlib.Path):
+        run_stat = run_dir.stat()
+        return module.RunDirectoryIdentity(
+            device=run_stat.st_dev,
+            inode=run_stat.st_ino,
+            uid=run_stat.st_uid,
+            gid=run_stat.st_gid,
+            mode=run_stat.st_mode & 0o7777,
+        )
+
+    def _write_proc_stat(
+        self,
+        proc_root: pathlib.Path,
+        *,
+        pid: int,
+        state: str,
+        process_group: int,
+    ) -> None:
+        process_dir = proc_root / str(pid)
+        process_dir.mkdir(parents=True)
+        (process_dir / "stat").write_text(
+            f"{pid} (fixture ) name) {state} 1 {process_group} 1 0\n",
+            encoding="utf-8",
+        )
+
+    def _write_terminal_run_state(
+        self,
+        run_dir: pathlib.Path,
+        *,
+        child_session_id: str,
+        child_status: str = "completed",
+    ) -> dict[str, object]:
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["overall_status"] = "passed"
+        state["orchestration"]["child_status"] = child_status
+        state["orchestration"]["child_session_id"] = child_session_id
+        for phase in state["phases"].values():
+            phase["status"] = "passed"
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return state
+
+    def _artifact_version_payload(self, path: pathlib.Path) -> dict[str, object]:
+        content = path.read_bytes()
+        file_stat = path.stat()
+        return {
+            "device": file_stat.st_dev,
+            "inode": file_stat.st_ino,
+            "uid": file_stat.st_uid,
+            "gid": file_stat.st_gid,
+            "mode": file_stat.st_mode & 0o7777,
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+
+    def _run_identity_payload(self, run_dir: pathlib.Path) -> dict[str, object]:
+        run_stat = run_dir.stat()
+        return {
+            "run_dev": run_stat.st_dev,
+            "run_ino": run_stat.st_ino,
+            "run_uid": run_stat.st_uid,
+            "run_gid": run_stat.st_gid,
+            "run_mode": run_stat.st_mode & 0o7777,
+        }
+
+    def _probe_exclusive_lock(
+        self,
+        lock_path: pathlib.Path,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl, os, sys\n"
+                    "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+                    "try:\n"
+                    "    try:\n"
+                    "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                    "    except BlockingIOError:\n"
+                    "        raise SystemExit(75)\n"
+                    "    fcntl.flock(fd, fcntl.LOCK_UN)\n"
+                    "finally:\n"
+                    "    os.close(fd)\n"
+                ),
+                str(lock_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _terminal_reconcile_payload(
+        self,
+        run_dir: pathlib.Path,
+        *,
+        child_session_id: str,
+        child_status: str = "completed",
+    ) -> dict[str, object]:
+        state_path = run_dir / "state.json"
+        previous_state_version = self._artifact_version_payload(state_path)
+        state = self._write_terminal_run_state(
+            run_dir,
+            child_session_id=child_session_id,
+            child_status=child_status,
+        )
+        return {
+            "overall_status": state["overall_status"],
+            "child_status": state["orchestration"]["child_status"],
+            "child_session_id": state["orchestration"]["child_session_id"],
+            "previous_state_version": previous_state_version,
+            "state_version": self._artifact_version_payload(state_path),
+            **self._run_identity_payload(run_dir),
+        }
+
+    def test_hook_commands_are_inert_without_explicit_compatibility_flag(
+        self,
+    ) -> None:
+        fake_home = self.root / "home-default-inert"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        index_path = adapter_dir / "index.json"
+        index_path.write_text("{legacy invalid json\n", encoding="utf-8")
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+        env.pop("CODEX_THREAD_ID", None)
+
+        payloads = {
+            "user-prompt-submit-hook": self._session_payload(
+                prompt="sensitive compatibility prompt"
+            ),
+            "stop-hook": {
+                "session_id": "session-1",
+                "cwd": str(self.repo),
+                "last_assistant_message": "sensitive compatibility response",
+            },
+        }
+        for command, payload in payloads.items():
+            with self.subTest(command=command):
+                completed = run(
+                    [sys.executable, str(ADAPTER_PATH), command],
+                    env=env,
+                    input_text=json.dumps(payload),
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout.strip(), "{}")
+                self.assertEqual(completed.stderr, "")
+
+        self.assertEqual(
+            index_path.read_text(encoding="utf-8"),
+            "{legacy invalid json\n",
+        )
+        self.assertFalse((fake_home / ".codex" / "log").exists())
+
+    def test_hook_commands_without_exact_flag_exit_before_stdin_eof(self) -> None:
+        fake_home = self.root / "home-open-stdin"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        index_path = adapter_dir / "index.json"
+        sentinel = "{legacy invalid json\n"
+        index_path.write_text(sentinel, encoding="utf-8")
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env.pop("CODEX_THREAD_ID", None)
+
+        for command in ("user-prompt-submit-hook", "stop-hook"):
+            with self.subTest(command=command):
+                completed = run_before_stdin_eof(
+                    [sys.executable, str(ADAPTER_PATH), command],
+                    cwd=self.repo,
+                    env=env,
+                    # Keep the writer open with zero bytes so even read(1) blocks.
+                    input_text="",
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout, "{}\n")
+                self.assertEqual(completed.stderr, "")
+
+        self.assertEqual(index_path.read_text(encoding="utf-8"), sentinel)
+        self.assertFalse((fake_home / ".codex" / "log").exists())
+
+    def test_hook_commands_without_exact_flag_are_inert_before_argparse(
+        self,
+    ) -> None:
+        fake_home = self.root / "home-abbreviated-flag"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        index_path = adapter_dir / "index.json"
+        sentinel = "{legacy invalid json\n"
+        index_path.write_text(sentinel, encoding="utf-8")
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+        env.pop("CODEX_THREAD_ID", None)
+
+        cases = (
+            (
+                ("user-prompt-submit-hook", "--enable"),
+                self._session_payload(
+                    prompt="abbreviated flag must not read this prompt"
+                ),
+            ),
+            (
+                ("stop-hook", "--unknown"),
+                {
+                    "session_id": "session-unknown",
+                    "cwd": str(self.repo),
+                    "last_assistant_message": (
+                        "unknown flag must not read this response"
+                    ),
+                },
+            ),
+            (
+                ("user-prompt-submit-hook", "--repo"),
+                self._session_payload(prompt="missing value must not read this prompt"),
+            ),
+            (
+                ("stop-hook", "--enable-compat-hook=true"),
+                {
+                    "session_id": "session-malformed",
+                    "cwd": str(self.repo),
+                    "last_assistant_message": (
+                        "malformed flag must not read this response"
+                    ),
+                },
+            ),
+            (
+                ("--enable", "stop-hook"),
+                {
+                    "session_id": "session-reordered",
+                    "cwd": str(self.repo),
+                    "last_assistant_message": (
+                        "reordered flag must not read this response"
+                    ),
+                },
+            ),
+            (
+                ("stop-hook", "--help"),
+                {
+                    "session_id": "session-help",
+                    "cwd": str(self.repo),
+                    "last_assistant_message": ("help flag must not read this response"),
+                },
+            ),
+            (
+                ("--help", "user-prompt-submit-hook"),
+                self._session_payload(
+                    prompt="reordered help must not read this prompt"
+                ),
+            ),
+        )
+        for args, payload in cases:
+            with self.subTest(args=args):
+                completed = run(
+                    [
+                        sys.executable,
+                        str(ADAPTER_PATH),
+                        *args,
+                    ],
+                    env=env,
+                    input_text=json.dumps(payload),
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout.strip(), "{}")
+                self.assertEqual(completed.stderr, "")
+                self.assertNotIn("must not read", completed.stderr)
+
+        self.assertEqual(index_path.read_text(encoding="utf-8"), sentinel)
+        self.assertFalse((fake_home / ".codex" / "log").exists())
+
+    def test_exact_flag_parse_errors_fail_open_without_running_hooks(self) -> None:
+        fake_home = self.root / "home-exact-malformed"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        index_path = adapter_dir / "index.json"
+        sentinel = "{legacy invalid json\n"
+        index_path.write_text(sentinel, encoding="utf-8")
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+
+        cases = (
+            (
+                "stop-hook",
+                "--enable-compat-hook",
+                "--unknown",
+            ),
+            (
+                "user-prompt-submit-hook",
+                "--enable-compat-hook",
+                "--repo",
+            ),
+            (
+                "--enable-compat-hook",
+                "stop-hook",
+            ),
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                completed = run(
+                    [sys.executable, str(ADAPTER_PATH), *args],
+                    env=env,
+                    input_text=json.dumps(
+                        {
+                            "session_id": "session-exact-malformed",
+                            "cwd": str(self.repo),
+                            "last_assistant_message": (
+                                "parse errors must not run the hook"
+                            ),
+                        }
+                    ),
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout.strip(), "{}")
+                self.assertIn("error:", completed.stderr)
+
+        self.assertEqual(index_path.read_text(encoding="utf-8"), sentinel)
+        self.assertFalse((fake_home / ".codex" / "log").exists())
+
+    def test_hook_and_non_hook_help_default_interactions(self) -> None:
+        exact_hook_help = run(
+            [
+                sys.executable,
+                str(ADAPTER_PATH),
+                "stop-hook",
+                "--enable-compat-hook",
+                "--help",
+            ],
+            input_text="help must not read stdin",
+        )
+        self.assertEqual(exact_hook_help.returncode, 0, exact_hook_help.stderr)
+        self.assertIn("--enable-compat-hook", exact_hook_help.stdout)
+        self.assertNotEqual(exact_hook_help.stdout.strip(), "{}")
+
+        top_level_help = run(
+            [sys.executable, str(ADAPTER_PATH), "--help"],
+        )
+        self.assertEqual(top_level_help.returncode, 0, top_level_help.stderr)
+        self.assertIn("prepare-active-run", top_level_help.stdout)
+        self.assertNotEqual(top_level_help.stdout.strip(), "{}")
+
+        no_command = run([sys.executable, str(ADAPTER_PATH)])
+        self.assertEqual(no_command.returncode, 2)
+        self.assertIn(
+            "the following arguments are required: command",
+            no_command.stderr,
+        )
+
+        non_hook_error = run(
+            [
+                sys.executable,
+                str(ADAPTER_PATH),
+                "show-index",
+                "--unknown",
+            ],
+        )
+        self.assertEqual(non_hook_error.returncode, 2)
+        self.assertIn("error:", non_hook_error.stderr)
+
+    def test_exact_compatibility_flag_activates_hook_commands(self) -> None:
+        submit = run(
+            [
+                sys.executable,
+                str(ADAPTER_PATH),
+                "user-prompt-submit-hook",
+                "--enable-compat-hook",
+            ],
+            input_text=json.dumps(
+                self._session_payload(
+                    session_id="session-exact-flag",
+                    prompt="exact flag prompt",
+                )
+            ),
+        )
+        self.assertEqual(submit.returncode, 0, submit.stderr)
+        self.assertEqual(submit.stdout.strip(), "{}")
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertIn("session-exact-flag", index["sessions"])
+
+        fake_home = self.root / "home-exact-flag"
+        env = os.environ.copy()
+        env["HOME"] = str(fake_home)
+        stop = run(
+            [
+                sys.executable,
+                str(ADAPTER_PATH),
+                "stop-hook",
+                "--enable-compat-hook",
+            ],
+            env=env,
+            input_text="{invalid json\n",
+        )
+        self.assertEqual(stop.returncode, 0, stop.stderr)
+        self.assertEqual(stop.stdout.strip(), "{}")
+        log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
+        self.assertTrue(log_path.is_file())
+        entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(entry["hook_command"], "stop-hook")
+        self.assertEqual(entry["error_type"], "JSONDecodeError")
+
+    def test_terminal_stop_prompts_refuse_missing_child_identity(self) -> None:
+        module = self._load_adapter_module()
+        run_dir = self.repo / ".codex-tmp" / "waited-delivery" / "damaged-run"
+        state = {
+            "orchestration": {
+                "child_status": "completed",
+                "child_session_id": "   ",
+            },
+            "artifacts": {},
+        }
+        prompts = [
+            module._build_stop_continuation_prompt(self.repo, run_dir, state),
+            module._build_stop_fallback_prompt(self.repo, run_dir, state),
+            module._build_stop_last_resort_prompt(
+                self.repo,
+                run_dir,
+                child_status="completed",
+                child_session_id=None,
+            ),
+            module._build_stop_emergency_prompt(
+                self.repo,
+                run_dir,
+                child_status="completed",
+                child_session_id=None,
+            ),
+        ]
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertIn("child_session_id", prompt)
+                self.assertNotIn("reconcile-active-run", prompt)
+
+        terminal_state = {
+            "overall_status": "passed",
+            "orchestration": {
+                "child_status": "completed",
+                "child_session_id": "   ",
+            },
+            "phases": {
+                phase_name: {"status": "passed"}
+                for phase_name in (
+                    "tests",
+                    "docs_sync",
+                    "internal_review",
+                    "external_review",
+                )
+            },
+        }
+        self.assertFalse(module._run_is_terminal(terminal_state))
+        terminal_state["orchestration"]["child_session_id"] = "child-exact"
+        self.assertTrue(module._run_is_terminal(terminal_state))
+        del terminal_state["phases"]["internal_review"]
+        self.assertFalse(module._run_is_terminal(terminal_state))
+
+    def test_emergency_prompt_uses_loaded_adapter_distribution_path(self) -> None:
+        layouts = (
+            pathlib.Path("skills/waited-delivery-compat"),
+            pathlib.Path("personal_codex/skills/waited-delivery-compat"),
+        )
+        for layout in layouts:
+            with self.subTest(layout=layout):
+                adapter_path = (
+                    self.root
+                    / "distribution"
+                    / layout
+                    / "scripts"
+                    / "waited_delivery_hook_adapter.py"
+                )
+                adapter_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ADAPTER_PATH, adapter_path)
+                module = self._load_adapter_module(adapter_path)
+
+                prompt = module._build_stop_emergency_prompt(
+                    self.repo,
+                    self.repo / ".codex-tmp" / "waited-delivery" / "active-run",
+                    child_status="failed",
+                    child_session_id="child-emergency",
+                )
+
+                command = prompt.split("Run this from the repo root:\n", 1)[1]
+                argv = shlex.split(command)
+                self.assertEqual(argv[0], sys.executable)
+                self.assertEqual(argv[1], str(adapter_path.resolve()))
+                self.assertEqual(argv[2], "reconcile-active-run")
+
+    def test_user_prompt_submit_hook_records_session_metadata(self) -> None:
+        completed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(),
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "{}")
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(index["latest_session_id"], "session-1")
+        record = index["sessions"]["session-1"]
+        self.assertEqual(record["transcript_path"], "/tmp/transcript-1.jsonl")
+        self.assertEqual(record["permission_mode"], "acceptEdits")
+        self.assertEqual(record["status"], "observed")
+        self.assertIsNone(record["run_dir"])
+
+    def test_schema_v2_client_fails_closed_on_schema_v3_cleanup_pending(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-v2-client-fail-closed"
+        preparation_id = "d1" * 16
+        reservation = self._seed_interrupted_preparation(
+            module,
+            session_id=session_id,
+            run_id="v2-client-fail-closed",
+            preparation_id=preparation_id,
+        )
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        module._cas_preparation_cleanup_pending(
+            self.repo.resolve(),
+            reservation,
+            expected_record=record,
+            reason="schema-v3 compatibility fixture",
+        )
+        before = self._index_path().read_bytes()
+
+        completed = run(
+            [
+                sys.executable,
+                str(SCHEMA_V2_CLIENT_PATH),
+                "observe",
+                "--index",
+                str(self._index_path()),
+                "--session-id",
+                session_id,
+                "--cwd",
+                str(self.repo),
+                "--started-at",
+                "2026-07-30T00:00:00+00:00",
+                "--prompt",
+                "must not rewrite cleanup_pending as active",
+            ]
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("unsupported adapter index schema", completed.stderr)
+        self.assertEqual(self._index_path().read_bytes(), before)
+        durable = json.loads(before)["sessions"][session_id]
+        self.assertEqual(durable["status"], module.CLEANUP_PENDING_STATUS)
+        self.assertEqual(durable["run_dir"], reservation.run_dir)
+        self.assertEqual(durable["preparation_id"], preparation_id)
+
+    def test_schema_v3_reader_recovers_frozen_schema_v2_preparation(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-v2-preparation"
+        preparation_id = "d2" * 16
+        run_id = "v2-preparation"
+        run_dir = self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        lease_path = module._preparation_lease_path(
+            self.repo.resolve(),
+            preparation_id,
+        )
+        started_at = "2026-07-30T00:00:00+00:00"
+        seeded = run(
+            [
+                sys.executable,
+                str(SCHEMA_V2_CLIENT_PATH),
+                "seed-preparing",
+                "--index",
+                str(self._index_path()),
+                "--session-id",
+                session_id,
+                "--cwd",
+                str(self.repo),
+                "--started-at",
+                started_at,
+                "--run-dir",
+                str(run_dir),
+                "--run-id",
+                run_id,
+                "--preparation-id",
+                preparation_id,
+                "--lease-path",
+                str(lease_path),
+            ]
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        legacy = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(legacy["schema_version"], 2)
+        reservation = module.PreparationReservation(
+            session_id=session_id,
+            preparation_id=preparation_id,
+            run_id=run_id,
+            run_dir=str(run_dir),
+            lease_path=str(lease_path),
+            started_at=started_at,
+        )
+        lease_fd = module._create_preparation_lease(
+            self.repo.resolve(),
+            reservation,
+        )
+        os.close(lease_fd)
+        clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+
+        with mock.patch.object(module.sys, "stdout", io.StringIO()):
+            self.assertEqual(module._recover_active_run(clear_args), 0)
+
+        migrated = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(migrated["schema_version"], module.INDEX_SCHEMA_VERSION)
+        record = migrated["sessions"][session_id]
+        self.assertEqual(record["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertEqual(record["run_dir"], str(run_dir))
+        self.assertFalse(lease_path.exists())
+
+    def test_user_prompt_submit_hook_does_not_follow_index_symlink(self) -> None:
+        adapter_dir = self._index_path().parent
+        adapter_dir.mkdir(parents=True, mode=0o700)
+        external_index = self.root / "external-index.json"
+        sentinel = json.dumps(
+            {
+                "schema_version": 1,
+                "latest_session_id": None,
+                "updated_at": None,
+                "sessions": {},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        external_index.write_text(sentinel, encoding="utf-8")
+        self._index_path().symlink_to(external_index)
+
+        completed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                prompt="must not be written through the index symlink"
+            ),
+            env_overrides={"HOME": str(self.root / "home-index-symlink")},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "{}")
+        self.assertEqual(external_index.read_text(encoding="utf-8"), sentinel)
+        self.assertTrue(self._index_path().is_symlink())
+
+    def test_index_storage_is_owner_private_under_open_umask(self) -> None:
+        previous_umask = os.umask(0)
+        try:
+            completed = self._run_adapter(
+                "user-prompt-submit-hook",
+                input_payload=self._session_payload(
+                    session_id="session-private-index",
+                    prompt="owner-private prompt",
+                ),
+            )
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        adapter_dir = self._index_path().parent
+        lock_path = adapter_dir / "index.lock"
+        self.assertEqual(adapter_dir.stat().st_mode & 0o7777, 0o700)
+        self.assertEqual(self._index_path().stat().st_mode & 0o7777, 0o600)
+        self.assertEqual(lock_path.stat().st_mode & 0o7777, 0o600)
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            index["sessions"]["session-private-index"]["last_prompt"],
+            "owner-private prompt",
+        )
+
+    def test_index_directory_creation_survives_restrictive_umask(self) -> None:
+        previous_umask = os.umask(0o777)
+        try:
+            completed = self._run_adapter(
+                "user-prompt-submit-hook",
+                input_payload=self._session_payload(
+                    session_id="session-restrictive-umask",
+                    prompt="persist through restrictive umask",
+                ),
+            )
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        adapter_dir = self._index_path().parent
+        self.assertEqual(
+            (self.repo / ".codex-tmp").stat().st_mode & 0o7777,
+            0o700,
+        )
+        self.assertEqual(adapter_dir.stat().st_mode & 0o7777, 0o700)
+        self.assertEqual(self._index_path().stat().st_mode & 0o7777, 0o600)
+        self.assertEqual(
+            (adapter_dir / "index.lock").stat().st_mode & 0o7777,
+            0o600,
+        )
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            index["sessions"]["session-restrictive-umask"]["last_prompt"],
+            "persist through restrictive umask",
+        )
+
+    def test_index_rejects_unsafe_parent_and_artifact_modes_without_mutation(
+        self,
+    ) -> None:
+        seeded = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-mode-seed"),
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        module = self._load_adapter_module()
+        index_path = self._index_path()
+        adapter_dir = index_path.parent
+        targets = (
+            ("repository-root", self.repo, 0o770),
+            ("codex-tmp-parent", self.repo / ".codex-tmp", 0o770),
+            ("adapter-directory", adapter_dir, 0o770),
+            ("index-file", index_path, 0o620),
+            ("index-lock", adapter_dir / "index.lock", 0o602),
+        )
+        for label, target, unsafe_mode in targets:
+            with self.subTest(case=label):
+                original_mode = target.stat().st_mode & 0o7777
+                target.chmod(unsafe_mode)
+                before_content = index_path.read_bytes()
+                before_stat = index_path.stat()
+                try:
+                    with self.assertRaises(module.RunSafetyError):
+                        with module._index_transaction(
+                            self.repo.resolve(),
+                            write=False,
+                        ):
+                            pass
+                    after_stat = index_path.stat()
+                    self.assertEqual(index_path.read_bytes(), before_content)
+                    self.assertEqual(
+                        (
+                            after_stat.st_dev,
+                            after_stat.st_ino,
+                            after_stat.st_mtime_ns,
+                        ),
+                        (
+                            before_stat.st_dev,
+                            before_stat.st_ino,
+                            before_stat.st_mtime_ns,
+                        ),
+                    )
+                finally:
+                    target.chmod(original_mode)
+
+    def test_index_transaction_serializes_load_modify_save(self) -> None:
+        seeded = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-seed"),
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        lock_path = self._index_path().parent / "index.lock"
+        lock_fd = os.open(lock_path, os.O_RDWR)
+        processes: list[subprocess.Popen[str]] = []
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            for session_id in ("session-race-a", "session-race-b"):
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(ADAPTER_PATH),
+                        "user-prompt-submit-hook",
+                        "--enable-compat-hook",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                assert process.stdin is not None
+                process.stdin.write(
+                    json.dumps(self._session_payload(session_id=session_id))
+                )
+                process.stdin.close()
+                process.stdin = None
+                processes.append(process)
+            time.sleep(0.2)
+            self.assertTrue(all(process.poll() is None for process in processes))
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(stdout.strip(), "{}")
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(index["sessions"]),
+            {"session-seed", "session-race-a", "session-race-b"},
+        )
+
+    def test_index_atomic_save_failure_preserves_previous_snapshot(self) -> None:
+        seeded = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-before-failure"),
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        before = self._index_path().read_bytes()
+        module = self._load_adapter_module()
+
+        with (
+            mock.patch.object(
+                module.os,
+                "replace",
+                side_effect=OSError("injected replace failure"),
+            ),
+            self.assertRaises(module.RunSafetyError),
+        ):
+            with module._index_transaction(self.repo.resolve(), write=True) as index:
+                module._update_session_observation(
+                    index,
+                    session_id="session-after-failure",
+                    cwd=str(self.repo),
+                    transcript_path=None,
+                    permission_mode=None,
+                    prompt="must not become visible",
+                )
+
+        self.assertEqual(self._index_path().read_bytes(), before)
+        self.assertEqual(
+            list(self._index_path().parent.glob(".index.json.*.tmp")),
+            [],
+        )
+
+    def test_refresh_timeout_kills_descendants_and_closes_passed_fds(self) -> None:
+        module = self._load_adapter_module()
+        script = self.root / "refresh-timeout-tree.py"
+        pid_path = self.root / "refresh-timeout.pid"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                inherited_fd = int(sys.argv[1])
+                pathlib.Path(sys.argv[2]).write_text(
+                    str(os.getpid()),
+                    encoding="utf-8",
+                )
+                os.set_inheritable(inherited_fd, True)
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    pass_fds=(inherited_fd,),
+                )
+                time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+        read_fd, write_fd = os.pipe()
+        try:
+            completed = module._run_bounded_refresh_process(
+                [
+                    sys.executable,
+                    str(script),
+                    str(write_fd),
+                    str(pid_path),
+                ],
+                pass_fds=(write_fd,),
+                env=os.environ.copy(),
+                timeout=0.3,
+                cleanup_timeout=3.0,
+                max_capture_bytes=64 * 1024,
+            )
+        finally:
+            os.close(write_fd)
+        try:
+            self.assertEqual(completed.returncode, 124, completed.stderr)
+            self.assertIn("hard timeout", completed.stderr)
+            process_group = int(pid_path.read_text(encoding="utf-8"))
+            self.assertFalse(
+                module._refresh_process_group_has_live_members(process_group)
+            )
+            os.set_blocking(read_fd, False)
+            self.assertEqual(os.read(read_fd, 1), b"")
+        finally:
+            os.close(read_fd)
+
+    def test_refresh_cleanup_keeps_leader_unreaped_until_group_absence(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        events: list[str] = []
+
+        class FakeProcess:
+            pid = 709
+
+        class FakeObserver:
+            reaped = False
+
+            def signal_group(self, signum: int) -> None:
+                if self.reaped:
+                    raise AssertionError("signal occurred after leader reap")
+                self_outer.assertEqual(signum, signal.SIGKILL)
+                events.append("signal")
+
+            def exited(self) -> bool:
+                if self.reaped:
+                    raise AssertionError("exit probe occurred after leader reap")
+                events.append("observe-exit")
+                return True
+
+            def reap(self, process, *, timeout: float | None = None) -> int:
+                if self.reaped:
+                    raise AssertionError("leader was reaped twice")
+                self_outer.assertEqual(process.pid, 709)
+                self_outer.assertIsNotNone(timeout)
+                assert timeout is not None
+                self_outer.assertGreater(timeout, 0)
+                events.append("reap")
+                self.reaped = True
+                return 0
+
+        class FakeSelector:
+            def get_map(self):
+                return {}
+
+        self_outer = self
+        observer = FakeObserver()
+
+        def process_group_state(pgid: int, **_kwargs: object) -> str:
+            if observer.reaped:
+                raise AssertionError("group probe occurred after leader reap")
+            self.assertEqual(pgid, 709)
+            events.append("prove-group-absence")
+            return "no-members"
+
+        with (
+            mock.patch.object(module, "_drain_refresh_output_once"),
+            mock.patch.object(
+                module,
+                "_refresh_process_group_state",
+                side_effect=process_group_state,
+            ),
+        ):
+            module._cleanup_refresh_process(
+                FakeProcess(),
+                observer,
+                FakeSelector(),
+                {"stdout": bytearray(), "stderr": bytearray()},
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+            )
+
+        self.assertEqual(
+            events,
+            ["signal", "observe-exit", "prove-group-absence", "reap"],
+        )
+
+    def test_refresh_static_sigchld_preflight_blocks_process_spawn(self) -> None:
+        module = self._load_adapter_module()
+        signal_transaction = mock.Mock()
+
+        with (
+            mock.patch.object(
+                module.signal,
+                "getsignal",
+                return_value=signal.SIG_IGN,
+            ),
+            mock.patch.object(module.selectors, "DefaultSelector") as selector,
+            mock.patch.object(module.subprocess, "Popen") as popen,
+            mock.patch.object(module.os, "killpg") as killpg,
+            self.assertRaisesRegex(
+                module.UserError,
+                "default SIGCHLD disposition",
+            ),
+        ):
+            module._run_bounded_refresh_process_supervised(
+                [sys.executable, "-c", "raise AssertionError('must not spawn')"],
+                pass_fds=(),
+                env=os.environ.copy(),
+                input_bytes=None,
+                timeout=1,
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+                signal_transaction=signal_transaction,
+            )
+
+        signal_transaction.raise_if_pending.assert_called_once_with()
+        selector.assert_not_called()
+        popen.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_refresh_non_cpython_preflight_blocks_process_spawn(self) -> None:
+        module = self._load_adapter_module()
+        implementation = mock.Mock()
+        implementation.name = "pypy"
+        signal_transaction = mock.Mock()
+        with (
+            mock.patch.object(module.sys, "implementation", implementation),
+            mock.patch.object(module.selectors, "DefaultSelector") as selector,
+            mock.patch.object(module.subprocess, "Popen") as popen,
+            mock.patch.object(module.os, "killpg") as killpg,
+            self.assertRaisesRegex(
+                module.UserError,
+                "reviewed CPython Popen finalizer semantics",
+            ),
+        ):
+            module._run_bounded_refresh_process_supervised(
+                [sys.executable, "-c", "raise AssertionError('must not spawn')"],
+                pass_fds=(),
+                env=os.environ.copy(),
+                input_bytes=None,
+                timeout=1,
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+                signal_transaction=signal_transaction,
+            )
+
+        signal_transaction.raise_if_pending.assert_called_once_with()
+        selector.assert_not_called()
+        popen.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_refresh_native_no_cldwait_precedes_all_supervision_resources(
+        self,
+    ) -> None:
+        payload = run_native_no_cldwait_preflight_probe(
+            ADAPTER_PATH,
+            entrypoint="adapter",
+        )
+
+        self.assertTrue(payload["auto_reaped"])
+        self.assertTrue(payload["restored_waitable"])
+        self.assertIn("SA_NOCLDWAIT", payload["rejection"])
+        self.assertEqual(
+            payload["calls"],
+            {
+                "killpg": 0,
+                "kqueue": 0,
+                "pipe": 0,
+                "popen": 0,
+                "selector": 0,
+            },
+        )
+
+    def test_refresh_native_no_cldwait_flags_fail_closed_for_supported_layouts(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        if ctypes.sizeof(ctypes.c_void_p) == 8 and ctypes.sizeof(ctypes.c_ulong) == 8:
+            self.assertEqual(ctypes.sizeof(module._LinuxSigaction), 152)
+            self.assertEqual(module._LinuxSigaction.handler.offset, 0)
+            self.assertEqual(module._LinuxSigaction.mask.offset, 8)
+            self.assertEqual(module._LinuxSigaction.flags.offset, 136)
+            self.assertEqual(module._LinuxSigaction.restorer.offset, 144)
+        cases = (
+            ("darwin", "_darwin_sigchld_action", module.DARWIN_SA_NOCLDWAIT),
+            ("linux", "_linux_sigchld_action", module.LINUX_SA_NOCLDWAIT),
+        )
+        for platform_name, action_name, no_cldwait_flag in cases:
+            with self.subTest(platform=platform_name):
+                with (
+                    mock.patch.object(
+                        module.signal,
+                        "getsignal",
+                        return_value=signal.SIG_DFL,
+                    ),
+                    mock.patch.object(
+                        module,
+                        action_name,
+                        return_value=(0, no_cldwait_flag),
+                    ),
+                    self.assertRaisesRegex(
+                        module._WaitableSigchldUnavailable,
+                        "SA_NOCLDWAIT",
+                    ),
+                ):
+                    module._require_waitable_sigchld_semantics(
+                        platform=platform_name,
+                    )
+
+    def test_refresh_unreviewed_linux_sigaction_abi_fails_before_libc(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        rejected_abis = (
+            ("x86_64", "x86_64-linux-musl"),
+            ("aarch64", "aarch64-linux-musl"),
+            ("riscv64", "riscv64-linux-gnu"),
+        )
+        for machine, multiarch in rejected_abis:
+            with self.subTest(machine=machine, multiarch=multiarch):
+                implementation = mock.Mock(_multiarch=multiarch)
+                with (
+                    mock.patch.object(
+                        module.os,
+                        "uname",
+                        return_value=mock.Mock(machine=machine),
+                    ),
+                    mock.patch.object(
+                        module.sys,
+                        "implementation",
+                        implementation,
+                    ),
+                    mock.patch.object(module.ctypes, "CDLL") as cdll,
+                    self.assertRaisesRegex(
+                        module._WaitableSigchldUnavailable,
+                        "no reviewed sigaction layout",
+                    ),
+                ):
+                    module._linux_sigchld_action()
+                cdll.assert_not_called()
+
+    def test_refresh_native_sigaction_query_failure_restores_errno(self) -> None:
+        module = self._load_adapter_module()
+
+        def fail_sigaction(*_args: object) -> int:
+            module.ctypes.set_errno(errno.EPERM)
+            return -1
+
+        fake_sigaction = mock.Mock(side_effect=fail_sigaction)
+        fake_library = mock.Mock(sigaction=fake_sigaction)
+        previous_errno = module.ctypes.get_errno()
+        try:
+            module.ctypes.set_errno(errno.EBUSY)
+            with (
+                mock.patch.object(
+                    module.ctypes,
+                    "CDLL",
+                    return_value=fake_library,
+                ),
+                self.assertRaisesRegex(
+                    module._WaitableSigchldUnavailable,
+                    "failed to inspect Darwin SIGCHLD disposition",
+                ),
+            ):
+                module._darwin_sigchld_action()
+            self.assertEqual(module.ctypes.get_errno(), errno.EBUSY)
+        finally:
+            module.ctypes.set_errno(previous_errno)
+
+    def test_refresh_unexpected_sigchld_query_failure_latches_after_spawn(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        for error_type in (RuntimeError, KeyboardInterrupt):
+            with self.subTest(error_type=error_type.__name__):
+                query_error = error_type("injected native-query failure")
+                with (
+                    mock.patch.object(
+                        module,
+                        "_waitable_sigchld_failure",
+                        side_effect=query_error,
+                    ),
+                    self.assertRaises(module._ProcessIdentityLost) as after_spawn,
+                ):
+                    module._require_waitable_sigchld_semantics(after_spawn=True)
+                self.assertIs(after_spawn.exception.__cause__, query_error)
+
+                pre_spawn_error = error_type("injected pre-spawn native-query failure")
+                with (
+                    mock.patch.object(
+                        module,
+                        "_waitable_sigchld_failure",
+                        side_effect=pre_spawn_error,
+                    ),
+                    self.assertRaises(
+                        module._WaitableSigchldUnavailable
+                    ) as before_spawn,
+                ):
+                    module._require_waitable_sigchld_semantics()
+                self.assertIs(before_spawn.exception.__cause__, pre_spawn_error)
+
+    def test_refresh_late_sigchld_loss_blocks_signal_and_group_probe(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        observer = object.__new__(module._UnreapedLeaderObserver)
+        observer.pid = 715
+        observer.platform = sys.platform
+        observer._reaped = False
+        observer._exited = False
+        observer._kqueue = None
+
+        with (
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value="SIGCHLD gained SA_NOCLDWAIT after observer binding",
+            ),
+            mock.patch.object(module.os, "killpg") as killpg,
+        ):
+            with self.assertRaises(module._ProcessIdentityLost):
+                observer.signal_group(signal.SIGKILL)
+            with self.assertRaises(module._ProcessIdentityLost):
+                module._refresh_process_group_state(715)
+
+        killpg.assert_not_called()
+
+    def test_refresh_darwin_observer_ctor_closes_early_kqueue_failures(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        cases = (
+            (
+                "post-spawn-reattest",
+                module._ProcessIdentityLost("injected identity loss"),
+                False,
+            ),
+            (
+                "non-oserror-control",
+                RuntimeError("injected control failure"),
+                True,
+            ),
+        )
+        for name, expected_error, fail_control in cases:
+            with self.subTest(name=name):
+                queue = mock.Mock()
+                if fail_control:
+                    queue.control.side_effect = expected_error
+                    require = mock.Mock(return_value=None)
+                    queue.close.side_effect = RuntimeError(
+                        "injected close failure must not mask primary"
+                    )
+                else:
+                    require = mock.Mock(side_effect=expected_error)
+                with (
+                    mock.patch.object(
+                        module,
+                        "_preflight_unreaped_leader_observer",
+                        return_value="darwin",
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_require_waitable_sigchld_semantics",
+                        require,
+                    ),
+                    mock.patch.object(
+                        module.select,
+                        "kqueue",
+                        return_value=queue,
+                        create=True,
+                    ),
+                    mock.patch.object(
+                        module.select,
+                        "kevent",
+                        return_value=object(),
+                        create=True,
+                    ),
+                    mock.patch.object(module.select, "KQ_FILTER_PROC", 1, create=True),
+                    mock.patch.object(module.select, "KQ_EV_ADD", 2, create=True),
+                    mock.patch.object(module.select, "KQ_EV_ENABLE", 4, create=True),
+                    mock.patch.object(module.select, "KQ_EV_ONESHOT", 8, create=True),
+                    mock.patch.object(module.select, "KQ_NOTE_EXIT", 16, create=True),
+                    self.assertRaises(type(expected_error)) as raised,
+                ):
+                    module._UnreapedLeaderObserver(714, platform="darwin")
+
+                self.assertIs(raised.exception, expected_error)
+                queue.close.assert_called_once_with()
+                if fail_control:
+                    queue.control.assert_called_once()
+                else:
+                    queue.control.assert_not_called()
+
+        expected_error = module._ProcessIdentityLost(
+            "injected identity loss after ownership transfer"
+        )
+        queue = mock.Mock()
+        queue.control.return_value = []
+        queue.close.side_effect = RuntimeError(
+            "injected transferred-close failure must not mask primary"
+        )
+        require = mock.Mock(side_effect=[None, expected_error])
+        with (
+            mock.patch.object(
+                module,
+                "_preflight_unreaped_leader_observer",
+                return_value="darwin",
+            ),
+            mock.patch.object(
+                module,
+                "_require_waitable_sigchld_semantics",
+                require,
+            ),
+            mock.patch.object(
+                module.select,
+                "kqueue",
+                return_value=queue,
+                create=True,
+            ),
+            mock.patch.object(
+                module.select,
+                "kevent",
+                return_value=object(),
+                create=True,
+            ),
+            mock.patch.object(module.select, "KQ_FILTER_PROC", 1, create=True),
+            mock.patch.object(module.select, "KQ_EV_ADD", 2, create=True),
+            mock.patch.object(module.select, "KQ_EV_ENABLE", 4, create=True),
+            mock.patch.object(module.select, "KQ_EV_ONESHOT", 8, create=True),
+            mock.patch.object(module.select, "KQ_NOTE_EXIT", 16, create=True),
+            self.assertRaises(type(expected_error)) as raised,
+        ):
+            module._UnreapedLeaderObserver(713, platform="darwin")
+
+        self.assertIs(raised.exception, expected_error)
+        queue.control.assert_called_once()
+        queue.close.assert_called_once_with()
+
+    def test_refresh_post_spawn_sigchld_loss_never_uses_numeric_group(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+
+        class FakeProcess:
+            pid = 716
+
+            def __init__(self) -> None:
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.wait = mock.Mock(
+                    side_effect=AssertionError("identity loss must never wait")
+                )
+                self.poll = mock.Mock(
+                    side_effect=AssertionError("identity loss must never poll")
+                )
+
+        process = FakeProcess()
+        module._UNREAPED_REFRESH_RECOVERY_PROCESSES.clear()
+        waitability = mock.Mock(
+            side_effect=[
+                None,
+                None,
+                "SIGCHLD gained SA_NOCLDWAIT after process launch",
+            ]
+        )
+        with (
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            mock.patch.object(
+                module.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+            mock.patch.object(module.os, "killpg") as killpg,
+            mock.patch.object(
+                module,
+                "_refresh_process_group_state",
+            ) as group_state,
+            self.assertRaisesRegex(
+                module._ProcessIdentityLost,
+                "changed after process launch",
+            ) as raised,
+        ):
+            module._run_bounded_refresh_process_supervised(
+                [sys.executable, "-c", "raise SystemExit(0)"],
+                pass_fds=(),
+                env=os.environ.copy(),
+                input_bytes=None,
+                timeout=1,
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+                signal_transaction=mock.Mock(),
+            )
+
+        popen.assert_called_once()
+        killpg.assert_not_called()
+        group_state.assert_not_called()
+        self.assertIsInstance(raised.exception.__cause__, module.UserError)
+        self.assertIn(
+            "cleanup-incomplete",
+            str(raised.exception.__cause__),
+        )
+        self.assertIn("status is unavailable", str(raised.exception.__cause__))
+        process.wait.assert_not_called()
+        process.poll.assert_not_called()
+        self.assertIn(
+            process,
+            module._UNREAPED_REFRESH_RECOVERY_PROCESSES,
+        )
+
+    def test_refresh_post_spawn_sigchld_query_failure_preserves_nested_cause(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+
+        class FakeProcess:
+            pid = 717
+
+            def __init__(self) -> None:
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.wait = mock.Mock(
+                    side_effect=AssertionError("identity loss must never wait")
+                )
+                self.poll = mock.Mock(
+                    side_effect=AssertionError("identity loss must never poll")
+                )
+
+        process = FakeProcess()
+        query_error = KeyboardInterrupt("injected SIGCHLD query interruption")
+        module._UNREAPED_REFRESH_RECOVERY_PROCESSES.clear()
+        waitability = mock.Mock(side_effect=[None, None, query_error])
+        with (
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            mock.patch.object(
+                module.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(module.os, "killpg") as killpg,
+            mock.patch.object(
+                module,
+                "_refresh_process_group_state",
+            ) as group_state,
+            self.assertRaises(module._ProcessIdentityLost) as raised,
+        ):
+            module._run_bounded_refresh_process_supervised(
+                [sys.executable, "-c", "raise SystemExit(0)"],
+                pass_fds=(),
+                env=os.environ.copy(),
+                input_bytes=None,
+                timeout=1,
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+                signal_transaction=mock.Mock(),
+            )
+
+        cleanup_evidence = raised.exception.__cause__
+        self.assertIsInstance(cleanup_evidence, module.UserError)
+        self.assertIs(cleanup_evidence.__cause__, query_error)
+        killpg.assert_not_called()
+        group_state.assert_not_called()
+        process.wait.assert_not_called()
+        process.poll.assert_not_called()
+        self.assertIn(
+            process,
+            module._UNREAPED_REFRESH_RECOVERY_PROCESSES,
+        )
+
+    def test_refresh_identity_loss_disarms_real_popen_finalizer(self) -> None:
+        module = self._load_adapter_module()
+        process = subprocess.Popen(
+            [sys.executable, "-c", "raise SystemExit(0)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        waited_pid, _status = os.waitpid(process.pid, 0)
+        self.assertEqual(waited_pid, process.pid)
+        self.assertIsNone(process.returncode)
+
+        module._UNREAPED_REFRESH_RECOVERY_PROCESSES.clear()
+        cleanup_error = module._refresh_identity_loss_cleanup_error(
+            process,
+            module._ProcessIdentityLost("injected identity loss"),
+            context="real-Popen finalizer regression",
+        )
+
+        self.assertIn("numeric-child polling disarmed", str(cleanup_error))
+        self.assertEqual(process.returncode, module.IDENTITY_LOST_RETURN_CODE)
+        self.assertIs(process._child_created, False)
+        self.assertIn(
+            process,
+            module._UNREAPED_REFRESH_RECOVERY_PROCESSES,
+        )
+
+        module._UNREAPED_REFRESH_RECOVERY_PROCESSES.clear()
+        object.__setattr__(process, "returncode", None)
+        object.__setattr__(process, "_child_created", True)
+        real_disarm = module._disarm_refresh_process_after_identity_loss
+        attempts = 0
+
+        def interrupt_first_disarm(candidate) -> None:
+            nonlocal attempts
+            attempts += 1
+            self.assertIn(
+                candidate,
+                module._UNREAPED_REFRESH_RECOVERY_PROCESSES,
+            )
+            if attempts == 1:
+                raise KeyboardInterrupt("injected disarm interruption")
+            real_disarm(candidate)
+
+        with mock.patch.object(
+            module,
+            "_disarm_refresh_process_after_identity_loss",
+            side_effect=interrupt_first_disarm,
+        ):
+            retry_error = module._refresh_identity_loss_cleanup_error(
+                process,
+                module._ProcessIdentityLost("injected retry identity loss"),
+                context="retention-before-disarm regression",
+            )
+
+        self.assertEqual(attempts, 2)
+        self.assertIn(
+            "safety retries=disarm:KeyboardInterrupt",
+            str(retry_error),
+        )
+        self.assertEqual(process.returncode, module.IDENTITY_LOST_RETURN_CODE)
+        self.assertIs(process._child_created, False)
+        module._UNREAPED_REFRESH_RECOVERY_PROCESSES.clear()
+        internal_poll = mock.Mock(
+            side_effect=AssertionError("disarmed finalizer must not poll")
+        )
+        object.__setattr__(process, "_internal_poll", internal_poll)
+        process.__del__()
+        internal_poll.assert_not_called()
+
+    def test_refresh_identity_loss_retain_interrupt_and_pin_fallback(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+
+        class FakeProcess:
+            pid = 718
+            stdin = None
+            stdout = None
+            stderr = None
+
+        process = FakeProcess()
+        module._UNREAPED_REFRESH_RECOVERY_PROCESSES.clear()
+        real_retain = module._retain_unreaped_refresh_process
+        retain_attempts = 0
+
+        def interrupt_first_retain(candidate) -> None:
+            nonlocal retain_attempts
+            retain_attempts += 1
+            self.assertEqual(
+                candidate.returncode,
+                module.IDENTITY_LOST_RETURN_CODE,
+            )
+            if retain_attempts == 1:
+                raise KeyboardInterrupt("injected retain interruption")
+            real_retain(candidate)
+
+        with mock.patch.object(
+            module,
+            "_retain_unreaped_refresh_process",
+            side_effect=interrupt_first_retain,
+        ):
+            cleanup_error = module._refresh_identity_loss_cleanup_error(
+                process,
+                module._ProcessIdentityLost("injected identity loss"),
+                context="sentinel-before-retain regression",
+            )
+
+        self.assertEqual(retain_attempts, 2)
+        self.assertIn("retain:KeyboardInterrupt", str(cleanup_error))
+        self.assertIn(
+            process,
+            module._UNREAPED_REFRESH_RECOVERY_PROCESSES,
+        )
+
+        class UndisarmableProcess:
+            __slots__ = ("pid", "stdin", "stdout", "stderr")
+
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+
+        module._UNREAPED_REFRESH_RECOVERY_PROCESSES.clear()
+        undisarmable = UndisarmableProcess(719)
+        with (
+            mock.patch.object(
+                module,
+                "_disarm_refresh_process_after_identity_loss",
+                side_effect=RuntimeError("injected disarm failure"),
+            ),
+            mock.patch.object(
+                module,
+                "_permanently_pin_refresh_process_after_identity_loss",
+            ) as pin,
+        ):
+            pinned_error = module._refresh_identity_loss_cleanup_error(
+                undisarmable,
+                module._ProcessIdentityLost("injected identity loss"),
+                context="permanent-pin fallback",
+            )
+        pin.assert_called_once_with(undisarmable)
+        self.assertIn("permanently pinned", str(pinned_error))
+
+        fatal = UndisarmableProcess(720)
+        with (
+            mock.patch.object(
+                module,
+                "_disarm_refresh_process_after_identity_loss",
+                side_effect=RuntimeError("injected disarm failure"),
+            ),
+            mock.patch.object(
+                module,
+                "_permanently_pin_refresh_process_after_identity_loss",
+                side_effect=RuntimeError("injected pin failure"),
+            ) as pin,
+            mock.patch.object(
+                module.os,
+                "_exit",
+                side_effect=SystemExit(70),
+            ) as fatal_exit,
+            self.assertRaises(SystemExit),
+        ):
+            module._refresh_identity_loss_cleanup_error(
+                fatal,
+                module._ProcessIdentityLost("injected identity loss"),
+                context="fatal safety fallback",
+            )
+        self.assertEqual(pin.call_count, 2)
+        fatal_exit.assert_called_once_with(70)
+
+    def test_refresh_final_cleanup_cannot_mask_primary_baseexception(self) -> None:
+        module = self._load_adapter_module()
+        resource = mock.Mock()
+        resource.close.side_effect = KeyboardInterrupt(
+            "injected final cleanup interruption"
+        )
+        primary = module._ProcessIdentityLost("identity-lost primary")
+
+        with self.assertRaises(type(primary)) as raised:
+            try:
+                raise primary
+            finally:
+                module._best_effort_close_refresh_resource(resource)
+
+        self.assertIs(raised.exception, primary)
+        resource.close.assert_called_once_with()
+
+    def test_refresh_observer_bind_failure_preserves_primary_exception(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        observer_error = module.UserError("injected observer bind failure")
+        cleanup_error = module.UserError("injected emergency cleanup failure")
+        signal_transaction = mock.Mock()
+
+        class FakeProcess:
+            pid = 717
+            stdin = io.BytesIO()
+            stdout = io.BytesIO()
+            stderr = io.BytesIO()
+
+        process = FakeProcess()
+        with (
+            mock.patch.object(
+                module,
+                "_preflight_unreaped_leader_observer",
+                return_value="linux",
+            ),
+            mock.patch.object(
+                module.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+            mock.patch.object(
+                module,
+                "_UnreapedLeaderObserver",
+                side_effect=observer_error,
+            ),
+            mock.patch.object(
+                module,
+                "_emergency_cleanup_refresh_process",
+                side_effect=cleanup_error,
+            ) as cleanup,
+        ):
+            with self.assertRaises(module.UserError) as raised:
+                module._run_bounded_refresh_process_supervised(
+                    [sys.executable, "-c", "pass"],
+                    pass_fds=(),
+                    env=os.environ.copy(),
+                    input_bytes=None,
+                    timeout=1,
+                    cleanup_timeout=1,
+                    max_capture_bytes=1024,
+                    signal_transaction=signal_transaction,
+                )
+
+        self.assertIs(raised.exception, observer_error)
+        self.assertIs(raised.exception.__cause__, cleanup_error)
+        popen.assert_called_once()
+        cleanup.assert_called_once()
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
+    def test_refresh_emergency_cleanup_kills_drains_then_bounded_reaps(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        events: list[str] = []
+
+        class FakeProcess:
+            pid = 718
+            stdin = object()
+            stdout = object()
+            stderr = object()
+            reaped = False
+
+            def wait(self, *, timeout: float | None = None) -> int:
+                self_outer.assertIsNotNone(timeout)
+                assert timeout is not None
+                self_outer.assertGreater(timeout, 0)
+                events.append("bounded-reap")
+                self.reaped = True
+                return 0
+
+        class FakeSelector:
+            def get_map(self):
+                return {}
+
+        self_outer = self
+        process = FakeProcess()
+
+        def kill_group(pgid: int, signum: int) -> None:
+            self.assertEqual((pgid, signum), (process.pid, signal.SIGKILL))
+            self.assertFalse(process.reaped)
+            events.append("sigkill")
+
+        def group_state(pgid: int, **_kwargs: object) -> str:
+            self.assertEqual(pgid, process.pid)
+            self.assertFalse(process.reaped)
+            events.append("prove-group-absence")
+            return "no-members"
+
+        with (
+            mock.patch.object(module.os, "killpg", side_effect=kill_group),
+            mock.patch.object(
+                module,
+                "_close_refresh_input",
+                side_effect=lambda *_args: events.append("close-input"),
+            ),
+            mock.patch.object(
+                module,
+                "_register_refresh_cleanup_output",
+                side_effect=lambda *_args: events.append("register-drain"),
+            ),
+            mock.patch.object(
+                module,
+                "_drain_refresh_output_once",
+                side_effect=lambda *_args, **_kwargs: events.append("drain"),
+            ),
+            mock.patch.object(
+                module,
+                "_refresh_process_group_state",
+                side_effect=group_state,
+            ),
+            mock.patch.object(
+                module.time,
+                "monotonic",
+                side_effect=[0, 0, 0, 0, 0],
+            ),
+        ):
+            module._emergency_cleanup_refresh_process(
+                process,
+                FakeSelector(),
+                {"stdout": bytearray(), "stderr": bytearray()},
+                cleanup_timeout=1,
+                max_capture_bytes=1024,
+            )
+
+        self.assertTrue(process.reaped)
+        self.assertEqual(
+            events,
+            [
+                "sigkill",
+                "close-input",
+                "register-drain",
+                "drain",
+                "prove-group-absence",
+                "bounded-reap",
+            ],
+        )
+
+    def test_refresh_incomplete_cleanup_retains_unreaped_process(self) -> None:
+        cases = (
+            ("live", {}, "process-group state remained live"),
+            ("unknown", {}, "process-group state remained unknown"),
+            (
+                "no-members",
+                {"stdout": mock.Mock(data="stdout")},
+                "failed to drain prompt refresh process pipes",
+            ),
+        )
+        for group_state, selector_map, expected_reason in cases:
+            with self.subTest(group_state=group_state, open_pipes=bool(selector_map)):
+                module = self._load_adapter_module()
+
+                class FakeProcess:
+                    pid = 713
+
+                class FakeObserver:
+                    reaped = False
+
+                    def signal_group(self, signum: int) -> None:
+                        self_outer.assertEqual(signum, signal.SIGKILL)
+
+                    def exited(self) -> bool:
+                        return True
+
+                    def reap(
+                        self,
+                        _process,
+                        *,
+                        timeout: float | None = None,
+                    ) -> int:
+                        self.reaped = True
+                        raise AssertionError(
+                            f"incomplete cleanup attempted reap with {timeout=}"
+                        )
+
+                class FakeSelector:
+                    def get_map(self):
+                        return selector_map
+
+                self_outer = self
+                process = FakeProcess()
+                observer = FakeObserver()
+                group_probe = mock.Mock(return_value=group_state)
+                with (
+                    mock.patch.object(
+                        module,
+                        "_refresh_process_group_state",
+                        group_probe,
+                    ),
+                    mock.patch.object(module, "_drain_refresh_output_once"),
+                    mock.patch.object(
+                        module.time,
+                        "monotonic",
+                        side_effect=lambda: 1 if group_probe.call_count else 0,
+                    ),
+                    self.assertRaisesRegex(
+                        module.UserError,
+                        expected_reason,
+                    ) as raised,
+                ):
+                    module._cleanup_refresh_process(
+                        process,
+                        observer,
+                        FakeSelector(),
+                        {"stdout": bytearray(), "stderr": bytearray()},
+                        cleanup_timeout=1,
+                        max_capture_bytes=1024,
+                    )
+
+                self.assertFalse(observer.reaped)
+                self.assertTrue(
+                    any(
+                        retained is process
+                        for retained in module._UNREAPED_REFRESH_RECOVERY_PROCESSES
+                    )
+                )
+                self.assertIn("remains unreaped and retained", str(raised.exception))
+
+    def test_refresh_observer_refuses_group_signal_after_leader_reap(self) -> None:
+        module = self._load_adapter_module()
+        observer = object.__new__(module._UnreapedLeaderObserver)
+        observer.pid = 711
+        observer._reaped = True
+
+        with (
+            mock.patch.object(module.os, "killpg") as killpg,
+            mock.patch.object(module.os, "waitid", create=True) as waitid,
+        ):
+            with self.assertRaisesRegex(module.UserError, "after leader reap"):
+                observer.signal_group(signal.SIGKILL)
+            with self.assertRaisesRegex(module.UserError, "already reaped"):
+                observer.exited()
+
+        killpg.assert_not_called()
+        waitid.assert_not_called()
+
+    def test_darwin_refresh_scan_uses_pid_count_and_zombie_capability(self) -> None:
+        module = self._load_adapter_module()
+        pgid = 719
+        errno_observations: list[tuple[str, int]] = []
+        pid_info_arguments: list[tuple[int, int, int]] = []
+
+        class FakeFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(
+            requested_pgid: int,
+            pid_array,
+            buffer_size: int,
+        ) -> int:
+            self.assertEqual(requested_pgid, pgid)
+            self.assertEqual(buffer_size, ctypes.sizeof(ctypes.c_int * 8))
+            errno_observations.append(("list", ctypes.get_errno()))
+            pid_array[0] = pgid
+            pid_array[1] = pgid + 1
+            ctypes.set_errno(errno.EBUSY)
+            return 2
+
+        def pid_info(
+            pid: int,
+            flavor: int,
+            argument: int,
+            info_pointer,
+            info_size: int,
+        ) -> int:
+            errno_observations.append(("info", ctypes.get_errno()))
+            pid_info_arguments.append((pid, flavor, argument))
+            self.assertEqual(info_size, ctypes.sizeof(module._DarwinProcBSDInfo))
+            info = ctypes.cast(
+                info_pointer,
+                ctypes.POINTER(module._DarwinProcBSDInfo),
+            ).contents
+            info.pbi_pid = pid
+            info.pbi_pgid = pgid
+            info.pbi_status = 5
+            ctypes.set_errno(errno.EAGAIN)
+            return info_size
+
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeFunction(list_group),
+            proc_pidinfo=FakeFunction(pid_info),
+        )
+        previous_errno = ctypes.get_errno()
+        try:
+            ctypes.set_errno(errno.EIO)
+            with (
+                mock.patch.object(
+                    module.ctypes,
+                    "CDLL",
+                    return_value=fake_libproc,
+                ),
+                mock.patch.object(
+                    module,
+                    "_waitable_sigchld_failure",
+                    return_value=None,
+                ),
+            ):
+                state = module._darwin_refresh_process_group_state(
+                    pgid,
+                    known_exited_leader_pid=pgid,
+                    max_entries=8,
+                )
+        finally:
+            ctypes.set_errno(previous_errno)
+
+        self.assertEqual(state, "zombie-only")
+        self.assertEqual(
+            errno_observations,
+            [("list", 0), ("info", 0), ("info", 0)],
+        )
+        self.assertEqual(
+            pid_info_arguments,
+            [(pgid, 3, 1), (pgid + 1, 3, 1)],
+        )
+
+    def test_darwin_refresh_scan_ignores_only_attested_leader_stale_status(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        pgid = 723
+        listed_pids = [pgid]
+
+        class FakeFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(
+            _requested_pgid: int,
+            pid_array,
+            _buffer_size: int,
+        ) -> int:
+            for index, pid in enumerate(listed_pids):
+                pid_array[index] = pid
+            return len(listed_pids)
+
+        def pid_info(
+            pid: int,
+            _flavor: int,
+            _argument: int,
+            info_pointer,
+            info_size: int,
+        ) -> int:
+            info = ctypes.cast(
+                info_pointer,
+                ctypes.POINTER(module._DarwinProcBSDInfo),
+            ).contents
+            info.pbi_pid = pid
+            info.pbi_pgid = pgid
+            info.pbi_status = 2
+            return info_size
+
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeFunction(list_group),
+            proc_pidinfo=FakeFunction(pid_info),
+        )
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
+        ):
+            self.assertEqual(
+                module._darwin_refresh_process_group_state(
+                    pgid,
+                    max_entries=8,
+                ),
+                "live",
+            )
+            self.assertEqual(
+                module._darwin_refresh_process_group_state(
+                    pgid,
+                    known_exited_leader_pid=pgid,
+                    max_entries=8,
+                ),
+                "zombie-only",
+            )
+            listed_pids.append(pgid + 1)
+            self.assertEqual(
+                module._darwin_refresh_process_group_state(
+                    pgid,
+                    known_exited_leader_pid=pgid,
+                    max_entries=8,
+                ),
+                "live",
+            )
+
+    def test_darwin_refresh_scan_treats_pidinfo_eperm_as_unknown(self) -> None:
+        module = self._load_adapter_module()
+        pgid = 727
+
+        class FakeFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(
+            _requested_pgid: int,
+            pid_array,
+            _buffer_size: int,
+        ) -> int:
+            pid_array[0] = pgid
+            return 1
+
+        def pid_info(
+            _pid: int,
+            flavor: int,
+            argument: int,
+            _info_pointer,
+            _info_size: int,
+        ) -> int:
+            self.assertEqual((flavor, argument), (3, 1))
+            self.assertEqual(ctypes.get_errno(), 0)
+            ctypes.set_errno(errno.EPERM)
+            return 0
+
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeFunction(list_group),
+            proc_pidinfo=FakeFunction(pid_info),
+        )
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
+        ):
+            self.assertEqual(
+                module._darwin_refresh_process_group_state(
+                    pgid,
+                    known_exited_leader_pid=pgid,
+                    max_entries=8,
+                ),
+                "unknown",
+            )
+
+    def test_darwin_refresh_scan_full_pid_buffer_is_unknown(self) -> None:
+        module = self._load_adapter_module()
+        pgid = 733
+
+        class FakeFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(
+            _requested_pgid: int,
+            pid_array,
+            _buffer_size: int,
+        ) -> int:
+            for index in range(4):
+                pid_array[index] = pgid + index
+            return 4
+
+        pid_info = mock.Mock(side_effect=AssertionError("must not inspect full buffer"))
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeFunction(list_group),
+            proc_pidinfo=pid_info,
+        )
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
+        ):
+            self.assertEqual(
+                module._darwin_refresh_process_group_state(
+                    pgid,
+                    known_exited_leader_pid=pgid,
+                    max_entries=4,
+                ),
+                "unknown",
+            )
+        pid_info.assert_not_called()
+
+    def test_darwin_refresh_scan_treats_known_leader_esrch_as_unknown(self) -> None:
+        module = self._load_adapter_module()
+        pgid = 739
+
+        class FakeFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(
+            _requested_pgid: int,
+            pid_array,
+            _buffer_size: int,
+        ) -> int:
+            pid_array[0] = pgid
+            return 1
+
+        def pid_info(
+            _pid: int,
+            _flavor: int,
+            _argument: int,
+            _info_pointer,
+            _info_size: int,
+        ) -> int:
+            ctypes.set_errno(errno.ESRCH)
+            return 0
+
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeFunction(list_group),
+            proc_pidinfo=FakeFunction(pid_info),
+        )
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                return_value=None,
+            ),
+        ):
+            self.assertEqual(
+                module._darwin_refresh_process_group_state(
+                    pgid,
+                    known_exited_leader_pid=pgid,
+                    max_entries=8,
+                ),
+                "unknown",
+            )
+
+    def test_darwin_refresh_scan_latches_mid_scan_sigchld_fence_loss(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        pgid = 741
+        inspected: list[int] = []
+
+        class FakeFunction:
+            def __init__(self, implementation) -> None:
+                self.implementation = implementation
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def list_group(
+            _requested_pgid: int,
+            pid_array,
+            _buffer_size: int,
+        ) -> int:
+            pid_array[0] = pgid
+            pid_array[1] = pgid + 1
+            return 2
+
+        def pid_info(
+            pid: int,
+            _flavor: int,
+            _argument: int,
+            info_pointer,
+            info_size: int,
+        ) -> int:
+            inspected.append(pid)
+            info = ctypes.cast(
+                info_pointer,
+                ctypes.POINTER(module._DarwinProcBSDInfo),
+            ).contents
+            info.pbi_pid = pid
+            info.pbi_pgid = pgid
+            info.pbi_status = 5
+            return info_size
+
+        fake_libproc = mock.Mock(
+            proc_listpgrppids=FakeFunction(list_group),
+            proc_pidinfo=FakeFunction(pid_info),
+        )
+        waitability = mock.Mock(
+            side_effect=[
+                None,
+                None,
+                "transient SIGCHLD fence loss",
+                None,
+            ]
+        )
+        with (
+            mock.patch.object(
+                module.ctypes,
+                "CDLL",
+                return_value=fake_libproc,
+            ),
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            self.assertRaisesRegex(
+                module._ProcessIdentityLost,
+                "transient SIGCHLD fence loss",
+            ),
+        ):
+            module._darwin_refresh_process_group_state(
+                pgid,
+                known_exited_leader_pid=pgid,
+                max_entries=8,
+            )
+
+        self.assertEqual(inspected, [pgid])
+        self.assertEqual(waitability.call_count, 3)
+        self.assertIsNone(waitability())
+
+    def test_linux_refresh_scan_latches_mid_scan_sigchld_fence_loss(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        pgid = 743
+        proc_root = self.root / "proc-mid-scan-fence-loss"
+        self._write_proc_stat(
+            proc_root,
+            pid=743,
+            state="Z",
+            process_group=pgid,
+        )
+        self._write_proc_stat(
+            proc_root,
+            pid=744,
+            state="Z",
+            process_group=pgid,
+        )
+        waitability = mock.Mock(
+            side_effect=[
+                None,
+                "transient SIGCHLD fence loss",
+                None,
+            ]
+        )
+        with (
+            mock.patch.object(
+                module,
+                "_waitable_sigchld_failure",
+                waitability,
+            ),
+            self.assertRaisesRegex(
+                module._ProcessIdentityLost,
+                "transient SIGCHLD fence loss",
+            ),
+        ):
+            module._linux_refresh_process_group_state(
+                pgid,
+                proc_root=proc_root,
+            )
+
+        self.assertEqual(waitability.call_count, 2)
+        self.assertIsNone(waitability())
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin libproc")
+    def test_darwin_refresh_scan_observes_real_unreaped_zombie(self) -> None:
+        module = self._load_adapter_module()
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(0.05)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        observer = None
+        try:
+            observer = module._UnreapedLeaderObserver(
+                process.pid,
+                platform="darwin",
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not observer.exited():
+                time.sleep(0.01)
+            self.assertTrue(
+                observer.exited(), "child did not become an unreaped zombie"
+            )
+            self.assertEqual(
+                module._darwin_refresh_process_group_state(
+                    process.pid,
+                    known_exited_leader_pid=process.pid,
+                ),
+                "zombie-only",
+            )
+        finally:
+            if observer is not None:
+                try:
+                    observer.reap(process, timeout=1)
+                except (subprocess.TimeoutExpired, module.UserError):
+                    process.kill()
+                    process.wait(timeout=1)
+            else:
+                process.kill()
+                process.wait(timeout=1)
+
+    def test_linux_refresh_scan_accepts_zombie_only_process_group(self) -> None:
+        module = self._load_adapter_module()
+        proc_root = self.root / "proc-zombie-only"
+        self._write_proc_stat(
+            proc_root,
+            pid=201,
+            state="Z",
+            process_group=77,
+        )
+        self._write_proc_stat(
+            proc_root,
+            pid=202,
+            state="Z",
+            process_group=77,
+        )
+        self._write_proc_stat(
+            proc_root,
+            pid=203,
+            state="S",
+            process_group=88,
+        )
+
+        self.assertEqual(
+            module._linux_refresh_process_group_state(77, proc_root=proc_root),
+            "zombie-only",
+        )
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertFalse(
+                module._refresh_process_group_has_live_members(
+                    77,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+    def test_linux_refresh_scan_keeps_live_process_group_member(self) -> None:
+        module = self._load_adapter_module()
+        proc_root = self.root / "proc-live-member"
+        self._write_proc_stat(
+            proc_root,
+            pid=301,
+            state="Z",
+            process_group=91,
+        )
+        self._write_proc_stat(
+            proc_root,
+            pid=302,
+            state="S",
+            process_group=91,
+        )
+
+        self.assertEqual(
+            module._linux_refresh_process_group_state(91, proc_root=proc_root),
+            "live",
+        )
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertTrue(
+                module._refresh_process_group_has_live_members(
+                    91,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+    def test_linux_refresh_scan_handles_non_utf8_process_name_as_bytes(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        proc_root = self.root / "proc-non-utf8-name"
+        process_dir = proc_root / "501"
+        process_dir.mkdir(parents=True)
+        (process_dir / "stat").write_bytes(b"501 (fixture \xff name) Z 1 109 1 0\n")
+
+        self.assertEqual(
+            module._linux_refresh_process_group_state(109, proc_root=proc_root),
+            "zombie-only",
+        )
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertFalse(
+                module._refresh_process_group_has_live_members(
+                    109,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+    def test_linux_refresh_scan_ambiguity_fails_closed(self) -> None:
+        module = self._load_adapter_module()
+        proc_root = self.root / "proc-ambiguous"
+        self._write_proc_stat(
+            proc_root,
+            pid=401,
+            state="Z",
+            process_group=101,
+        )
+        self.assertEqual(
+            module._linux_refresh_process_group_state(
+                101,
+                proc_root=proc_root,
+                deadline=time.monotonic() - 1,
+            ),
+            "unknown",
+        )
+
+        stat_path = proc_root / "401" / "stat"
+        stat_path.write_text("ambiguous\n", encoding="utf-8")
+        self.assertEqual(
+            module._linux_refresh_process_group_state(101, proc_root=proc_root),
+            "unknown",
+        )
+
+        stat_path.unlink()
+        stat_path.mkdir()
+        self.assertEqual(
+            module._linux_refresh_process_group_state(101, proc_root=proc_root),
+            "unknown",
+        )
+        stat_path.rmdir()
+        stat_path.write_bytes(b"401 (fixture) \xff 1 101 1 0\n")
+        with mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertTrue(
+                module._refresh_process_group_has_live_members(
+                    101,
+                    proc_root=proc_root,
+                    platform="linux",
+                )
+            )
+
+    def test_linux_refresh_scan_iteration_error_fails_closed(self) -> None:
+        module = self._load_adapter_module()
+
+        class FailingProcEntries:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError("injected proc iteration failure")
+
+        with mock.patch.object(
+            module.os,
+            "scandir",
+            side_effect=lambda _root: FailingProcEntries(),
+        ):
+            self.assertEqual(
+                module._linux_refresh_process_group_state(113),
+                "unknown",
+            )
+            with mock.patch.object(module.os, "killpg", return_value=None):
+                self.assertTrue(
+                    module._refresh_process_group_has_live_members(
+                        113,
+                        platform="linux",
+                    )
+                )
+
+    def test_refresh_signal_cleans_process_group_before_redelivery(self) -> None:
+        module = self._load_adapter_module()
+        script = self.root / "refresh-signal-tree.py"
+        pid_path = self.root / "refresh-signal.pid"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                import pathlib
+                import subprocess
+                import sys
+                import time
+
+                inherited_fd = int(sys.argv[1])
+                pathlib.Path(sys.argv[2]).write_text(
+                    str(os.getpid()),
+                    encoding="utf-8",
+                )
+                os.set_inheritable(inherited_fd, True)
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    pass_fds=(inherited_fd,),
+                )
+                time.sleep(60)
+                """
+            ),
+            encoding="utf-8",
+        )
+        read_fd, write_fd = os.pipe()
+        received_signals: list[int] = []
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        signal.signal(
+            signal.SIGTERM,
+            lambda signum, _frame: received_signals.append(signum),
+        )
+        sender = threading.Thread(
+            target=lambda: (
+                time.sleep(0.3),
+                os.kill(os.getpid(), signal.SIGTERM),
+            ),
+            daemon=True,
+        )
+        sender.start()
+        try:
+            completed = module._run_bounded_refresh_process(
+                [
+                    sys.executable,
+                    str(script),
+                    str(write_fd),
+                    str(pid_path),
+                ],
+                pass_fds=(write_fd,),
+                env=os.environ.copy(),
+                timeout=5.0,
+                cleanup_timeout=3.0,
+                max_capture_bytes=64 * 1024,
+            )
+        finally:
+            sender.join(timeout=2)
+            signal.signal(signal.SIGTERM, previous_handler)
+            os.close(write_fd)
+        try:
+            self.assertEqual(completed.returncode, 128 + signal.SIGTERM)
+            self.assertEqual(received_signals, [signal.SIGTERM])
+            process_group = int(pid_path.read_text(encoding="utf-8"))
+            self.assertFalse(
+                module._refresh_process_group_has_live_members(process_group)
+            )
+            os.set_blocking(read_fd, False)
+            self.assertEqual(os.read(read_fd, 1), b"")
+        finally:
+            os.close(read_fd)
+
+    def test_prepare_active_run_registers_run_dir_for_single_observed_session(
+        self,
+    ) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(),
+        )
+        completed = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        run_dir = pathlib.Path(payload["run_dir"])
+        self.assertTrue(run_dir.is_dir())
+
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        record = index["sessions"]["session-1"]
+        self.assertEqual(record["status"], "active")
+        self.assertEqual(record["run_dir"], str(run_dir))
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        orchestration = state["orchestration"]
+        self.assertEqual(orchestration["parent_session_id"], "session-1")
+        self.assertEqual(
+            orchestration["parent_transcript_path"], "/tmp/transcript-1.jsonl"
+        )
+        self.assertEqual(orchestration["permission_mode"], "acceptEdits")
+
+    def test_prepare_active_run_accepts_exact_prospective_index_limit(self) -> None:
+        session_id = "session-prepare-exact-limit"
+        run_id = "prepare-exact-limit"
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        fixed_now = "2026-07-30T04:05:06+00:00"
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        preparation_id = "1" * 32
+        prospective_run_dir = (
+            self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        )
+        prospective_index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        record = prospective_index["sessions"][session_id]
+        record["run_dir"] = str(prospective_run_dir)
+        record["status"] = "preparing"
+        record["updated_at"] = fixed_now
+        record["preparation_id"] = preparation_id
+        record["preparation_run_id"] = run_id
+        record["preparation_lease_path"] = str(
+            module._preparation_lease_path(self.repo.resolve(), preparation_id)
+        )
+        record["preparation_started_at"] = fixed_now
+        record["preparation_reason"] = None
+        prospective_index["latest_session_id"] = session_id
+        prospective_content = module._serialize_index_for_commit(
+            prospective_index,
+            transaction_time=fixed_now,
+            context="test prospective index",
+        )
+        recovery_projection = copy.deepcopy(prospective_index)
+        recovery_record = recovery_projection["sessions"][session_id]
+        recovery_record["status"] = "recovery_required"
+        recovery_record["preparation_reason"] = (
+            "x" * module.PREPARATION_REASON_MAX_CHARS
+        )
+        recovery_projection["updated_at"] = fixed_now
+        projected_content = (
+            json.dumps(
+                recovery_projection,
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        self.assertLess(len(prospective_content), len(projected_content))
+        captured_stdout = io.StringIO()
+        real_bridge = module._run_bridge_json_with_lease
+        saw_durable_reservation = False
+
+        def inspect_then_create(
+            lease_fd: int,
+            *bridge_args: str,
+        ) -> dict[str, object]:
+            nonlocal saw_durable_reservation
+            run_id_index = bridge_args.index("--run-id") + 1
+            self.assertEqual(bridge_args[run_id_index], run_id)
+            preparation_index = bridge_args.index("--preparation-id") + 1
+            self.assertEqual(bridge_args[preparation_index], preparation_id)
+            durable = json.loads(self._index_path().read_text(encoding="utf-8"))
+            durable_record = durable["sessions"][session_id]
+            self.assertEqual(durable_record["status"], "preparing")
+            self.assertEqual(durable_record["preparation_id"], preparation_id)
+            self.assertEqual(durable_record["run_dir"], str(prospective_run_dir))
+            saw_durable_reservation = True
+            return real_bridge(lease_fd, *bridge_args)
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "INDEX_MAX_BYTES",
+                len(projected_content),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=inspect_then_create,
+            ),
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+        ):
+            self.assertEqual(module._prepare_active_run(args), 0)
+
+        self.assertTrue(saw_durable_reservation)
+        self.assertTrue(prospective_run_dir.is_dir())
+        committed = json.loads(self._index_path().read_text(encoding="utf-8"))
+        committed_record = committed["sessions"][session_id]
+        self.assertEqual(committed_record["status"], "active")
+        self.assertEqual(committed_record["preparation_id"], preparation_id)
+        self.assertFalse(
+            pathlib.Path(committed_record["preparation_lease_path"]).exists()
+        )
+        state = json.loads(
+            (prospective_run_dir / "state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["schema_version"], 5)
+        self.assertEqual(state["preparation_id"], preparation_id)
+        self.assertEqual(
+            json.loads(captured_stdout.getvalue())["run_dir"],
+            str(prospective_run_dir),
+        )
+
+    def test_prepare_active_run_capacity_preflight_has_no_side_effects(
+        self,
+    ) -> None:
+        session_id = "session-prepare-over-limit"
+        run_id = "prepare-over-limit"
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        fixed_now = "2026-07-30T05:06:07+00:00"
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        preparation_id = "2" * 32
+        prospective_run_dir = (
+            self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        )
+        prospective_index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        record = prospective_index["sessions"][session_id]
+        record["run_dir"] = str(prospective_run_dir)
+        record["status"] = "preparing"
+        record["updated_at"] = fixed_now
+        record["preparation_id"] = preparation_id
+        record["preparation_run_id"] = run_id
+        record["preparation_lease_path"] = str(
+            module._preparation_lease_path(self.repo.resolve(), preparation_id)
+        )
+        record["preparation_started_at"] = fixed_now
+        record["preparation_reason"] = None
+        prospective_index["latest_session_id"] = session_id
+        prospective_content = module._serialize_index_for_commit(
+            prospective_index,
+            transaction_time=fixed_now,
+            context="test prospective index",
+        )
+        recovery_projection = copy.deepcopy(prospective_index)
+        recovery_record = recovery_projection["sessions"][session_id]
+        recovery_record["status"] = "recovery_required"
+        recovery_record["preparation_reason"] = (
+            "x" * module.PREPARATION_REASON_MAX_CHARS
+        )
+        recovery_projection["updated_at"] = fixed_now
+        projected_content = (
+            json.dumps(
+                recovery_projection,
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        original_index = self._index_path().read_bytes()
+        self.assertLess(len(original_index), len(prospective_content))
+        self.assertLess(len(prospective_content), len(projected_content))
+        captured_stdout = io.StringIO()
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "INDEX_MAX_BYTES",
+                len(projected_content) - 1,
+            ),
+            mock.patch.object(module, "_create_preparation_lease") as lease_mock,
+            mock.patch.object(module, "_run_bridge_json_with_lease") as bridge_mock,
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "would consume reserved preparation recovery capacity",
+            ),
+        ):
+            module._prepare_active_run(args)
+
+        lease_mock.assert_not_called()
+        bridge_mock.assert_not_called()
+        self.assertFalse(prospective_run_dir.exists())
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertEqual(self._index_path().read_bytes(), original_index)
+
+    def test_prepare_active_run_rejects_concurrent_index_drift_without_output(
+        self,
+    ) -> None:
+        session_id = "session-prepare-index-drift"
+        run_id = "prepare-index-drift"
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        fixed_now = "2026-07-30T06:07:08+00:00"
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        preparation_id = "3" * 32
+        prospective_run_dir = (
+            self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        )
+        replacement_index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        replacement_index["sessions"][session_id]["last_prompt"] = (
+            "out-of-band concurrent update"
+        )
+        replacement_index["updated_at"] = "2026-07-30T06:07:09+00:00"
+        replacement_content = (
+            json.dumps(
+                replacement_index,
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        captured_stdout = io.StringIO()
+        real_bridge = module._run_bridge_json_with_lease
+
+        def create_run_then_drift(
+            lease_fd: int,
+            *bridge_args: str,
+        ) -> dict[str, object]:
+            durable = json.loads(self._index_path().read_text(encoding="utf-8"))
+            self.assertEqual(
+                durable["sessions"][session_id]["status"],
+                "preparing",
+            )
+            replacement_path = self._index_path().with_name(
+                ".index.concurrent-replacement"
+            )
+            replacement_path.write_bytes(replacement_content)
+            replacement_path.chmod(0o600)
+            os.replace(replacement_path, self._index_path())
+            return real_bridge(lease_fd, *bridge_args)
+
+        with (
+            mock.patch.object(module, "_utc_now", return_value=fixed_now),
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=create_run_then_drift,
+            ),
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+            self.assertRaisesRegex(
+                module.UserError,
+                "recovery fence update also failed",
+            ),
+        ):
+            module._prepare_active_run(args)
+
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertEqual(self._index_path().read_bytes(), replacement_content)
+        self.assertTrue(prospective_run_dir.is_dir())
+        committed = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertIsNone(committed["sessions"][session_id]["run_dir"])
+        state = json.loads(
+            (prospective_run_dir / "state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["preparation_id"], preparation_id)
+        self.assertTrue(
+            module._preparation_lease_path(
+                self.repo.resolve(),
+                preparation_id,
+            ).exists()
+        )
+
+    def test_preparation_lease_rejects_unsafe_mode(self) -> None:
+        module = self._load_adapter_module()
+        reservation = self._seed_interrupted_preparation(
+            module,
+            session_id="session-unsafe-lease-mode",
+            run_id="unsafe-lease-mode",
+            preparation_id="ab" * 16,
+        )
+        lease_path = pathlib.Path(reservation.lease_path)
+        original_mode = lease_path.stat().st_mode & 0o7777
+        lease_path.chmod(0o620)
+        repo_fd: int | None = None
+        codex_tmp_fd: int | None = None
+        adapter_fd: int | None = None
+        lease_fd: int | None = None
+        try:
+            repo_fd, codex_tmp_fd, adapter_fd = module._open_index_directories(
+                self.repo.resolve()
+            )
+            lease_fd = os.open(
+                lease_path.name,
+                os.O_RDWR,
+                dir_fd=adapter_fd,
+            )
+            with self.assertRaisesRegex(
+                module.RunSafetyError,
+                "access policy",
+            ):
+                module._validate_preparation_lease_fd(
+                    adapter_fd,
+                    lease_fd,
+                    reservation,
+                )
+        finally:
+            if lease_fd is not None:
+                os.close(lease_fd)
+            if adapter_fd is not None:
+                os.close(adapter_fd)
+            if codex_tmp_fd is not None:
+                os.close(codex_tmp_fd)
+            if repo_fd is not None:
+                os.close(repo_fd)
+            lease_path.chmod(original_mode)
+
+    def test_reservation_commit_failures_never_launch_bridge(self) -> None:
+        for failure_point in ("before-replace", "after-replace"):
+            with self.subTest(failure_point=failure_point):
+                session_id = f"session-reservation-{failure_point}"
+                run_id = f"reservation-{failure_point}"
+                preparation_id = (
+                    "a1" * 16 if failure_point == "before-replace" else "b2" * 16
+                )
+                observed = self._run_adapter(
+                    "user-prompt-submit-hook",
+                    input_payload=self._session_payload(session_id=session_id),
+                )
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                module = self._load_adapter_module()
+                args = self._prepare_active_args(
+                    module,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+                original_index = self._index_path().read_bytes()
+                real_save = module._atomic_save_index_at
+                save_calls = 0
+
+                def fail_reservation_commit(*save_args, **save_kwargs):
+                    nonlocal save_calls
+                    save_calls += 1
+                    if failure_point == "before-replace":
+                        raise module.RunSafetyError(
+                            "simulated reservation failure before replacement"
+                        )
+                    real_save(*save_args, **save_kwargs)
+                    raise module.RunSafetyError(
+                        "simulated reservation fsync ambiguity after replacement"
+                    )
+
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        module.uuid,
+                        "uuid4",
+                        return_value=uuid.UUID(hex=preparation_id),
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_atomic_save_index_at",
+                        side_effect=fail_reservation_commit,
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_run_bridge_json_with_lease",
+                    ) as bridge,
+                    mock.patch.object(module.sys, "stdout", stdout),
+                    self.assertRaises(module.UserError),
+                ):
+                    module._prepare_active_run(args)
+                self.assertEqual(save_calls, 1)
+                bridge.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                lease_path = module._preparation_lease_path(
+                    self.repo.resolve(),
+                    preparation_id,
+                )
+                if failure_point == "before-replace":
+                    self.assertEqual(self._index_path().read_bytes(), original_index)
+                    self.assertFalse(lease_path.exists())
+                else:
+                    record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                        "sessions"
+                    ][session_id]
+                    self.assertEqual(record["status"], "preparing")
+                    self.assertEqual(record["preparation_id"], preparation_id)
+                    self.assertTrue(lease_path.is_file())
+                self.assertFalse(
+                    (self.repo / ".codex-tmp" / "waited-delivery" / run_id).exists()
+                )
+
+    def test_prepare_bridge_failure_without_run_clears_exact_reservation(self) -> None:
+        session_id = "session-bridge-failure-absent"
+        run_id = "bridge-failure-absent"
+        preparation_id = "4" * 32
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        stdout = io.StringIO()
+        saw_busy_lease = False
+
+        def fail_before_create(
+            _lease_fd: int,
+            *_bridge_args: str,
+        ) -> dict[str, object]:
+            nonlocal saw_busy_lease
+            doctor = self._run_adapter(
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "doctor",
+            )
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+            self.assertEqual(json.loads(doctor.stdout)["status"], "in_progress")
+            saw_busy_lease = True
+            raise module.UserError("simulated bridge failure before creation")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=fail_before_create,
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "cleared safely"),
+        ):
+            module._prepare_active_run(args)
+
+        self.assertTrue(saw_busy_lease)
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(
+            record["run_dir"],
+            str(self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id),
+        )
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertFalse(
+            module._preparation_lease_path(
+                self.repo.resolve(),
+                preparation_id,
+            ).exists()
+        )
+        self.assertFalse(
+            (self.repo / ".codex-tmp" / "waited-delivery" / run_id).exists()
+        )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork semantics")
+    def test_bridge_failure_with_inherited_writer_never_clears_reservation(
+        self,
+    ) -> None:
+        session_id = "session-bridge-failure-inherited-writer"
+        run_id = "bridge-failure-inherited-writer"
+        preparation_id = "e5" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        run_dir = self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        ready_read, ready_write = os.pipe()
+        release_read, release_write = os.pipe()
+        child_pid: int | None = None
+        stdout = io.StringIO()
+
+        def fail_while_inherited_writer_survives(
+            _lease_fd: int,
+            *_bridge_args: str,
+        ) -> dict[str, object]:
+            nonlocal child_pid
+            child_pid = os.fork()
+            if child_pid == 0:
+                try:
+                    os.close(ready_read)
+                    os.close(release_write)
+                    os.write(ready_write, b"1")
+                    os.close(ready_write)
+                    if os.read(release_read, 1) != b"1":
+                        os._exit(96)
+                    os.close(release_read)
+                    run_dir.mkdir(parents=True, mode=0o700)
+                    run_dir.chmod(0o700)
+                except BaseException:
+                    os._exit(97)
+                os._exit(0)
+            os.close(ready_write)
+            os.close(release_read)
+            self.assertEqual(os.read(ready_read, 1), b"1")
+            os.close(ready_read)
+            raise module.UserError(
+                "simulated bridge death before inherited writer creates the run"
+            )
+
+        try:
+            with (
+                mock.patch.object(
+                    module.uuid,
+                    "uuid4",
+                    return_value=uuid.UUID(hex=preparation_id),
+                ),
+                mock.patch.object(
+                    module,
+                    "_run_bridge_json_with_lease",
+                    side_effect=fail_while_inherited_writer_survives,
+                ),
+                mock.patch.object(
+                    module,
+                    "_expected_run_entry_presence",
+                ) as presence,
+                mock.patch.object(module.sys, "stdout", stdout),
+                self.assertRaisesRegex(module.UserError, "remains recorded"),
+            ):
+                module._prepare_active_run(args)
+            presence.assert_not_called()
+            self.assertEqual(stdout.getvalue(), "")
+            record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                "sessions"
+            ][session_id]
+            self.assertEqual(record["status"], "recovery_required")
+            self.assertEqual(record["preparation_id"], preparation_id)
+            self.assertIn(
+                "inherited-writer quiescence could not be proved",
+                record["preparation_reason"],
+            )
+            self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+
+            os.write(release_write, b"1")
+            os.close(release_write)
+            release_write = -1
+            assert child_pid is not None
+            waited_pid, wait_status = os.waitpid(child_pid, 0)
+            self.assertEqual(waited_pid, child_pid)
+            self.assertTrue(os.WIFEXITED(wait_status))
+            self.assertEqual(os.WEXITSTATUS(wait_status), 0)
+            child_pid = None
+            self.assertTrue(run_dir.is_dir())
+            preserved = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                "sessions"
+            ][session_id]
+            self.assertEqual(preserved["status"], "recovery_required")
+            self.assertEqual(preserved["run_dir"], str(run_dir))
+        finally:
+            for file_descriptor in (
+                ready_read,
+                ready_write,
+                release_read,
+                release_write,
+            ):
+                if file_descriptor >= 0:
+                    try:
+                        os.close(file_descriptor)
+                    except OSError:
+                        pass
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.waitpid(child_pid, 0)
+
+    def test_ambiguous_inherited_lease_close_is_never_retried_or_cleared(
+        self,
+    ) -> None:
+        session_id = "session-ambiguous-inherited-close"
+        run_id = "ambiguous-inherited-close"
+        preparation_id = "f6" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        real_retire = module._retire_inherited_preparation_lease
+        stdout = io.StringIO()
+
+        def close_then_report_ambiguity(lease_fd: int) -> None:
+            real_retire(lease_fd)
+            raise OSError("simulated ambiguous close result")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=module.UserError("simulated bridge failure"),
+            ),
+            mock.patch.object(
+                module,
+                "_retire_inherited_preparation_lease",
+                side_effect=close_then_report_ambiguity,
+            ) as retire,
+            mock.patch.object(
+                module,
+                "_expected_run_entry_presence",
+            ) as presence,
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "remains recorded"),
+        ):
+            module._prepare_active_run(args)
+
+        retire.assert_called_once()
+        presence.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertIn(
+            "lease ownership could not be retired exactly once",
+            record["preparation_reason"],
+        )
+        self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+        self.assertFalse(
+            (self.repo / ".codex-tmp" / "waited-delivery" / run_id).exists()
+        )
+
+    def test_partial_prepare_fences_stop_and_active_mutations(self) -> None:
+        session_id = "session-partial-preparation"
+        run_id = "partial-preparation"
+        preparation_id = "5" * 32
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        run_dir = self.repo.resolve() / ".codex-tmp" / "waited-delivery" / run_id
+        stdout = io.StringIO()
+
+        def create_partial_then_fail(
+            _lease_fd: int,
+            *_bridge_args: str,
+        ) -> dict[str, object]:
+            run_dir.mkdir(parents=True, mode=0o700)
+            run_dir.chmod(0o700)
+            raise module.UserError("simulated failure after mkdir")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=create_partial_then_fail,
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "remains recorded"),
+        ):
+            module._prepare_active_run(args)
+
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+
+        stop_stdout = io.StringIO()
+        stop_stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                module.sys,
+                "stdin",
+                io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+            ),
+            mock.patch.object(module.sys, "stdout", stop_stdout),
+            mock.patch.object(module.sys, "stderr", stop_stderr),
+            mock.patch.object(module, "_load_stop_run_state") as load_run,
+        ):
+            self.assertEqual(module._stop_hook(argparse.Namespace()), 2)
+        load_run.assert_not_called()
+        self.assertEqual(stop_stdout.getvalue(), "")
+        self.assertIn("Do not finish.", stop_stderr.getvalue())
+        self.assertIn(preparation_id, stop_stderr.getvalue())
+        self.assertIn("recover-active-run", stop_stderr.getvalue())
+
+        retry_args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id="partial-preparation-retry",
+        )
+        with (
+            mock.patch.object(module, "_run_bridge_json_with_lease") as bridge,
+            self.assertRaisesRegex(module.UserError, "unfinished recovery_required"),
+        ):
+            module._prepare_active_run(retry_args)
+        bridge.assert_not_called()
+
+        attach_args = module._build_parser().parse_args(
+            [
+                "attach-child-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-session-id",
+                "child-partial",
+                "--session-id",
+                session_id,
+            ]
+        )
+        with (
+            mock.patch.object(module, "_run_bridge_passthrough") as bridge,
+            self.assertRaisesRegex(module.UserError, "recovery_required"),
+        ):
+            module._attach_child_active_run(attach_args)
+        bridge.assert_not_called()
+
+    def test_prepare_rejects_mismatched_bridge_receipt_without_output(self) -> None:
+        session_id = "session-mismatched-receipt"
+        run_id = "mismatched-receipt"
+        preparation_id = "c3" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                return_value={
+                    "run_dir": str(self.root / "unexpected-run"),
+                    "preparation_id": "wrong-preparation",
+                    "preparation_lease_inherited": True,
+                },
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "does not match the exact"),
+        ):
+            module._prepare_active_run(args)
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertIn("does not match", record["preparation_reason"])
+        self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+
+    def test_interrupted_prepare_remains_recoverable_and_clears_only_when_quiescent(
+        self,
+    ) -> None:
+        session_id = "session-interrupted-preparation"
+        run_id = "interrupted-preparation"
+        preparation_id = "6" * 32
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=KeyboardInterrupt,
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            module._prepare_active_run(args)
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "preparing")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        observed_again = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="updated while preparation remains fenced",
+                transcript_path="/tmp/updated-interrupted.jsonl",
+            ),
+        )
+        self.assertEqual(observed_again.returncode, 0, observed_again.stderr)
+        preserved = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(preserved["status"], "preparing")
+        self.assertEqual(preserved["preparation_id"], preparation_id)
+        self.assertEqual(preserved["run_dir"], record["run_dir"])
+        self.assertEqual(
+            preserved["transcript_path"],
+            "/tmp/updated-interrupted.jsonl",
+        )
+
+        doctor_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+            ]
+        )
+        doctor_stdout = io.StringIO()
+        with mock.patch.object(module.sys, "stdout", doctor_stdout):
+            self.assertEqual(module._recover_active_run(doctor_args), 0)
+        self.assertEqual(json.loads(doctor_stdout.getvalue())["status"], "absent")
+
+        clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+        clear_stdout = io.StringIO()
+        with mock.patch.object(module.sys, "stdout", clear_stdout):
+            self.assertEqual(module._recover_active_run(clear_args), 0)
+        self.assertEqual(json.loads(clear_stdout.getvalue())["status"], "cleared")
+        cleared = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(cleared["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(cleared["run_dir"], record["run_dir"])
+        self.assertEqual(cleared["preparation_id"], preparation_id)
+        self.assertFalse(
+            module._preparation_lease_path(
+                self.repo.resolve(),
+                preparation_id,
+            ).exists()
+        )
+
+    def test_clear_absent_recovers_both_cleanup_pending_crash_points(self) -> None:
+        cases = (
+            (
+                "before-lease-unlink",
+                "a8" * 16,
+                "cleanup_pending_lease_present",
+                True,
+            ),
+            (
+                "before-final-cas",
+                "b9" * 16,
+                "cleanup_pending_final_cas",
+                False,
+            ),
+        )
+        for label, preparation_id, doctor_status, lease_present in cases:
+            with self.subTest(case=label):
+                module = self._load_adapter_module()
+                session_id = f"session-{label}"
+                run_id = f"run-{label}"
+                reservation = self._seed_interrupted_preparation(
+                    module,
+                    session_id=session_id,
+                    run_id=run_id,
+                    preparation_id=preparation_id,
+                )
+                original_record = json.loads(
+                    self._index_path().read_text(encoding="utf-8")
+                )["sessions"][session_id]
+                clear_args = module._build_parser().parse_args(
+                    [
+                        "recover-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--session-id",
+                        session_id,
+                        "--preparation-id",
+                        preparation_id,
+                        "--action",
+                        "clear-absent",
+                    ]
+                )
+                if label == "before-lease-unlink":
+                    patch_target = "_remove_preparation_lease"
+                    failure_message = "simulated failure before lease unlink"
+                else:
+                    patch_target = "_cas_clear_cleanup_pending"
+                    failure_message = "simulated failure before final CAS"
+                with (
+                    mock.patch.object(
+                        module,
+                        patch_target,
+                        side_effect=module.RunSafetyError(failure_message),
+                    ),
+                    self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        failure_message,
+                    ),
+                ):
+                    module._recover_active_run(clear_args)
+
+                pending = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(
+                    pending["status"],
+                    module.CLEANUP_PENDING_STATUS,
+                )
+                for field in (
+                    "run_dir",
+                    "preparation_id",
+                    "preparation_run_id",
+                    "preparation_lease_path",
+                    "preparation_started_at",
+                ):
+                    self.assertEqual(pending[field], original_record[field])
+                self.assertEqual(
+                    pathlib.Path(reservation.lease_path).exists(),
+                    lease_present,
+                )
+
+                doctor_args = module._build_parser().parse_args(
+                    [
+                        "recover-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--session-id",
+                        session_id,
+                        "--preparation-id",
+                        preparation_id,
+                    ]
+                )
+                doctor_stdout = io.StringIO()
+                with mock.patch.object(module.sys, "stdout", doctor_stdout):
+                    self.assertEqual(module._recover_active_run(doctor_args), 0)
+                self.assertEqual(
+                    json.loads(doctor_stdout.getvalue())["status"],
+                    doctor_status,
+                )
+
+                clear_stdout = io.StringIO()
+                with mock.patch.object(module.sys, "stdout", clear_stdout):
+                    self.assertEqual(module._recover_active_run(clear_args), 0)
+                self.assertEqual(
+                    json.loads(clear_stdout.getvalue())["status"],
+                    "cleared",
+                )
+                cleared = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(
+                    cleared["status"],
+                    module.CLEANUP_COMPLETE_STATUS,
+                )
+                self.assertEqual(cleared["run_dir"], reservation.run_dir)
+                self.assertEqual(cleared["preparation_id"], preparation_id)
+                self.assertFalse(pathlib.Path(reservation.lease_path).exists())
+
+    def test_absent_lease_parent_is_fsynced_before_cleanup_final_cas(self) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-cleanup-parent-fsync"
+        preparation_id = "bf" * 16
+        self._seed_interrupted_preparation(
+            module,
+            session_id=session_id,
+            run_id="cleanup-parent-fsync",
+            preparation_id=preparation_id,
+        )
+        clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+        with (
+            mock.patch.object(
+                module,
+                "_cas_clear_cleanup_pending",
+                side_effect=module.RunSafetyError(
+                    "simulated crash before cleanup final CAS"
+                ),
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "simulated crash before cleanup final CAS",
+            ),
+        ):
+            module._recover_active_run(clear_args)
+
+        events: list[str] = []
+        real_fsync_absence = module._fsync_preparation_lease_absence
+        real_complete = module._mark_preparation_cleanup_complete
+
+        def fsync_absence(*args, **kwargs):
+            real_fsync_absence(*args, **kwargs)
+            events.append("lease-parent-fsynced")
+
+        def complete_reservation(*args, **kwargs):
+            events.append("cleanup-tombstone-committed")
+            return real_complete(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                module,
+                "_fsync_preparation_lease_absence",
+                side_effect=fsync_absence,
+            ),
+            mock.patch.object(
+                module,
+                "_mark_preparation_cleanup_complete",
+                side_effect=complete_reservation,
+            ),
+            mock.patch.object(module.sys, "stdout", io.StringIO()),
+        ):
+            self.assertEqual(module._recover_active_run(clear_args), 0)
+
+        self.assertEqual(
+            events,
+            ["lease-parent-fsynced", "cleanup-tombstone-committed"],
+        )
+
+    def test_cleanup_pending_final_cas_rejects_observation_race(self) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-cleanup-final-cas-race"
+        preparation_id = "ca" * 16
+        reservation = self._seed_interrupted_preparation(
+            module,
+            session_id=session_id,
+            run_id="cleanup-final-cas-race",
+            preparation_id=preparation_id,
+        )
+        clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+        real_remove = module._remove_preparation_lease
+
+        def remove_then_observe(*args, **kwargs):
+            real_remove(*args, **kwargs)
+            observed = self._run_adapter(
+                "user-prompt-submit-hook",
+                input_payload=self._session_payload(
+                    session_id=session_id,
+                    prompt="observation racing the final cleanup CAS",
+                    transcript_path="/tmp/cleanup-final-cas-race.jsonl",
+                ),
+            )
+            self.assertEqual(observed.returncode, 0, observed.stderr)
+
+        with (
+            mock.patch.object(
+                module,
+                "_remove_preparation_lease",
+                side_effect=remove_then_observe,
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "changed before final CAS",
+            ),
+        ):
+            module._recover_active_run(clear_args)
+
+        pending = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(pending["status"], module.CLEANUP_PENDING_STATUS)
+        self.assertEqual(
+            pending["transcript_path"],
+            "/tmp/cleanup-final-cas-race.jsonl",
+        )
+        self.assertEqual(pending["preparation_id"], preparation_id)
+        self.assertFalse(pathlib.Path(reservation.lease_path).exists())
+
+        doctor_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                preparation_id,
+            ]
+        )
+        doctor_stdout = io.StringIO()
+        with mock.patch.object(module.sys, "stdout", doctor_stdout):
+            self.assertEqual(module._recover_active_run(doctor_args), 0)
+        self.assertEqual(
+            json.loads(doctor_stdout.getvalue())["status"],
+            "cleanup_pending_final_cas",
+        )
+
+        with mock.patch.object(module.sys, "stdout", io.StringIO()):
+            self.assertEqual(module._recover_active_run(clear_args), 0)
+        cleared = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(cleared["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(cleared["preparation_id"], preparation_id)
+
+    def test_cleanup_transaction_restores_previous_snapshot_after_commit_uncertainty(
+        self,
+    ) -> None:
+        cases = (
+            "after-replace",
+            "final-fsync",
+            "readback",
+            "post-commit-revalidation",
+        )
+        for case_number, case in enumerate(cases, start=1):
+            with self.subTest(case=case):
+                module = self._load_adapter_module()
+                session_id = f"session-cleanup-uncertain-{case}"
+                preparation_id = f"{case_number + 10:02x}" * 16
+                reservation, _pending = self._seed_cleanup_pending_without_lease(
+                    module,
+                    session_id=session_id,
+                    run_id=f"cleanup-uncertain-{case}",
+                    preparation_id=preparation_id,
+                )
+                clear_args = module._build_parser().parse_args(
+                    [
+                        "recover-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--session-id",
+                        session_id,
+                        "--preparation-id",
+                        preparation_id,
+                        "--action",
+                        "clear-absent",
+                    ]
+                )
+                if case == "after-replace":
+                    real_replace = module.os.replace
+
+                    def fail_after_replace(*replace_args, **replace_kwargs):
+                        real_replace(*replace_args, **replace_kwargs)
+                        raise OSError("simulated failure after index replacement")
+
+                    patcher = mock.patch.object(
+                        module.os,
+                        "replace",
+                        side_effect=fail_after_replace,
+                    )
+                elif case == "final-fsync":
+                    real_fsync = module.os.fsync
+                    raised = False
+
+                    def fail_after_final_fsync(file_descriptor):
+                        nonlocal raised
+                        real_fsync(file_descriptor)
+                        if raised or not self._index_path().exists():
+                            return
+                        durable = json.loads(
+                            self._index_path().read_text(encoding="utf-8")
+                        )["sessions"][session_id]
+                        if durable["status"] == module.CLEANUP_COMPLETE_STATUS:
+                            raised = True
+                            raise OSError(
+                                "simulated failure after final directory fsync"
+                            )
+
+                    patcher = mock.patch.object(
+                        module.os,
+                        "fsync",
+                        side_effect=fail_after_final_fsync,
+                    )
+                elif case == "readback":
+                    real_read = module._read_index_bytes_at
+                    raised = False
+
+                    def fail_tombstone_readback(adapter_fd):
+                        nonlocal raised
+                        result = real_read(adapter_fd)
+                        if not raised and result is not None:
+                            durable = json.loads(result[0])["sessions"][session_id]
+                            if durable["status"] == module.CLEANUP_COMPLETE_STATUS:
+                                raised = True
+                                raise module.RunSafetyError(
+                                    "simulated cleanup tombstone readback failure"
+                                )
+                        return result
+
+                    patcher = mock.patch.object(
+                        module,
+                        "_read_index_bytes_at",
+                        side_effect=fail_tombstone_readback,
+                    )
+                else:
+                    real_revalidate = module._revalidate_index_directories
+
+                    def fail_post_commit_revalidation(*revalidate_args):
+                        real_revalidate(*revalidate_args)
+                        if not self._index_path().exists():
+                            return
+                        durable = json.loads(
+                            self._index_path().read_text(encoding="utf-8")
+                        )["sessions"][session_id]
+                        if durable["status"] == module.CLEANUP_COMPLETE_STATUS:
+                            raise module.RunSafetyError(
+                                "simulated post-commit directory revalidation failure"
+                            )
+
+                    patcher = mock.patch.object(
+                        module,
+                        "_revalidate_index_directories",
+                        side_effect=fail_post_commit_revalidation,
+                    )
+
+                with (
+                    patcher,
+                    self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        "simulated",
+                    ),
+                ):
+                    module._recover_active_run(clear_args)
+
+                durable = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(
+                    durable["status"],
+                    module.CLEANUP_PENDING_STATUS,
+                )
+                self.assertEqual(durable["run_dir"], reservation.run_dir)
+                self.assertEqual(durable["preparation_id"], preparation_id)
+                self.assertEqual(
+                    durable["preparation_lease_path"],
+                    reservation.lease_path,
+                )
+                retry_stdout = io.StringIO()
+                with mock.patch.object(module.sys, "stdout", retry_stdout):
+                    self.assertEqual(module._recover_active_run(clear_args), 0)
+                self.assertEqual(
+                    json.loads(retry_stdout.getvalue())["status"],
+                    "cleared",
+                )
+                retried = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(
+                    retried["status"],
+                    module.CLEANUP_COMPLETE_STATUS,
+                )
+                self.assertEqual(retried["preparation_id"], preparation_id)
+
+    def test_old_cleanup_retry_never_clears_a_new_reservation(self) -> None:
+        module = self._load_adapter_module()
+        session_id = "session-cleanup-new-reservation"
+        old_preparation_id = "e1" * 16
+        reservation, _pending = self._seed_cleanup_pending_without_lease(
+            module,
+            session_id=session_id,
+            run_id="cleanup-old-reservation",
+            preparation_id=old_preparation_id,
+        )
+        old_clear_args = module._build_parser().parse_args(
+            [
+                "recover-active-run",
+                "--repo",
+                str(self.repo),
+                "--session-id",
+                session_id,
+                "--preparation-id",
+                old_preparation_id,
+                "--action",
+                "clear-absent",
+            ]
+        )
+        real_replace = module.os.replace
+
+        def fail_after_replace(*replace_args, **replace_kwargs):
+            real_replace(*replace_args, **replace_kwargs)
+            raise OSError("simulated old cleanup replacement ambiguity")
+
+        with (
+            mock.patch.object(
+                module.os,
+                "replace",
+                side_effect=fail_after_replace,
+            ),
+            self.assertRaisesRegex(module.RunSafetyError, "simulated"),
+        ):
+            module._recover_active_run(old_clear_args)
+        tombstone = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(tombstone["status"], module.CLEANUP_PENDING_STATUS)
+        self.assertEqual(tombstone["run_dir"], reservation.run_dir)
+
+        with mock.patch.object(module.sys, "stdout", io.StringIO()):
+            self.assertEqual(module._recover_active_run(old_clear_args), 0)
+        completed = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(completed["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(completed["preparation_id"], old_preparation_id)
+
+        new_preparation_id = "e2" * 16
+        new_args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id="cleanup-new-reservation",
+        )
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=new_preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=KeyboardInterrupt,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            module._prepare_active_run(new_args)
+        new_record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(new_record["status"], "preparing")
+        self.assertEqual(new_record["preparation_id"], new_preparation_id)
+
+        with self.assertRaisesRegex(
+            module.RunSafetyError,
+            "requested preparation id does not match",
+        ):
+            module._recover_active_run(old_clear_args)
+        preserved = json.loads(self._index_path().read_text(encoding="utf-8"))[
+            "sessions"
+        ][session_id]
+        self.assertEqual(preserved["status"], "preparing")
+        self.assertEqual(preserved["preparation_id"], new_preparation_id)
+
+    def test_bridge_failure_cleanup_orders_pending_unlink_and_final_cas(
+        self,
+    ) -> None:
+        session_id = "session-bridge-cleanup-order"
+        run_id = "bridge-cleanup-order"
+        preparation_id = "cb" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        events: list[str] = []
+        real_pending = module._cas_preparation_cleanup_pending
+        real_remove = module._remove_preparation_lease
+        real_clear = module._cas_clear_cleanup_pending
+
+        def record_pending(*pending_args, **pending_kwargs):
+            result = real_pending(*pending_args, **pending_kwargs)
+            events.append("cleanup_pending")
+            return result
+
+        def record_remove(*remove_args, **remove_kwargs):
+            record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                "sessions"
+            ][session_id]
+            self.assertEqual(record["status"], module.CLEANUP_PENDING_STATUS)
+            result = real_remove(*remove_args, **remove_kwargs)
+            events.append("lease_unlinked_and_parent_fsynced")
+            return result
+
+        def record_clear(*clear_args, **clear_kwargs):
+            self.assertFalse(
+                module._preparation_lease_path(
+                    self.repo.resolve(),
+                    preparation_id,
+                ).exists()
+            )
+            result = real_clear(*clear_args, **clear_kwargs)
+            events.append("final_index_cas")
+            return result
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=module.UserError("simulated bridge failure"),
+            ),
+            mock.patch.object(
+                module,
+                "_cas_preparation_cleanup_pending",
+                side_effect=record_pending,
+            ),
+            mock.patch.object(
+                module,
+                "_remove_preparation_lease",
+                side_effect=record_remove,
+            ),
+            mock.patch.object(
+                module,
+                "_cas_clear_cleanup_pending",
+                side_effect=record_clear,
+            ),
+            self.assertRaisesRegex(module.UserError, "cleared safely"),
+        ):
+            module._prepare_active_run(args)
+
+        self.assertEqual(
+            events,
+            [
+                "cleanup_pending",
+                "lease_unlinked_and_parent_fsynced",
+                "final_index_cas",
+            ],
+        )
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], module.CLEANUP_COMPLETE_STATUS)
+        self.assertEqual(record["preparation_id"], preparation_id)
+
+    def test_complete_failed_bridge_can_be_doctored_and_resumed(self) -> None:
+        session_id = "session-complete-failed-bridge"
+        run_id = "complete-failed-bridge"
+        preparation_id = "7" * 32
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        real_bridge = module._run_bridge_json_with_lease
+        stdout = io.StringIO()
+
+        def complete_then_fail(
+            lease_fd: int,
+            *bridge_args: str,
+        ) -> dict[str, object]:
+            real_bridge(lease_fd, *bridge_args)
+            raise module.UserError("simulated lost bridge receipt")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=complete_then_fail,
+            ),
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaisesRegex(module.UserError, "lost bridge receipt"),
+        ):
+            module._prepare_active_run(args)
+        self.assertEqual(stdout.getvalue(), "")
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+
+        doctor = self._run_adapter(
+            "recover-active-run",
+            "--repo",
+            str(self.repo),
+            "--session-id",
+            session_id,
+            "--preparation-id",
+            preparation_id,
+            "--action",
+            "doctor",
+        )
+        self.assertEqual(doctor.returncode, 0, doctor.stderr)
+        self.assertEqual(
+            json.loads(doctor.stdout)["status"],
+            "complete_not_activated",
+        )
+        resumed = self._run_adapter(
+            "recover-active-run",
+            "--repo",
+            str(self.repo),
+            "--session-id",
+            session_id,
+            "--preparation-id",
+            preparation_id,
+            "--action",
+            "resume",
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(json.loads(resumed.stdout)["status"], "active")
+        active = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(active["status"], "active")
+        self.assertEqual(active["preparation_id"], preparation_id)
+        self.assertFalse(pathlib.Path(active["preparation_lease_path"]).exists())
+
+    def test_resume_rejects_mismatched_run_transaction_attestation(self) -> None:
+        session_id = "session-mismatched-attestation"
+        run_id = "mismatched-attestation"
+        preparation_id = "d4" * 16
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        args = self._prepare_active_args(
+            module,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        real_bridge = module._run_bridge_json_with_lease
+
+        def complete_then_fail(
+            lease_fd: int,
+            *bridge_args: str,
+        ) -> dict[str, object]:
+            real_bridge(lease_fd, *bridge_args)
+            raise module.UserError("simulated receipt loss before attestation tamper")
+
+        with (
+            mock.patch.object(
+                module.uuid,
+                "uuid4",
+                return_value=uuid.UUID(hex=preparation_id),
+            ),
+            mock.patch.object(
+                module,
+                "_run_bridge_json_with_lease",
+                side_effect=complete_then_fail,
+            ),
+            self.assertRaises(module.UserError),
+        ):
+            module._prepare_active_run(args)
+        run_dir = self.repo / ".codex-tmp" / "waited-delivery" / run_id
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["preparation_id"] = "tampered-transaction"
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        resumed = self._run_adapter(
+            "recover-active-run",
+            "--repo",
+            str(self.repo),
+            "--session-id",
+            session_id,
+            "--preparation-id",
+            preparation_id,
+            "--action",
+            "resume",
+        )
+        self.assertNotEqual(resumed.returncode, 0)
+        self.assertEqual(resumed.stdout, "")
+        self.assertIn(
+            "does not attest the preparation transaction",
+            resumed.stderr,
+        )
+        record = json.loads(self._index_path().read_text(encoding="utf-8"))["sessions"][
+            session_id
+        ]
+        self.assertEqual(record["status"], "recovery_required")
+        self.assertEqual(record["preparation_id"], preparation_id)
+        self.assertTrue(pathlib.Path(record["preparation_lease_path"]).is_file())
+
+    def test_activation_commit_failures_keep_recoverable_identity_without_output(
+        self,
+    ) -> None:
+        for failure_point in ("before-replace", "after-replace"):
+            with self.subTest(failure_point=failure_point):
+                session_id = f"session-activation-{failure_point}"
+                run_id = f"activation-{failure_point}"
+                preparation_id = (
+                    "8" * 32 if failure_point == "before-replace" else "9" * 32
+                )
+                observed = self._run_adapter(
+                    "user-prompt-submit-hook",
+                    input_payload=self._session_payload(session_id=session_id),
+                )
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                module = self._load_adapter_module()
+                args = self._prepare_active_args(
+                    module,
+                    session_id=session_id,
+                    run_id=run_id,
+                )
+                real_save = module._atomic_save_index_at
+                save_calls = 0
+
+                def fail_activation_commit(*save_args, **save_kwargs):
+                    nonlocal save_calls
+                    save_calls += 1
+                    if save_calls == 2 and failure_point == "before-replace":
+                        raise module.RunSafetyError(
+                            "simulated activation CAS failure before replacement"
+                        )
+                    result = real_save(*save_args, **save_kwargs)
+                    if save_calls == 2 and failure_point == "after-replace":
+                        raise module.RunSafetyError(
+                            "simulated activation fsync ambiguity after replacement"
+                        )
+                    return result
+
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        module.uuid,
+                        "uuid4",
+                        return_value=uuid.UUID(hex=preparation_id),
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_atomic_save_index_at",
+                        side_effect=fail_activation_commit,
+                    ),
+                    mock.patch.object(module.sys, "stdout", stdout),
+                    self.assertRaisesRegex(
+                        module.UserError,
+                        "activation could not be verified",
+                    ),
+                ):
+                    module._prepare_active_run(args)
+                self.assertEqual(stdout.getvalue(), "")
+                record = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                expected_status = (
+                    "recovery_required"
+                    if failure_point == "before-replace"
+                    else "active"
+                )
+                self.assertEqual(record["status"], expected_status)
+                self.assertEqual(record["preparation_id"], preparation_id)
+                self.assertTrue(
+                    pathlib.Path(record["preparation_lease_path"]).is_file()
+                )
+
+                resumed = self._run_adapter(
+                    "recover-active-run",
+                    "--repo",
+                    str(self.repo),
+                    "--session-id",
+                    session_id,
+                    "--preparation-id",
+                    preparation_id,
+                    "--action",
+                    "resume",
+                )
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                self.assertEqual(json.loads(resumed.stdout)["status"], "active")
+                recovered = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                    "sessions"
+                ][session_id]
+                self.assertEqual(recovered["status"], "active")
+                self.assertFalse(
+                    pathlib.Path(recovered["preparation_lease_path"]).exists()
+                )
+
+    def test_prepare_refuses_tampered_terminal_run_before_replacement(self) -> None:
+        for case in ("run-dir-symlink", "state-symlink", "repo-mismatch"):
+            with self.subTest(case=case):
+                session_id = f"session-existing-terminal-{case}"
+                run_id = f"existing-terminal-{case}"
+                run_dir = self._prepare_indexed_run(session_id, run_id)
+                state_path = run_dir / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["overall_status"] = "blocked"
+                state["orchestration"]["child_status"] = "completed"
+                state["orchestration"]["child_session_id"] = f"child-{case}"
+                for phase in state["phases"].values():
+                    phase["status"] = "blocked"
+                if case == "repo-mismatch":
+                    state["repo_root"] = str(self.root / "other-repo")
+                state_path.write_text(
+                    json.dumps(state, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                if case == "run-dir-symlink":
+                    external_run = self.root / f"external-{run_id}"
+                    run_dir.rename(external_run)
+                    run_dir.symlink_to(external_run, target_is_directory=True)
+                elif case == "state-symlink":
+                    external_state = self.root / f"external-{run_id}.json"
+                    state_path.rename(external_state)
+                    state_path.symlink_to(external_state)
+
+                original_index = self._index_path().read_bytes()
+                module = self._load_adapter_module()
+                args = self._prepare_active_args(
+                    module,
+                    session_id=session_id,
+                    run_id=f"replacement-{case}",
+                )
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        module,
+                        "_create_preparation_lease",
+                    ) as lease,
+                    mock.patch.object(
+                        module,
+                        "_run_bridge_json_with_lease",
+                    ) as bridge,
+                    mock.patch.object(module.sys, "stdout", stdout),
+                    self.assertRaisesRegex(
+                        module.UserError,
+                        "cannot be retired safely",
+                    ),
+                ):
+                    module._prepare_active_run(args)
+                lease.assert_not_called()
+                bridge.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(self._index_path().read_bytes(), original_index)
+
+    def test_prepare_active_run_rejects_ambiguous_sessions_without_selector(
+        self,
+    ) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-1",
+                prompt="Prepare delivery for session one",
+                transcript_path="/tmp/transcript-1.jsonl",
+            ),
+        )
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-2",
+                prompt="Prepare delivery for session two",
+                transcript_path="/tmp/transcript-2.jsonl",
+            ),
+        )
+
+        completed = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("ambiguous session selection", completed.stderr)
+        self.assertIn("session-1", completed.stderr)
+        self.assertIn("session-2", completed.stderr)
+
+    def test_prepare_active_run_can_select_by_prompt_text(self) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-1",
+                prompt="Prepare delivery for session one",
+                transcript_path="/tmp/transcript-1.jsonl",
+            ),
+        )
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-2",
+                prompt="Prepare delivery for session two",
+                transcript_path="/tmp/transcript-2.jsonl",
+            ),
+        )
+
+        completed = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--prompt-text",
+            "Prepare delivery for session one",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_dir = pathlib.Path(json.loads(completed.stdout)["run_dir"])
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["orchestration"]["parent_session_id"], "session-1")
+
+    def test_prepare_active_run_can_select_by_transcript_path(self) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-1",
+                prompt="Prepare delivery for session one",
+                transcript_path="/tmp/transcript-1.jsonl",
+            ),
+        )
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-2",
+                prompt="Prepare delivery for session two",
+                transcript_path="/tmp/transcript-2.jsonl",
+            ),
+        )
+
+        completed = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--transcript-path",
+            "/tmp/transcript-2.jsonl",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_dir = pathlib.Path(json.loads(completed.stdout)["run_dir"])
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["orchestration"]["parent_session_id"], "session-2")
+
+    def test_prepare_active_run_prefers_current_thread_env_session(self) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-1",
+                prompt="Prepare delivery for session one",
+                transcript_path="/tmp/transcript-1.jsonl",
+            ),
+        )
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-2",
+                prompt="Prepare delivery for session two",
+                transcript_path="/tmp/transcript-2.jsonl",
+            ),
+        )
+
+        completed = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            env_overrides={"CODEX_THREAD_ID": "session-2"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_dir = pathlib.Path(json.loads(completed.stdout)["run_dir"])
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["orchestration"]["parent_session_id"], "session-2")
+
+    def test_prepare_active_run_rejects_unknown_current_thread_env_session(
+        self,
+    ) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-1",
+                prompt="Prepare delivery for session one",
+                transcript_path="/tmp/transcript-1.jsonl",
+            ),
+        )
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-2",
+                prompt="Prepare delivery for session two",
+                transcript_path="/tmp/transcript-2.jsonl",
+            ),
+        )
+
+        completed = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            env_overrides={"CODEX_THREAD_ID": "missing-session"},
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "current Codex thread is not recorded for this repo", completed.stderr
+        )
+        self.assertIn("CODEX_THREAD_ID=missing-session", completed.stderr)
+
+    def test_prepare_active_run_explicit_session_id_overrides_current_thread_env(
+        self,
+    ) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-1",
+                prompt="Prepare delivery for session one",
+                transcript_path="/tmp/transcript-1.jsonl",
+            ),
+        )
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-2",
+                prompt="Prepare delivery for session two",
+                transcript_path="/tmp/transcript-2.jsonl",
+            ),
+        )
+
+        completed = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--session-id",
+            "session-1",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            env_overrides={"CODEX_THREAD_ID": "session-2"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_dir = pathlib.Path(json.loads(completed.stdout)["run_dir"])
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["orchestration"]["parent_session_id"], "session-1")
+
+    def test_attach_child_active_run_rejects_unknown_run_dir(self) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(),
+        )
+
+        completed = self._run_adapter(
+            "attach-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            str(self.repo / ".codex-tmp" / "waited-delivery" / "missing-run"),
+            "--child-session-id",
+            "child-missing",
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "no observed Codex session currently owns run_dir=",
+            completed.stderr,
+        )
+
+    def test_stop_hook_blocks_active_run_and_allows_after_guard(self) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(),
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        payload = json.loads(prepare.stdout)
+        run_dir = payload["run_dir"]
+
+        stop_payload = {
+            "session_id": "session-1",
+            "transcript_path": "/tmp/transcript-1.jsonl",
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "I am about to stop",
+        }
+        completed = self._run_adapter("stop-hook", input_payload=stop_payload)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("Do not finish", completed.stderr)
+        self.assertIn(str(pathlib.Path(run_dir) / "parent-prompt.md"), completed.stderr)
+
+        stop_payload["stop_hook_active"] = True
+        completed = self._run_adapter("stop-hook", input_payload=stop_payload)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "{}")
+
+    def test_stop_hook_keeps_blocking_when_index_commit_fails(self) -> None:
+        session_id = "session-index-commit-failure"
+        self._prepare_indexed_run(session_id, "index-commit-failure")
+        module = self._load_adapter_module()
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        commit_error = module.RunSafetyError("injected index commit failure")
+
+        with (
+            mock.patch.object(
+                module.sys,
+                "stdin",
+                io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+            ),
+            mock.patch.object(module.sys, "stdout", captured_stdout),
+            mock.patch.object(module.sys, "stderr", captured_stderr),
+            mock.patch.object(
+                module,
+                "_utc_now",
+                return_value="2999-01-01T00:00:00+00:00",
+            ),
+            mock.patch.object(
+                module,
+                "_atomic_save_index_at",
+                side_effect=commit_error,
+            ),
+            mock.patch.object(module, "_record_hook_failure") as record_failure,
+        ):
+            returncode = module._stop_hook(argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertIn("Do not finish", captured_stderr.getvalue())
+        record_failure.assert_called_once_with(commit_error)
+
+    def test_stop_hook_regenerates_legacy_prompts_before_spawning_child(self) -> None:
+        session_id = "session-legacy-pending"
+        transcript_path = "/tmp/transcript-legacy-pending.jsonl"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="Recover a legacy pending run",
+                transcript_path=transcript_path,
+            ),
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Recover a legacy pending run",
+            "--session-id",
+            session_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
+        legacy_runner = pathlib.Path(
+            "/legacy/skills/waited-delivery/scripts/waited_delivery_runner.py"
+        )
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (run_dir / prompt_name).write_text(
+                f"legacy prompt sentinel\n`{sys.executable} {legacy_runner}`\n",
+                encoding="utf-8",
+            )
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload={
+                "session_id": session_id,
+                "transcript_path": transcript_path,
+                "cwd": str(self.repo),
+                "hook_event_name": "Stop",
+                "model": "gpt-5.5",
+                "permission_mode": "acceptEdits",
+                "stop_hook_active": False,
+                "last_assistant_message": "recover pending run",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("regenerated", completed.stderr)
+        self.assertIn(str(run_dir / "parent-prompt.md"), completed.stderr)
+        self.assertIn(str(run_dir / "child-prompt.md"), completed.stderr)
+        self.assertNotIn("legacy prompt sentinel", completed.stderr)
+        self.assertNotIn(str(legacy_runner), completed.stderr)
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            prompt = (run_dir / prompt_name).read_text(encoding="utf-8")
+            self.assertIn(str(RUNNER_PATH), prompt)
+            self.assertNotIn(str(legacy_runner), prompt)
+            self.assertNotIn("legacy prompt sentinel", prompt)
+
+    def test_stop_hook_tightens_owned_legacy_run_directory_mode(self) -> None:
+        session_id = "session-legacy-directory-mode"
+        run_dir = self._prepare_indexed_run(session_id, "legacy-directory-mode")
+        run_dir.chmod(0o755)
+        legacy_identity = run_dir.stat()
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload=self._stop_payload_for(session_id),
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("Do not finish", completed.stderr)
+        hardened_identity = run_dir.stat()
+        self.assertEqual(
+            (
+                hardened_identity.st_dev,
+                hardened_identity.st_ino,
+                hardened_identity.st_uid,
+                hardened_identity.st_gid,
+            ),
+            (
+                legacy_identity.st_dev,
+                legacy_identity.st_ino,
+                legacy_identity.st_uid,
+                legacy_identity.st_gid,
+            ),
+        )
+        self.assertEqual(hardened_identity.st_mode & 0o7777, 0o700)
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            self.assertIn(
+                str(RUNNER_PATH),
+                (run_dir / prompt_name).read_text(encoding="utf-8"),
+            )
+
+    def test_stop_hook_rejects_nonlegacy_open_run_directory_mode(self) -> None:
+        session_id = "session-open-directory-mode"
+        run_dir = self._prepare_indexed_run(session_id, "open-directory-mode")
+        parent_prompt = run_dir / "parent-prompt.md"
+        original_prompt = parent_prompt.read_bytes()
+        run_dir.chmod(0o777)
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload=self._stop_payload_for(session_id),
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("failed repository/path safety validation", completed.stderr)
+        self.assertEqual(run_dir.stat().st_mode & 0o7777, 0o777)
+        self.assertEqual(parent_prompt.read_bytes(), original_prompt)
+
+    def test_state_reader_rejects_unsafe_parent_run_and_artifact_modes(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        cases = (
+            ("repository-root", "repo", 0o770),
+            ("codex-tmp-parent", "codex-tmp", 0o770),
+            ("runs-parent", "runs", 0o770),
+            ("run-directory", "run", 0o710),
+            ("state", "state.json", 0o620),
+            ("child-prompt", "child-prompt.md", 0o602),
+            ("parent-prompt", "parent-prompt.md", 0o620),
+        )
+        for label, target, unsafe_mode in cases:
+            with self.subTest(case=label):
+                run_dir = self._prepare_indexed_run(
+                    f"session-state-mode-{label}",
+                    f"state-mode-{label}",
+                )
+                target_path = (
+                    self.repo
+                    if target == "repo"
+                    else self.repo / ".codex-tmp"
+                    if target == "codex-tmp"
+                    else run_dir.parent
+                    if target == "runs"
+                    else run_dir
+                    if target == "run"
+                    else run_dir / target
+                )
+                state_path = run_dir / "state.json"
+                original_mode = target_path.stat().st_mode & 0o7777
+                target_path.chmod(unsafe_mode)
+                before_content = state_path.read_bytes()
+                before_stat = state_path.stat()
+                try:
+                    with self.assertRaises(module.RunSafetyError):
+                        module._load_stop_run_state(
+                            self.repo.resolve(),
+                            str(run_dir),
+                        )
+                    after_stat = state_path.stat()
+                    self.assertEqual(state_path.read_bytes(), before_content)
+                    self.assertEqual(
+                        (
+                            after_stat.st_dev,
+                            after_stat.st_ino,
+                            after_stat.st_mtime_ns,
+                        ),
+                        (
+                            before_stat.st_dev,
+                            before_stat.st_ino,
+                            before_stat.st_mtime_ns,
+                        ),
+                    )
+                finally:
+                    target_path.chmod(original_mode)
+
+    def test_stop_hook_rejects_future_state_schema_without_clearing_index(
+        self,
+    ) -> None:
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                session_id = (
+                    "session-future-terminal-schema"
+                    if terminal
+                    else "session-future-active-schema"
+                )
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    ("future-terminal-schema" if terminal else "future-active-schema"),
+                )
+                state_path = run_dir / "state.json"
+                if terminal:
+                    state = self._write_terminal_run_state(
+                        run_dir,
+                        child_session_id=f"child-{session_id}",
+                    )
+                else:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["schema_version"] = 6
+                state_path.write_text(
+                    json.dumps(state, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                index_before = self._index_path().read_bytes()
+
+                fake_home = self.root / f"home-{session_id}"
+                completed = self._run_adapter(
+                    "stop-hook",
+                    input_payload=self._stop_payload_for(session_id),
+                    env_overrides={
+                        "HOME": str(fake_home),
+                    },
+                )
+
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertIn(
+                    "failed repository/path safety validation",
+                    completed.stderr,
+                )
+                log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
+                entry = json.loads(
+                    log_path.read_text(encoding="utf-8").splitlines()[-1]
+                )
+                self.assertEqual(entry["error_type"], "RunSafetyError")
+                self.assertIn("unsupported schema", entry["error_message"])
+                self.assertEqual(self._index_path().read_bytes(), index_before)
+                record = json.loads(index_before)["sessions"][session_id]
+                self.assertEqual(record["status"], "active")
+                self.assertEqual(record["run_dir"], str(run_dir))
+
+    def test_stop_hook_refreshes_prompt_for_active_legacy_child(self) -> None:
+        session_id = "session-legacy-active"
+        transcript_path = "/tmp/transcript-legacy-active.jsonl"
+        child_session_id = "child-legacy-active"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="Recover an active legacy child",
+                transcript_path=transcript_path,
+            ),
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Recover an active legacy child",
+            "--session-id",
+            session_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
+        attached = self._run_adapter(
+            "attach-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            str(run_dir),
+            "--child-session-id",
+            child_session_id,
+            "--session-id",
+            session_id,
+        )
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        legacy_runner = pathlib.Path(
+            "/legacy/skills/waited-delivery/scripts/waited_delivery_runner.py"
+        )
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (run_dir / prompt_name).write_text(
+                f"active legacy prompt\n`{sys.executable} {legacy_runner}`\n",
+                encoding="utf-8",
+            )
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload={
+                "session_id": session_id,
+                "transcript_path": transcript_path,
+                "cwd": str(self.repo),
+                "hook_event_name": "Stop",
+                "model": "gpt-5.5",
+                "permission_mode": "acceptEdits",
+                "stop_hook_active": False,
+                "last_assistant_message": "recover active child",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn(child_session_id, completed.stderr)
+        self.assertIn("re-read the regenerated child prompt", completed.stderr)
+        self.assertNotIn(str(legacy_runner), completed.stderr)
+        child_prompt = (run_dir / "child-prompt.md").read_text(encoding="utf-8")
+        self.assertIn(str(RUNNER_PATH), child_prompt)
+        self.assertNotIn(str(legacy_runner), child_prompt)
+        self.assertNotIn("active legacy prompt", child_prompt)
+
+    def test_stop_hook_blocks_external_run_dir_without_writing_it(self) -> None:
+        session_id = "session-external-run"
+        run_dir = self._prepare_indexed_run(session_id, "external-source")
+        external_run = self.root / "external-run"
+        shutil.copytree(run_dir, external_run)
+        sentinel = "external prompt must remain unchanged\n"
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (external_run / prompt_name).write_text(sentinel, encoding="utf-8")
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        index["sessions"][session_id]["run_dir"] = str(external_run)
+        self._index_path().write_text(
+            json.dumps(index),
+            encoding="utf-8",
+        )
+        fake_home = self.root / "home-external-run"
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload=self._stop_payload_for(session_id),
+            env_overrides={"HOME": str(fake_home)},
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("failed repository/path safety validation", completed.stderr)
+        self.assertIn("Do not execute commands", completed.stderr)
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            self.assertEqual(
+                (external_run / prompt_name).read_text(encoding="utf-8"),
+                sentinel,
+            )
+
+    def test_stop_hook_blocks_repo_mismatch_before_prompt_refresh(self) -> None:
+        session_id = "session-repo-mismatch"
+        run_dir = self._prepare_indexed_run(session_id, "repo-mismatch")
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["repo_root"] = str(self.root / "different-repo")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        sentinel = "repo mismatch prompt\n"
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            (run_dir / prompt_name).write_text(sentinel, encoding="utf-8")
+        fake_home = self.root / "home-repo-mismatch"
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload=self._stop_payload_for(session_id),
+            env_overrides={"HOME": str(fake_home)},
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("failed repository/path safety validation", completed.stderr)
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            self.assertEqual(
+                (run_dir / prompt_name).read_text(encoding="utf-8"),
+                sentinel,
+            )
+
+    def test_stop_hook_rejects_symlinked_run_components_and_artifacts(self) -> None:
+        cases = ("run-dir", "state.json", "child-prompt.md", "parent-prompt.md")
+        for index, target_name in enumerate(cases):
+            with self.subTest(target=target_name):
+                session_id = f"session-symlink-{index}"
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    f"symlink-{index}",
+                )
+                external_target = self.root / f"external-target-{index}"
+                if target_name == "run-dir":
+                    run_dir.rename(external_target)
+                    run_dir.symlink_to(external_target, target_is_directory=True)
+                    sentinel_paths = [
+                        external_target / "child-prompt.md",
+                        external_target / "parent-prompt.md",
+                    ]
+                else:
+                    artifact = run_dir / target_name
+                    artifact.rename(external_target)
+                    artifact.symlink_to(external_target)
+                    sentinel_paths = [external_target]
+                sentinel_values = {path: path.read_bytes() for path in sentinel_paths}
+                fake_home = self.root / f"home-symlink-{index}"
+
+                completed = self._run_adapter(
+                    "stop-hook",
+                    input_payload=self._stop_payload_for(session_id),
+                    env_overrides={"HOME": str(fake_home)},
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn(
+                    "failed repository/path safety validation",
+                    completed.stderr,
+                )
+                for path, content in sentinel_values.items():
+                    self.assertEqual(path.read_bytes(), content)
+
+    def test_stop_artifact_read_allows_metadata_only_churn(self) -> None:
+        session_id = "session-read-metadata-churn"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "read-metadata-churn",
+        )
+        module = self._load_adapter_module()
+        run_fd = module._open_stop_run_directory(
+            self.repo.resolve(),
+            run_dir.name,
+        )
+        state_path = run_dir / "state.json"
+        expected = state_path.read_bytes()
+        original = state_path.stat()
+        real_read = module.os.read
+        changed = False
+
+        def read_then_touch(file_fd: int, size: int) -> bytes:
+            nonlocal changed
+            chunk = real_read(file_fd, size)
+            if chunk and not changed:
+                changed = True
+                os.utime(
+                    state_path,
+                    ns=(
+                        original.st_atime_ns,
+                        original.st_mtime_ns + 1_000_000,
+                    ),
+                )
+            return chunk
+
+        try:
+            with mock.patch.object(
+                module.os,
+                "read",
+                side_effect=read_then_touch,
+            ):
+                actual = module._read_stop_regular_file(
+                    run_fd,
+                    "state.json",
+                    max_bytes=module.STATE_MAX_BYTES,
+                )
+        finally:
+            module.os.close(run_fd)
+
+        self.assertTrue(changed)
+        self.assertEqual(actual, expected)
+        self.assertNotEqual(state_path.stat().st_mtime_ns, original.st_mtime_ns)
+
+    def test_stop_artifact_read_rejects_content_or_access_change(self) -> None:
+        for mutation in ("content", "access"):
+            with self.subTest(mutation=mutation):
+                session_id = f"session-read-{mutation}-change"
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    f"read-{mutation}-change",
+                )
+                module = self._load_adapter_module()
+                run_fd = module._open_stop_run_directory(
+                    self.repo.resolve(),
+                    run_dir.name,
+                )
+                state_path = run_dir / "state.json"
+                original_content = state_path.read_bytes()
+                replacement = (
+                    b"[" if original_content[:1] != b"[" else b"{"
+                ) + original_content[1:]
+                real_read = module.os.read
+                changed = False
+
+                def read_then_mutate(file_fd: int, size: int) -> bytes:
+                    nonlocal changed
+                    chunk = real_read(file_fd, size)
+                    if chunk and not changed:
+                        changed = True
+                        if mutation == "content":
+                            state_path.write_bytes(replacement)
+                        else:
+                            state_path.chmod(0o640)
+                    return chunk
+
+                try:
+                    with mock.patch.object(
+                        module.os,
+                        "read",
+                        side_effect=read_then_mutate,
+                    ):
+                        with self.assertRaisesRegex(
+                            module.RunSafetyError,
+                            "identity, access, size, or content changed",
+                        ):
+                            module._read_stop_regular_file(
+                                run_fd,
+                                "state.json",
+                                max_bytes=module.STATE_MAX_BYTES,
+                            )
+                finally:
+                    module.os.close(run_fd)
+                self.assertTrue(changed)
+
+    def test_stop_hook_fails_closed_on_prompt_link_replacement_after_preflight(
+        self,
+    ) -> None:
+        session_id = "session-link-replacement"
+        self._prepare_indexed_run(session_id, "link-replacement")
+        external_target = self.root / "link-replacement-target"
+        external_target.write_text(
+            "external replacement sentinel\n",
+            encoding="utf-8",
+        )
+        original_external = external_target.read_bytes()
+        module = self._load_adapter_module()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def replace_after_preflight(
+            current_run_dir: pathlib.Path,
+            _: pathlib.Path,
+            __: tuple[int, int],
+        ) -> tuple[pathlib.Path, pathlib.Path]:
+            child_prompt = current_run_dir / "child-prompt.md"
+            child_prompt.unlink()
+            child_prompt.symlink_to(external_target)
+            raise module.UserError("simulated refresh interruption")
+
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.root / "home-link-replacement")},
+            clear=False,
+        ):
+            with mock.patch.object(
+                module,
+                "_refresh_recovery_prompts",
+                side_effect=replace_after_preflight,
+            ):
+                with mock.patch.object(
+                    module.sys,
+                    "stdin",
+                    io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                ):
+                    with mock.patch.object(module.sys, "stdout", stdout):
+                        with mock.patch.object(module.sys, "stderr", stderr):
+                            returncode = module._stop_hook(argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "failed repository/path safety validation",
+            stderr.getvalue(),
+        )
+        self.assertEqual(external_target.read_bytes(), original_external)
+
+    def test_stop_hook_fails_closed_on_run_directory_replacement_after_preflight(
+        self,
+    ) -> None:
+        session_id = "session-directory-replacement"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "directory-replacement",
+        )
+        module = self._load_adapter_module()
+        real_refresh = module._refresh_recovery_prompts
+        original_dir = self.root / "original-run-directory"
+        sentinel = "replacement directory prompt must remain unchanged\n"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def replace_after_preflight(
+            current_run_dir: pathlib.Path,
+            repo_root: pathlib.Path,
+            run_identity: tuple[int, int],
+        ) -> tuple[pathlib.Path, pathlib.Path]:
+            current_run_dir.rename(original_dir)
+            shutil.copytree(original_dir, current_run_dir)
+            for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                (current_run_dir / prompt_name).write_text(
+                    sentinel,
+                    encoding="utf-8",
+                )
+            return real_refresh(current_run_dir, repo_root, run_identity)
+
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.root / "home-directory-replacement")},
+            clear=False,
+        ):
+            with mock.patch.object(
+                module,
+                "_refresh_recovery_prompts",
+                side_effect=replace_after_preflight,
+            ):
+                with mock.patch.object(
+                    module.sys,
+                    "stdin",
+                    io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                ):
+                    with mock.patch.object(module.sys, "stdout", stdout):
+                        with mock.patch.object(module.sys, "stderr", stderr):
+                            returncode = module._stop_hook(argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "failed repository/path safety validation",
+            stderr.getvalue(),
+        )
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            self.assertEqual(
+                (run_dir / prompt_name).read_text(encoding="utf-8"),
+                sentinel,
+            )
+
+    def test_stop_hook_fails_closed_on_run_access_change_after_preflight(
+        self,
+    ) -> None:
+        session_id = "session-access-change"
+        run_dir = self._prepare_indexed_run(session_id, "access-change")
+        module = self._load_adapter_module()
+        real_refresh = module._refresh_recovery_prompts
+        sentinel = {
+            prompt_name: (run_dir / prompt_name).read_bytes()
+            for prompt_name in ("child-prompt.md", "parent-prompt.md")
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def change_access_after_preflight(
+            current_run_dir: pathlib.Path,
+            repo_root: pathlib.Path,
+            run_identity,
+        ) -> tuple[pathlib.Path, pathlib.Path]:
+            current_run_dir.chmod(0o755)
+            return real_refresh(current_run_dir, repo_root, run_identity)
+
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.root / "home-access-change")},
+            clear=False,
+        ):
+            with mock.patch.object(
+                module,
+                "_refresh_recovery_prompts",
+                side_effect=change_access_after_preflight,
+            ):
+                with mock.patch.object(
+                    module.sys,
+                    "stdin",
+                    io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                ):
+                    with mock.patch.object(module.sys, "stdout", stdout):
+                        with mock.patch.object(module.sys, "stderr", stderr):
+                            returncode = module._stop_hook(argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "failed repository/path safety validation",
+            stderr.getvalue(),
+        )
+        for prompt_name, original in sentinel.items():
+            self.assertEqual((run_dir / prompt_name).read_bytes(), original)
+
+    def test_stop_hook_revalidates_run_identity_after_prompt_refresh(
+        self,
+    ) -> None:
+        for mutation in ("replacement", "access"):
+            with self.subTest(mutation=mutation):
+                session_id = f"session-post-refresh-{mutation}"
+                self._prepare_indexed_run(
+                    session_id,
+                    f"post-refresh-{mutation}",
+                )
+                module = self._load_adapter_module()
+                real_refresh = module._refresh_recovery_prompts
+                original_dir = self.root / f"post-refresh-original-{mutation}"
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                def mutate_after_refresh(
+                    current_run_dir: pathlib.Path,
+                    repo_root: pathlib.Path,
+                    run_identity,
+                ) -> tuple[pathlib.Path, pathlib.Path]:
+                    result = real_refresh(
+                        current_run_dir,
+                        repo_root,
+                        run_identity,
+                    )
+                    if mutation == "replacement":
+                        current_run_dir.rename(original_dir)
+                        shutil.copytree(original_dir, current_run_dir)
+                    else:
+                        current_run_dir.chmod(0o755)
+                    return result
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(self.root / f"home-post-refresh-{mutation}")},
+                    clear=False,
+                ):
+                    with mock.patch.object(
+                        module,
+                        "_refresh_recovery_prompts",
+                        side_effect=mutate_after_refresh,
+                    ):
+                        with mock.patch.object(
+                            module.sys,
+                            "stdin",
+                            io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                        ):
+                            with mock.patch.object(module.sys, "stdout", stdout):
+                                with mock.patch.object(module.sys, "stderr", stderr):
+                                    returncode = module._stop_hook(argparse.Namespace())
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(
+                    "failed repository/path safety validation",
+                    stderr.getvalue(),
+                )
+
+    def test_stop_hook_binds_refreshed_prompt_identity_access_and_content(
+        self,
+    ) -> None:
+        expected_errors = {
+            "replacement": "was replaced after prompt refresh",
+            "content": "content changed after prompt refresh",
+            "access": "access policy changed after prompt refresh",
+        }
+        for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+            for mutation in (*expected_errors, "timestamps"):
+                with self.subTest(prompt=prompt_name, mutation=mutation):
+                    session_id = (
+                        f"session-prompt-{prompt_name.removesuffix('.md')}-{mutation}"
+                    )
+                    self._prepare_indexed_run(
+                        session_id,
+                        f"prompt-{prompt_name.removesuffix('.md')}-{mutation}",
+                    )
+                    module = self._load_adapter_module()
+                    real_refresh = module._refresh_recovery_prompts
+                    displaced_prompt = self.root / (
+                        f"displaced-{prompt_name}-{mutation}"
+                    )
+                    fake_home = self.root / (
+                        f"home-prompt-{prompt_name.removesuffix('.md')}-{mutation}"
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+
+                    def mutate_after_refresh(
+                        current_run_dir: pathlib.Path,
+                        repo_root: pathlib.Path,
+                        run_identity,
+                    ):
+                        refreshed = real_refresh(
+                            current_run_dir,
+                            repo_root,
+                            run_identity,
+                        )
+                        prompt_path = current_run_dir / prompt_name
+                        original_stat = prompt_path.stat()
+                        original_content = prompt_path.read_bytes()
+                        if mutation == "replacement":
+                            prompt_path.rename(displaced_prompt)
+                            prompt_path.write_bytes(original_content)
+                            prompt_path.chmod(original_stat.st_mode & 0o7777)
+                        elif mutation == "content":
+                            replacement = bytearray(original_content)
+                            replacement[0] ^= 1
+                            prompt_path.write_bytes(replacement)
+                        elif mutation == "access":
+                            prompt_path.chmod(0o640)
+                        else:
+                            os.utime(
+                                prompt_path,
+                                ns=(
+                                    original_stat.st_atime_ns,
+                                    original_stat.st_mtime_ns + 1_000_000_000,
+                                ),
+                            )
+                        return refreshed
+
+                    with mock.patch.dict(
+                        os.environ,
+                        {"HOME": str(fake_home)},
+                        clear=False,
+                    ):
+                        with mock.patch.object(
+                            module,
+                            "_refresh_recovery_prompts",
+                            side_effect=mutate_after_refresh,
+                        ):
+                            with mock.patch.object(
+                                module.sys,
+                                "stdin",
+                                io.StringIO(
+                                    json.dumps(self._stop_payload_for(session_id))
+                                ),
+                            ):
+                                with mock.patch.object(module.sys, "stdout", stdout):
+                                    with mock.patch.object(
+                                        module.sys,
+                                        "stderr",
+                                        stderr,
+                                    ):
+                                        returncode = module._stop_hook(
+                                            argparse.Namespace()
+                                        )
+
+                    self.assertEqual(returncode, 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    if mutation == "timestamps":
+                        self.assertIn("regenerated", stderr.getvalue())
+                        self.assertNotIn(
+                            "failed repository/path safety validation",
+                            stderr.getvalue(),
+                        )
+                    else:
+                        self.assertIn(
+                            "failed repository/path safety validation",
+                            stderr.getvalue(),
+                        )
+                        log_path = (
+                            self._home_log_dir(fake_home)
+                            / "waited-delivery-hooks.jsonl"
+                        )
+                        entry = json.loads(
+                            log_path.read_text(encoding="utf-8").splitlines()[-1]
+                        )
+                        self.assertEqual(entry["error_type"], "RunSafetyError")
+                        self.assertIn(
+                            expected_errors[mutation],
+                            entry["error_message"],
+                        )
+
+    def test_stop_hook_binds_runner_version_returned_through_bridge(self) -> None:
+        mutations = {
+            "replacement": ("inode", "was replaced before process start"),
+            "access": ("mode", "access policy changed before process start"),
+            "content": ("sha256", "content changed before process start"),
+        }
+        for mutation, (field, expected_error) in mutations.items():
+            with self.subTest(mutation=mutation):
+                session_id = f"session-runner-{mutation}-mismatch"
+                self._prepare_indexed_run(
+                    session_id,
+                    f"runner-{mutation}-mismatch",
+                )
+                module = self._load_adapter_module()
+                real_run_bridge_json = module._run_refresh_bridge_json
+                fake_home = self.root / f"home-runner-{mutation}-mismatch"
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                def corrupt_runner_version(
+                    snapshots,
+                    *args: str,
+                ) -> dict[str, object]:
+                    payload = real_run_bridge_json(snapshots, *args)
+                    runner_version = payload["runner_version"]
+                    assert isinstance(runner_version, dict)
+                    current = runner_version[field]
+                    if field == "sha256":
+                        runner_version[field] = "0" * 64
+                    else:
+                        assert isinstance(current, int)
+                        runner_version[field] = current ^ 0o040
+                    return payload
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(fake_home)},
+                    clear=False,
+                ):
+                    with mock.patch.object(
+                        module,
+                        "_run_refresh_bridge_json",
+                        side_effect=corrupt_runner_version,
+                    ):
+                        with mock.patch.object(
+                            module.sys,
+                            "stdin",
+                            io.StringIO(json.dumps(self._stop_payload_for(session_id))),
+                        ):
+                            with mock.patch.object(module.sys, "stdout", stdout):
+                                with mock.patch.object(module.sys, "stderr", stderr):
+                                    returncode = module._stop_hook(argparse.Namespace())
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(
+                    "failed repository/path safety validation",
+                    stderr.getvalue(),
+                )
+                log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
+                entry = json.loads(
+                    log_path.read_text(encoding="utf-8").splitlines()[-1]
+                )
+                self.assertEqual(entry["error_type"], "RunSafetyError")
+                self.assertIn(expected_error, entry["error_message"])
+
+    def test_refresh_source_frame_avoids_filesystem_snapshots_under_umask(
+        self,
+    ) -> None:
+        probe = textwrap.dedent(
+            """\
+            import importlib.util
+            import pathlib
+            import sys
+
+            adapter_path = pathlib.Path(sys.argv[1])
+            spec = importlib.util.spec_from_file_location(
+                "waited_delivery_refresh_snapshot_umask_probe",
+                adapter_path,
+            )
+            if spec is None or spec.loader is None:
+                raise RuntimeError("cannot load hook adapter")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            with module._verified_refresh_launch_sources() as sources:
+                frame = module._refresh_source_frame(sources)
+                if frame[:8] != module.SOURCE_FRAME_MAGIC:
+                    raise RuntimeError("source frame magic mismatch")
+                if sources.bridge.content not in frame:
+                    raise RuntimeError("bridge source is absent from frame")
+                if sources.runner.content not in frame:
+                    raise RuntimeError("runner source is absent from frame")
+            """
+        )
+        completed = run(
+            [sys.executable, "-c", probe, str(ADAPTER_PATH)],
+            env={
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            umask=0o777,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+
+    def test_launch_sources_reject_unsafe_parent_and_source_modes(self) -> None:
+        module = self._load_adapter_module()
+        for target_name, unsafe_mode in (
+            ("source-parent", 0o770),
+            ("bridge", 0o620),
+            ("runner", 0o602),
+        ):
+            with self.subTest(target=target_name):
+                bridge_path, runner_path = self._private_launch_sources(
+                    f"unsafe-mode-{target_name}"
+                )
+                target_path = (
+                    bridge_path.parent
+                    if target_name == "source-parent"
+                    else bridge_path
+                    if target_name == "bridge"
+                    else runner_path
+                )
+                original_mode = target_path.stat().st_mode & 0o7777
+                target_path.chmod(unsafe_mode)
+                try:
+                    with (
+                        mock.patch.object(module, "BRIDGE_PATH", bridge_path),
+                        mock.patch.object(module, "RUNNER_PATH", runner_path),
+                        self.assertRaisesRegex(
+                            module.RunSafetyError,
+                            "writable by group or other users",
+                        ),
+                    ):
+                        with module._verified_refresh_launch_sources():
+                            self.fail("unsafe launch source was admitted")
+                finally:
+                    target_path.chmod(original_mode)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin extended ACLs")
+    def test_adapter_rejects_darwin_acl_on_index_state_and_source_parents(
+        self,
+    ) -> None:
+        seeded = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-adapter-acl"),
+        )
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        run_dir = self._prepare_indexed_run(
+            "session-state-acl",
+            "state-acl",
+        )
+        module = self._load_adapter_module()
+        bridge_path, runner_path = self._private_launch_sources("darwin-acl")
+        cases = (
+            (
+                "index-parent",
+                self._index_path().parent,
+                lambda: self._read_index_under_module(module),
+            ),
+            (
+                "state",
+                run_dir / "state.json",
+                lambda: module._load_stop_run_state(
+                    self.repo.resolve(),
+                    str(run_dir),
+                ),
+            ),
+            (
+                "source-parent",
+                bridge_path.parent,
+                lambda: self._read_launch_sources_under_module(
+                    module,
+                    bridge_path,
+                    runner_path,
+                ),
+            ),
+        )
+        for label, target_path, action in cases:
+            with self.subTest(case=label):
+                acl_result = run(
+                    [
+                        "/bin/chmod",
+                        "+a",
+                        "everyone allow write",
+                        str(target_path),
+                    ]
+                )
+                self.assertEqual(acl_result.returncode, 0, acl_result.stderr)
+                try:
+                    with self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        "named or extended ACL",
+                    ):
+                        result = action()
+                        if (
+                            isinstance(result, tuple)
+                            and len(result) == 4
+                            and isinstance(result[3], int)
+                        ):
+                            os.close(result[3])
+                finally:
+                    remove_acl = run(["/bin/chmod", "-N", str(target_path)])
+                    self.assertEqual(
+                        remove_acl.returncode,
+                        0,
+                        remove_acl.stderr,
+                    )
+
+    def _read_index_under_module(self, module) -> None:
+        with module._index_transaction(self.repo.resolve(), write=False):
+            pass
+
+    def _read_launch_sources_under_module(
+        self,
+        module,
+        bridge_path: pathlib.Path,
+        runner_path: pathlib.Path,
+    ) -> None:
+        with (
+            mock.patch.object(module, "BRIDGE_PATH", bridge_path),
+            mock.patch.object(module, "RUNNER_PATH", runner_path),
+        ):
+            with module._verified_refresh_launch_sources():
+                pass
+
+    def test_adapter_darwin_acl_probe_accepts_only_exact_unsupported_errnos(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        libc = mock.Mock()
+        libc.acl_get_fd_np = mock.Mock(return_value=None)
+        libc.acl_free = mock.Mock(return_value=0)
+
+        with (
+            mock.patch.object(module.sys, "platform", "darwin"),
+            mock.patch.object(module.ctypes, "CDLL", return_value=libc),
+            mock.patch.object(module.ctypes, "set_errno"),
+            mock.patch.object(module.errno, "ENOENT", 2),
+            mock.patch.object(module.errno, "EACCES", 13),
+            mock.patch.object(module.errno, "EBADF", 9),
+            mock.patch.object(module.errno, "ENOMEM", 12),
+            mock.patch.object(module.errno, "EINVAL", 22),
+            mock.patch.object(module.errno, "ENOTSUP", 45),
+            mock.patch.object(module.errno, "ENOATTR", 93, create=True),
+            mock.patch.object(module.errno, "ENODATA", 96, create=True),
+            mock.patch.object(module.errno, "EOPNOTSUPP", 102, create=True),
+        ):
+            for error_number in (45, 102):
+                with (
+                    self.subTest(error_number=error_number),
+                    mock.patch.object(
+                        module.ctypes,
+                        "get_errno",
+                        return_value=error_number,
+                    ),
+                ):
+                    self.assertFalse(
+                        module._descriptor_has_extended_acl(
+                            123,
+                            label="synthetic Darwin adapter artifact",
+                        )
+                    )
+
+            rejected_errors = {
+                "bad-file-descriptor": module.errno.EBADF,
+                "permission-denied": module.errno.EACCES,
+                "invalid-acl-type": module.errno.EINVAL,
+                "out-of-memory": module.errno.ENOMEM,
+                "no-attribute": module.errno.ENOATTR,
+                "enotsup-adjacent": module.errno.ENOTSUP + 1,
+                "eopnotsupp-adjacent": module.errno.EOPNOTSUPP + 1,
+            }
+            for case, error_number in rejected_errors.items():
+                with (
+                    self.subTest(case=case, error_number=error_number),
+                    mock.patch.object(
+                        module.ctypes,
+                        "get_errno",
+                        return_value=error_number,
+                    ),
+                    self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        "extended ACL cannot be inspected safely",
+                    ),
+                ):
+                    module._descriptor_has_extended_acl(
+                        123,
+                        label="synthetic Darwin adapter artifact",
+                    )
+
+    def test_adapter_linux_posix_acl_xattr_is_rejected_fail_closed(self) -> None:
+        module = self._load_adapter_module()
+        state_path = self.repo / "tracked.txt"
+        state_fd = os.open(state_path, os.O_RDONLY)
+        try:
+            with (
+                mock.patch.object(module.sys, "platform", "linux"),
+                mock.patch.object(
+                    module.os,
+                    "getxattr",
+                    create=True,
+                    return_value=b"synthetic-posix-acl",
+                ),
+                self.assertRaisesRegex(
+                    module.RunSafetyError,
+                    "named or extended ACL",
+                ),
+            ):
+                module._require_no_extended_acl(
+                    state_fd,
+                    label="synthetic Linux adapter state",
+                )
+            with (
+                mock.patch.object(module.sys, "platform", "linux"),
+                mock.patch.object(
+                    module.os,
+                    "getxattr",
+                    create=True,
+                    side_effect=OSError(
+                        getattr(module.errno, "ENODATA", module.errno.ENOENT),
+                        "no POSIX ACL",
+                    ),
+                ),
+            ):
+                module._require_no_extended_acl(
+                    state_fd,
+                    label="synthetic Linux adapter state",
+                )
+
+            def default_acl_only(_file_fd, attribute):
+                if attribute == "system.posix_acl_access":
+                    raise OSError(
+                        getattr(module.errno, "ENODATA", module.errno.ENOENT),
+                        "no POSIX access ACL",
+                    )
+                return b"synthetic-posix-default-acl"
+
+            with (
+                mock.patch.object(module.sys, "platform", "linux"),
+                mock.patch.object(
+                    module.os,
+                    "getxattr",
+                    create=True,
+                    side_effect=default_acl_only,
+                ),
+                self.assertRaisesRegex(
+                    module.RunSafetyError,
+                    "named or extended ACL",
+                ),
+            ):
+                module._require_no_extended_acl(
+                    state_fd,
+                    label="synthetic Linux adapter default ACL",
+                )
+        finally:
+            os.close(state_fd)
+
+    def test_refresh_source_input_early_rejection_cleans_process_group(self) -> None:
+        module = self._load_adapter_module()
+        pid_path = self.root / "early-source-reject.pid"
+        script = self.root / "early-source-reject.py"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import pathlib
+                import subprocess
+                import sys
+
+                pathlib.Path(sys.argv[1]).write_text(
+                    str(__import__("os").getpid()),
+                    encoding="utf-8",
+                )
+                subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    stdin=subprocess.DEVNULL,
+                )
+                """
+            ),
+            encoding="utf-8",
+        )
+        completed = module._run_bounded_refresh_process(
+            [sys.executable, str(script), str(pid_path)],
+            pass_fds=(),
+            env=os.environ.copy(),
+            input_bytes=b"x" * (2 * 1024 * 1024),
+            timeout=2.0,
+            cleanup_timeout=3.0,
+            max_capture_bytes=64 * 1024,
+        )
+        self.assertEqual(completed.returncode, 126, completed.stderr)
+        self.assertIn("rejected its source frame", completed.stderr)
+        pgid = int(pid_path.read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pgid, 0)
+
+    def test_refresh_source_frame_binds_lengths_digests_and_bytes(
+        self,
+    ) -> None:
+        module = self._load_adapter_module()
+        with module._verified_refresh_launch_sources() as sources:
+            frame = module._refresh_source_frame(sources)
+        offset = 8
+        self.assertEqual(frame[:offset], module.SOURCE_FRAME_MAGIC)
+        bridge_size = int.from_bytes(frame[offset : offset + 8], "big")
+        offset += 8
+        bridge_digest = frame[offset : offset + 32]
+        offset += 32
+        runner_size = int.from_bytes(frame[offset : offset + 8], "big")
+        offset += 8
+        runner_digest = frame[offset : offset + 32]
+        offset += 32
+        self.assertEqual(bridge_size, len(sources.bridge.content))
+        self.assertEqual(runner_size, len(sources.runner.content))
+        self.assertEqual(
+            bridge_digest,
+            hashlib.sha256(sources.bridge.content).digest(),
+        )
+        self.assertEqual(
+            runner_digest,
+            hashlib.sha256(sources.runner.content).digest(),
+        )
+        self.assertEqual(
+            frame[offset : offset + bridge_size],
+            sources.bridge.content,
+        )
+        offset += bridge_size
+        self.assertEqual(frame[offset:], sources.runner.content)
+
+    def test_all_bridge_entrypoints_use_isolated_pipe_bound_sources(self) -> None:
+        module = self._load_adapter_module()
+        bridge_path, runner_path = self._private_launch_sources(
+            "all-bridge-entrypoints"
+        )
+        invocations: list[
+            tuple[list[str], tuple[int, ...], dict[str, str], bytes | None]
+        ] = []
+
+        def capture_launch(
+            command: list[str],
+            *,
+            pass_fds: tuple[int, ...],
+            env: dict[str, str],
+            input_bytes: bytes | None,
+            **_bounds: object,
+        ) -> subprocess.CompletedProcess[str]:
+            invocations.append((command, pass_fds, env, input_bytes))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout='{"status":"ok"}\n',
+                stderr="",
+            )
+
+        with (
+            mock.patch.object(module, "BRIDGE_PATH", bridge_path),
+            mock.patch.object(module, "RUNNER_PATH", runner_path),
+            mock.patch.object(
+                module,
+                "_run_bounded_refresh_process",
+                side_effect=capture_launch,
+            ),
+        ):
+            self.assertEqual(
+                module._run_bridge_json("reconcile-live"),
+                {"status": "ok"},
+            )
+            self.assertEqual(
+                module._run_bridge_json_with_lease(37, "prepare-live"),
+                {"status": "ok"},
+            )
+            with mock.patch.object(module.sys, "stdout", io.StringIO()):
+                self.assertEqual(
+                    module._run_bridge_passthrough("finish-child-live"),
+                    0,
+                )
+
+        self.assertEqual(len(invocations), 3)
+        self.assertEqual(
+            [pass_fds for _command, pass_fds, _env, _frame in invocations],
+            [(), (37,), ()],
+        )
+        for command, _pass_fds, env, frame in invocations:
+            self.assertEqual(command[0], sys.executable)
+            self.assertEqual(command[1:5], ["-I", "-B", "-S", "-c"])
+            self.assertEqual(command[5], module.SOURCE_PIPE_BOOTSTRAP)
+            self.assertEqual(command[6], str(bridge_path))
+            self.assertEqual(command[7], str(runner_path))
+            self.assertIsNotNone(frame)
+            assert frame is not None
+            self.assertEqual(frame[:8], module.SOURCE_FRAME_MAGIC)
+            self.assertIn(bridge_path.read_bytes(), frame)
+            self.assertIn(runner_path.read_bytes(), frame)
+            self.assertFalse(
+                any(
+                    name.startswith("PYTHON") or name == "__PYVENV_LAUNCHER__"
+                    for name in env
+                )
+            )
+
+    def test_refresh_launch_revalidates_bridge_and_runner_before_process(
+        self,
+    ) -> None:
+        expected_errors = {
+            "replacement": "was replaced before process start",
+            "content": "content changed before process start",
+            "access": "access policy changed before process start",
+        }
+        for artifact_name in ("bridge", "runner"):
+            for mutation in (*expected_errors, "timestamps"):
+                with self.subTest(artifact=artifact_name, mutation=mutation):
+                    module = self._load_adapter_module()
+                    bridge_path, runner_path = self._private_launch_sources(
+                        f"{artifact_name}-{mutation}"
+                    )
+                    source_path = (
+                        bridge_path if artifact_name == "bridge" else runner_path
+                    )
+                    run_dir = self._prepare_indexed_run(
+                        f"session-launch-{artifact_name}-{mutation}",
+                        f"launch-{artifact_name}-{mutation}",
+                    )
+                    watched_paths = tuple(
+                        run_dir / name
+                        for name in (
+                            "state.json",
+                            "child-prompt.md",
+                            "parent-prompt.md",
+                        )
+                    )
+                    before = {
+                        path: (path.stat().st_ino, path.read_bytes())
+                        for path in watched_paths
+                    }
+                    run_identity = self._run_identity(module, run_dir)
+                    real_revalidate = module._revalidate_refresh_launch_sources
+                    displaced = self.root / (
+                        f"displaced-launch-{artifact_name}-{mutation}.py"
+                    )
+
+                    def mutate_before_revalidation(sources) -> None:
+                        original_stat = source_path.stat()
+                        original_content = source_path.read_bytes()
+                        if mutation == "replacement":
+                            source_path.rename(displaced)
+                            source_path.write_bytes(original_content)
+                            source_path.chmod(original_stat.st_mode & 0o7777)
+                        elif mutation == "content":
+                            changed = bytearray(original_content)
+                            changed[0] ^= 1
+                            source_path.write_bytes(changed)
+                        elif mutation == "access":
+                            source_path.chmod((original_stat.st_mode & 0o7777) ^ 0o040)
+                        else:
+                            os.utime(
+                                source_path,
+                                ns=(
+                                    original_stat.st_atime_ns,
+                                    original_stat.st_mtime_ns + 1_000_000_000,
+                                ),
+                            )
+                        real_revalidate(sources)
+
+                    patches = (
+                        mock.patch.object(module, "BRIDGE_PATH", bridge_path),
+                        mock.patch.object(module, "RUNNER_PATH", runner_path),
+                        mock.patch.object(
+                            module,
+                            "_revalidate_refresh_launch_sources",
+                            side_effect=mutate_before_revalidation,
+                        ),
+                    )
+                    with patches[0], patches[1], patches[2]:
+                        if mutation == "timestamps":
+                            refreshed = module._refresh_recovery_prompts(
+                                run_dir,
+                                self.repo.resolve(),
+                                run_identity,
+                            )
+                            self.assertEqual(
+                                refreshed.child_prompt,
+                                run_dir / "child-prompt.md",
+                            )
+                        else:
+                            with mock.patch.object(
+                                module,
+                                "_run_bounded_refresh_process",
+                            ) as process_run:
+                                with self.assertRaisesRegex(
+                                    module.RunSafetyError,
+                                    expected_errors[mutation],
+                                ):
+                                    module._refresh_recovery_prompts(
+                                        run_dir,
+                                        self.repo.resolve(),
+                                        run_identity,
+                                    )
+                                process_run.assert_not_called()
+                            for path, (
+                                expected_inode,
+                                expected_content,
+                            ) in before.items():
+                                self.assertEqual(path.stat().st_ino, expected_inode)
+                                self.assertEqual(path.read_bytes(), expected_content)
+
+    def test_refresh_launch_executes_pipe_bound_sources_across_source_aba(
+        self,
+    ) -> None:
+        for artifact_name in ("bridge", "runner"):
+            with self.subTest(artifact=artifact_name):
+                module = self._load_adapter_module()
+                bridge_path, runner_path = self._private_launch_sources(
+                    f"aba-{artifact_name}"
+                )
+                source_path = bridge_path if artifact_name == "bridge" else runner_path
+                source_identity = source_path.stat()
+                run_dir = self._prepare_indexed_run(
+                    f"session-launch-aba-{artifact_name}",
+                    f"launch-aba-{artifact_name}",
+                )
+                for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                    (run_dir / prompt_name).write_text(
+                        "legacy launch-window prompt\n",
+                        encoding="utf-8",
+                    )
+                run_identity = self._run_identity(module, run_dir)
+                displaced = self.root / f"aba-original-{artifact_name}.py"
+                marker = self.root / f"aba-executed-{artifact_name}.txt"
+                malicious = (
+                    "#!/usr/bin/env python3\n"
+                    "import pathlib\n"
+                    f"pathlib.Path({str(marker)!r}).write_text("
+                    "'unexpected path execution\\n', encoding='utf-8')\n"
+                    "raise SystemExit(93)\n"
+                )
+                real_run = module._run_bounded_refresh_process
+                process_commands: list[list[str]] = []
+                process_environments: list[dict[str, str] | None] = []
+                process_inputs: list[bytes | None] = []
+                process_pass_fds: list[tuple[int, ...]] = []
+
+                def run_during_source_aba(
+                    cmd: list[str],
+                    *,
+                    pass_fds: tuple[int, ...],
+                    env: dict[str, str],
+                    input_bytes: bytes | None = None,
+                    **bounds: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    process_commands.append(cmd)
+                    process_environments.append(env)
+                    process_inputs.append(input_bytes)
+                    process_pass_fds.append(pass_fds)
+                    source_path.rename(displaced)
+                    source_path.write_text(malicious, encoding="utf-8")
+                    source_path.chmod(source_identity.st_mode & 0o7777)
+                    try:
+                        return real_run(
+                            cmd,
+                            pass_fds=pass_fds,
+                            env=env,
+                            input_bytes=input_bytes,
+                            **bounds,
+                        )
+                    finally:
+                        source_path.unlink()
+                        displaced.rename(source_path)
+
+                with (
+                    mock.patch.object(
+                        module,
+                        "BRIDGE_PATH",
+                        bridge_path,
+                    ),
+                    mock.patch.object(
+                        module,
+                        "RUNNER_PATH",
+                        runner_path,
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_run_bounded_refresh_process",
+                        side_effect=run_during_source_aba,
+                    ),
+                ):
+                    refreshed = module._refresh_recovery_prompts(
+                        run_dir,
+                        self.repo.resolve(),
+                        run_identity,
+                    )
+
+                self.assertEqual(len(process_commands), 1)
+                self.assertEqual(
+                    process_commands[0][1:5],
+                    ["-I", "-B", "-S", "-c"],
+                )
+                self.assertEqual(
+                    process_commands[0][5],
+                    module.SOURCE_PIPE_BOOTSTRAP,
+                )
+                self.assertEqual(process_pass_fds, [()])
+                self.assertIsNotNone(process_inputs[0])
+                assert process_inputs[0] is not None
+                self.assertIn(
+                    source_path.read_bytes(),
+                    process_inputs[0],
+                )
+                self.assertIsNotNone(process_environments[0])
+                assert process_environments[0] is not None
+                self.assertFalse(
+                    any(
+                        name.startswith("PYTHON") or name == "__PYVENV_LAUNCHER__"
+                        for name in process_environments[0]
+                    )
+                )
+                self.assertFalse(marker.exists())
+                self.assertEqual(source_path.stat().st_ino, source_identity.st_ino)
+                self.assertEqual(
+                    refreshed.parent_prompt,
+                    run_dir / "parent-prompt.md",
+                )
+                for prompt_name in ("child-prompt.md", "parent-prompt.md"):
+                    prompt = (run_dir / prompt_name).read_text(encoding="utf-8")
+                    self.assertIn(str(runner_path), prompt)
+                    self.assertNotIn("legacy launch-window prompt", prompt)
+
+    def test_stop_hook_fails_open_when_index_is_invalid(self) -> None:
+        fake_home = self.root / "home-stop-invalid"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        (adapter_dir / "index.json").write_text("{invalid json\n", encoding="utf-8")
+
+        stop_payload = {
+            "session_id": "session-1",
+            "transcript_path": "/tmp/transcript-1.jsonl",
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "I am about to stop",
+        }
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload=stop_payload,
+            env_overrides={"HOME": str(fake_home)},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "{}")
+        self.assertEqual(completed.stderr.strip(), "")
+        log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
+        self.assertTrue(log_path.is_file())
+        entries = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(entries[-1]["hook_command"], "stop-hook")
+        self.assertEqual(entries[-1]["session_id"], "session-1")
+        self.assertEqual(entries[-1]["error_type"], "JSONDecodeError")
+        self.assertIsNone(entries[-1]["prompt_preview"])
+        self.assertIsNone(entries[-1]["assistant_preview"])
+        self.assertNotIn(
+            "I am about to stop",
+            log_path.read_text(encoding="utf-8"),
+        )
+
+    def test_user_prompt_submit_hook_fails_open_when_index_is_invalid(self) -> None:
+        fake_home = self.root / "home-submit-invalid"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        (adapter_dir / "index.json").write_text("{invalid json\n", encoding="utf-8")
+
+        completed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(),
+            env_overrides={"HOME": str(fake_home)},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "{}")
+        self.assertEqual(completed.stderr.strip(), "")
+        log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
+        self.assertTrue(log_path.is_file())
+        entries = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(entries[-1]["hook_command"], "user-prompt-submit-hook")
+        self.assertIsNone(entries[-1]["prompt_preview"])
+        self.assertIsNone(entries[-1]["assistant_preview"])
+        self.assertNotIn(
+            "Please use waited delivery",
+            log_path.read_text(encoding="utf-8"),
+        )
+
+    def test_stop_hook_debug_env_mirrors_fail_open_error_to_stderr(self) -> None:
+        fake_home = self.root / "home-stop-debug"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        (adapter_dir / "index.json").write_text("{invalid json\n", encoding="utf-8")
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload={
+                "session_id": "session-debug",
+                "transcript_path": "/tmp/transcript-debug.jsonl",
+                "cwd": str(self.repo),
+                "hook_event_name": "Stop",
+                "model": "gpt-5.5",
+                "permission_mode": "acceptEdits",
+                "stop_hook_active": False,
+                "last_assistant_message": "debug me",
+            },
+            env_overrides={
+                "HOME": str(fake_home),
+                "WAITED_DELIVERY_HOOK_DEBUG": "1",
+            },
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("waited-delivery hook fail-open (stop-hook)", completed.stderr)
+
+    def test_fail_open_survives_debug_stderr_and_log_write_failures(self) -> None:
+        fake_home = self.root / "home-fail-open-debug"
+
+        class BrokenStderr:
+            def write(self, _: str) -> int:
+                raise BrokenPipeError("stderr closed")
+
+            def flush(self) -> None:
+                return None
+
+        module = self._load_adapter_module()
+        stdout = io.StringIO()
+        error = RuntimeError("boom")
+        setattr(error, "hook_command", "stop-hook")
+        setattr(
+            error,
+            "hook_payload",
+            {
+                "session_id": "session-debug-broken-stderr",
+                "cwd": str(self.repo),
+                "transcript_path": "/tmp/transcript-debug-broken-stderr.jsonl",
+            },
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(fake_home), "WAITED_DELIVERY_HOOK_DEBUG": "1"},
+            clear=False,
+        ):
+            with mock.patch.object(
+                module, "_append_hook_log", side_effect=OSError("disk full")
+            ):
+                with mock.patch.object(module.sys, "stdout", stdout):
+                    with mock.patch.object(module.sys, "stderr", BrokenStderr()):
+                        returncode = module._fail_open_hook_response(error)
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout.getvalue().strip(), "{}")
+
+    def test_hook_archive_label_is_unique(self) -> None:
+        module = self._load_adapter_module()
+        path = pathlib.Path("waited-delivery-hooks.2.jsonl")
+        with mock.patch.object(
+            module.uuid,
+            "uuid4",
+            side_effect=[
+                module.uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                module.uuid.UUID("22222222-2222-2222-2222-222222222222"),
+            ],
+        ):
+            first = module._hook_archive_label(path)
+            second = module._hook_archive_label(path)
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.endswith("-waited-delivery-hooks.2"))
+        self.assertTrue(second.endswith("-waited-delivery-hooks.2"))
+
+    def test_compress_hook_log_falls_back_to_jsonl_when_zstd_missing(self) -> None:
+        module = self._load_adapter_module()
+        fake_home = self.root / "home-fallback-archive"
+        log_dir = self._home_log_dir(fake_home)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        source = log_dir / "waited-delivery-hooks.2.jsonl"
+        source.write_text("fallback\n", encoding="utf-8")
+
+        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+            with mock.patch.object(module.shutil, "which", return_value=None):
+                module._compress_hook_log(source)
+
+        self.assertFalse(source.exists())
+        archives = sorted(log_dir.glob("waited-delivery-hooks-*.jsonl"))
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(archives[0].read_text(encoding="utf-8"), "fallback\n")
+        self.assertEqual(list(log_dir.glob("waited-delivery-hooks-*.jsonl.zst")), [])
+
+    def test_hook_diagnostics_rotate_and_compress_with_zstd(self) -> None:
+        zstd = shutil.which("zstd")
+        if zstd is None:
+            self.skipTest("zstd not available")
+        fake_home = self.root / "home-rotation"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        env: Mapping[str, str | None] = {
+            "HOME": str(fake_home),
+            "WAITED_DELIVERY_HOOK_LOG_MAX_BYTES": "256",
+            "WAITED_DELIVERY_HOOK_LOG_UNCOMPRESSED_SLOTS": "3",
+        }
+        for _ in range(4):
+            (adapter_dir / "index.json").write_text("{invalid json\n", encoding="utf-8")
+            completed = self._run_adapter(
+                "stop-hook",
+                input_payload={
+                    "session_id": "session-rotation",
+                    "transcript_path": "/tmp/transcript-rotation.jsonl",
+                    "cwd": str(self.repo),
+                    "hook_event_name": "Stop",
+                    "model": "gpt-5.5",
+                    "permission_mode": "acceptEdits",
+                    "stop_hook_active": False,
+                    "last_assistant_message": "rotate me",
+                },
+                env_overrides=env,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+        log_dir = self._home_log_dir(fake_home)
+        self.assertTrue((log_dir / "waited-delivery-hooks.jsonl").is_file())
+        self.assertTrue((log_dir / "waited-delivery-hooks.1.jsonl").is_file())
+        self.assertTrue((log_dir / "waited-delivery-hooks.2.jsonl").is_file())
+        compressed = list(log_dir.glob("waited-delivery-hooks-*.jsonl.zst"))
+        self.assertTrue(compressed)
+        self.assertGreater(compressed[0].stat().st_size, 0)
+        verify = run([zstd, "-t", str(compressed[0])])
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+
+    def test_hook_log_max_bytes_zero_uses_default_limit(self) -> None:
+        fake_home = self.root / "home-max-bytes-zero"
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        (adapter_dir / "index.json").write_text("{invalid json\n", encoding="utf-8")
+        log_dir = self._home_log_dir(fake_home)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "waited-delivery-hooks.jsonl").write_text("", encoding="utf-8")
+
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload={
+                "session_id": "session-max-bytes-zero",
+                "transcript_path": "/tmp/transcript-max-bytes-zero.jsonl",
+                "cwd": str(self.repo),
+                "hook_event_name": "Stop",
+                "model": "gpt-5.5",
+                "permission_mode": "acceptEdits",
+                "stop_hook_active": False,
+                "last_assistant_message": "max bytes zero",
+            },
+            env_overrides={
+                "HOME": str(fake_home),
+                "WAITED_DELIVERY_HOOK_LOG_MAX_BYTES": "0",
+            },
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue((log_dir / "waited-delivery-hooks.jsonl").is_file())
+        self.assertFalse((log_dir / "waited-delivery-hooks.1.jsonl").exists())
+        self.assertEqual(list(log_dir.glob("waited-delivery-hooks-*.jsonl*")), [])
+
+    def test_hook_diagnostics_prune_old_archives(self) -> None:
+        fake_home = self.root / "home-prune"
+        log_dir = self._home_log_dir(fake_home)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stale = log_dir / "waited-delivery-hooks-19990101T000000Z-old.jsonl.zst"
+        stale.write_bytes(zlib.compress(b"stale"))
+        old_ts = 946684800
+        os.utime(stale, (old_ts, old_ts))
+
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        (adapter_dir / "index.json").write_text("{invalid json\n", encoding="utf-8")
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload={
+                "session_id": "session-prune",
+                "transcript_path": "/tmp/transcript-prune.jsonl",
+                "cwd": str(self.repo),
+                "hook_event_name": "Stop",
+                "model": "gpt-5.5",
+                "permission_mode": "acceptEdits",
+                "stop_hook_active": False,
+                "last_assistant_message": "prune me",
+            },
+            env_overrides={
+                "HOME": str(fake_home),
+                "WAITED_DELIVERY_HOOK_LOG_RETENTION_DAYS": "7",
+            },
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse(stale.exists())
+
+    def test_hook_diagnostics_skip_prune_when_recently_pruned(self) -> None:
+        fake_home = self.root / "home-prune-skip"
+        log_dir = self._home_log_dir(fake_home)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stale = log_dir / "waited-delivery-hooks-19990101T000000Z-old.jsonl.zst"
+        stale.write_bytes(zlib.compress(b"stale"))
+        old_ts = 946684800
+        os.utime(stale, (old_ts, old_ts))
+        stamp = log_dir / "waited-delivery-hooks.prune-stamp"
+        stamp.touch()
+
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        (adapter_dir / "index.json").write_text("{invalid json\n", encoding="utf-8")
+        completed = self._run_adapter(
+            "stop-hook",
+            input_payload={
+                "session_id": "session-prune-skip",
+                "transcript_path": "/tmp/transcript-prune-skip.jsonl",
+                "cwd": str(self.repo),
+                "hook_event_name": "Stop",
+                "model": "gpt-5.5",
+                "permission_mode": "acceptEdits",
+                "stop_hook_active": False,
+                "last_assistant_message": "skip prune",
+            },
+            env_overrides={
+                "HOME": str(fake_home),
+                "WAITED_DELIVERY_HOOK_LOG_RETENTION_DAYS": "7",
+            },
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(stale.exists())
+
+    def test_reconcile_active_run_clears_index_for_completed_run(self) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-2"),
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            "--session-id",
+            "session-2",
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = json.loads(prepare.stdout)["run_dir"]
+        attached = self._run_adapter(
+            "attach-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dir,
+            "--child-session-id",
+            "child-1",
+            "--session-id",
+            "session-2",
+        )
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        self._finish_child(run_dir, "session-2", "child-1")
+        self._commit_implementation()
+
+        for phase_name in ("tests", "docs_sync", "internal_review", "external_review"):
+            completed = self._run_runner(
+                "record-phase",
+                "--run-dir",
+                run_dir,
+                "--phase",
+                phase_name,
+                "--status",
+                "passed",
+                "--summary",
+                f"{phase_name} passed",
+                *(
+                    ["--evidence", "reviewer terminal artifact"]
+                    if phase_name in ("internal_review", "external_review")
+                    else []
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        completed = self._run_adapter(
+            "reconcile-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dir,
+            "--child-status",
+            "completed",
+            "--child-session-id",
+            "child-1",
+            "--session-id",
+            "session-2",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["overall_status"], "passed")
+
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        record = index["sessions"]["session-2"]
+        self.assertEqual(record["status"], "completed")
+        self.assertIsNone(record["run_dir"])
+
+    def test_reconcile_rejects_unsafe_forged_terminal_state_before_index_clear(
+        self,
+    ) -> None:
+        session_id = "session-forged-terminal-state"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "forged-terminal-state",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            "child-forged-terminal",
+        )
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                "child-forged-terminal",
+                "--session-id",
+                session_id,
+            ]
+        )
+        index_before = self._index_path().read_bytes()
+        state_path = run_dir / "state.json"
+
+        def forge_unsafe_terminal_state(*_args: str) -> dict[str, object]:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["overall_status"] = "passed"
+            state["orchestration"]["child_status"] = "completed"
+            state["orchestration"]["child_session_id"] = "child-forged-terminal"
+            for phase in state["phases"].values():
+                phase["status"] = "passed"
+            state_path.write_text(
+                json.dumps(state, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            state_path.chmod(0o666)
+            return {"overall_status": "passed"}
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=forge_unsafe_terminal_state,
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "writable by group or other users",
+            ),
+        ):
+            module._reconcile_active_run(args)
+
+        self.assertEqual(self._index_path().read_bytes(), index_before)
+        record = json.loads(index_before)["sessions"][session_id]
+        self.assertEqual(record["status"], "active")
+        self.assertEqual(record["run_dir"], str(run_dir))
+
+    def test_reconcile_rejects_run_path_replacement_during_bridge(self) -> None:
+        session_id = "session-reconcile-run-replacement"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "reconcile-run-replacement",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            "child-reconcile-replacement",
+        )
+        replacement = run_dir.with_name(f"{run_dir.name}-replacement")
+        parked = run_dir.with_name(f"{run_dir.name}-parked")
+        shutil.copytree(run_dir, replacement)
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                "child-reconcile-replacement",
+                "--session-id",
+                session_id,
+            ]
+        )
+        index_before = self._index_path().read_bytes()
+
+        def replace_run_path(*_args: str) -> dict[str, object]:
+            run_dir.rename(parked)
+            replacement.rename(run_dir)
+            return {}
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=replace_run_path,
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "run directory was replaced",
+            ),
+        ):
+            module._reconcile_active_run(args)
+
+        self.assertTrue(parked.is_dir())
+        self.assertTrue(run_dir.is_dir())
+        self.assertEqual(self._index_path().read_bytes(), index_before)
+        record = json.loads(index_before)["sessions"][session_id]
+        self.assertEqual(record["status"], "active")
+        self.assertEqual(record["run_dir"], str(run_dir))
+
+    def test_reconcile_rejects_run_lock_replacement_during_bridge(self) -> None:
+        session_id = "session-reconcile-lock-replacement"
+        child_session_id = "child-reconcile-lock-replacement"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "reconcile-lock-replacement",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            child_session_id,
+        )
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                child_session_id,
+                "--session-id",
+                session_id,
+            ]
+        )
+        index_before = self._index_path().read_bytes()
+        lock_path = run_dir / ".state.lock"
+        parked_lock = run_dir / ".state.lock.parked"
+
+        def publish_and_replace_lock(*_args: str) -> dict[str, object]:
+            payload = self._terminal_reconcile_payload(
+                run_dir,
+                child_session_id=child_session_id,
+            )
+            lock_path.rename(parked_lock)
+            lock_path.write_bytes(b"replacement")
+            lock_path.chmod(0o600)
+            return payload
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=publish_and_replace_lock,
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "run lock was replaced",
+            ),
+        ):
+            module._reconcile_active_run(args)
+
+        self.assertEqual(self._index_path().read_bytes(), index_before)
+        self.assertTrue(parked_lock.is_file())
+        self.assertTrue(lock_path.is_file())
+
+    def test_reconcile_rejects_state_version_drift_before_index_update(
+        self,
+    ) -> None:
+        session_id = "session-reconcile-state-drift"
+        child_session_id = "child-reconcile-state-drift"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "reconcile-state-drift",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            child_session_id,
+        )
+        state_path = run_dir / "state.json"
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                child_session_id,
+                "--session-id",
+                session_id,
+            ]
+        )
+        index_before = self._index_path().read_bytes()
+        previous_state_version = self._artifact_version_payload(state_path)
+        real_validate = module._validate_stop_run_state_descriptor
+        validation_count = 0
+
+        def publish_terminal_state(*_args: str) -> dict[str, object]:
+            state = self._write_terminal_run_state(
+                run_dir,
+                child_session_id=child_session_id,
+            )
+            return {
+                "overall_status": state["overall_status"],
+                "child_status": state["orchestration"]["child_status"],
+                "child_session_id": state["orchestration"]["child_session_id"],
+                "previous_state_version": previous_state_version,
+                "state_version": self._artifact_version_payload(state_path),
+                **self._run_identity_payload(run_dir),
+            }
+
+        def validate_then_drift(*validate_args, **validate_kwargs):
+            nonlocal validation_count
+            result = real_validate(*validate_args, **validate_kwargs)
+            validation_count += 1
+            if validation_count == 2:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["post_validation_drift"] = True
+                state_path.write_text(
+                    json.dumps(state, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            return result
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=publish_terminal_state,
+            ),
+            mock.patch.object(
+                module,
+                "_validate_stop_run_state_descriptor",
+                side_effect=validate_then_drift,
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "content changed.*state.json",
+            ),
+        ):
+            module._reconcile_active_run(args)
+
+        self.assertEqual(validation_count, 2)
+        self.assertEqual(self._index_path().read_bytes(), index_before)
+        record = json.loads(index_before)["sessions"][session_id]
+        self.assertEqual(record["status"], "active")
+        self.assertEqual(record["run_dir"], str(run_dir))
+
+    def test_reconcile_rejects_mismatched_previous_state_receipt(self) -> None:
+        session_id = "session-reconcile-previous-state-mismatch"
+        child_session_id = "child-reconcile-previous-state-mismatch"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "reconcile-previous-state-mismatch",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            child_session_id,
+        )
+        state_path = run_dir / "state.json"
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                child_session_id,
+                "--session-id",
+                session_id,
+            ]
+        )
+        index_before = self._index_path().read_bytes()
+        previous_state_version = self._artifact_version_payload(state_path)
+        previous_state_version["sha256"] = "0" * 64
+
+        def publish_with_wrong_previous_receipt(
+            *_args: str,
+        ) -> dict[str, object]:
+            state = self._write_terminal_run_state(
+                run_dir,
+                child_session_id=child_session_id,
+            )
+            return {
+                "overall_status": state["overall_status"],
+                "child_status": state["orchestration"]["child_status"],
+                "child_session_id": state["orchestration"]["child_session_id"],
+                "previous_state_version": previous_state_version,
+                "state_version": self._artifact_version_payload(state_path),
+                **self._run_identity_payload(run_dir),
+            }
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=publish_with_wrong_previous_receipt,
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "content changed.*pre-reconcile state.json",
+            ),
+        ):
+            module._reconcile_active_run(args)
+
+        self.assertEqual(self._index_path().read_bytes(), index_before)
+        record = json.loads(index_before)["sessions"][session_id]
+        self.assertEqual(record["status"], "active")
+        self.assertEqual(record["run_dir"], str(run_dir))
+
+    def test_reconcile_binds_initial_run_session_child_and_preparation_state(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "run-id",
+                "active run state does not match the indexed run identity",
+                lambda state: state.__setitem__("run_id", "other-run"),
+            ),
+            (
+                "parent-session",
+                "active run state does not match the indexed parent session",
+                lambda state: state["orchestration"].__setitem__(
+                    "parent_session_id",
+                    "other-parent",
+                ),
+            ),
+            (
+                "child-session",
+                "active run state does not match the requested child session",
+                lambda state: state["orchestration"].__setitem__(
+                    "child_session_id",
+                    "other-child",
+                ),
+            ),
+            (
+                "preparation",
+                "active run state does not match the indexed preparation identity",
+                lambda state: state.__setitem__(
+                    "preparation_id",
+                    "other-preparation",
+                ),
+            ),
+        )
+        for case_name, expected_error, mutate in cases:
+            with self.subTest(case=case_name):
+                session_id = f"session-reconcile-binding-{case_name}"
+                child_session_id = f"child-reconcile-binding-{case_name}"
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    f"reconcile-binding-{case_name}",
+                )
+                self._attach_child(
+                    run_dir,
+                    session_id,
+                    child_session_id,
+                )
+                state_path = run_dir / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                mutate(state)
+                state_path.write_text(
+                    json.dumps(state, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                index_before = self._index_path().read_bytes()
+                module = self._load_adapter_module()
+                args = module._build_parser().parse_args(
+                    [
+                        "reconcile-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--run-dir",
+                        str(run_dir),
+                        "--child-status",
+                        "completed",
+                        "--child-session-id",
+                        child_session_id,
+                        "--session-id",
+                        session_id,
+                    ]
+                )
+
+                with (
+                    mock.patch.object(module, "_run_bridge_json") as bridge,
+                    self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        expected_error,
+                    ),
+                ):
+                    module._reconcile_active_run(args)
+
+                bridge.assert_not_called()
+                self.assertEqual(self._index_path().read_bytes(), index_before)
+
+    def test_reconcile_binds_final_state_to_requested_child_status(self) -> None:
+        session_id = "session-reconcile-final-status"
+        child_session_id = "child-reconcile-final-status"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "reconcile-final-status",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            child_session_id,
+        )
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                child_session_id,
+                "--session-id",
+                session_id,
+            ]
+        )
+        index_before = self._index_path().read_bytes()
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=lambda *_args: self._terminal_reconcile_payload(
+                    run_dir,
+                    child_session_id=child_session_id,
+                    child_status="failed",
+                ),
+            ),
+            self.assertRaisesRegex(
+                module.RunSafetyError,
+                "terminal run state does not match the requested child status",
+            ),
+        ):
+            module._reconcile_active_run(args)
+
+        self.assertEqual(self._index_path().read_bytes(), index_before)
+
+    def test_reconcile_binds_final_run_session_child_and_preparation_state(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "run-id",
+                "active run state does not match the indexed run identity",
+                lambda state: state.__setitem__("run_id", "other-final-run"),
+            ),
+            (
+                "parent-session",
+                "active run state does not match the indexed parent session",
+                lambda state: state["orchestration"].__setitem__(
+                    "parent_session_id",
+                    "other-final-parent",
+                ),
+            ),
+            (
+                "child-session",
+                "active run state does not match the requested child session",
+                lambda state: state["orchestration"].__setitem__(
+                    "child_session_id",
+                    "other-final-child",
+                ),
+            ),
+            (
+                "preparation",
+                "active run state does not match the indexed preparation identity",
+                lambda state: state.__setitem__(
+                    "preparation_id",
+                    "other-final-preparation",
+                ),
+            ),
+        )
+        for case_name, expected_error, mutate in cases:
+            with self.subTest(case=case_name):
+                session_id = f"session-reconcile-final-binding-{case_name}"
+                child_session_id = f"child-reconcile-final-binding-{case_name}"
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    f"reconcile-final-binding-{case_name}",
+                )
+                self._attach_child(
+                    run_dir,
+                    session_id,
+                    child_session_id,
+                )
+                state_path = run_dir / "state.json"
+                module = self._load_adapter_module()
+                args = module._build_parser().parse_args(
+                    [
+                        "reconcile-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--run-dir",
+                        str(run_dir),
+                        "--child-status",
+                        "completed",
+                        "--child-session-id",
+                        child_session_id,
+                        "--session-id",
+                        session_id,
+                    ]
+                )
+                index_before = self._index_path().read_bytes()
+
+                def publish_drifted_terminal_state(
+                    *_args: str,
+                ) -> dict[str, object]:
+                    previous_state_version = self._artifact_version_payload(state_path)
+                    state = self._write_terminal_run_state(
+                        run_dir,
+                        child_session_id=child_session_id,
+                    )
+                    mutate(state)
+                    state_path.write_text(
+                        json.dumps(state, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    orchestration = state["orchestration"]
+                    return {
+                        "overall_status": state["overall_status"],
+                        "child_status": orchestration["child_status"],
+                        "child_session_id": orchestration["child_session_id"],
+                        "previous_state_version": previous_state_version,
+                        "state_version": self._artifact_version_payload(state_path),
+                        **self._run_identity_payload(run_dir),
+                    }
+
+                with (
+                    mock.patch.object(
+                        module,
+                        "_run_bridge_json",
+                        side_effect=publish_drifted_terminal_state,
+                    ),
+                    self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        expected_error,
+                    ),
+                ):
+                    module._reconcile_active_run(args)
+
+                self.assertEqual(self._index_path().read_bytes(), index_before)
+
+    def test_reconcile_bridge_runs_before_adapter_acquires_run_lock(self) -> None:
+        session_id = "session-reconcile-bridge-no-lock"
+        child_session_id = "child-reconcile-bridge-no-lock"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "reconcile-bridge-no-lock",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            child_session_id,
+        )
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                child_session_id,
+                "--session-id",
+                session_id,
+            ]
+        )
+        bridge_probe_count = 0
+
+        def publish_after_unlocked_probe(*_args: str) -> dict[str, object]:
+            nonlocal bridge_probe_count
+            bridge_probe_count += 1
+            probe = self._probe_exclusive_lock(run_dir / ".state.lock")
+            self.assertEqual(
+                probe.returncode,
+                0,
+                "the adapter held .state.lock while reconcile-live needed it: "
+                f"{probe.stderr}",
+            )
+            return self._terminal_reconcile_payload(
+                run_dir,
+                child_session_id=child_session_id,
+            )
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=publish_after_unlocked_probe,
+            ),
+            mock.patch.object(module.sys, "stdout", new=io.StringIO()),
+        ):
+            self.assertEqual(module._reconcile_active_run(args), 0)
+
+        self.assertEqual(bridge_probe_count, 1)
+
+    def test_reconcile_holds_run_lock_through_index_publication(self) -> None:
+        session_id = "session-reconcile-commit-lock"
+        child_session_id = "child-reconcile-commit-lock"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "reconcile-commit-lock",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            child_session_id,
+        )
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                child_session_id,
+                "--session-id",
+                session_id,
+            ]
+        )
+        real_atomic_save = module._atomic_save_index_at
+        commit_probe_count = 0
+
+        def assert_cross_process_run_lock(*atomic_args, **atomic_kwargs):
+            nonlocal commit_probe_count
+            commit_probe_count += 1
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import fcntl, os, sys\n"
+                        "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+                        "try:\n"
+                        "    try:\n"
+                        "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                        "    except BlockingIOError:\n"
+                        "        raise SystemExit(0)\n"
+                        "    raise SystemExit(1)\n"
+                        "finally:\n"
+                        "    os.close(fd)\n"
+                    ),
+                    str(run_dir / ".state.lock"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                probe.returncode,
+                0,
+                "a separate process acquired the run lock during index publication: "
+                f"{probe.stderr}",
+            )
+            return real_atomic_save(*atomic_args, **atomic_kwargs)
+
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=lambda *_args: self._terminal_reconcile_payload(
+                    run_dir,
+                    child_session_id=child_session_id,
+                ),
+            ),
+            mock.patch.object(
+                module,
+                "_atomic_save_index_at",
+                side_effect=assert_cross_process_run_lock,
+            ),
+            mock.patch.object(module.sys, "stdout", new=io.StringIO()),
+        ):
+            self.assertEqual(module._reconcile_active_run(args), 0)
+
+        self.assertEqual(commit_probe_count, 1)
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(index["sessions"][session_id]["status"], "completed")
+
+    def test_reconcile_commit_guard_restores_index_after_os_replace_tamper(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "run-replacement",
+                "active run directory was replaced",
+            ),
+            (
+                "lock-replacement",
+                "active run lock was replaced",
+            ),
+            (
+                "run-mode",
+                "active run directory access identity changed",
+            ),
+            (
+                "lock-mode",
+                "active run lock was replaced",
+            ),
+        )
+        for case_name, expected_error in cases:
+            with self.subTest(case=case_name):
+                session_id = f"session-reconcile-commit-{case_name}"
+                child_session_id = f"child-reconcile-commit-{case_name}"
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    f"reconcile-commit-{case_name}",
+                )
+                self._attach_child(
+                    run_dir,
+                    session_id,
+                    child_session_id,
+                )
+                module = self._load_adapter_module()
+                args = module._build_parser().parse_args(
+                    [
+                        "reconcile-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--run-dir",
+                        str(run_dir),
+                        "--child-status",
+                        "completed",
+                        "--child-session-id",
+                        child_session_id,
+                        "--session-id",
+                        session_id,
+                    ]
+                )
+                index_before = self._index_path().read_bytes()
+                replacement = run_dir.with_name(f"{run_dir.name}-replacement")
+                parked = run_dir.with_name(f"{run_dir.name}-parked")
+                if case_name == "run-replacement":
+                    shutil.copytree(run_dir, replacement)
+                real_replace = module.os.replace
+                injected = False
+
+                def inject_at_index_replace(
+                    source,
+                    destination,
+                    *,
+                    src_dir_fd=None,
+                    dst_dir_fd=None,
+                ):
+                    nonlocal injected
+                    if destination == module.INDEX_FILE_NAME and not injected:
+                        injected = True
+                        if case_name == "run-replacement":
+                            run_dir.rename(parked)
+                            replacement.rename(run_dir)
+                        elif case_name == "lock-replacement":
+                            lock_path = run_dir / ".state.lock"
+                            lock_path.rename(run_dir / ".state.lock.parked")
+                            lock_path.write_bytes(b"replacement")
+                            lock_path.chmod(0o600)
+                        elif case_name == "run-mode":
+                            run_dir.chmod(0o755)
+                        else:
+                            (run_dir / ".state.lock").chmod(0o644)
+                    return real_replace(
+                        source,
+                        destination,
+                        src_dir_fd=src_dir_fd,
+                        dst_dir_fd=dst_dir_fd,
+                    )
+
+                with (
+                    mock.patch.object(
+                        module,
+                        "_run_bridge_json",
+                        side_effect=lambda *_args: (
+                            self._terminal_reconcile_payload(
+                                run_dir,
+                                child_session_id=child_session_id,
+                            )
+                        ),
+                    ),
+                    mock.patch.object(
+                        module.os,
+                        "replace",
+                        side_effect=inject_at_index_replace,
+                    ),
+                    self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        expected_error,
+                    ),
+                ):
+                    module._reconcile_active_run(args)
+
+                self.assertTrue(injected)
+                self.assertEqual(
+                    self._index_path().read_bytes(),
+                    index_before,
+                    "post-publication guard failure did not restore the exact "
+                    "pre-transaction index content",
+                )
+                record = json.loads(index_before)["sessions"][session_id]
+                self.assertEqual(record["status"], "active")
+                self.assertEqual(record["run_dir"], str(run_dir))
+
+    def test_reconcile_restores_index_after_each_publication_fault(
+        self,
+    ) -> None:
+        cases = (
+            "directory-fsync",
+            "published-readback",
+            "final-directory-revalidation",
+            "final-lock-revalidation",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                session_id = f"session-reconcile-publication-{case}"
+                child_session_id = f"child-reconcile-publication-{case}"
+                run_dir = self._prepare_indexed_run(
+                    session_id,
+                    f"reconcile-publication-{case}",
+                )
+                self._attach_child(
+                    run_dir,
+                    session_id,
+                    child_session_id,
+                )
+                module = self._load_adapter_module()
+                args = module._build_parser().parse_args(
+                    [
+                        "reconcile-active-run",
+                        "--repo",
+                        str(self.repo),
+                        "--run-dir",
+                        str(run_dir),
+                        "--child-status",
+                        "completed",
+                        "--child-session-id",
+                        child_session_id,
+                        "--session-id",
+                        session_id,
+                    ]
+                )
+                index_before = self._index_path().read_bytes()
+                injected = False
+                publication_returned = False
+                patchers: list[mock._patch] = []
+
+                if case == "directory-fsync":
+                    real_fsync = module.os.fsync
+
+                    def fail_directory_fsync(file_descriptor):
+                        nonlocal injected
+                        real_fsync(file_descriptor)
+                        if injected or not self._index_path().exists():
+                            return
+                        durable = json.loads(
+                            self._index_path().read_text(encoding="utf-8")
+                        )["sessions"][session_id]
+                        if durable["status"] == "completed":
+                            injected = True
+                            raise OSError(
+                                "simulated reconciliation directory fsync failure"
+                            )
+
+                    patchers.append(
+                        mock.patch.object(
+                            module.os,
+                            "fsync",
+                            side_effect=fail_directory_fsync,
+                        )
+                    )
+                elif case == "published-readback":
+                    real_read = module._read_index_bytes_at
+
+                    def fail_published_readback(adapter_fd):
+                        nonlocal injected
+                        result = real_read(adapter_fd)
+                        if not injected and result is not None:
+                            durable = json.loads(result[0])["sessions"][session_id]
+                            if durable["status"] == "completed":
+                                injected = True
+                                raise module.RunSafetyError(
+                                    "simulated reconciliation published readback "
+                                    "failure"
+                                )
+                        return result
+
+                    patchers.append(
+                        mock.patch.object(
+                            module,
+                            "_read_index_bytes_at",
+                            side_effect=fail_published_readback,
+                        )
+                    )
+                else:
+                    real_atomic_save = module._atomic_save_index_at
+
+                    def record_publication(*atomic_args, **atomic_kwargs):
+                        nonlocal publication_returned
+                        receipt = real_atomic_save(*atomic_args, **atomic_kwargs)
+                        publication_returned = True
+                        return receipt
+
+                    patchers.append(
+                        mock.patch.object(
+                            module,
+                            "_atomic_save_index_at",
+                            side_effect=record_publication,
+                        )
+                    )
+                    if case == "final-directory-revalidation":
+                        real_revalidate = module._revalidate_index_directories
+
+                        def fail_final_directory_revalidation(*revalidate_args):
+                            nonlocal injected
+                            real_revalidate(*revalidate_args)
+                            if publication_returned and not injected:
+                                injected = True
+                                raise module.RunSafetyError(
+                                    "simulated reconciliation final directory "
+                                    "revalidation failure"
+                                )
+
+                        patchers.append(
+                            mock.patch.object(
+                                module,
+                                "_revalidate_index_directories",
+                                side_effect=fail_final_directory_revalidation,
+                            )
+                        )
+                    else:
+                        real_revalidate = module._revalidate_index_lock
+
+                        def fail_final_lock_revalidation(*revalidate_args):
+                            nonlocal injected
+                            real_revalidate(*revalidate_args)
+                            if publication_returned and not injected:
+                                injected = True
+                                raise module.RunSafetyError(
+                                    "simulated reconciliation final lock "
+                                    "revalidation failure"
+                                )
+
+                        patchers.append(
+                            mock.patch.object(
+                                module,
+                                "_revalidate_index_lock",
+                                side_effect=fail_final_lock_revalidation,
+                            )
+                        )
+
+                stdout = io.StringIO()
+                with contextlib.ExitStack() as patches:
+                    patches.enter_context(
+                        mock.patch.object(
+                            module,
+                            "_run_bridge_json",
+                            side_effect=lambda *_args: (
+                                self._terminal_reconcile_payload(
+                                    run_dir,
+                                    child_session_id=child_session_id,
+                                )
+                            ),
+                        )
+                    )
+                    patches.enter_context(
+                        mock.patch.object(module.sys, "stdout", stdout)
+                    )
+                    for patcher in patchers:
+                        patches.enter_context(patcher)
+                    with self.assertRaisesRegex(
+                        module.RunSafetyError,
+                        "simulated reconciliation",
+                    ):
+                        module._reconcile_active_run(args)
+
+                self.assertTrue(injected)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(self._index_path().read_bytes(), index_before)
+                record = json.loads(index_before)["sessions"][session_id]
+                self.assertEqual(record["status"], "active")
+
+    def test_reconcile_reports_manual_recovery_when_restore_cannot_be_proved(
+        self,
+    ) -> None:
+        session_id = "session-reconcile-manual-recovery"
+        child_session_id = "child-reconcile-manual-recovery"
+        run_dir = self._prepare_indexed_run(
+            session_id,
+            "reconcile-manual-recovery",
+        )
+        self._attach_child(
+            run_dir,
+            session_id,
+            child_session_id,
+        )
+        module = self._load_adapter_module()
+        args = module._build_parser().parse_args(
+            [
+                "reconcile-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                str(run_dir),
+                "--child-status",
+                "completed",
+                "--child-session-id",
+                child_session_id,
+                "--session-id",
+                session_id,
+            ]
+        )
+        index_before = self._index_path().read_bytes()
+        previous_digest = hashlib.sha256(index_before).hexdigest()
+        real_fsync = module.os.fsync
+        injected = False
+
+        def fail_directory_fsync(file_descriptor):
+            nonlocal injected
+            real_fsync(file_descriptor)
+            if injected or not self._index_path().exists():
+                return
+            durable = json.loads(self._index_path().read_text(encoding="utf-8"))[
+                "sessions"
+            ][session_id]
+            if durable["status"] == "completed":
+                injected = True
+                raise OSError("simulated reconciliation directory fsync failure")
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                module,
+                "_run_bridge_json",
+                side_effect=lambda *_args: self._terminal_reconcile_payload(
+                    run_dir,
+                    child_session_id=child_session_id,
+                ),
+            ),
+            mock.patch.object(
+                module.os,
+                "fsync",
+                side_effect=fail_directory_fsync,
+            ),
+            mock.patch.object(
+                module,
+                "_restore_index_after_failed_publication",
+                side_effect=module.RunSafetyError("simulated recovery proof failure"),
+            ) as restore,
+            mock.patch.object(module.sys, "stdout", stdout),
+            self.assertRaises(module.RunSafetyError) as raised,
+        ):
+            module._reconcile_active_run(args)
+
+        self.assertTrue(injected)
+        restore.assert_called_once()
+        self.assertEqual(stdout.getvalue(), "")
+        message = str(raised.exception)
+        self.assertIn("manual_recovery_required=true", message)
+        self.assertIn("stage=directory-fsync", message)
+        self.assertIn(f"sha256={previous_digest}", message)
+        self.assertIn("simulated recovery proof failure", message)
+        published = self._index_path().read_bytes()
+        self.assertIn(
+            f"sha256={hashlib.sha256(published).hexdigest()}",
+            message,
+        )
+        record = json.loads(published)["sessions"][session_id]
+        self.assertEqual(record["status"], "completed")
+
+    def test_index_recovery_requires_complete_published_recovery_version(
+        self,
+    ) -> None:
+        session_id = "session-recovery-version"
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        module = self._load_adapter_module()
+        repo_fd = codex_tmp_fd = adapter_fd = None
+        try:
+            (
+                repo_fd,
+                codex_tmp_fd,
+                adapter_fd,
+            ) = module._open_index_directories(self.repo.resolve())
+            loaded = module._read_index_bytes_at(adapter_fd)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            previous_content, previous_version = loaded
+            index = module._decode_index(previous_content, self._index_path())
+            index["latest_session_id"] = None
+            receipt = module._atomic_save_index_at(
+                adapter_fd,
+                index,
+                previous_version,
+                context="recovery version test",
+            )
+            real_read = module._read_index_bytes_at
+
+            def report_replaced_recovery_identity(current_adapter_fd):
+                result = real_read(current_adapter_fd)
+                if result is not None and result[0] == previous_content:
+                    return (
+                        result[0],
+                        result[1]._replace(inode=result[1].inode + 1),
+                    )
+                return result
+
+            with (
+                mock.patch.object(
+                    module,
+                    "_read_index_bytes_at",
+                    side_effect=report_replaced_recovery_identity,
+                ),
+                self.assertRaisesRegex(
+                    module.RunSafetyError,
+                    "publication recovery could not be verified",
+                ),
+            ):
+                module._restore_index_after_failed_publication(
+                    adapter_fd,
+                    previous_content=receipt.previous_content,
+                    published_content=receipt.published_content,
+                    published_version=receipt.published_version,
+                )
+        finally:
+            for file_descriptor in (adapter_fd, codex_tmp_fd, repo_fd):
+                if file_descriptor is not None:
+                    os.close(file_descriptor)
+
+        self.assertEqual(self._index_path().read_bytes(), previous_content)
+
+    def test_reconcile_run_lock_cleanup_preserves_primary_errors(self) -> None:
+        module = self._load_adapter_module()
+
+        class PrimaryFailure(RuntimeError):
+            pass
+
+        def make_lock_fixture(label: str) -> tuple[pathlib.Path, int]:
+            run_dir = self.root / f"reconcile-lock-cleanup-{label}"
+            run_dir.mkdir(mode=0o700)
+            lock_path = run_dir / ".state.lock"
+            lock_path.write_bytes(b"")
+            lock_path.chmod(0o600)
+            return lock_path, os.open(run_dir, os.O_RDONLY)
+
+        lock_path, run_fd = make_lock_fixture("acquire")
+        try:
+            with (
+                module._open_stop_run_lock_descriptor(run_fd) as (
+                    lock_fd,
+                    lock_identity,
+                ),
+                mock.patch.object(
+                    module.fcntl,
+                    "flock",
+                    side_effect=OSError("synthetic acquire failure"),
+                ),
+                self.assertRaisesRegex(
+                    module.RunSafetyError,
+                    "cannot be acquired safely",
+                ),
+            ):
+                with module._acquired_stop_run_lock(
+                    run_fd,
+                    lock_fd,
+                    lock_identity,
+                ):
+                    self.fail("acquire failure unexpectedly entered the lock body")
+        finally:
+            os.close(run_fd)
+        self.assertEqual(self._probe_exclusive_lock(lock_path).returncode, 0)
+
+        for body_raises in (True, False):
+            with self.subTest(unlock_with_primary=body_raises):
+                lock_path, run_fd = make_lock_fixture(
+                    f"unlock-{'primary' if body_raises else 'cleanup'}"
+                )
+                real_flock = module.fcntl.flock
+
+                def fail_unlock(lock_fd: int, operation: int) -> None:
+                    if operation == fcntl.LOCK_UN:
+                        raise OSError("synthetic unlock failure")
+                    real_flock(lock_fd, operation)
+
+                try:
+                    with module._open_stop_run_lock_descriptor(run_fd) as (
+                        lock_fd,
+                        lock_identity,
+                    ):
+                        with mock.patch.object(
+                            module.fcntl,
+                            "flock",
+                            side_effect=fail_unlock,
+                        ):
+                            if body_raises:
+                                with self.assertRaisesRegex(
+                                    PrimaryFailure,
+                                    "primary lock-body failure",
+                                ):
+                                    with module._acquired_stop_run_lock(
+                                        run_fd,
+                                        lock_fd,
+                                        lock_identity,
+                                    ):
+                                        raise PrimaryFailure(
+                                            "primary lock-body failure"
+                                        )
+                            else:
+                                with self.assertRaisesRegex(
+                                    module.RunSafetyError,
+                                    "cannot be released safely",
+                                ):
+                                    with module._acquired_stop_run_lock(
+                                        run_fd,
+                                        lock_fd,
+                                        lock_identity,
+                                    ):
+                                        pass
+                finally:
+                    os.close(run_fd)
+                self.assertEqual(
+                    self._probe_exclusive_lock(lock_path).returncode,
+                    0,
+                )
+
+        for body_raises in (True, False):
+            with self.subTest(close_with_primary=body_raises):
+                lock_path, run_fd = make_lock_fixture(
+                    f"close-{'primary' if body_raises else 'cleanup'}"
+                )
+                lock_stat = lock_path.stat()
+                leaked_lock_fds: list[int] = []
+                real_close = module.os.close
+
+                def fail_lock_close(file_fd: int) -> None:
+                    file_stat = os.fstat(file_fd)
+                    if (
+                        file_stat.st_dev,
+                        file_stat.st_ino,
+                    ) == (
+                        lock_stat.st_dev,
+                        lock_stat.st_ino,
+                    ):
+                        leaked_lock_fds.append(file_fd)
+                        raise OSError("synthetic close failure")
+                    real_close(file_fd)
+
+                try:
+                    with mock.patch.object(
+                        module.os,
+                        "close",
+                        side_effect=fail_lock_close,
+                    ):
+                        if body_raises:
+                            with self.assertRaisesRegex(
+                                PrimaryFailure,
+                                "primary descriptor-body failure",
+                            ):
+                                with module._open_stop_run_lock_descriptor(run_fd):
+                                    raise PrimaryFailure(
+                                        "primary descriptor-body failure"
+                                    )
+                        else:
+                            with self.assertRaisesRegex(
+                                module.RunSafetyError,
+                                "descriptor cannot be closed safely",
+                            ):
+                                with module._open_stop_run_lock_descriptor(run_fd):
+                                    pass
+                finally:
+                    for leaked_fd in leaked_lock_fds:
+                        real_close(leaked_fd)
+                    real_close(run_fd)
+                self.assertEqual(len(leaked_lock_fds), 1)
+                self.assertEqual(
+                    self._probe_exclusive_lock(lock_path).returncode,
+                    0,
+                )
+
+    def test_finish_child_active_run_rejects_cross_session_run(self) -> None:
+        run_dirs: dict[str, str] = {}
+        for session_id in ("session-owner-a", "session-owner-b"):
+            observed = self._run_adapter(
+                "user-prompt-submit-hook",
+                input_payload=self._session_payload(session_id=session_id),
+            )
+            self.assertEqual(observed.returncode, 0, observed.stderr)
+            prepared = self._run_adapter(
+                "prepare-active-run",
+                "--repo",
+                str(self.repo),
+                "--goal",
+                "Verify session ownership",
+                "--external-helper",
+                str(self.fake_helper),
+                "--no-fallback-smoke",
+                "--session-id",
+                session_id,
+            )
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            run_dirs[session_id] = json.loads(prepared.stdout)["run_dir"]
+
+        completed = self._run_adapter(
+            "finish-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dirs["session-owner-b"],
+            "--child-status",
+            "completed",
+            "--child-session-id",
+            "child-owner-b",
+            "--session-id",
+            "session-owner-a",
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("does not own run_dir", completed.stderr)
+
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            index["sessions"]["session-owner-a"]["run_dir"],
+            run_dirs["session-owner-a"],
+        )
+        self.assertEqual(
+            index["sessions"]["session-owner-b"]["run_dir"],
+            run_dirs["session-owner-b"],
+        )
+
+    def test_stop_hook_reconcile_prompt_includes_repo(self) -> None:
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id="session-3"),
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            "--session-id",
+            "session-3",
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = json.loads(prepare.stdout)["run_dir"]
+        self._commit_implementation()
+
+        attach = self._run_adapter(
+            "attach-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dir,
+            "--child-session-id",
+            "child-3",
+            "--session-id",
+            "session-3",
+        )
+        self.assertEqual(attach.returncode, 0, attach.stderr)
+        self._finish_child(run_dir, "session-3", "child-3")
+
+        for phase_name in ("tests", "docs_sync", "internal_review", "external_review"):
+            completed = self._run_runner(
+                "record-phase",
+                "--run-dir",
+                run_dir,
+                "--phase",
+                phase_name,
+                "--status",
+                "passed",
+                "--summary",
+                f"{phase_name} passed",
+                *(
+                    ["--evidence", "reviewer terminal artifact"]
+                    if phase_name in ("internal_review", "external_review")
+                    else []
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        state_path = pathlib.Path(run_dir) / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["orchestration"]["child_status"] = "completed"
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+        stop_payload = {
+            "session_id": "session-3",
+            "transcript_path": "/tmp/transcript-3.jsonl",
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "I am about to stop",
+        }
+        completed = self._run_adapter("stop-hook", input_payload=stop_payload)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("reconcile-active-run", completed.stderr)
+        self.assertIn("--repo", completed.stderr)
+        self.assertIn(str(self.repo), completed.stderr)
+        self.assertIn("--child-session-id child-3", completed.stderr)
+
+    def test_stop_hook_keeps_blocking_when_prompt_render_fails(self) -> None:
+        fake_home = self.root / "home-stop-blocking"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-block",
+                prompt="Block on active waited delivery",
+                transcript_path="/tmp/transcript-block.jsonl",
+            ),
+            env_overrides={"HOME": str(fake_home)},
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--session-id",
+            "session-block",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            env_overrides={"HOME": str(fake_home)},
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["orchestration"]["child_status"] = "failed"
+        state["orchestration"]["child_session_id"] = "child-terminal-fallback"
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+        stop_payload = {
+            "session_id": "session-block",
+            "transcript_path": "/tmp/transcript-block.jsonl",
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "keep blocking",
+        }
+
+        module = self._load_adapter_module()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+            with mock.patch.object(
+                module,
+                "_build_stop_continuation_prompt",
+                side_effect=RuntimeError("boom"),
+            ):
+                with mock.patch.object(
+                    module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
+                ):
+                    with mock.patch.object(module.sys, "stderr", stderr):
+                        returncode = module._stop_hook(module.argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertIn("Do not finish yet.", stderr.getvalue())
+        self.assertIn(str(run_dir / "state.json"), stderr.getvalue())
+        log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
+        entries = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(entries[-1]["hook_command"], "stop-hook")
+        self.assertEqual(entries[-1]["error_type"], "RuntimeError")
+        self.assertEqual(entries[-1]["session_id"], "session-block")
+
+    def test_stop_hook_fallback_prompt_preserves_terminal_child_status(self) -> None:
+        for child_status in ("completed", "failed", "interrupted"):
+            with self.subTest(child_status=child_status):
+                fake_home = self.root / f"home-stop-terminal-fallback-{child_status}"
+                session_id = f"session-terminal-fallback-{child_status}"
+                transcript_path = (
+                    f"/tmp/transcript-terminal-fallback-{child_status}.jsonl"
+                )
+                self._run_adapter(
+                    "user-prompt-submit-hook",
+                    input_payload=self._session_payload(
+                        session_id=session_id,
+                        prompt="Reconcile a waited delivery child",
+                        transcript_path=transcript_path,
+                    ),
+                    env_overrides={"HOME": str(fake_home)},
+                )
+                prepare = self._run_adapter(
+                    "prepare-active-run",
+                    "--repo",
+                    str(self.repo),
+                    "--goal",
+                    "Wrap current repo changes",
+                    "--session-id",
+                    session_id,
+                    "--external-helper",
+                    str(self.fake_helper),
+                    "--no-fallback-smoke",
+                    env_overrides={"HOME": str(fake_home)},
+                )
+                self.assertEqual(prepare.returncode, 0, prepare.stderr)
+                run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
+                state_path = run_dir / "state.json"
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                state["orchestration"]["child_status"] = child_status
+                state["orchestration"]["child_session_id"] = "child-terminal-fallback"
+                state_path.write_text(
+                    json.dumps(state, indent=2, sort_keys=True) + "\n"
+                )
+
+                stop_payload = {
+                    "session_id": session_id,
+                    "transcript_path": transcript_path,
+                    "cwd": str(self.repo),
+                    "hook_event_name": "Stop",
+                    "model": "gpt-5.5",
+                    "permission_mode": "acceptEdits",
+                    "stop_hook_active": False,
+                    "last_assistant_message": f"reconcile {child_status} child",
+                }
+
+                module = self._load_adapter_module()
+                stderr = io.StringIO()
+                with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+                    with mock.patch.object(
+                        module,
+                        "_build_stop_continuation_prompt",
+                        side_effect=RuntimeError("boom"),
+                    ):
+                        with mock.patch.object(
+                            module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
+                        ):
+                            with mock.patch.object(module.sys, "stderr", stderr):
+                                returncode = module._stop_hook(
+                                    module.argparse.Namespace()
+                                )
+
+                self.assertEqual(returncode, 2)
+                self.assertIn(f"--child-status {child_status}", stderr.getvalue())
+                self.assertIn(
+                    "--child-session-id child-terminal-fallback", stderr.getvalue()
+                )
+
+    def test_stop_hook_fallback_prompt_waits_for_active_child(self) -> None:
+        fake_home = self.root / "home-stop-active-child-fallback"
+        session_id = "session-active-child-fallback"
+        transcript_path = "/tmp/transcript-active-child-fallback.jsonl"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="Keep waiting for an active waited delivery child",
+                transcript_path=transcript_path,
+            ),
+            env_overrides={"HOME": str(fake_home)},
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--session-id",
+            session_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            env_overrides={"HOME": str(fake_home)},
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["orchestration"]["child_status"] = "running"
+        state["orchestration"]["child_session_id"] = "child-live"
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+        stop_payload = {
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "keep waiting for child",
+        }
+
+        module = self._load_adapter_module()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+            with mock.patch.object(
+                module,
+                "_build_stop_continuation_prompt",
+                side_effect=RuntimeError("boom"),
+            ):
+                with mock.patch.object(
+                    module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
+                ):
+                    with mock.patch.object(module.sys, "stderr", stderr):
+                        returncode = module._stop_hook(module.argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertIn("Keep waiting for delivery child `child-live`", stderr.getvalue())
+
+    def test_stop_hook_fallback_prompt_requires_spawn_when_child_missing(self) -> None:
+        fake_home = self.root / "home-stop-no-child-fallback"
+        session_id = "session-no-child-fallback"
+        transcript_path = "/tmp/transcript-no-child-fallback.jsonl"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="Resume waited delivery before a child is attached",
+                transcript_path=transcript_path,
+            ),
+            env_overrides={"HOME": str(fake_home)},
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--session-id",
+            session_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            env_overrides={"HOME": str(fake_home)},
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+
+        stop_payload = {
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "spawn the child next",
+        }
+
+        module = self._load_adapter_module()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+            with mock.patch.object(
+                module,
+                "_build_stop_continuation_prompt",
+                side_effect=RuntimeError("boom"),
+            ):
+                with mock.patch.object(
+                    module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
+                ):
+                    with mock.patch.object(module.sys, "stderr", stderr):
+                        returncode = module._stop_hook(module.argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertIn(
+            "Continue the required spawn -> attach-child -> wait sequence.",
+            stderr.getvalue(),
+        )
+
+    def test_stop_hook_keeps_blocking_when_fallback_builder_fails(self) -> None:
+        fake_home = self.root / "home-stop-last-resort"
+        session_id = "session-last-resort"
+        transcript_path = "/tmp/transcript-last-resort.jsonl"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="Use the last-resort waited delivery stop prompt",
+                transcript_path=transcript_path,
+            ),
+            env_overrides={"HOME": str(fake_home)},
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--session-id",
+            session_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            env_overrides={"HOME": str(fake_home)},
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["orchestration"]["child_status"] = "failed"
+        state["orchestration"]["child_session_id"] = "child-last-resort"
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+        stop_payload = {
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "last resort prompt",
+        }
+
+        module = self._load_adapter_module()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+            with mock.patch.object(
+                module,
+                "_build_stop_continuation_prompt",
+                side_effect=RuntimeError("continuation boom"),
+            ):
+                with mock.patch.object(
+                    module,
+                    "_build_stop_fallback_prompt",
+                    side_effect=RuntimeError("fallback boom"),
+                ):
+                    with mock.patch.object(
+                        module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
+                    ):
+                        with mock.patch.object(module.sys, "stderr", stderr):
+                            returncode = module._stop_hook(module.argparse.Namespace())
+
+        self.assertEqual(returncode, 2)
+        self.assertIn(
+            "A waited-delivery run for this session is still active.", stderr.getvalue()
+        )
+        self.assertIn(str(run_dir / "state.json"), stderr.getvalue())
+        self.assertIn("--child-status failed", stderr.getvalue())
+        self.assertIn("--child-session-id child-last-resort", stderr.getvalue())
+
+    def test_stop_hook_keeps_blocking_when_last_resort_builder_fails(self) -> None:
+        fake_home = self.root / "home-stop-emergency"
+        session_id = "session-emergency"
+        transcript_path = "/tmp/transcript-emergency.jsonl"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id=session_id,
+                prompt="Use the emergency waited delivery stop prompt",
+                transcript_path=transcript_path,
+            ),
+            env_overrides={"HOME": str(fake_home)},
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--session-id",
+            session_id,
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            env_overrides={"HOME": str(fake_home)},
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
+        state_path = run_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["orchestration"]["child_status"] = "failed"
+        state["orchestration"]["child_session_id"] = "child-emergency"
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+        stop_payload = {
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "emergency prompt",
+        }
+
+        module = self._load_adapter_module()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
+            with mock.patch.object(
+                module,
+                "_build_stop_continuation_prompt",
+                side_effect=RuntimeError("continuation boom"),
+            ):
+                with mock.patch.object(
+                    module,
+                    "_build_stop_fallback_prompt",
+                    side_effect=RuntimeError("fallback boom"),
+                ):
+                    with mock.patch.object(
+                        module,
+                        "_build_stop_last_resort_prompt",
+                        side_effect=RuntimeError("last resort boom"),
+                    ):
+                        with mock.patch.object(
+                            module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
+                        ):
+                            with mock.patch.object(module.sys, "stderr", stderr):
+                                returncode = module._stop_hook(
+                                    module.argparse.Namespace()
+                                )
+
+        self.assertEqual(returncode, 2)
+        self.assertIn("Run this from the repo root:", stderr.getvalue())
+        self.assertIn("--child-status failed", stderr.getvalue())
+        self.assertIn("--child-session-id child-emergency", stderr.getvalue())
+
+    def test_stop_hook_fails_open_when_prompt_write_fails(self) -> None:
+        fake_home = self.root / "home-stop-write-fail"
+        self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(
+                session_id="session-write-fail",
+                prompt="Block on active waited delivery",
+                transcript_path="/tmp/transcript-write-fail.jsonl",
+            ),
+            env_overrides={"HOME": str(fake_home)},
+        )
+        prepare = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Wrap current repo changes",
+            "--session-id",
+            "session-write-fail",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            env_overrides={"HOME": str(fake_home)},
+        )
+        self.assertEqual(prepare.returncode, 0, prepare.stderr)
+
+        stop_payload = {
+            "session_id": "session-write-fail",
+            "transcript_path": "/tmp/transcript-write-fail.jsonl",
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "write fails",
+        }
+
+        class BrokenStderr:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def write(self, _: str) -> int:
+                self.calls += 1
+                raise BrokenPipeError("stderr closed")
+
+            def flush(self) -> None:
+                return None
+
+        module = self._load_adapter_module()
+        broken_stderr = BrokenStderr()
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(fake_home), "WAITED_DELIVERY_HOOK_DEBUG": "1"},
+            clear=False,
+        ):
+            with mock.patch.object(
+                module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
+            ):
+                with mock.patch.object(module.sys, "stderr", broken_stderr):
+                    returncode = module._stop_hook(module.argparse.Namespace())
+
+        self.assertEqual(returncode, 0)
+        self.assertGreaterEqual(broken_stderr.calls, 1)
+        log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
+        entries = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(entries[-1]["hook_command"], "stop-hook")
+        self.assertEqual(entries[-1]["error_type"], "BrokenPipeError")
+        self.assertEqual(entries[-1]["session_id"], "session-write-fail")
+
+
+if __name__ == "__main__":
+    unittest.main()

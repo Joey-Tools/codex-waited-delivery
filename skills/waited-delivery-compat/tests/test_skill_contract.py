@@ -1,3 +1,5 @@
+"""Contract tests for the waited-delivery compatibility skill."""
+
 from __future__ import annotations
 
 import pathlib
@@ -7,9 +9,11 @@ import unittest
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SKILL_PATH = SKILL_ROOT / "SKILL.md"
+OPENAI_YAML_PATH = SKILL_ROOT / "agents" / "openai.yaml"
+HOOK_ADAPTER_REFERENCE_PATH = SKILL_ROOT / "references" / "hook-adapter.md"
 DISTRIBUTION_PROFILE_BY_SKILL_LAYOUT = {
-    pathlib.Path("skills/waited-delivery"): "canonical",
-    pathlib.Path("personal_codex/skills/waited-delivery"): "private",
+    pathlib.Path("skills/waited-delivery-compat"): "canonical",
+    pathlib.Path("personal_codex/skills/waited-delivery-compat"): "private",
 }
 
 
@@ -29,7 +33,9 @@ def distribution_contract_context(
         if repo_root / layout != skill_root:
             continue
         return repo_root, profile
-    raise AssertionError(f"unsupported waited-delivery skill layout: {skill_root}")
+    raise AssertionError(
+        f"unsupported waited-delivery compatibility skill layout: {skill_root}"
+    )
 
 
 REPO_ROOT, DISTRIBUTION_PROFILE = distribution_contract_context(SKILL_ROOT)
@@ -52,7 +58,7 @@ def require_canonical_documentation(
             "the private skill-only distribution"
         )
     if profile != "canonical":
-        test_case.fail(f"unsupported waited-delivery distribution profile: {profile}")
+        test_case.fail(f"unsupported waited-delivery compatibility profile: {profile}")
     missing_paths = tuple(path for path in documentation_paths if not path.exists())
     if missing_paths:
         test_case.fail(
@@ -74,11 +80,40 @@ class SkillContractTest(unittest.TestCase):
 
     def test_private_skill_layout_selects_private_profile(self) -> None:
         root = pathlib.Path("/example/repository")
-        skill_root = root / "personal_codex" / "skills" / "waited-delivery"
+        skill_root = root / "personal_codex" / "skills" / "waited-delivery-compat"
         self.assertEqual(
             (root, "private"),
             distribution_contract_context(skill_root),
         )
+
+    def test_skill_is_explicit_only_compatibility_surface(self) -> None:
+        skill = SKILL_PATH.read_text(encoding="utf-8")
+        openai_yaml = OPENAI_YAML_PATH.read_text(encoding="utf-8")
+        hook_reference = HOOK_ADAPTER_REFERENCE_PATH.read_text(encoding="utf-8")
+
+        self.assertTrue(skill.startswith("---\nname: waited-delivery-compat\n"))
+        self.assertIn("never use it for default change delivery", skill)
+        self.assertIn(
+            "Do not install or link it into the active personal skill directory",
+            skill,
+        )
+        self.assertIn("--enable-compat-hook", skill)
+        self.assertIn("`refresh-prompts`", skill)
+        self.assertIn("`refresh-prompts-live`", skill)
+        self.assertIn("internal in-memory runner recovery target", skill)
+        self.assertIn(
+            "No source snapshot file or inherited source FD exists",
+            skill,
+        )
+        self.assertIn("Python `-I -B -S`", skill)
+        self.assertIn(
+            "both `anonymous-pipe-memory` transports",
+            hook_reference,
+        )
+        self.assertIn("allow_implicit_invocation: false", openai_yaml)
+        self.assertIn("$waited-delivery-compat", openai_yaml)
+        self.assertIn("<compat-skill-root>", hook_reference)
+        self.assertNotIn("~/.codex/skills/waited-delivery", hook_reference)
 
     def test_private_distribution_skips_repository_documentation(self) -> None:
         with self.assertRaises(unittest.SkipTest):
@@ -192,6 +227,63 @@ class SkillContractTest(unittest.TestCase):
         readme = " ".join(README_PATH.read_text(encoding="utf-8").split())
         self.assertIn("compatibility/diagnostic dependency", readme)
         self.assertNotIn("review transport/runtime dependency", readme)
+
+    def test_documents_directional_schema_migration_contract(self) -> None:
+        require_canonical_documentation(self)
+        dependencies = " ".join(DEPENDENCIES_PATH.read_text(encoding="utf-8").split())
+        contract_phrases = (
+            "schema `3` `preparing` reservation",
+            "Adapter index schema `3` reads schemas `1` and `2`",
+            "upgrades them one way on the next successful index commit",
+            "A schema `2` adapter must reject schema `3` before any mutation",
+            "must not downgrade the document or rewrite a `cleanup_complete` fence",
+            "runner state schema `5` records the same transaction UUID",
+            "Runner state schema `5` reads schemas `1` through `4`",
+            "upgrades them one way on the next successful state publish",
+            "migration requires exact identity: unchanged values are allowed, while "
+            "changed values are rejected",
+            "Schema `4` recovery is directional",
+            "a schema `5` runner may recover and upgrade it",
+            "a schema `4` runner must reject schema `5`",
+            "every future schema fails closed",
+        )
+
+        for phrase in contract_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, dependencies)
+
+    def test_documents_reference_only_downstream_retirement(self) -> None:
+        require_canonical_documentation(self)
+        dependencies = " ".join(DEPENDENCIES_PATH.read_text(encoding="utf-8").split())
+
+        self.assertIn(
+            "`personal_codex/skills/waited-delivery-compat` reference-only "
+            "distribution layout",
+            dependencies,
+        )
+        self.assertIn("legacy `skills/waited-delivery` target", dependencies)
+        self.assertIn("downstream `removed_links` metadata", dependencies)
+        self.assertIn(
+            "`skills/change-delivery-workflow` as its replacement",
+            dependencies,
+        )
+        self.assertIn(
+            "Direct repository links use the byte-identical checked-in "
+            "historical target",
+            dependencies,
+        )
+        self.assertIn(
+            "Aggregate and private-overlay packaging must preserve both legacy "
+            "files and the compatibility runner",
+            dependencies,
+        )
+        self.assertIn(
+            "`removed_links` may retire the target only after the effective hook "
+            "list is empty and active legacy runs have drained",
+            dependencies,
+        )
+        self.assertIn("fixed executable redirect", dependencies)
+        self.assertIn("no active run still persists a command", dependencies)
 
 
 if __name__ == "__main__":

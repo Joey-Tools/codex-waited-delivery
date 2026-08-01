@@ -1,12 +1,12 @@
 # Dependencies
 
-The waited-delivery runner is intentionally experimental. Its optional external
-fallback-lane readiness smoke defaults to `isolated_review` from the sibling
-`review-orchestration-playbook` skill layout used by the public
-`codex-review-workflows` repository. In this workflow, that helper is low-level
-compatibility/diagnostic tooling for the readiness probe only. It cannot start,
-satisfy, substitute for, or count as the named internal single review, and the
-probe never counts as review coverage.
+The waited-delivery compatibility runner is intentionally historical and
+experimental. Its optional external fallback-lane readiness smoke defaults to
+`isolated_review` from the sibling `review-orchestration-playbook` skill layout
+used by the public `codex-review-workflows` repository. In this workflow, that
+helper is low-level compatibility/diagnostic tooling for the readiness probe
+only. It cannot start, satisfy, substitute for, or count as the named internal
+single review, and the probe never counts as review coverage.
 
 The named internal single review remains exactly one fresh/clear-context Codex
 `reviewer` agent owned by the parent after the delivery child returns. The
@@ -19,13 +19,118 @@ while implementation state is dirty/untracked, or when nonblank terminal
 reviewer evidence is missing. Bulk phase closure cannot mark review phases
 passed.
 
+The compatibility runner has no text-decoding dependency for dirty-file
+discovery: it consumes binary NUL-framed porcelain output and applies the
+runtime filesystem `surrogateescape` codec only after record boundaries and
+rename/copy path arity are known. Human-facing path rendering uses one
+backslash-based escape grammar for all Unicode control/format/line/paragraph
+separators, invalid bytes, backslashes, Markdown backticks, and edge spaces.
+Ordinary printable Unicode remains readable. Output is capped at `512` UTF-8
+bytes per path. A reserved `⟦truncated;...⟧` token cannot be forged by input
+because its delimiters are escaped in ordinary path content. The token binds
+identity kind, byte length, and SHA-256: exact `os.fsencode()` bytes for
+filesystem-encodable paths, or explicitly labeled, stable
+`utf8-surrogatepass` bytes for non-surrogateescape surrogates and other
+filesystem-codec failures. JSON state publication also has a strict `4 MiB`
+encoded-size ceiling checked after serialization but before temporary file
+allocation or replacement, so a rejected growth transition preserves the
+previous recoverable state. Nonterminal saves additionally project an
+interrupted child, decision-point closure of open phases, mandatory timestamps,
+and derived overall status; a save that would consume this terminal reserve is
+rejected while the old state is still recoverable. Finish and reconciliation
+use one deterministic transaction timestamp and validate the full terminal
+candidate before summary publication. Prompt refresh validates the candidate
+state with its canonical prompt paths before replacing either prompt.
+
+The runner applies the same pre-publication rule to initial run creation: it
+builds the full state, worst-case terminal projection, and all UTF-8 artifacts
+before opening or creating the run path, then descriptor-revalidates and
+parent-directory-fsyncs every created name before a successful receipt. The
+hook adapter then persists a schema `3` `preparing` reservation before invoking
+`prepare-live`. Adapter index schema `3` reads schemas `1` and `2`, then
+upgrades them one way on the next successful index commit. A schema `2`
+adapter must reject schema `3` before any mutation; it must not downgrade the
+document or rewrite a `cleanup_complete` fence. A descriptor-validated `0600`
+preparation lease is inherited across adapter/bridge/runner, runner state
+schema `5` records the same transaction UUID, and a second short index
+transaction promotes only that exact, fully-attested run to `active`. Runner
+state schema `5` reads schemas `1` through `4`, then upgrades them one way on
+the next successful state publish. For oversized legacy text carried by
+schemas `1` through `4`, migration requires exact identity: unchanged values
+are allowed, while changed values are rejected. Schema `4` recovery is
+directional: a schema `5` runner may recover and upgrade it, but a schema `4`
+runner must reject schema `5`; every future schema fails closed.
+Index-capacity rejection cannot launch the bridge, create a run, or publish
+stdout. Recovery first proves the cooperative writer chain is quiescent by
+retiring the adapter's inherited reference once and reacquiring the lease
+through an independent open; a busy or ambiguous lease prevents run-entry
+inspection. Absent, partial, mismatched, tampered, or complete runs are then
+reported or handled through `recover-active-run` without recursive deletion,
+and an existing association cannot be replaced until its terminal state
+passes the same descriptor-bound path checks.
+
 Operators can avoid that layout dependency by passing `--external-helper` to
 the runner or bridge commands, or disable the readiness smoke when it is not
 needed. Neither choice changes the internal reviewer identity or count.
 
-The private overlay packages the skill under the explicit
-`personal_codex/skills/waited-delivery` distribution layout without this
-repository-level README or dependency document. Distribution-profile contract
-tests therefore keep validating the synced skill and runtime in that recognized
-layout, but skip only the canonical documentation assertions. Missing or partial
-documentation in the canonical `skills/waited-delivery` layout remains an error.
+The private overlay may retain the compatibility source under the explicit
+`personal_codex/skills/waited-delivery-compat` reference-only distribution
+layout without this repository-level README or dependency document. It must not
+link that directory into the active personal skill installation.
+
+Legacy hook removal is a two-release migration:
+
+1. In the first release, replace the old active `kind: skill` link with an
+   inert `kind: directory` link backed by the repository asset
+   `legacy-hook-shims/waited-delivery/scripts/` onto every installed or
+   aggregate `skills/waited-delivery/scripts/` path still named by a hook
+   registration or persisted active-run command. Direct repository links use
+   the byte-identical checked-in historical target at that path. Both source
+   directories omit `SKILL.md`; the adapter never parses argv, reads stdin,
+   writes state, or returns a blocking status. The runner is a fixed executable
+   redirect to the sibling packaged
+   `skills/waited-delivery-compat/scripts/waited_delivery_runner.py`. It opens
+   that source with `O_NOFOLLOW | O_NONBLOCK`, rejects a FIFO or other
+   non-regular object after `fstat` without waiting for another endpoint, binds
+   the regular-file object, current-user access policy, bounded size, and two
+   equal byte reads, then forks a one-shot writer that transfers those verified
+   bytes through an anonymous pipe. The current Python interpreter is replaced
+   by a fixed `-I -B -S -c` bootstrap that verifies the exact length, EOF, and
+   SHA-256 digest, reaps the writer, preserves the canonical compatibility path
+   in `__file__` and the original runner arguments, and compiles the bytes in
+   memory. No regular-file source snapshot is created. Replacing or modifying
+   the source path after binding,
+   including through a pre-held writable descriptor or hard link, cannot
+   change the executed bytes. Aggregate and private-overlay packaging must
+   preserve both legacy files and the compatibility runner at those relative
+   release paths. Record that
+   active-skill-to-inert-directory identity change with its own append-only
+   `removed_links` migration entry while keeping the target installed.
+2. Remove every default `UserPromptSubmit` and `Stop` registration on each host,
+   then verify the effective hook configuration contains no legacy adapter
+   path. Independently verify that no active run still persists a command for
+   the legacy runner path.
+3. Only after both proofs, retire the legacy `skills/waited-delivery` target by
+   removing the non-discoverable directory link in a later release and
+   appending a second entry to downstream `removed_links` metadata with
+   `skills/change-delivery-workflow` as its replacement. Preserve the first
+   migration entry as history.
+
+Do not remove the legacy link in the same transaction that merely requests hook
+configuration cleanup. A stale registration must continue to reach the inert
+adapter until absence is independently verified, and an active pre-rename child
+must continue to reach the fixed runner redirect until legacy runs drain. The
+compatibility implementation under `waited-delivery-compat` remains
+explicit-only; only the non-discoverable fixed redirect is retained at the
+legacy path.
+
+Contract tests exercise the direct repository link, aggregate and private
+overlay release layouts, and the two-phase order: the inert adapter and runner
+redirect remain callable while a registration or active legacy run exists,
+then `removed_links` may retire the target only after the effective hook list
+is empty and active legacy runs have drained.
+
+Distribution-profile contract tests keep validating a synced reference-only
+copy in that recognized layout, but skip only the canonical documentation
+assertions. Missing or partial documentation in the canonical
+`skills/waited-delivery-compat` layout remains an error.

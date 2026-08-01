@@ -1,0 +1,92 @@
+# Compatibility Hook / Supervisor Bridge
+
+Use this bridge only when an explicit compatibility experiment needs to drive historical `waited-delivery` state without hard-coding runner internals.
+
+## Bridge Script
+
+- [waited_delivery_bridge.py](../scripts/waited_delivery_bridge.py)
+- If the user explicitly requests a compatibility hook experiment and hooks are
+  already available, use the higher-level adapter documented in
+  [hook-adapter.md](hook-adapter.md) with its required
+  `--enable-compat-hook` flag.
+
+## Stable Env Contract
+
+The bridge deliberately uses a repo-owned env contract instead of assuming any undocumented Codex hook env names:
+
+- `WAITED_DELIVERY_PARENT_SESSION_ID`
+- `WAITED_DELIVERY_PARENT_TURN_ID`
+- `WAITED_DELIVERY_PARENT_TRANSCRIPT_PATH`
+- `WAITED_DELIVERY_PERMISSION_MODE`
+
+Future hooks or app adapters should translate product-specific metadata into these env vars before calling the bridge.
+If a future hook payload exposes only a subset of those fields, the bridge still accepts partial metadata and lets the runner persist what is actually known.
+The current outer adapter already follows this rule: it may observe product-specific values such as host-injected `CODEX_THREAD_ID`, but it translates them before calling the bridge rather than teaching the runner about undocumented product env names.
+
+## Adapter Execution Contract
+
+The outer adapter never path-executes this bridge or the runner. For every
+adapter-driven `prepare-live`, `bind-parent-live`, `attach-child-live`,
+`finish-child-live`, `reconcile-live`, and `refresh-prompts-live` operation, it
+first stable-binds both source objects and exact bytes. The repository root,
+`.codex-tmp`, adapter directory, index, lock, preparation lease, runs root,
+run, state/prompts, and bridge/runner source parents and files must be
+current-user-owned, reject group/other write, and carry no Darwin extended or
+Linux POSIX ACL; held descriptors revalidate that property at the operation
+boundary.
+
+The adapter sends a bounded two-source frame to a fixed Python `-I -B -S -c`
+bootstrap. That bootstrap verifies magic, lengths, EOF, and SHA-256 before
+compiling the bridge in memory. The bridge then sends the already bound runner
+bytes through a second bounded frame to another isolated bootstrap. Direct
+standalone bridge invocation remains a compatibility CLI, but it is not the
+adapter execution path.
+
+## Commands
+
+- `prepare-live`
+  - wraps `waited_delivery_runner.py prepare --json`
+  - injects parent metadata from args or env
+  - for an adapter reservation, requires `--preparation-id` together with an inherited open `--preparation-lease-fd`, keeps that descriptor across its own process, forwards both the descriptor and stable transaction ID to the runner, and returns the runner's lease-inheritance attestation
+  - lets the runner publish schema `5` state with the same preparation ID; preparation-aware schema `4` remains recovery-readable, and the bridge does not select, clear, or activate the adapter reservation itself
+- `bind-parent-live`
+  - patches bounded parent metadata into an existing run when the ids or other outer-adapter metadata become known later; over-limit metadata is rejected before a state write, while an unchanged oversized value loaded from schema `1` through `4` remains usable only through its schema-`5` exact identity marker
+- `attach-child-live`
+  - wraps `attach-child`, rejects a blank, invalid-UTF-8, or encoded-over-limit child id before state open/mutation, and also propagates bounded parent metadata from args or env
+- `refresh-prompts-live`
+  - is an internal anonymous-pipe-bound target for the outer adapter; it refuses an ordinary source-path launch
+  - requires framed bridge and runner source bytes, their complete device/inode, uid/gid/mode, size, and SHA-256 provenance versions, and the separate canonical filenames to publish or use for compilation diagnostics
+  - requires Python `-I -B -S`; a fixed outer bootstrap validates frame magic, bounded exact lengths, EOF, and both SHA-256 digests before compiling the bridge in memory, while Python environment-injection variables are removed
+  - launches the runner through a second fixed bootstrap with its own bounded exact-length, EOF, and SHA-256 frame; the runner validates the injected bytes again under the run lock immediately before the first prompt/state write
+  - validates and returns refresh schema `3` with exact bridge/runner source versions, `anonymous-pipe-memory` transport, non-reopenability, canonical compile filenames, isolated-execution attestation, and regenerated run-local child/parent versions
+  - accepts `--expected-repo-root` from the outer adapter so the runner can enforce exact repo containment again under the run-level state lock
+  - accepts `--expected-run-dev`, `--expected-run-ino`, `--expected-run-uid`, `--expected-run-gid`, and `--expected-run-mode` only as one complete set, forwards them to the runner, and returns the refreshed identity so the outer adapter can bind one exact directory object and POSIX access identity across the bridge call
+  - still passes through the ordinary runner reopen gate: current-user ownership, no group/other write, and no Darwin extended or Linux POSIX ACL on repository-side parents, run, state, prompts, smoke prompt, and lock; current-user exact legacy `0755` is tightened through the held run descriptor before artifact reads
+  - creates new run-tree directories as exact descriptor-revalidated `0700` objects and new artifact temporaries/locks as exact descriptor-revalidated `0600` regular files even when the process umask masks every owner bit
+  - never falls back to the bridge's or runner's mutable source path; the outer adapter owns stable source binding, prelaunch source-version revalidation, framed delivery, and process-group cleanup
+- `finish-child-live`
+  - requires the exact attached `child_session_id` and wraps `finish-child` so the bridge can persist the child's matching terminal status after `wait` and before parent-owned review
+- `reconcile-live`
+  - requires that same exact child id and wraps `reconcile-parent --json`
+  - when called by the adapter, its result is not enough to clear the index; the adapter reopens and validates the terminal reconciled state through the pinned run-directory descriptor first
+- `print-env-contract`
+  - prints the current env keys expected by the bridge
+
+## Intended Use
+
+1. A hook or supervisor resolves whichever parent metadata it can reliably observe.
+2. It exports those fields as `WAITED_DELIVERY_*`.
+3. It calls `prepare-live`.
+4. The parent session or adapter spawns the delivery child and calls `attach-child-live`.
+5. After `wait` returns, it calls `finish-child-live` with the exact id recorded by `attach-child-live`.
+6. The parent forms the committed clean/frozen range and records its review phases.
+7. It calls `reconcile-live` with that same exact id only after every phase is terminal.
+
+## Notes
+
+- This bridge does not assume a specific Codex App or Codex CLI hook payload shape.
+- Call `refresh-prompts-live` only through the outer adapter's anonymous-pipe source launcher. Direct standalone use of the other bridge commands retains the ordinary compatibility CLI, but every adapter call uses stable-bound bridge and runner bytes through the isolated two-frame launch contract.
+- If stock App / hooks later expose different metadata names, only the outer adapter should need to change.
+- `prepare-live` and `attach-child-live` prefer explicit CLI args over env vars when both are present.
+- Preparation IDs are correlation evidence rather than secrets or authentication credentials. The inherited lease coordinates only the adapter/bridge/runner chain; a runner descendant may retain the same open-file-description after the bridge process exits, so the outer adapter must retire its own inherited reference and independently reacquire the lock before declaring that chain quiescent. Recovery and CAS policy remain owned by the outer adapter.
+- The bridge remains useful even when an outer hook can only provide `session_id`, `transcript_path`, or `permission_mode` but not a true `turn_id`.
