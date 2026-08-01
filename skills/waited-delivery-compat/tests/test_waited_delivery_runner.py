@@ -3067,11 +3067,11 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
                 )
                 prompt_path = pathlib.Path(sys.argv[1])
                 os.close(int(prompt_path.name))
+                print("READY", flush=True)
                 pathlib.Path(sys.argv[2]).write_text(
                     str(os.getpgrp()),
                     encoding="utf-8",
                 )
-                print("READY", flush=True)
                 time.sleep(60)
                 """
             ),
