@@ -64,7 +64,13 @@ creating the run path. An over-limit state, invalid explicit/automatic run ID,
 or unencodable prompt therefore emits no success payload and leaves the run
 tree untouched. Once creation begins, each parent/name entry is descriptor
 revalidated and parent-directory-fsynced before artifact publication, so a
-successful receipt does not outrun run-tree name durability.
+successful receipt does not outrun run-tree name durability. A newly created
+parent or run directory is bootstrapped through its parent descriptor only so
+an owner-bit-masking umask cannot prevent the first open; the opened object is
+then forced to exact `0700` through its own descriptor and revalidated for the
+same identity and ACL policy. New artifact temporaries and the run lock are
+likewise forced to exact `0600` through their descriptors before any content,
+lock, replacement, or success receipt can use them.
 
 Every ordinary runner reopen walks the repository, `.codex-tmp`,
 `waited-delivery`, and run entries descriptor-relative with no-follow
@@ -96,6 +102,12 @@ bootstrap, which compiles the bridge in memory; that bridge sends the already
 bound runner bytes through a second bounded frame to another isolated
 bootstrap. Adapter-driven execution never path-executes or reopens either
 source after binding.
+
+The non-discoverable historical runner redirect independently walks the
+release bundle root, `skills`, compatibility skill, and `scripts` entries
+through no-follow descriptors. Every directory and the final runner source
+must remain current-user-owned, reject group/other write, and carry no Darwin
+extended or Linux POSIX ACL before and after the two bounded source reads.
 
 Runner fallback smoke, adapter bridge supervision, and the subprocess test
 support attest native `sigaction(SIGCHLD)` before creating selectors, pipes, or

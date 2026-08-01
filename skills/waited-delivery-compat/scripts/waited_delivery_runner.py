@@ -787,13 +787,74 @@ def _harden_run_directory(
     return hardened
 
 
+def _create_private_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    label: str,
+) -> int:
+    """Create and descriptor-bind an exact 0700 directory despite the umask."""
+
+    _validate_component_name(name, label="directory name")
+    os.mkdir(name, DIRECTORY_MODE, dir_fd=parent_fd)
+    created = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    _require_owned_nonwritable_directory(created, label=f"new {label}")
+    try:
+        os.chmod(
+            name,
+            DIRECTORY_MODE,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except (NotImplementedError, OSError) as error:
+        raise UserError(f"cannot bootstrap exact mode 0700 for new {label}") from error
+    named_hardened = os.stat(
+        name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    if (
+        not _same_object(created, named_hardened)
+        or not stat.S_ISDIR(named_hardened.st_mode)
+        or named_hardened.st_uid != os.geteuid()
+        or stat.S_IMODE(named_hardened.st_mode) != DIRECTORY_MODE
+    ):
+        raise UserError(
+            f"new {label} object or access policy changed while bootstrapping"
+        )
+    directory_fd = _open_directory_at(parent_fd, name)
+    try:
+        opened = os.fstat(directory_fd)
+        if not _same_object(created, opened):
+            raise UserError(f"new {label} was replaced before descriptor binding")
+        try:
+            os.fchmod(directory_fd, DIRECTORY_MODE)
+        except OSError as error:
+            raise UserError(f"cannot enforce exact mode 0700 on new {label}") from error
+        identity = _bound_owned_directory_identity(
+            parent_fd,
+            name,
+            directory_fd,
+            label=label,
+        )
+        if identity.mode != DIRECTORY_MODE:
+            raise UserError(f"new {label} did not retain exact mode 0700")
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
 def _ensure_directory_at(parent_fd: int, name: str) -> int:
     _validate_component_name(name, label="directory name")
     try:
-        os.mkdir(name, DIRECTORY_MODE, dir_fd=parent_fd)
+        directory_fd = _create_private_directory_at(
+            parent_fd,
+            name,
+            label=f"run parent directory {name}",
+        )
     except FileExistsError:
-        pass
-    directory_fd = _open_directory_at(parent_fd, name)
+        directory_fd = _open_directory_at(parent_fd, name)
     try:
         descriptor_stat = os.fstat(directory_fd)
         named_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1007,12 +1068,15 @@ def _create_run_directory(
         codex_tmp_fd = _ensure_directory_at(repo_fd, ".codex-tmp")
         runs_fd = _ensure_directory_at(codex_tmp_fd, RUNS_DIR_NAME)
         try:
-            os.mkdir(run_id, DIRECTORY_MODE, dir_fd=runs_fd)
+            run_fd = _create_private_directory_at(
+                runs_fd,
+                run_id,
+                label="run directory",
+            )
         except FileExistsError as error:
             raise UserError(
                 f"run directory already exists for run id: {run_id}"
             ) from error
-        run_fd = _open_directory_at(runs_fd, run_id)
         _harden_run_directory(
             runs_fd,
             run_id,
@@ -1452,6 +1516,10 @@ def _atomic_write_regular(
             FILE_MODE,
             dir_fd=run_fd,
         )
+        temp_identity = _harden_private_regular_descriptor(
+            temp_fd,
+            label=f"temporary run artifact {name}",
+        )
         offset = 0
         while offset < len(encoded):
             written_bytes = os.write(temp_fd, encoded[offset:])
@@ -1459,16 +1527,6 @@ def _atomic_write_regular(
                 raise UserError(f"failed to write temporary run artifact: {name}")
             offset += written_bytes
         os.fsync(temp_fd)
-        temp_identity = _directory_identity(os.fstat(temp_fd))
-        if (
-            temp_identity.uid != os.geteuid()
-            or temp_identity.mode & UNTRUSTED_WRITE_MASK
-        ):
-            raise UserError(f"temporary run artifact access policy is unsafe: {name}")
-        _require_no_extended_acl(
-            temp_fd,
-            label=f"temporary run artifact {name}",
-        )
         os.close(temp_fd)
         temp_fd = None
         _validate_expected_artifact(
@@ -1869,6 +1927,36 @@ def _save_state(
     return written_version
 
 
+def _harden_private_regular_descriptor(
+    file_fd: int,
+    *,
+    label: str,
+) -> DirectoryIdentity:
+    initial = os.fstat(file_fd)
+    if not stat.S_ISREG(initial.st_mode):
+        raise UserError(f"{label} must be a regular file")
+    if initial.st_uid != os.geteuid():
+        raise UserError(f"{label} must be owned by the current user")
+    if stat.S_IMODE(initial.st_mode) & UNTRUSTED_WRITE_MASK:
+        raise UserError(f"{label} must not be writable by group or other users")
+    _require_no_extended_acl(file_fd, label=label)
+    try:
+        os.fchmod(file_fd, FILE_MODE)
+    except OSError as error:
+        raise UserError(f"cannot enforce exact mode 0600 on {label}") from error
+    hardened = os.fstat(file_fd)
+    if (
+        not stat.S_ISREG(hardened.st_mode)
+        or not _same_object(initial, hardened)
+        or hardened.st_uid != initial.st_uid
+        or hardened.st_gid != initial.st_gid
+        or stat.S_IMODE(hardened.st_mode) != FILE_MODE
+    ):
+        raise UserError(f"{label} object or access policy changed while hardening")
+    _require_no_extended_acl(file_fd, label=label)
+    return _directory_identity(hardened)
+
+
 @contextlib.contextmanager
 def _open_run_lock_descriptor(
     run_fd: int,
@@ -1887,15 +1975,11 @@ def _open_run_lock_descriptor(
     except OSError as error:
         raise UserError("cannot open run lock without following links") from error
     try:
-        lock_stat = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_stat.st_mode):
-            raise UserError("run lock must be a regular file")
-        if lock_stat.st_uid != os.geteuid():
-            raise UserError("run lock must be owned by the current user")
-        if stat.S_IMODE(lock_stat.st_mode) & UNTRUSTED_WRITE_MASK:
-            raise UserError("run lock must not be writable by group or other users")
-        _require_no_extended_acl(lock_fd, label="run lock")
-        yield lock_fd, _directory_identity(lock_stat)
+        lock_identity = _harden_private_regular_descriptor(
+            lock_fd,
+            label="run lock",
+        )
+        yield lock_fd, lock_identity
     finally:
         os.close(lock_fd)
 

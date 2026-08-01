@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -99,6 +101,80 @@ def _validate_compat_runner_metadata(metadata: os.stat_result) -> None:
         raise RuntimeError("compatibility runner size is outside the accepted bound")
 
 
+def _validate_compat_directory_metadata(
+    metadata: os.stat_result,
+    *,
+    label: str,
+) -> None:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"{label} is not a directory")
+    if metadata.st_uid != os.geteuid():
+        raise RuntimeError(f"{label} is not owned by the current user")
+    if metadata.st_mode & 0o022:
+        raise RuntimeError(f"{label} is group- or other-writable")
+
+
+def _descriptor_has_extended_acl(file_fd: int, *, label: str) -> bool:
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        acl_get_fd_np = libc.acl_get_fd_np
+        acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        acl_get_fd_np.restype = ctypes.c_void_p
+        acl_free = libc.acl_free
+        acl_free.argtypes = [ctypes.c_void_p]
+        acl_free.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        acl = acl_get_fd_np(file_fd, 0x00000100)
+        if not acl:
+            error_number = ctypes.get_errno()
+            if error_number in {
+                errno.ENOENT,
+                getattr(errno, "ENODATA", errno.ENOENT),
+                errno.ENOTSUP,
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+            }:
+                return False
+            raise RuntimeError(f"{label} extended ACL cannot be inspected safely")
+        if acl_free(acl) != 0:
+            raise RuntimeError(f"{label} extended ACL inspection cleanup failed")
+        return True
+    if sys.platform.startswith("linux"):
+        getxattr = getattr(os, "getxattr", None)
+        if getxattr is None:
+            raise RuntimeError(
+                f"{label} POSIX ACL inspection is unavailable on this runtime"
+            )
+        for attribute in (
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+        ):
+            try:
+                getxattr(file_fd, attribute)
+            except OSError as error:
+                if error.errno in {
+                    getattr(errno, "ENODATA", -1),
+                    getattr(errno, "ENOATTR", -1),
+                    errno.ENOTSUP,
+                    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+                }:
+                    continue
+                raise RuntimeError(
+                    f"{label} POSIX ACL cannot be inspected safely"
+                ) from error
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    f"{label} POSIX ACL cannot be inspected descriptor-relatively"
+                ) from error
+            return True
+        return False
+    raise RuntimeError(f"{label} ACL inspection is unsupported on {sys.platform}")
+
+
+def _require_no_extended_acl(file_fd: int, *, label: str) -> None:
+    if _descriptor_has_extended_acl(file_fd, label=label):
+        raise RuntimeError(f"{label} must not carry a named or extended ACL")
+
+
 def _object_access_identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
@@ -111,6 +187,48 @@ def _object_access_identity(metadata: os.stat_result) -> tuple[int, ...]:
 
 def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _validate_directory_binding(
+    parent_fd: int | None,
+    name: str | None,
+    directory_fd: int,
+    *,
+    label: str,
+) -> None:
+    descriptor = os.fstat(directory_fd)
+    _validate_compat_directory_metadata(descriptor, label=label)
+    _require_no_extended_acl(directory_fd, label=label)
+    if parent_fd is None or name is None:
+        return
+    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    _validate_compat_directory_metadata(named, label=f"named {label}")
+    if not _same_object(descriptor, named):
+        raise RuntimeError(f"{label} identity changed while binding runner source")
+
+
+def _validate_runner_binding(
+    parent_fd: int,
+    name: str,
+    runner_fd: int,
+) -> os.stat_result:
+    descriptor = os.fstat(runner_fd)
+    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    _validate_compat_runner_metadata(descriptor)
+    _validate_compat_runner_metadata(named)
+    _require_no_extended_acl(runner_fd, label="compatibility runner")
+    if not _same_object(descriptor, named):
+        raise RuntimeError("compatibility runner identity changed while binding")
+    return descriptor
 
 
 def _runner_version(metadata: os.stat_result) -> tuple[int, ...]:
@@ -143,20 +261,68 @@ def _stable_runner_source(path: Path) -> bytes:
         raise RuntimeError(
             "compatibility runner binding requires nonblocking source open"
         )
-    runner_fd = os.open(
-        path,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | nonblock,
+    path = Path(os.path.abspath(path))
+    expected_relative = Path(
+        "skills/waited-delivery-compat/scripts/waited_delivery_runner.py"
     )
     try:
-        before = os.fstat(runner_fd)
-        _validate_compat_runner_metadata(before)
+        bundle_root = path.parents[3]
+        relative = path.relative_to(bundle_root)
+    except (IndexError, ValueError) as error:
+        raise RuntimeError("compatibility runner path layout is invalid") from error
+    if relative != expected_relative:
+        raise RuntimeError("compatibility runner path layout is invalid")
+
+    directory_fds: list[tuple[int | None, str | None, int, str]] = []
+    runner_fd: int | None = None
+    try:
+        bundle_fd = os.open(bundle_root, _directory_open_flags())
+        directory_fds.append((None, None, bundle_fd, "release bundle root"))
+        _validate_directory_binding(
+            None,
+            None,
+            bundle_fd,
+            label="release bundle root",
+        )
+        parent_fd = bundle_fd
+        for component, label in (
+            ("skills", "release skills directory"),
+            ("waited-delivery-compat", "compatibility skill directory"),
+            ("scripts", "compatibility scripts directory"),
+        ):
+            directory_fd = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=parent_fd,
+            )
+            directory_fds.append((parent_fd, component, directory_fd, label))
+            _validate_directory_binding(
+                parent_fd,
+                component,
+                directory_fd,
+                label=label,
+            )
+            parent_fd = directory_fd
+        runner_name = expected_relative.name
+        runner_fd = os.open(
+            runner_name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | nonblock,
+            dir_fd=parent_fd,
+        )
+        before = _validate_runner_binding(parent_fd, runner_name, runner_fd)
         first = _read_runner_fd(runner_fd)
         second = _read_runner_fd(runner_fd)
-        after = os.fstat(runner_fd)
-        _validate_compat_runner_metadata(after)
+        for binding in directory_fds:
+            _validate_directory_binding(
+                binding[0],
+                binding[1],
+                binding[2],
+                label=binding[3],
+            )
+        after = _validate_runner_binding(parent_fd, runner_name, runner_fd)
         if _runner_version(after) != _runner_version(before) or first != second:
             raise RuntimeError(
                 "compatibility runner changed while its bytes were being bound"
@@ -165,7 +331,10 @@ def _stable_runner_source(path: Path) -> bytes:
             raise RuntimeError("compatibility runner size changed during stable read")
         return second
     finally:
-        os.close(runner_fd)
+        if runner_fd is not None:
+            os.close(runner_fd)
+        for _parent_fd, _name, directory_fd, _label in reversed(directory_fds):
+            os.close(directory_fd)
 
 
 def _runner_source_pipe(content: bytes) -> tuple[int, int]:

@@ -164,13 +164,18 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         return pathlib.Path(completed.stdout.strip())
 
-    def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def _run_runner(
+        self,
+        *args: str,
+        umask: int = -1,
+    ) -> subprocess.CompletedProcess[str]:
         completed = run(
             [
                 sys.executable,
                 str(SCRIPT_PATH),
                 *args,
-            ]
+            ],
+            umask=umask,
         )
         return completed
 
@@ -471,6 +476,78 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         self.assertIn("never review coverage", parent_prompt)
         self.assertIn("reconcile-parent", parent_prompt)
         self.assertTrue((run_dir / "fallback-smoke.command.txt").is_file())
+
+    def test_prepare_enforces_private_modes_under_owner_masking_umask(self) -> None:
+        shutil.rmtree(self.repo / ".codex-tmp")
+        completed = self._run_runner(
+            "prepare",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Enforce private publication modes",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            umask=0o777,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_dir = pathlib.Path(completed.stdout.strip())
+
+        for directory in (
+            self.repo / ".codex-tmp",
+            run_dir.parent,
+            run_dir,
+        ):
+            with self.subTest(directory=directory):
+                self.assertEqual(
+                    stat.S_IMODE(directory.stat().st_mode),
+                    0o700,
+                )
+        expected_files = {
+            ".state.lock",
+            "child-contract.md",
+            "child-prompt.md",
+            "fallback-smoke.prompt.md",
+            "fallback-smoke.command.txt",
+            "parent-prompt.md",
+            "state.json",
+        }
+        self.assertEqual(
+            {path.name for path in run_dir.iterdir()},
+            expected_files,
+        )
+        for artifact in run_dir.iterdir():
+            with self.subTest(artifact=artifact):
+                self.assertTrue(artifact.is_file())
+                self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+
+    def test_existing_run_update_enforces_mode_under_owner_masking_umask(
+        self,
+    ) -> None:
+        run_dir = self._prepare("--no-fallback-smoke")
+        state_path = run_dir / "state.json"
+        before_inode = state_path.stat().st_ino
+
+        completed = self._run_runner(
+            "begin-phase",
+            "--run-dir",
+            str(run_dir),
+            "--phase",
+            "tests",
+            "--summary",
+            "exercise restrictive umask update",
+            umask=0o777,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotEqual(state_path.stat().st_ino, before_inode)
+        self.assertEqual(stat.S_IMODE(state_path.stat().st_mode), 0o600)
+        self.assertEqual(
+            stat.S_IMODE((run_dir / ".state.lock").stat().st_mode),
+            0o600,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["phases"]["tests"]["status"], "running")
 
     def test_changed_files_keep_rename_source_when_target_is_ignored(self) -> None:
         module = self._load_runner_module()

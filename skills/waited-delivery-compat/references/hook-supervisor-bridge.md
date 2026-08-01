@@ -62,6 +62,7 @@ adapter execution path.
   - accepts `--expected-repo-root` from the outer adapter so the runner can enforce exact repo containment again under the run-level state lock
   - accepts `--expected-run-dev`, `--expected-run-ino`, `--expected-run-uid`, `--expected-run-gid`, and `--expected-run-mode` only as one complete set, forwards them to the runner, and returns the refreshed identity so the outer adapter can bind one exact directory object and POSIX access identity across the bridge call
   - still passes through the ordinary runner reopen gate: current-user ownership, no group/other write, and no Darwin extended or Linux POSIX ACL on repository-side parents, run, state, prompts, smoke prompt, and lock; current-user exact legacy `0755` is tightened through the held run descriptor before artifact reads
+  - creates new run-tree directories as exact descriptor-revalidated `0700` objects and new artifact temporaries/locks as exact descriptor-revalidated `0600` regular files even when the process umask masks every owner bit
   - never falls back to the bridge's or runner's mutable source path; the outer adapter owns stable source binding, prelaunch source-version revalidation, framed delivery, and process-group cleanup
 - `finish-child-live`
   - requires the exact attached `child_session_id` and wraps `finish-child` so the bridge can persist the child's matching terminal status after `wait` and before parent-owned review

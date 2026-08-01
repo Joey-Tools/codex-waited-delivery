@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib.util
 import io
 import json
@@ -233,6 +234,104 @@ class LegacyHookShimTests(unittest.TestCase):
                 ):
                     module._stable_runner_source(COMPAT_RUNNER)
                 open_mock.assert_not_called()
+
+    def test_legacy_runner_rejects_simulated_linux_acl_on_source_chain(self) -> None:
+        module = self._load_redirect_module(LEGACY_RUNNER)
+        for target in (COMPAT_RUNNER.parent, COMPAT_RUNNER):
+            with self.subTest(target=target):
+                target_identity = target.stat()
+
+                def getxattr(file_fd: int, attribute: str) -> bytes:
+                    opened = os.fstat(file_fd)
+                    if (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ) == (
+                        target_identity.st_dev,
+                        target_identity.st_ino,
+                    ) and attribute == "system.posix_acl_access":
+                        return b"synthetic-posix-acl"
+                    raise OSError(errno.ENODATA, "no POSIX ACL")
+
+                with (
+                    mock.patch.object(module.sys, "platform", "linux"),
+                    mock.patch.object(
+                        module.os,
+                        "getxattr",
+                        side_effect=getxattr,
+                        create=True,
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "must not carry a named or extended ACL",
+                    ),
+                ):
+                    module._stable_runner_source(COMPAT_RUNNER)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Darwin extended ACLs")
+    def test_legacy_runner_rejects_real_darwin_acl_on_source_chain(self) -> None:
+        for relative_target in (
+            Path("skills/waited-delivery-compat/scripts"),
+            Path("skills/waited-delivery-compat/scripts/waited_delivery_runner.py"),
+        ):
+            with self.subTest(target=relative_target):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    redirect = (
+                        root
+                        / "legacy-hook-shims"
+                        / "waited-delivery"
+                        / "scripts"
+                        / "waited_delivery_runner.py"
+                    )
+                    redirect.parent.mkdir(parents=True)
+                    shutil.copy2(LEGACY_RUNNER, redirect)
+                    compat_runner = (
+                        root
+                        / "skills"
+                        / "waited-delivery-compat"
+                        / "scripts"
+                        / "waited_delivery_runner.py"
+                    )
+                    compat_runner.parent.mkdir(parents=True)
+                    shutil.copy2(COMPAT_RUNNER, compat_runner)
+                    acl_target = root / relative_target
+                    acl_result = subprocess.run(
+                        [
+                            "/bin/chmod",
+                            "+a",
+                            "everyone allow write",
+                            str(acl_target),
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(acl_result.returncode, 0, acl_result.stderr)
+                    try:
+                        completed = self._invoke_runner(
+                            redirect,
+                            "--help",
+                            root=root,
+                        )
+                        self.assertEqual(completed.returncode, 126)
+                        self.assertEqual(completed.stdout, "")
+                        self.assertIn(
+                            "must not carry a named or extended ACL",
+                            completed.stderr,
+                        )
+                    finally:
+                        remove_acl = subprocess.run(
+                            ["/bin/chmod", "-N", str(acl_target)],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(
+                            remove_acl.returncode,
+                            0,
+                            remove_acl.stderr,
+                        )
 
     def test_legacy_runner_pipe_writer_and_exec_failures_are_reaped(self) -> None:
         for runner in (LEGACY_RUNNER, HISTORICAL_TARGET_RUNNER):
