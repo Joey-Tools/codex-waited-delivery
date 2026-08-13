@@ -33,6 +33,30 @@ def top_level_job_ids(workflow: str) -> list[str]:
     return job_ids
 
 
+def checkout_steps(workflow: str) -> list[str]:
+    lines = workflow.splitlines()
+    steps: list[str] = []
+    for index, line in enumerate(lines):
+        if not line.lstrip().startswith("- uses: actions/checkout@"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        end = index + 1
+        while end < len(lines):
+            candidate = lines[end]
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate.strip() and (
+                candidate_indent < indent
+                or (
+                    candidate_indent == indent
+                    and candidate.lstrip().startswith("- ")
+                )
+            ):
+                break
+            end += 1
+        steps.append("\n".join(lines[index:end]))
+    return steps
+
+
 class RequiredCiWorkflowTests(unittest.TestCase):
     def test_private_distribution_is_identified_without_repository_files(self) -> None:
         root = Path("/example/repository")
@@ -69,19 +93,17 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(top_level_job_ids(workflow), ["test"])
         self.assertIn("runs-on: ubuntu-latest", workflow)
-        self.assertEqual(workflow.count("uses: actions/checkout@"), 1)
+        checkout = checkout_steps(workflow)
+        self.assertGreater(len(checkout), 0)
         self.assertEqual(
-            workflow.count("repository: ${{ inputs.repository }}"), 1
+            workflow.count("repository: ${{ inputs.repository }}"), len(checkout)
         )
-        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), 1)
-        self.assertIn(
-            "      - uses: actions/checkout@v4\n"
-            "        with:\n"
-            "          repository: ${{ inputs.repository }}\n"
-            "          ref: ${{ inputs.ref }}\n"
-            "      - uses: actions/setup-python@v5\n",
-            workflow,
-        )
+        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), len(checkout))
+        self.assertEqual(workflow.count("persist-credentials: false"), len(checkout))
+        for step in checkout:
+            self.assertIn("repository: ${{ inputs.repository }}", step)
+            self.assertIn("ref: ${{ inputs.ref }}", step)
+            self.assertEqual(step.count("persist-credentials: false"), 1)
         self.assertIn(
             "python3 -m py_compile skills/waited-delivery/scripts/*.py",
             workflow,
