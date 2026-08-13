@@ -52,10 +52,36 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         workflow_path = REPO_ROOT / ".github/workflows/required-ci.yml"
         workflow = workflow_path.read_text(encoding="utf-8")
 
-        self.assertIn("on:\n  workflow_call:\n", workflow)
+        self.assertIn(
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      repository:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "      ref:\n"
+            "        required: true\n"
+            "        type: string\n"
+            "\n"
+            "permissions:\n",
+            workflow,
+        )
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(top_level_job_ids(workflow), ["test"])
         self.assertIn("runs-on: ubuntu-latest", workflow)
+        self.assertEqual(workflow.count("uses: actions/checkout@"), 1)
+        self.assertEqual(
+            workflow.count("repository: ${{ inputs.repository }}"), 1
+        )
+        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), 1)
+        self.assertIn(
+            "      - uses: actions/checkout@v4\n"
+            "        with:\n"
+            "          repository: ${{ inputs.repository }}\n"
+            "          ref: ${{ inputs.ref }}\n"
+            "      - uses: actions/setup-python@v5\n",
+            workflow,
+        )
         self.assertIn(
             "python3 -m py_compile skills/waited-delivery/scripts/*.py",
             workflow,
