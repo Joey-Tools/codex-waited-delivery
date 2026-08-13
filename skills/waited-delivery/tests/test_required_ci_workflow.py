@@ -12,6 +12,12 @@ def distribution_contract_context(skill_root: Path) -> tuple[Path, str]:
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT, DISTRIBUTION_PROFILE = distribution_contract_context(SKILL_ROOT)
+EXPECTED_REPOSITORY = "Joey-Tools/codex-waited-delivery"
+REPOSITORY_GUARD = (
+    "      - name: Reject unexpected repository\n"
+    f"        if: ${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}\n"
+    "        run: exit 1"
+)
 
 
 def top_level_job_ids(workflow: str) -> list[str]:
@@ -89,14 +95,21 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         checkout = checkout_steps(workflow)
         self.assertGreater(len(checkout), 0)
         self.assertEqual(
-            workflow.count("repository: ${{ github.repository }}"), len(checkout)
+            workflow.count(
+                REPOSITORY_GUARD + "\n      - uses: actions/checkout@"
+            ),
+            len(checkout),
+        )
+        self.assertEqual(
+            workflow.count(f"repository: {EXPECTED_REPOSITORY}"), len(checkout)
         )
         self.assertEqual(workflow.count("ref: ${{ github.sha }}"), len(checkout))
         self.assertEqual(workflow.count("persist-credentials: false"), len(checkout))
         for step in checkout:
-            self.assertIn("repository: ${{ github.repository }}", step)
+            self.assertIn(f"repository: {EXPECTED_REPOSITORY}", step)
             self.assertIn("ref: ${{ github.sha }}", step)
             self.assertEqual(step.count("persist-credentials: false"), 1)
+        self.assertNotIn("repository: ${{ github.repository }}", workflow)
         self.assertNotIn("inputs.repository", workflow)
         self.assertNotIn("inputs.ref", workflow)
         self.assertIn(
