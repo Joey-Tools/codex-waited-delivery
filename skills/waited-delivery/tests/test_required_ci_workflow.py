@@ -2,7 +2,16 @@ from pathlib import Path
 import unittest
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+def distribution_contract_context(skill_root: Path) -> tuple[Path, str]:
+    if skill_root.parts[-3:] == ("personal_codex", "skills", "waited-delivery"):
+        return skill_root.parents[2], "private"
+    if skill_root.parts[-2:] == ("skills", "waited-delivery"):
+        return skill_root.parents[1], "canonical"
+    raise AssertionError(f"unsupported waited-delivery skill layout: {skill_root}")
+
+
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT, DISTRIBUTION_PROFILE = distribution_contract_context(SKILL_ROOT)
 
 
 def top_level_job_ids(workflow: str) -> list[str]:
@@ -25,10 +34,23 @@ def top_level_job_ids(workflow: str) -> list[str]:
 
 
 class RequiredCiWorkflowTests(unittest.TestCase):
-    def test_entry_wraps_only_the_required_linux_helper_tests(self) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/required-ci.yml").read_text(
-            encoding="utf-8"
+    def test_private_distribution_is_identified_without_repository_files(self) -> None:
+        root = Path("/example/repository")
+        self.assertEqual(
+            (root, "private"),
+            distribution_contract_context(
+                root / "personal_codex/skills/waited-delivery"
+            ),
         )
+
+    def test_entry_wraps_only_the_required_linux_helper_tests(self) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "repository-only required CI contract is not packaged in the "
+                "private skill-only distribution"
+            )
+        workflow_path = REPO_ROOT / ".github/workflows/required-ci.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
 
         self.assertIn("on:\n  workflow_call:\n", workflow)
         self.assertIn("permissions:\n  contents: read\n", workflow)
