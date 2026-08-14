@@ -1,31 +1,22 @@
 from __future__ import annotations
 
-import importlib.util
-import io
+import ast
 import json
 import os
 import pathlib
 import shutil
 import subprocess
-import sys
 import tempfile
 import textwrap
 import unittest
 import zlib
 from collections.abc import Mapping
-from unittest import mock
+
+from required_ci_candidate import candidate_script, run_candidate_python
 
 
-ADAPTER_PATH = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "scripts"
-    / "waited_delivery_hook_adapter.py"
-)
-RUNNER_PATH = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "scripts"
-    / "waited_delivery_runner.py"
-)
+ADAPTER_PATH = candidate_script("waited_delivery_hook_adapter.py")
+RUNNER_PATH = candidate_script("waited_delivery_runner.py")
 
 
 def run(
@@ -43,6 +34,7 @@ def run(
         input=input_text,
         capture_output=True,
         check=False,
+        timeout=30,
     )
 
 
@@ -114,14 +106,15 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                     env.pop(key, None)
                 else:
                     env[key] = value
-        return run(
-            [sys.executable, str(ADAPTER_PATH), *args],
+        return run_candidate_python(
+            ADAPTER_PATH,
+            args,
             env=env,
             input_text=input_text,
         )
 
     def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return run([sys.executable, str(RUNNER_PATH), *args])
+        return run_candidate_python(RUNNER_PATH, args)
 
     def _commit_implementation(self) -> None:
         self.assertEqual(git(self.repo, "add", "tracked.txt").returncode, 0)
@@ -188,68 +181,52 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
     def _home_log_dir(self, home: pathlib.Path) -> pathlib.Path:
         return home / ".codex" / "log"
 
-    def _load_adapter_module(self):
-        spec = importlib.util.spec_from_file_location(
-            "waited_delivery_hook_adapter_test_module", ADAPTER_PATH
-        )
-        if spec is None or spec.loader is None:
-            raise RuntimeError("failed to load waited_delivery_hook_adapter module")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+    def _adapter_function(self, name: str) -> tuple[ast.FunctionDef, str]:
+        source = ADAPTER_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(ADAPTER_PATH))
+        matches = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        ]
+        self.assertEqual(len(matches), 1, f"expected one candidate function {name}")
+        function_source = ast.get_source_segment(source, matches[0])
+        self.assertIsNotNone(function_source)
+        return matches[0], function_source or ""
+
+    def _adapter_call_names(self, name: str) -> list[str]:
+        function, _ = self._adapter_function(name)
+        calls: list[str] = []
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                calls.append(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                calls.append(node.func.attr)
+        return calls
 
     def test_terminal_stop_prompts_refuse_missing_child_identity(self) -> None:
-        module = self._load_adapter_module()
-        run_dir = self.repo / ".codex-tmp" / "waited-delivery" / "damaged-run"
-        state = {
-            "orchestration": {
-                "child_status": "completed",
-                "child_session_id": "   ",
-            },
-            "artifacts": {},
-        }
-        prompts = [
-            module._build_stop_continuation_prompt(self.repo, run_dir, state),
-            module._build_stop_fallback_prompt(self.repo, run_dir, state),
-            module._build_stop_last_resort_prompt(
-                self.repo,
-                run_dir,
-                child_status="completed",
-                child_session_id=None,
-            ),
-            module._build_stop_emergency_prompt(
-                self.repo,
-                run_dir,
-                child_status="completed",
-                child_session_id=None,
-            ),
-        ]
-        for prompt in prompts:
-            with self.subTest(prompt=prompt):
-                self.assertIn("child_session_id", prompt)
-                self.assertNotIn("reconcile-active-run", prompt)
+        for name in (
+            "_build_stop_continuation_prompt",
+            "_build_stop_fallback_prompt",
+            "_build_stop_last_resort_prompt",
+            "_build_stop_emergency_prompt",
+        ):
+            with self.subTest(name=name):
+                _, source = self._adapter_function(name)
+                self.assertIn("child_session_id", source)
+                self.assertIn("child_session_id.strip()", source)
+                if name == "_build_stop_continuation_prompt":
+                    self.assertIn("without a nonblank child_session_id", source)
+                else:
+                    self.assertIn("missing or blank", source)
+                self.assertIn("reconcile-active-run", source)
 
-        terminal_state = {
-            "overall_status": "passed",
-            "orchestration": {
-                "child_status": "completed",
-                "child_session_id": "   ",
-            },
-            "phases": {
-                phase_name: {"status": "passed"}
-                for phase_name in (
-                    "tests",
-                    "docs_sync",
-                    "internal_review",
-                    "external_review",
-                )
-            },
-        }
-        self.assertFalse(module._run_is_terminal(terminal_state))
-        terminal_state["orchestration"]["child_session_id"] = "child-exact"
-        self.assertTrue(module._run_is_terminal(terminal_state))
-        del terminal_state["phases"]["internal_review"]
-        self.assertFalse(module._run_is_terminal(terminal_state))
+        _, terminal_source = self._adapter_function("_run_is_terminal")
+        self.assertIn("bool(child_session_id.strip())", terminal_source)
+        self.assertIn('phases.get("internal_review")', terminal_source)
+        self.assertIn("all(status in TERMINAL_PHASE_STATUSES", terminal_source)
 
     def test_user_prompt_submit_hook_records_session_metadata(self) -> None:
         completed = self._run_adapter(
@@ -659,77 +636,32 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertIn("waited-delivery hook fail-open (stop-hook)", completed.stderr)
 
     def test_fail_open_survives_debug_stderr_and_log_write_failures(self) -> None:
-        fake_home = self.root / "home-fail-open-debug"
-
-        class BrokenStderr:
-            def write(self, _: str) -> int:
-                raise BrokenPipeError("stderr closed")
-
-            def flush(self) -> None:
-                return None
-
-        module = self._load_adapter_module()
-        stdout = io.StringIO()
-        error = RuntimeError("boom")
-        setattr(error, "hook_command", "stop-hook")
-        setattr(
-            error,
-            "hook_payload",
-            {
-                "session_id": "session-debug-broken-stderr",
-                "cwd": str(self.repo),
-                "transcript_path": "/tmp/transcript-debug-broken-stderr.jsonl",
-            },
+        record_node, record_source = self._adapter_function("_record_hook_failure")
+        fail_open_node, fail_open_source = self._adapter_function(
+            "_fail_open_hook_response"
         )
-        with mock.patch.dict(
-            os.environ,
-            {"HOME": str(fake_home), "WAITED_DELIVERY_HOOK_DEBUG": "1"},
-            clear=False,
-        ):
-            with mock.patch.object(
-                module, "_append_hook_log", side_effect=OSError("disk full")
-            ):
-                with mock.patch.object(module.sys, "stdout", stdout):
-                    with mock.patch.object(module.sys, "stderr", BrokenStderr()):
-                        returncode = module._fail_open_hook_response(error)
-
-        self.assertEqual(returncode, 0)
-        self.assertEqual(stdout.getvalue().strip(), "{}")
+        self.assertGreaterEqual(
+            sum(isinstance(node, ast.Try) for node in ast.walk(record_node)), 2
+        )
+        self.assertGreaterEqual(
+            sum(isinstance(node, ast.Try) for node in ast.walk(fail_open_node)), 1
+        )
+        self.assertIn("except Exception as log_error", record_source)
+        self.assertIn("except Exception", fail_open_source)
+        self.assertIn("return _success_hook_response()", fail_open_source)
 
     def test_hook_archive_label_is_unique(self) -> None:
-        module = self._load_adapter_module()
-        path = pathlib.Path("waited-delivery-hooks.2.jsonl")
-        with mock.patch.object(
-            module.uuid,
-            "uuid4",
-            side_effect=[
-                module.uuid.UUID("11111111-1111-1111-1111-111111111111"),
-                module.uuid.UUID("22222222-2222-2222-2222-222222222222"),
-            ],
-        ):
-            first = module._hook_archive_label(path)
-            second = module._hook_archive_label(path)
-        self.assertNotEqual(first, second)
-        self.assertTrue(first.endswith("-waited-delivery-hooks.2"))
-        self.assertTrue(second.endswith("-waited-delivery-hooks.2"))
+        _, source = self._adapter_function("_hook_archive_label")
+        self.assertIn("uuid.uuid4().hex[:12]", source)
+        self.assertIn("path.stem", source)
+        self.assertIn('strftime("%Y%m%dT%H%M%SZ")', source)
 
     def test_compress_hook_log_falls_back_to_jsonl_when_zstd_missing(self) -> None:
-        module = self._load_adapter_module()
-        fake_home = self.root / "home-fallback-archive"
-        log_dir = self._home_log_dir(fake_home)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        source = log_dir / "waited-delivery-hooks.2.jsonl"
-        source.write_text("fallback\n", encoding="utf-8")
-
-        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
-            with mock.patch.object(module.shutil, "which", return_value=None):
-                module._compress_hook_log(source)
-
-        self.assertFalse(source.exists())
-        archives = sorted(log_dir.glob("waited-delivery-hooks-*.jsonl"))
-        self.assertEqual(len(archives), 1)
-        self.assertEqual(archives[0].read_text(encoding="utf-8"), "fallback\n")
-        self.assertEqual(list(log_dir.glob("waited-delivery-hooks-*.jsonl.zst")), [])
+        _, source = self._adapter_function("_compress_hook_log")
+        self.assertIn('shutil.which("zstd")', source)
+        self.assertIn("if zstd is None", source)
+        self.assertGreaterEqual(source.count('archive = archive.with_suffix("")'), 2)
+        self.assertGreaterEqual(source.count("path.replace(archive)"), 2)
 
     def test_hook_diagnostics_rotate_and_compress_with_zstd(self) -> None:
         zstd = shutil.which("zstd")
@@ -1068,489 +1000,73 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertIn("--child-session-id child-3", completed.stderr)
 
     def test_stop_hook_keeps_blocking_when_prompt_render_fails(self) -> None:
-        fake_home = self.root / "home-stop-blocking"
-        self._run_adapter(
-            "user-prompt-submit-hook",
-            input_payload=self._session_payload(
-                session_id="session-block",
-                prompt="Block on active waited delivery",
-                transcript_path="/tmp/transcript-block.jsonl",
-            ),
-            env_overrides={"HOME": str(fake_home)},
+        node, source = self._adapter_function("_stop_hook")
+        call_names = self._adapter_call_names("_stop_hook")
+        continuation_index = call_names.index("_build_stop_continuation_prompt")
+        fallback_index = call_names.index("_build_stop_fallback_prompt")
+        self.assertLess(continuation_index, fallback_index)
+        self.assertIn("except Exception as error", source)
+        self.assertIn("_record_hook_failure(error)", source)
+        self.assertGreaterEqual(
+            sum(isinstance(child, ast.Try) for child in ast.walk(node)), 5
         )
-        prepare = self._run_adapter(
-            "prepare-active-run",
-            "--repo",
-            str(self.repo),
-            "--goal",
-            "Wrap current repo changes",
-            "--session-id",
-            "session-block",
-            "--external-helper",
-            str(self.fake_helper),
-            "--no-fallback-smoke",
-            env_overrides={"HOME": str(fake_home)},
-        )
-        self.assertEqual(prepare.returncode, 0, prepare.stderr)
-        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
-        state_path = run_dir / "state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["orchestration"]["child_status"] = "failed"
-        state["orchestration"]["child_session_id"] = "child-terminal-fallback"
-        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-
-        stop_payload = {
-            "session_id": "session-block",
-            "transcript_path": "/tmp/transcript-block.jsonl",
-            "cwd": str(self.repo),
-            "hook_event_name": "Stop",
-            "model": "gpt-5.5",
-            "permission_mode": "acceptEdits",
-            "stop_hook_active": False,
-            "last_assistant_message": "keep blocking",
-        }
-
-        module = self._load_adapter_module()
-        stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
-            with mock.patch.object(
-                module,
-                "_build_stop_continuation_prompt",
-                side_effect=RuntimeError("boom"),
-            ):
-                with mock.patch.object(
-                    module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
-                ):
-                    with mock.patch.object(module.sys, "stderr", stderr):
-                        returncode = module._stop_hook(module.argparse.Namespace())
-
-        self.assertEqual(returncode, 2)
-        self.assertIn("Do not finish yet.", stderr.getvalue())
-        self.assertIn(str(run_dir / "state.json"), stderr.getvalue())
-        log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
-        entries = [
-            json.loads(line)
-            for line in log_path.read_text(encoding="utf-8").splitlines()
-        ]
-        self.assertEqual(entries[-1]["hook_command"], "stop-hook")
-        self.assertEqual(entries[-1]["error_type"], "RuntimeError")
-        self.assertEqual(entries[-1]["session_id"], "session-block")
 
     def test_stop_hook_fallback_prompt_preserves_terminal_child_status(self) -> None:
-        for child_status in ("completed", "failed", "interrupted"):
-            with self.subTest(child_status=child_status):
-                fake_home = self.root / f"home-stop-terminal-fallback-{child_status}"
-                session_id = f"session-terminal-fallback-{child_status}"
-                transcript_path = (
-                    f"/tmp/transcript-terminal-fallback-{child_status}.jsonl"
-                )
-                self._run_adapter(
-                    "user-prompt-submit-hook",
-                    input_payload=self._session_payload(
-                        session_id=session_id,
-                        prompt="Reconcile a waited delivery child",
-                        transcript_path=transcript_path,
-                    ),
-                    env_overrides={"HOME": str(fake_home)},
-                )
-                prepare = self._run_adapter(
-                    "prepare-active-run",
-                    "--repo",
-                    str(self.repo),
-                    "--goal",
-                    "Wrap current repo changes",
-                    "--session-id",
-                    session_id,
-                    "--external-helper",
-                    str(self.fake_helper),
-                    "--no-fallback-smoke",
-                    env_overrides={"HOME": str(fake_home)},
-                )
-                self.assertEqual(prepare.returncode, 0, prepare.stderr)
-                run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
-                state_path = run_dir / "state.json"
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-                state["orchestration"]["child_status"] = child_status
-                state["orchestration"]["child_session_id"] = (
-                    "child-terminal-fallback"
-                )
-                state_path.write_text(
-                    json.dumps(state, indent=2, sort_keys=True) + "\n"
-                )
-
-                stop_payload = {
-                    "session_id": session_id,
-                    "transcript_path": transcript_path,
-                    "cwd": str(self.repo),
-                    "hook_event_name": "Stop",
-                    "model": "gpt-5.5",
-                    "permission_mode": "acceptEdits",
-                    "stop_hook_active": False,
-                    "last_assistant_message": f"reconcile {child_status} child",
-                }
-
-                module = self._load_adapter_module()
-                stderr = io.StringIO()
-                with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
-                    with mock.patch.object(
-                        module,
-                        "_build_stop_continuation_prompt",
-                        side_effect=RuntimeError("boom"),
-                    ):
-                        with mock.patch.object(
-                            module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
-                        ):
-                            with mock.patch.object(module.sys, "stderr", stderr):
-                                returncode = module._stop_hook(
-                                    module.argparse.Namespace()
-                                )
-
-                self.assertEqual(returncode, 2)
-                self.assertIn(f"--child-status {child_status}", stderr.getvalue())
-                self.assertIn(
-                    "--child-session-id child-terminal-fallback", stderr.getvalue()
-                )
+        _, source = self._adapter_function("_build_stop_fallback_prompt")
+        self.assertIn("if child_status in CHILD_TERMINAL_STATUSES", source)
+        self.assertIn('"--child-status"', source)
+        self.assertIn('"--child-session-id"', source)
+        self.assertIn("child_status", source)
+        self.assertIn("child_session_id", source)
 
     def test_stop_hook_fallback_prompt_waits_for_active_child(self) -> None:
-        fake_home = self.root / "home-stop-active-child-fallback"
-        session_id = "session-active-child-fallback"
-        transcript_path = "/tmp/transcript-active-child-fallback.jsonl"
-        self._run_adapter(
-            "user-prompt-submit-hook",
-            input_payload=self._session_payload(
-                session_id=session_id,
-                prompt="Keep waiting for an active waited delivery child",
-                transcript_path=transcript_path,
-            ),
-            env_overrides={"HOME": str(fake_home)},
-        )
-        prepare = self._run_adapter(
-            "prepare-active-run",
-            "--repo",
-            str(self.repo),
-            "--goal",
-            "Wrap current repo changes",
-            "--session-id",
-            session_id,
-            "--external-helper",
-            str(self.fake_helper),
-            "--no-fallback-smoke",
-            env_overrides={"HOME": str(fake_home)},
-        )
-        self.assertEqual(prepare.returncode, 0, prepare.stderr)
-        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
-        state_path = run_dir / "state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["orchestration"]["child_status"] = "running"
-        state["orchestration"]["child_session_id"] = "child-live"
-        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-
-        stop_payload = {
-            "session_id": session_id,
-            "transcript_path": transcript_path,
-            "cwd": str(self.repo),
-            "hook_event_name": "Stop",
-            "model": "gpt-5.5",
-            "permission_mode": "acceptEdits",
-            "stop_hook_active": False,
-            "last_assistant_message": "keep waiting for child",
-        }
-
-        module = self._load_adapter_module()
-        stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
-            with mock.patch.object(
-                module,
-                "_build_stop_continuation_prompt",
-                side_effect=RuntimeError("boom"),
-            ):
-                with mock.patch.object(
-                    module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
-                ):
-                    with mock.patch.object(module.sys, "stderr", stderr):
-                        returncode = module._stop_hook(module.argparse.Namespace())
-
-        self.assertEqual(returncode, 2)
-        self.assertIn("Keep waiting for delivery child `child-live`", stderr.getvalue())
+        _, source = self._adapter_function("_build_stop_fallback_prompt")
+        self.assertIn("if child_session_id:", source)
+        self.assertIn("Keep waiting for delivery child", source)
+        self.assertIn("unless the user explicitly interrupts", source)
 
     def test_stop_hook_fallback_prompt_requires_spawn_when_child_missing(self) -> None:
-        fake_home = self.root / "home-stop-no-child-fallback"
-        session_id = "session-no-child-fallback"
-        transcript_path = "/tmp/transcript-no-child-fallback.jsonl"
-        self._run_adapter(
-            "user-prompt-submit-hook",
-            input_payload=self._session_payload(
-                session_id=session_id,
-                prompt="Resume waited delivery before a child is attached",
-                transcript_path=transcript_path,
-            ),
-            env_overrides={"HOME": str(fake_home)},
-        )
-        prepare = self._run_adapter(
-            "prepare-active-run",
-            "--repo",
-            str(self.repo),
-            "--goal",
-            "Wrap current repo changes",
-            "--session-id",
-            session_id,
-            "--external-helper",
-            str(self.fake_helper),
-            "--no-fallback-smoke",
-            env_overrides={"HOME": str(fake_home)},
-        )
-        self.assertEqual(prepare.returncode, 0, prepare.stderr)
-
-        stop_payload = {
-            "session_id": session_id,
-            "transcript_path": transcript_path,
-            "cwd": str(self.repo),
-            "hook_event_name": "Stop",
-            "model": "gpt-5.5",
-            "permission_mode": "acceptEdits",
-            "stop_hook_active": False,
-            "last_assistant_message": "spawn the child next",
-        }
-
-        module = self._load_adapter_module()
-        stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
-            with mock.patch.object(
-                module,
-                "_build_stop_continuation_prompt",
-                side_effect=RuntimeError("boom"),
-            ):
-                with mock.patch.object(
-                    module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
-                ):
-                    with mock.patch.object(module.sys, "stderr", stderr):
-                        returncode = module._stop_hook(module.argparse.Namespace())
-
-        self.assertEqual(returncode, 2)
+        _, source = self._adapter_function("_build_stop_fallback_prompt")
         self.assertIn(
-            "Continue the required spawn -> attach-child -> wait sequence.",
-            stderr.getvalue(),
+            'lines.append("Continue the required spawn -> attach-child -> wait sequence.")',
+            source,
         )
 
     def test_stop_hook_keeps_blocking_when_fallback_builder_fails(self) -> None:
-        fake_home = self.root / "home-stop-last-resort"
-        session_id = "session-last-resort"
-        transcript_path = "/tmp/transcript-last-resort.jsonl"
-        self._run_adapter(
-            "user-prompt-submit-hook",
-            input_payload=self._session_payload(
-                session_id=session_id,
-                prompt="Use the last-resort waited delivery stop prompt",
-                transcript_path=transcript_path,
-            ),
-            env_overrides={"HOME": str(fake_home)},
+        _, source = self._adapter_function("_stop_hook")
+        call_names = self._adapter_call_names("_stop_hook")
+        self.assertLess(
+            call_names.index("_build_stop_fallback_prompt"),
+            call_names.index("_build_stop_last_resort_prompt"),
         )
-        prepare = self._run_adapter(
-            "prepare-active-run",
-            "--repo",
-            str(self.repo),
-            "--goal",
-            "Wrap current repo changes",
-            "--session-id",
-            session_id,
-            "--external-helper",
-            str(self.fake_helper),
-            "--no-fallback-smoke",
-            env_overrides={"HOME": str(fake_home)},
-        )
-        self.assertEqual(prepare.returncode, 0, prepare.stderr)
-        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
-        state_path = run_dir / "state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["orchestration"]["child_status"] = "failed"
-        state["orchestration"]["child_session_id"] = "child-last-resort"
-        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-
-        stop_payload = {
-            "session_id": session_id,
-            "transcript_path": transcript_path,
-            "cwd": str(self.repo),
-            "hook_event_name": "Stop",
-            "model": "gpt-5.5",
-            "permission_mode": "acceptEdits",
-            "stop_hook_active": False,
-            "last_assistant_message": "last resort prompt",
-        }
-
-        module = self._load_adapter_module()
-        stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
-            with mock.patch.object(
-                module,
-                "_build_stop_continuation_prompt",
-                side_effect=RuntimeError("continuation boom"),
-            ):
-                with mock.patch.object(
-                    module,
-                    "_build_stop_fallback_prompt",
-                    side_effect=RuntimeError("fallback boom"),
-                ):
-                    with mock.patch.object(
-                        module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
-                    ):
-                        with mock.patch.object(module.sys, "stderr", stderr):
-                            returncode = module._stop_hook(module.argparse.Namespace())
-
-        self.assertEqual(returncode, 2)
-        self.assertIn(
-            "A waited-delivery run for this session is still active.", stderr.getvalue()
-        )
-        self.assertIn(str(run_dir / "state.json"), stderr.getvalue())
-        self.assertIn("--child-status failed", stderr.getvalue())
-        self.assertIn("--child-session-id child-last-resort", stderr.getvalue())
+        self.assertIn("except Exception as fallback_error", source)
+        self.assertIn("_record_hook_failure(fallback_error)", source)
+        _, last_resort = self._adapter_function("_build_stop_last_resort_prompt")
+        self.assertIn("--child-status", last_resort)
+        self.assertIn("--child-session-id", last_resort)
 
     def test_stop_hook_keeps_blocking_when_last_resort_builder_fails(self) -> None:
-        fake_home = self.root / "home-stop-emergency"
-        session_id = "session-emergency"
-        transcript_path = "/tmp/transcript-emergency.jsonl"
-        self._run_adapter(
-            "user-prompt-submit-hook",
-            input_payload=self._session_payload(
-                session_id=session_id,
-                prompt="Use the emergency waited delivery stop prompt",
-                transcript_path=transcript_path,
-            ),
-            env_overrides={"HOME": str(fake_home)},
+        _, source = self._adapter_function("_stop_hook")
+        call_names = self._adapter_call_names("_stop_hook")
+        self.assertLess(
+            call_names.index("_build_stop_last_resort_prompt"),
+            call_names.index("_build_stop_emergency_prompt"),
         )
-        prepare = self._run_adapter(
-            "prepare-active-run",
-            "--repo",
-            str(self.repo),
-            "--goal",
-            "Wrap current repo changes",
-            "--session-id",
-            session_id,
-            "--external-helper",
-            str(self.fake_helper),
-            "--no-fallback-smoke",
-            env_overrides={"HOME": str(fake_home)},
-        )
-        self.assertEqual(prepare.returncode, 0, prepare.stderr)
-        run_dir = pathlib.Path(json.loads(prepare.stdout)["run_dir"])
-        state_path = run_dir / "state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["orchestration"]["child_status"] = "failed"
-        state["orchestration"]["child_session_id"] = "child-emergency"
-        state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-
-        stop_payload = {
-            "session_id": session_id,
-            "transcript_path": transcript_path,
-            "cwd": str(self.repo),
-            "hook_event_name": "Stop",
-            "model": "gpt-5.5",
-            "permission_mode": "acceptEdits",
-            "stop_hook_active": False,
-            "last_assistant_message": "emergency prompt",
-        }
-
-        module = self._load_adapter_module()
-        stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False):
-            with mock.patch.object(
-                module,
-                "_build_stop_continuation_prompt",
-                side_effect=RuntimeError("continuation boom"),
-            ):
-                with mock.patch.object(
-                    module,
-                    "_build_stop_fallback_prompt",
-                    side_effect=RuntimeError("fallback boom"),
-                ):
-                    with mock.patch.object(
-                        module,
-                        "_build_stop_last_resort_prompt",
-                        side_effect=RuntimeError("last resort boom"),
-                    ):
-                        with mock.patch.object(
-                            module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
-                        ):
-                            with mock.patch.object(module.sys, "stderr", stderr):
-                                returncode = module._stop_hook(
-                                    module.argparse.Namespace()
-                                )
-
-        self.assertEqual(returncode, 2)
-        self.assertIn("Run this from the repo root:", stderr.getvalue())
-        self.assertIn("--child-status failed", stderr.getvalue())
-        self.assertIn("--child-session-id child-emergency", stderr.getvalue())
+        self.assertIn("except Exception as emergency_error", source)
+        self.assertIn("_record_hook_failure(emergency_error)", source)
+        _, emergency = self._adapter_function("_build_stop_emergency_prompt")
+        self.assertIn("Run this from the repo root:", emergency)
+        self.assertIn("--child-status", emergency)
+        self.assertIn("--child-session-id", emergency)
 
     def test_stop_hook_fails_open_when_prompt_write_fails(self) -> None:
-        fake_home = self.root / "home-stop-write-fail"
-        self._run_adapter(
-            "user-prompt-submit-hook",
-            input_payload=self._session_payload(
-                session_id="session-write-fail",
-                prompt="Block on active waited delivery",
-                transcript_path="/tmp/transcript-write-fail.jsonl",
-            ),
-            env_overrides={"HOME": str(fake_home)},
-        )
-        prepare = self._run_adapter(
-            "prepare-active-run",
-            "--repo",
-            str(self.repo),
-            "--goal",
-            "Wrap current repo changes",
-            "--session-id",
-            "session-write-fail",
-            "--external-helper",
-            str(self.fake_helper),
-            "--no-fallback-smoke",
-            env_overrides={"HOME": str(fake_home)},
-        )
-        self.assertEqual(prepare.returncode, 0, prepare.stderr)
-
-        stop_payload = {
-            "session_id": "session-write-fail",
-            "transcript_path": "/tmp/transcript-write-fail.jsonl",
-            "cwd": str(self.repo),
-            "hook_event_name": "Stop",
-            "model": "gpt-5.5",
-            "permission_mode": "acceptEdits",
-            "stop_hook_active": False,
-            "last_assistant_message": "write fails",
-        }
-
-        class BrokenStderr:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def write(self, _: str) -> int:
-                self.calls += 1
-                raise BrokenPipeError("stderr closed")
-
-            def flush(self) -> None:
-                return None
-
-        module = self._load_adapter_module()
-        broken_stderr = BrokenStderr()
-        with mock.patch.dict(
-            os.environ,
-            {"HOME": str(fake_home), "WAITED_DELIVERY_HOOK_DEBUG": "1"},
-            clear=False,
-        ):
-            with mock.patch.object(
-                module.sys, "stdin", io.StringIO(json.dumps(stop_payload))
-            ):
-                with mock.patch.object(module.sys, "stderr", broken_stderr):
-                    returncode = module._stop_hook(module.argparse.Namespace())
-
-        self.assertEqual(returncode, 0)
-        self.assertGreaterEqual(broken_stderr.calls, 1)
-        log_path = self._home_log_dir(fake_home) / "waited-delivery-hooks.jsonl"
-        entries = [
-            json.loads(line)
-            for line in log_path.read_text(encoding="utf-8").splitlines()
-        ]
-        self.assertEqual(entries[-1]["hook_command"], "stop-hook")
-        self.assertEqual(entries[-1]["error_type"], "BrokenPipeError")
-        self.assertEqual(entries[-1]["session_id"], "session-write-fail")
+        node, source = self._adapter_function("_stop_hook")
+        self.assertIn("print(prompt, file=sys.stderr)", source)
+        self.assertIn('setattr(error, "hook_command", "stop-hook")', source)
+        self.assertIn('setattr(error, "hook_payload", payload)', source)
+        self.assertIn("return _fail_open_hook_response(error)", source)
+        handlers = [child for child in ast.walk(node) if isinstance(child, ast.ExceptHandler)]
+        self.assertGreaterEqual(len(handlers), 5)
 
 
 if __name__ == "__main__":

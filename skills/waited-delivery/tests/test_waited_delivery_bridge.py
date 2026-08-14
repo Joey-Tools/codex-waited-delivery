@@ -4,22 +4,15 @@ import json
 import os
 import pathlib
 import subprocess
-import sys
 import tempfile
 import textwrap
 import unittest
 
+from required_ci_candidate import candidate_script, run_candidate_python
 
-BRIDGE_PATH = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "scripts"
-    / "waited_delivery_bridge.py"
-)
-RUNNER_PATH = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "scripts"
-    / "waited_delivery_runner.py"
-)
+
+BRIDGE_PATH = candidate_script("waited_delivery_bridge.py")
+RUNNER_PATH = candidate_script("waited_delivery_runner.py")
 
 
 def run(
@@ -35,6 +28,7 @@ def run(
         text=True,
         capture_output=True,
         check=False,
+        timeout=30,
     )
 
 
@@ -90,7 +84,7 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
         self.tempdir.cleanup()
 
     def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return run([sys.executable, str(RUNNER_PATH), *args])
+        return run_candidate_python(RUNNER_PATH, args)
 
     def _run_bridge(
         self, *args: str, env: dict[str, str] | None = None
@@ -98,7 +92,7 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
         bridge_env = os.environ.copy()
         if env:
             bridge_env.update(env)
-        return run([sys.executable, str(BRIDGE_PATH), *args], env=bridge_env)
+        return run_candidate_python(BRIDGE_PATH, args, env=bridge_env)
 
     def _prepare_run_dir(self) -> pathlib.Path:
         completed = self._run_runner(

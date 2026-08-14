@@ -4,8 +4,10 @@ import pathlib
 import tempfile
 import unittest
 
+from required_ci_candidate import candidate_path
 
-SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+SKILL_ROOT = candidate_path("skills/waited-delivery")
 SKILL_PATH = SKILL_ROOT / "SKILL.md"
 DISTRIBUTION_PROFILE_BY_SKILL_LAYOUT = {
     pathlib.Path("skills/waited-delivery"): "canonical",

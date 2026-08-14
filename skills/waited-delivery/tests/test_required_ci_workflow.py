@@ -1,15 +1,45 @@
 import ast
 import contextlib
+import hashlib
 import io
+import importlib.util
 from pathlib import Path
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+
+
+TRUSTED_CANDIDATE_SUPPORT_PATH = Path(__file__).resolve(strict=True).with_name(
+    "required_ci_candidate.py"
+)
+try:
+    TRUSTED_CANDIDATE_SUPPORT_SOURCE = TRUSTED_CANDIDATE_SUPPORT_PATH.read_bytes()
+except OSError as error:
+    raise AssertionError("trusted candidate support cannot be read") from error
+TRUSTED_CANDIDATE_SUPPORT_SHA256 = hashlib.sha256(
+    TRUSTED_CANDIDATE_SUPPORT_SOURCE
+).hexdigest()
+
+
+def _load_trusted_candidate_support():
+    spec = importlib.util.spec_from_file_location(
+        "required_ci_candidate", TRUSTED_CANDIDATE_SUPPORT_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("trusted candidate support cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_CANDIDATE_SUPPORT = _load_trusted_candidate_support()
 
 
 def distribution_contract_context(skill_root: Path) -> tuple[Path, str]:
@@ -24,11 +54,12 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 TRUSTED_REPO_ROOT, DISTRIBUTION_PROFILE = distribution_contract_context(SKILL_ROOT)
 EXPECTED_REPOSITORY = "Joey-Tools/codex-waited-delivery"
 EXPECTED_TEST_TIMEOUT_MINUTES = "10"
-REQUIRED_CI_CANDIDATE_ROOT_ENV = "REQUIRED_CI_CANDIDATE_ROOT"
+REQUIRED_CI_CANDIDATE_ROOT_ENV = _CANDIDATE_SUPPORT.CANDIDATE_ROOT_ENV
+REQUIRED_CI_CANDIDATE_SHA_ENV = _CANDIDATE_SUPPORT.CANDIDATE_SHA_ENV
 CANDIDATE_TESTS_RELATIVE_PATH = Path("skills/waited-delivery/tests")
 TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 180
 TRUSTED_TEST_CHILD_SUCCESS_EXIT = 73
-TRUSTED_TEST_RECEIPT_SCHEMA_VERSION = 1
+TRUSTED_TEST_RECEIPT_SCHEMA_VERSION = 2
 TRUSTED_TEST_RECEIPT_SENTINEL = "REQUIRED_CI_TRUSTED_TESTS_COMPLETED:"
 TRUSTED_TEST_SUPERVISOR_FLAG = "--run-trusted-tests"
 TRUSTED_TEST_CHILD_FLAG = "--run-trusted-test-suite"
@@ -49,12 +80,17 @@ TRUSTED_CHECKOUT_INPUTS = {
     "path": ".required-ci",
     "persist-credentials": "false",
 }
-TRUSTED_VALIDATOR_ENV = {
-    REQUIRED_CI_CANDIDATE_ROOT_ENV: "${{ github.workspace }}/.candidate"
+TRUSTED_RUNTIME_ENV = {
+    REQUIRED_CI_CANDIDATE_ROOT_ENV: "${{ github.workspace }}/.candidate",
+    REQUIRED_CI_CANDIDATE_SHA_ENV: "${{ github.sha }}",
 }
 CANDIDATE_COMPILE_COMMAND = (
-    'python3 -I -m py_compile "$GITHUB_WORKSPACE"/'
-    ".candidate/skills/waited-delivery/scripts/*.py"
+    'python3 -I -X pycache_prefix="$RUNNER_TEMP/required-ci-pycache" '
+    '-m py_compile "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/'
+    'waited_delivery_bridge.py" "$GITHUB_WORKSPACE/.candidate/skills/'
+    'waited-delivery/scripts/waited_delivery_hook_adapter.py" '
+    '"$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/'
+    'waited_delivery_runner.py"'
 )
 TRUSTED_VALIDATOR_COMMAND = (
     'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
@@ -77,6 +113,7 @@ TRUSTED_CHECKOUT_STEP = (
     "      - name: Check out trusted Required CI source\n"
     "        uses: actions/checkout@v4\n"
     "        with:\n"
+    "          # GitHub.com job workflow identity pins this reusable leaf's own source.\n"
     "          repository: ${{ job.workflow_repository }}\n"
     "          ref: ${{ job.workflow_sha }}\n"
     "          path: .required-ci\n"
@@ -91,6 +128,7 @@ TRUSTED_TEST_SUPERVISOR_STEP = (
     "      - name: Run trusted Required CI tests\n"
     "        env:\n"
     "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
+    "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n"
     "        run: |\n"
     f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
 )
@@ -101,6 +139,7 @@ REQUIRED_EXECUTION_STEPS = (
     "      - name: Validate Required CI structure\n"
     "        env:\n"
     "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
+    "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n"
     "        run: |\n"
     f"          {TRUSTED_VALIDATOR_COMMAND}\n"
     f"{TRUSTED_TEST_SUPERVISOR_STEP}"
@@ -358,15 +397,50 @@ def _assert_candidate_absent_from_sys_path(candidate_root: Path) -> None:
             raise AssertionError("candidate checkout must not appear on trusted sys.path")
 
 
+def _trusted_test_source_manifest(repo_root: Path) -> dict[str, str]:
+    tests_root = repo_root.resolve(strict=True) / CANDIDATE_TESTS_RELATIVE_PATH
+    support_path = tests_root / "required_ci_candidate.py"
+    paths = sorted(tests_root.glob("test_*.py")) + [support_path]
+    manifest: dict[str, str] = {}
+    for path in paths:
+        try:
+            path.lstat()
+            resolved = path.resolve(strict=True)
+            source = path.read_bytes()
+        except OSError as error:
+            raise AssertionError("trusted test source cannot be read") from error
+        if not path.is_file() or path.is_symlink() or resolved != path:
+            raise AssertionError("trusted test source must be an ordinary file")
+        relative = path.relative_to(repo_root).as_posix()
+        manifest[relative] = hashlib.sha256(source).hexdigest()
+    if len(manifest) != len(paths):
+        raise AssertionError("trusted test source inventory is duplicated")
+    support_relative = (
+        CANDIDATE_TESTS_RELATIVE_PATH / "required_ci_candidate.py"
+    ).as_posix()
+    if manifest[support_relative] != TRUSTED_CANDIDATE_SUPPORT_SHA256:
+        raise AssertionError("trusted candidate support does not match loaded bytes")
+    return manifest
+
+
 def _trusted_test_suite_receipt(
     trusted_repo_root: Path, candidate_root: Path
 ) -> dict[str, object]:
     trusted_inventory = _direct_test_inventory(trusted_repo_root, "trusted")
+    trusted_source_sha256 = _trusted_test_source_manifest(trusted_repo_root)
     expected_test_ids = _inventory_test_ids(trusted_inventory)
     trusted_tests_root = (
         trusted_repo_root.resolve(strict=True) / CANDIDATE_TESTS_RELATIVE_PATH
     )
     _assert_candidate_absent_from_sys_path(candidate_root)
+    candidate_sha, require_clean = _CANDIDATE_SUPPORT.expected_candidate_sha(
+        candidate_root
+    )
+    candidate_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+        candidate_root,
+        candidate_sha,
+        require_clean=require_clean,
+    )
 
     loader = unittest.TestLoader()
     captured_stdout = io.StringIO()
@@ -413,10 +487,21 @@ def _trusted_test_suite_receipt(
         raise AssertionError(f"trusted test suite did not complete exactly: {details}")
     if _direct_test_inventory(trusted_repo_root, "trusted") != trusted_inventory:
         raise AssertionError("trusted expected test inventory changed during execution")
+    if _trusted_test_source_manifest(trusted_repo_root) != trusted_source_sha256:
+        raise AssertionError("trusted test source changed during execution")
+    final_candidate_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+        candidate_root,
+        candidate_sha,
+        require_clean=require_clean,
+    )
+    if final_candidate_binding != candidate_binding:
+        raise AssertionError("candidate checkout binding changed during trusted tests")
     return {
         "schema_version": TRUSTED_TEST_RECEIPT_SCHEMA_VERSION,
         "status": "completed",
+        **candidate_binding,
         "trusted_inventory": trusted_inventory,
+        "trusted_source_sha256": trusted_source_sha256,
         "expected_test_count": len(expected_test_ids),
         "executed_test_count": result.testsRun,
         **result_counts,
@@ -431,7 +516,10 @@ def _bounded_failure_text(value: str, limit: int = 2000) -> str:
 
 
 def _validated_trusted_child_receipt(
-    completed: subprocess.CompletedProcess[str], trusted_inventory: list[dict[str, object]]
+    completed: subprocess.CompletedProcess[str],
+    trusted_inventory: list[dict[str, object]],
+    trusted_source_sha256: dict[str, str],
+    candidate_binding: dict[str, object],
 ) -> dict[str, object]:
     if completed.returncode != TRUSTED_TEST_CHILD_SUCCESS_EXIT:
         details = _bounded_failure_text(completed.stderr or completed.stdout)
@@ -445,7 +533,9 @@ def _validated_trusted_child_receipt(
     expected_receipt = {
         "schema_version": TRUSTED_TEST_RECEIPT_SCHEMA_VERSION,
         "status": "completed",
+        **candidate_binding,
         "trusted_inventory": trusted_inventory,
+        "trusted_source_sha256": trusted_source_sha256,
         "expected_test_count": expected_test_count,
         "executed_test_count": expected_test_count,
         "failures": 0,
@@ -480,8 +570,17 @@ def supervise_trusted_required_ci_tests(
 ) -> dict[str, object]:
     _assert_candidate_absent_from_sys_path(candidate_root)
     trusted_inventory = _direct_test_inventory(trusted_repo_root, "trusted")
+    trusted_source_sha256 = _trusted_test_source_manifest(trusted_repo_root)
     candidate_static_inventory = _direct_test_inventory(candidate_root, "candidate")
     _require_expected_test_inventory(trusted_inventory, candidate_static_inventory)
+    candidate_sha, require_clean = _CANDIDATE_SUPPORT.expected_candidate_sha(
+        candidate_root
+    )
+    candidate_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+        candidate_root,
+        candidate_sha,
+        require_clean=require_clean,
+    )
 
     child_environment = os.environ.copy()
     child_environment.pop("PYTHONHOME", None)
@@ -489,6 +588,7 @@ def supervise_trusted_required_ci_tests(
     child_environment[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(
         candidate_root.resolve(strict=True)
     )
+    child_environment[REQUIRED_CI_CANDIDATE_SHA_ENV] = candidate_sha
     trusted_supervisor = Path(__file__).resolve(strict=True)
     try:
         trusted_supervisor_source = trusted_supervisor.read_bytes()
@@ -514,7 +614,12 @@ def supervise_trusted_required_ci_tests(
         raise AssertionError(
             "trusted Required CI tests did not complete before the fixed timeout"
         ) from error
-    receipt = _validated_trusted_child_receipt(completed, trusted_inventory)
+    receipt = _validated_trusted_child_receipt(
+        completed,
+        trusted_inventory,
+        trusted_source_sha256,
+        candidate_binding,
+    )
 
     try:
         final_supervisor_source = trusted_supervisor.read_bytes()
@@ -526,11 +631,20 @@ def supervise_trusted_required_ci_tests(
         raise AssertionError("trusted candidate test supervisor changed")
     if _direct_test_inventory(trusted_repo_root, "trusted") != trusted_inventory:
         raise AssertionError("trusted expected test inventory changed during execution")
+    if _trusted_test_source_manifest(trusted_repo_root) != trusted_source_sha256:
+        raise AssertionError("trusted test source changed during execution")
     if (
         _direct_test_inventory(candidate_root, "candidate")
         != candidate_static_inventory
     ):
         raise AssertionError("candidate static test inventory changed during execution")
+    final_candidate_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+        candidate_root,
+        candidate_sha,
+        require_clean=require_clean,
+    )
+    if final_candidate_binding != candidate_binding:
+        raise AssertionError("candidate checkout binding changed during supervision")
     return receipt
 
 
@@ -1313,7 +1427,7 @@ def _validate_test_job(
         "validator step name",
     )
     _require_exact_mapping(
-        validator_step["env"], TRUSTED_VALIDATOR_ENV, "validator environment"
+        validator_step["env"], TRUSTED_RUNTIME_ENV, "validator environment"
     )
     _require_run_block(
         lines,
@@ -1331,7 +1445,7 @@ def _validate_test_job(
         "test step name",
     )
     _require_exact_mapping(
-        test_step["env"], TRUSTED_VALIDATOR_ENV, "test supervisor environment"
+        test_step["env"], TRUSTED_RUNTIME_ENV, "test supervisor environment"
     )
     _require_run_block(
         lines,
@@ -1483,6 +1597,26 @@ def validate_required_ci_repository(repo_root: Path) -> list[str]:
         workflow = workflow_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise AssertionError("candidate required-ci.yml cannot be read") from error
+    support_path = (
+        repo_root
+        / "skills/waited-delivery/tests/required_ci_candidate.py"
+    )
+    try:
+        support_source = support_path.read_bytes()
+        resolved_support = support_path.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            "candidate repository must contain trusted candidate support"
+        ) from error
+    if (
+        support_path.is_symlink()
+        or not support_path.is_file()
+        or resolved_support != support_path
+        or support_source != TRUSTED_CANDIDATE_SUPPORT_SOURCE
+    ):
+        raise AssertionError(
+            "candidate trusted support must match the Required CI source"
+        )
     checkouts = validate_required_workflow(workflow)
     callers = required_ci_callers_in_repository(repo_root)
     if callers:
@@ -1991,6 +2125,16 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                 "${{ github.workspace }}",
                 1,
             ),
+            "validator candidate SHA env is missing": workflow.replace(
+                "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n",
+                "",
+                1,
+            ),
+            "validator candidate SHA env is relaxed": workflow.replace(
+                "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n",
+                "          REQUIRED_CI_CANDIDATE_SHA: ${{ job.workflow_sha }}\n",
+                1,
+            ),
             "validator environment has an extra key": workflow.replace(
                 "          REQUIRED_CI_CANDIDATE_ROOT: "
                 "${{ github.workspace }}/.candidate\n",
@@ -2076,6 +2220,24 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                 ),
                 1,
             ),
+            "candidate SHA environment is missing": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_STEP,
+                TRUSTED_TEST_SUPERVISOR_STEP.replace(
+                    "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n",
+                    "",
+                    1,
+                ),
+                1,
+            ),
+            "candidate SHA environment is relaxed": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_STEP,
+                TRUSTED_TEST_SUPERVISOR_STEP.replace(
+                    "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n",
+                    "          REQUIRED_CI_CANDIDATE_SHA: ${{ job.workflow_sha }}\n",
+                    1,
+                ),
+                1,
+            ),
             "candidate root environment adds PYTHONPATH": secure_workflow.replace(
                 TRUSTED_TEST_SUPERVISOR_STEP,
                 TRUSTED_TEST_SUPERVISOR_STEP.replace(
@@ -2118,7 +2280,9 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
         for state in ("deleted", "replaced"):
             with self.subTest(state=state):
                 with tempfile.TemporaryDirectory() as temporary_directory:
-                    candidate_root = Path(temporary_directory) / ".candidate"
+                    candidate_root = (
+                        Path(temporary_directory).resolve(strict=True) / ".candidate"
+                    )
                     workflow_path = (
                         candidate_root / ".github/workflows/required-ci.yml"
                     )
@@ -2129,8 +2293,12 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                         / "skills/waited-delivery/tests/"
                         "test_required_ci_workflow.py"
                     )
+                    candidate_validator.parent.mkdir(parents=True)
+                    shutil.copyfile(
+                        TRUSTED_CANDIDATE_SUPPORT_PATH,
+                        candidate_validator.parent / "required_ci_candidate.py",
+                    )
                     if state == "replaced":
-                        candidate_validator.parent.mkdir(parents=True)
                         candidate_validator.write_text(
                             "raise SystemExit(0)\n", encoding="utf-8"
                         )
@@ -2142,6 +2310,36 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                         insecure_workflow, encoding="utf-8"
                     )
                     with self.assertRaises(AssertionError):
+                        validate_required_ci_repository(candidate_root)
+
+    def test_candidate_support_missing_replacement_or_symlink_fails_closed(
+        self,
+    ) -> None:
+        secure_workflow = self.required_workflow()
+        for state in ("missing", "replaced", "symlink"):
+            with self.subTest(state=state):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    candidate_root = (
+                        Path(temporary_directory).resolve(strict=True) / ".candidate"
+                    )
+                    workflow_path = (
+                        candidate_root / ".github/workflows/required-ci.yml"
+                    )
+                    workflow_path.parent.mkdir(parents=True)
+                    workflow_path.write_text(secure_workflow, encoding="utf-8")
+                    support_path = (
+                        candidate_root
+                        / "skills/waited-delivery/tests/required_ci_candidate.py"
+                    )
+                    support_path.parent.mkdir(parents=True)
+                    if state == "replaced":
+                        support_path.write_text("raise SystemExit(0)\n", encoding="utf-8")
+                    elif state == "symlink":
+                        support_path.symlink_to(TRUSTED_CANDIDATE_SUPPORT_PATH)
+
+                    with self.assertRaisesRegex(
+                        AssertionError, "trusted candidate support|trusted support"
+                    ):
                         validate_required_ci_repository(candidate_root)
 
     def test_runner_text_in_a_fake_node_does_not_satisfy_the_contract(self) -> None:
@@ -2335,7 +2533,89 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.required_module(),
         )
         (candidate_root / "skills/waited-delivery/tests").mkdir(parents=True)
+        trusted_support = trusted_root / CANDIDATE_TESTS_RELATIVE_PATH / (
+            "required_ci_candidate.py"
+        )
+        shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, trusted_support)
+        scripts_root = candidate_root / "skills/waited-delivery/scripts"
+        scripts_root.mkdir(parents=True)
+        for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS:
+            (candidate_root / relative_path).write_text("pass\n", encoding="utf-8")
         return trusted_root, candidate_root
+
+    def initialize_candidate_checkout(self, candidate_root: Path) -> str:
+        commands = (
+            [
+                _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                "-C",
+                str(candidate_root),
+                "init",
+                "--object-format=sha1",
+            ],
+            [
+                _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                "-C",
+                str(candidate_root),
+                "add",
+                "--all",
+            ],
+            [
+                _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                "-C",
+                str(candidate_root),
+                "-c",
+                "user.name=Required CI Test",
+                "-c",
+                "user.email=required-ci@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "candidate fixture",
+            ],
+        )
+        for command in commands:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if completed.returncode != 0:
+                raise AssertionError(completed.stderr)
+        completed = subprocess.run(
+            [
+                _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                "-C",
+                str(candidate_root),
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        candidate_sha = completed.stdout.strip()
+        self.assertRegex(candidate_sha, r"\A[0-9a-f]{40}\Z")
+        return candidate_sha
+
+    def supervise(self, trusted_root: Path, candidate_root: Path) -> dict[str, object]:
+        candidate_sha = self.initialize_candidate_checkout(candidate_root)
+        with mock.patch.dict(
+            os.environ,
+            {
+                REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+            },
+            clear=False,
+        ):
+            return supervise_trusted_required_ci_tests(
+                trusted_root, candidate_root
+            )
 
     def test_supervisor_proves_expected_inventory_and_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2349,16 +2629,18 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "        pass\n",
             )
 
-            receipt = supervise_trusted_required_ci_tests(
-                trusted_root, candidate_root
-            )
+            receipt = self.supervise(trusted_root, candidate_root)
 
         self.assertEqual(
             set(receipt),
             {
                 "schema_version",
                 "status",
+                "candidate_root",
+                "candidate_sha",
+                "candidate_script_sha256",
                 "trusted_inventory",
+                "trusted_source_sha256",
                 "expected_test_count",
                 "executed_test_count",
                 "failures",
@@ -2368,10 +2650,70 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "unexpected_successes",
             },
         )
-        self.assertEqual(receipt["schema_version"], 1)
+        self.assertEqual(receipt["schema_version"], 2)
         self.assertEqual(receipt["status"], "completed")
         self.assertEqual(receipt["expected_test_count"], 2)
         self.assertEqual(receipt["executed_test_count"], 2)
+
+    def test_supervisor_rejects_empty_candidate_runtime_with_preserved_inventory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            trusted_root = root / ".required-ci"
+            candidate_root = root / ".candidate"
+            source_tests_root = (
+                TRUSTED_REPO_ROOT / "skills/waited-delivery/tests"
+            )
+            functional_test_modules = (
+                "test_skill_contract.py",
+                "test_waited_delivery_bridge.py",
+                "test_waited_delivery_hook_adapter.py",
+                "test_waited_delivery_runner.py",
+            )
+            copied_paths = (
+                Path("README.md"),
+                Path("docs/DEPENDENCIES.md"),
+                Path("skills/waited-delivery/SKILL.md"),
+            )
+            for repository_root in (trusted_root, candidate_root):
+                for relative_path in copied_paths:
+                    destination = repository_root / relative_path
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(TRUSTED_REPO_ROOT / relative_path, destination)
+                tests_root = repository_root / CANDIDATE_TESTS_RELATIVE_PATH
+                tests_root.mkdir(parents=True, exist_ok=True)
+                for module_name in functional_test_modules:
+                    shutil.copyfile(
+                        source_tests_root / module_name,
+                        tests_root / module_name,
+                    )
+                if repository_root == trusted_root:
+                    shutil.copyfile(
+                        TRUSTED_CANDIDATE_SUPPORT_PATH,
+                        tests_root / "required_ci_candidate.py",
+                    )
+
+            trusted_scripts_root = (
+                trusted_root / "skills/waited-delivery/scripts"
+            )
+            candidate_scripts_root = (
+                candidate_root / "skills/waited-delivery/scripts"
+            )
+            trusted_scripts_root.mkdir(parents=True)
+            candidate_scripts_root.mkdir(parents=True)
+            for source_script in sorted(
+                (TRUSTED_REPO_ROOT / "skills/waited-delivery/scripts").glob("*.py")
+            ):
+                shutil.copyfile(source_script, trusted_scripts_root / source_script.name)
+                (candidate_scripts_root / source_script.name).write_text(
+                    "pass\n", encoding="utf-8"
+                )
+
+            with self.assertRaisesRegex(
+                AssertionError, "trusted Required CI tests did not complete"
+            ):
+                self.supervise(trusted_root, candidate_root)
 
     def test_supervisor_child_argv_and_environment_are_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2388,14 +2730,28 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 captured_calls.append((command, kwargs.copy()))
                 return actual_run(command, **kwargs)
 
-            with mock.patch.object(subprocess, "run", side_effect=recording_run):
-                receipt = supervise_trusted_required_ci_tests(
-                    trusted_root, candidate_root
-                )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                with mock.patch.object(subprocess, "run", side_effect=recording_run):
+                    receipt = supervise_trusted_required_ci_tests(
+                        trusted_root, candidate_root
+                    )
 
         self.assertEqual(receipt["status"], "completed")
-        self.assertEqual(len(captured_calls), 1)
-        command, options = captured_calls[0]
+        child_calls = [
+            call
+            for call in captured_calls
+            if call[0][:2] == [sys.executable, "-I"]
+        ]
+        self.assertEqual(len(child_calls), 1)
+        command, options = child_calls[0]
         self.assertEqual(
             command,
             [
@@ -2412,6 +2768,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(
             child_environment[REQUIRED_CI_CANDIDATE_ROOT_ENV], str(candidate_root)
         )
+        self.assertEqual(
+            child_environment[REQUIRED_CI_CANDIDATE_SHA_ENV], candidate_sha
+        )
         self.assertNotIn("PYTHONHOME", child_environment)
         self.assertNotIn("PYTHONPATH", child_environment)
 
@@ -2426,6 +2785,37 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             finally:
                 sys.path[:] = original_sys_path
 
+    def test_supervisor_rejects_missing_or_replaced_trusted_support(self) -> None:
+        for state in ("missing", "replaced", "symlink"):
+            with self.subTest(state=state):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root = self.prepare_roots(
+                        temporary_directory
+                    )
+                    self.write_test_module(
+                        candidate_root, "test_required.py", self.required_module()
+                    )
+                    support_path = (
+                        trusted_root
+                        / CANDIDATE_TESTS_RELATIVE_PATH
+                        / "required_ci_candidate.py"
+                    )
+                    if state == "missing":
+                        support_path.unlink()
+                    elif state == "replaced":
+                        support_path.write_text(
+                            "raise SystemExit(0)\n", encoding="utf-8"
+                        )
+                    else:
+                        support_path.unlink()
+                        support_path.symlink_to(TRUSTED_CANDIDATE_SUPPORT_PATH)
+
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "trusted test source|trusted candidate support",
+                    ):
+                        self.supervise(trusted_root, candidate_root)
+
     def test_supervisor_does_not_load_candidate_root_unittest_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             trusted_root, candidate_root = self.prepare_roots(temporary_directory)
@@ -2439,9 +2829,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 candidate_root, "test_required.py", self.required_module()
             )
 
-            receipt = supervise_trusted_required_ci_tests(
-                trusted_root, candidate_root
-            )
+            receipt = self.supervise(trusted_root, candidate_root)
 
             self.assertEqual(receipt["status"], "completed")
             self.assertFalse(canary.exists())
@@ -2480,9 +2868,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         candidate_root, "test_required.py", candidate_module
                     )
 
-                    receipt = supervise_trusted_required_ci_tests(
-                        trusted_root, candidate_root
-                    )
+                    receipt = self.supervise(trusted_root, candidate_root)
 
                     self.assertEqual(receipt["status"], "completed")
                     self.assertFalse(canary.exists())
@@ -2527,7 +2913,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 candidate_root, "test_required.py", candidate_module
             )
 
-            receipt = supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+            receipt = self.supervise(trusted_root, candidate_root)
 
             self.assertEqual(receipt["status"], "completed")
             self.assertFalse(canary.exists())
@@ -2552,7 +2938,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 candidate_root, "test_required.py", candidate_module
             )
 
-            receipt = supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+            receipt = self.supervise(trusted_root, candidate_root)
 
             self.assertEqual(receipt["status"], "completed")
             self.assertFalse(canary.exists())
@@ -2564,7 +2950,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             (tests_root / "README.txt").write_text("no tests\n", encoding="utf-8")
 
             with self.assertRaisesRegex(AssertionError, "expected test inventory"):
-                supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+                self.supervise(trusted_root, candidate_root)
 
     def test_supervisor_does_not_import_candidate_system_exit_zero(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2584,7 +2970,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "        pass\n",
             )
 
-            receipt = supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+            receipt = self.supervise(trusted_root, candidate_root)
 
             self.assertEqual(receipt["status"], "completed")
             self.assertFalse(canary.exists())
@@ -2603,7 +2989,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(AssertionError, "load_tests"):
-                supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+                self.supervise(trusted_root, candidate_root)
 
     def test_supervisor_does_not_execute_candidate_test_early_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2623,7 +3009,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 candidate_root, "test_required.py", candidate_module
             )
 
-            receipt = supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+            receipt = self.supervise(trusted_root, candidate_root)
 
             self.assertEqual(receipt["status"], "completed")
             self.assertFalse(canary.exists())
@@ -2659,9 +3045,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     with self.assertRaisesRegex(
                         AssertionError, "expected test inventory"
                     ):
-                        supervise_trusted_required_ci_tests(
-                            trusted_root, candidate_root
-                        )
+                        self.supervise(trusted_root, candidate_root)
 
     def test_supervisor_rejects_skipped_expected_tests(self) -> None:
         fixtures = {
@@ -2691,9 +3075,241 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     )
 
                     with self.assertRaisesRegex(AssertionError, "decorators"):
-                        supervise_trusted_required_ci_tests(
-                            trusted_root, candidate_root
+                        self.supervise(trusted_root, candidate_root)
+
+    def test_candidate_cannot_reselect_trusted_git_after_support_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            self.write_test_module(
+                candidate_root, "test_required.py", self.required_module()
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            fake_bin = Path(temporary_directory).resolve(strict=True) / "candidate-bin"
+            fake_bin.mkdir()
+            canary = fake_bin / "executed"
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/bin/sh\n"
+                f"printf executed > {str(canary)!r}\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            fake_git.chmod(0o755)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                    "PATH": str(fake_bin),
+                },
+                clear=False,
+            ):
+                binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                    candidate_root, candidate_sha, require_clean=True
+                )
+
+            argv = _CANDIDATE_SUPPORT.candidate_git_argv(
+                candidate_root, "rev-parse", "HEAD"
+            )
+            self.assertEqual(
+                argv[0], _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE
+            )
+            self.assertTrue(Path(argv[0]).is_absolute())
+            self.assertNotIn(candidate_root, Path(argv[0]).parents)
+            self.assertEqual(binding["candidate_sha"], candidate_sha)
+            self.assertFalse(canary.exists())
+            self.assertTrue(trusted_root.is_dir())
+
+    def test_candidate_binding_rejects_invalid_sha_and_dirty_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            self.write_test_module(
+                candidate_root, "test_required.py", self.required_module()
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha.upper(),
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AssertionError, "lowercase 40-hex"):
+                    _CANDIDATE_SUPPORT.expected_candidate_sha(candidate_root)
+
+            (candidate_root / "untracked.txt").write_text(
+                "candidate mutation\n", encoding="utf-8"
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AssertionError, "exactly clean"):
+                    _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                        candidate_root, candidate_sha, require_clean=True
+                    )
+
+    def test_candidate_script_persistent_mutation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            runner_path = (
+                candidate_root
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            runner_path.write_text(
+                "from pathlib import Path\n"
+                "target = Path(__file__).with_name('waited_delivery_bridge.py')\n"
+                "target.write_text('tampered\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "candidate implementation bytes|candidate checkout"
+                ):
+                    _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+
+    def test_candidate_script_restore_is_isolated_before_next_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            scripts_root = candidate_root / "skills/waited-delivery/scripts"
+            runner_path = scripts_root / "waited_delivery_runner.py"
+            bridge_path = scripts_root / "waited_delivery_bridge.py"
+            runner_path.write_text(
+                "from pathlib import Path\n"
+                "target = Path(__file__).with_name('waited_delivery_bridge.py')\n"
+                "original = target.read_bytes()\n"
+                "target.write_bytes(b'tampered\\n')\n"
+                "target.write_bytes(original)\n"
+                "print('restored')\n",
+                encoding="utf-8",
+            )
+            bridge_path.write_text("print('original')\n", encoding="utf-8")
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                restored = _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+                subsequent = _CANDIDATE_SUPPORT.run_candidate_python(bridge_path)
+
+            self.assertEqual(restored.returncode, 0, restored.stderr)
+            self.assertEqual(restored.stdout, "restored\n")
+            self.assertEqual(subsequent.returncode, 0, subsequent.stderr)
+            self.assertEqual(subsequent.stdout, "original\n")
+
+    def test_candidate_stdout_cannot_form_the_trusted_parent_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            self.write_test_module(
+                candidate_root, "test_required.py", self.required_module()
+            )
+            runner_path = (
+                candidate_root
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            runner_path.write_text(
+                f"print({TRUSTED_TEST_RECEIPT_SENTINEL!r} + '{{}}')\n",
+                encoding="utf-8",
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                candidate_output = _CANDIDATE_SUPPORT.run_candidate_python(
+                    runner_path
+                )
+                candidate_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                    candidate_root, candidate_sha, require_clean=True
+                )
+
+            self.assertEqual(candidate_output.returncode, 0)
+            self.assertEqual(
+                candidate_output.stdout,
+                f"{TRUSTED_TEST_RECEIPT_SENTINEL}{{}}\n",
+            )
+            trusted_inventory = _direct_test_inventory(trusted_root, "trusted")
+            trusted_manifest = _trusted_test_source_manifest(trusted_root)
+            with self.assertRaisesRegex(
+                AssertionError, "did not complete under the isolated child"
+            ):
+                _validated_trusted_child_receipt(
+                    candidate_output,
+                    trusted_inventory,
+                    trusted_manifest,
+                    candidate_binding,
+                )
+
+    def test_candidate_subprocess_timeout_and_lingering_group_fail_closed(self) -> None:
+        fixtures = {
+            "timeout": (
+                "import time\n"
+                "time.sleep(30)\n",
+                "fixed timeout",
+            ),
+            "lingering process group": (
+                "import subprocess\n"
+                "import sys\n"
+                "subprocess.Popen(\n"
+                "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+                "    stdin=subprocess.DEVNULL,\n"
+                "    stdout=subprocess.DEVNULL,\n"
+                "    stderr=subprocess.DEVNULL,\n"
+                ")\n",
+                "active process group",
+            ),
+        }
+        for name, (source, message) in fixtures.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    _, candidate_root = self.prepare_roots(temporary_directory)
+                    runner_path = (
+                        candidate_root
+                        / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+                    )
+                    runner_path.write_text(source, encoding="utf-8")
+                    candidate_sha = self.initialize_candidate_checkout(candidate_root)
+                    with mock.patch.dict(
+                        os.environ,
+                        {
+                            REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                            REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                        },
+                        clear=False,
+                    ):
+                        timeout = (
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "CANDIDATE_PROCESS_TIMEOUT_SECONDS",
+                                0.1,
+                            )
+                            if name == "timeout"
+                            else contextlib.nullcontext()
                         )
+                        with timeout:
+                            with self.assertRaisesRegex(AssertionError, message):
+                                _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
 
 
 class RequiredCiCallerRegressionTests(unittest.TestCase):

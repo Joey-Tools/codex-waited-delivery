@@ -3,17 +3,14 @@ from __future__ import annotations
 import json
 import pathlib
 import subprocess
-import sys
 import tempfile
 import textwrap
 import unittest
 
+from required_ci_candidate import candidate_script, run_candidate_python
 
-SCRIPT_PATH = (
-    pathlib.Path(__file__).resolve().parents[1]
-    / "scripts"
-    / "waited_delivery_runner.py"
-)
+
+SCRIPT_PATH = candidate_script("waited_delivery_runner.py")
 
 
 def run(
@@ -29,6 +26,7 @@ def run(
         text=True,
         capture_output=True,
         check=False,
+        timeout=30,
     )
 
 
@@ -113,14 +111,7 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         return pathlib.Path(completed.stdout.strip())
 
     def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
-        completed = run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                *args,
-            ]
-        )
-        return completed
+        return run_candidate_python(SCRIPT_PATH, args)
 
     def _commit_implementation(self) -> None:
         self.assertEqual(
@@ -284,14 +275,10 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
 
     def test_run_fallback_smoke_records_ready_sample(self) -> None:
         run_dir = self._prepare()
-        completed = run(
-            [
-                sys.executable,
-                str(SCRIPT_PATH),
-                "run-fallback-smoke",
-                "--run-dir",
-                str(run_dir),
-            ]
+        completed = self._run_runner(
+            "run-fallback-smoke",
+            "--run-dir",
+            str(run_dir),
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "READY")
