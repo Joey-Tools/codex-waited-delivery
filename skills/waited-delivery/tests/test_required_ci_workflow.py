@@ -1,3 +1,6 @@
+import ast
+import contextlib
+import io
 from pathlib import Path
 import json
 import os
@@ -6,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 def distribution_contract_context(skill_root: Path) -> tuple[Path, str]:
@@ -21,6 +25,13 @@ TRUSTED_REPO_ROOT, DISTRIBUTION_PROFILE = distribution_contract_context(SKILL_RO
 EXPECTED_REPOSITORY = "Joey-Tools/codex-waited-delivery"
 EXPECTED_TEST_TIMEOUT_MINUTES = "10"
 REQUIRED_CI_CANDIDATE_ROOT_ENV = "REQUIRED_CI_CANDIDATE_ROOT"
+CANDIDATE_TESTS_RELATIVE_PATH = Path("skills/waited-delivery/tests")
+TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 180
+TRUSTED_TEST_CHILD_SUCCESS_EXIT = 73
+TRUSTED_TEST_RECEIPT_SCHEMA_VERSION = 1
+TRUSTED_TEST_RECEIPT_SENTINEL = "REQUIRED_CI_TRUSTED_TESTS_COMPLETED:"
+TRUSTED_TEST_SUPERVISOR_FLAG = "--run-trusted-tests"
+TRUSTED_TEST_CHILD_FLAG = "--run-trusted-test-suite"
 REPOSITORY_GUARD = (
     "      - name: Reject unexpected repository\n"
     f"        if: ${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}\n"
@@ -49,9 +60,9 @@ TRUSTED_VALIDATOR_COMMAND = (
     'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
     'test_required_ci_workflow.py"'
 )
-CANDIDATE_TEST_COMMAND = (
-    'python3 -I -m unittest discover -s "$GITHUB_WORKSPACE/'
-    '.candidate/skills/waited-delivery/tests"'
+TRUSTED_TEST_SUPERVISOR_COMMAND = (
+    'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
+    f'test_required_ci_workflow.py" {TRUSTED_TEST_SUPERVISOR_FLAG}'
 )
 CANDIDATE_CHECKOUT_STEP = (
     "      - name: Check out candidate\n"
@@ -76,6 +87,13 @@ PYTHON_SETUP_STEP = (
     "        with:\n"
     '          python-version: "3.x"\n'
 )
+TRUSTED_TEST_SUPERVISOR_STEP = (
+    "      - name: Run trusted Required CI tests\n"
+    "        env:\n"
+    "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
+    "        run: |\n"
+    f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
+)
 REQUIRED_EXECUTION_STEPS = (
     "      - name: Compile candidate Python helpers\n"
     "        run: |\n"
@@ -85,9 +103,7 @@ REQUIRED_EXECUTION_STEPS = (
     "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
     "        run: |\n"
     f"          {TRUSTED_VALIDATOR_COMMAND}\n"
-    "      - name: Run candidate tests\n"
-    "        run: |\n"
-    f"          {CANDIDATE_TEST_COMMAND}\n"
+    f"{TRUSTED_TEST_SUPERVISOR_STEP}"
 )
 
 
@@ -123,6 +139,429 @@ def required_ci_repository_root(trusted_repo_root: Path) -> Path:
 
 
 REPO_ROOT = required_ci_repository_root(TRUSTED_REPO_ROOT)
+
+
+def _direct_test_inventory(repo_root: Path, description: str) -> list[dict[str, object]]:
+    if not repo_root.is_absolute() or repo_root.is_symlink():
+        raise AssertionError(f"{description} repository root must be absolute and real")
+    try:
+        resolved_repo_root = repo_root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            f"{description} repository root must be an existing directory"
+        ) from error
+    if not resolved_repo_root.is_dir():
+        raise AssertionError(f"{description} repository root must be a directory")
+    if resolved_repo_root != repo_root:
+        raise AssertionError(f"{description} repository root must not use symlinks")
+
+    tests_root = resolved_repo_root / CANDIDATE_TESTS_RELATIVE_PATH
+    if tests_root.is_symlink():
+        raise AssertionError(f"{description} test root must not be a symlink")
+    try:
+        resolved_tests_root = tests_root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            f"{description} expected test inventory root is missing"
+        ) from error
+    if not resolved_tests_root.is_dir():
+        raise AssertionError(
+            f"{description} expected test inventory root must be a directory"
+        )
+    if resolved_tests_root != tests_root:
+        raise AssertionError(f"{description} test root escapes the repository")
+
+    try:
+        entries = sorted(resolved_tests_root.iterdir(), key=lambda path: path.name)
+    except OSError as error:
+        raise AssertionError(
+            f"{description} expected test inventory cannot be enumerated"
+        ) from error
+    modules = [
+        entry
+        for entry in entries
+        if entry.name.startswith("test_") and entry.suffix == ".py"
+    ]
+    if not modules:
+        raise AssertionError(f"{description} expected test inventory must not be empty")
+
+    inventory: list[dict[str, object]] = []
+    for module_path in modules:
+        if module_path.is_symlink() or not module_path.is_file():
+            raise AssertionError(
+                f"{description} test module {module_path.name!r} must be an ordinary file"
+            )
+        inventory.append(
+            {
+                "module": module_path.name,
+                "test_ids": _static_test_ids(module_path, description),
+            }
+        )
+    return inventory
+
+
+def _static_test_ids(module_path: Path, description: str) -> list[str]:
+    try:
+        source = module_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise AssertionError(
+            f"{description} test module {module_path.name!r} cannot be read as UTF-8"
+        ) from error
+    try:
+        tree = ast.parse(source, filename=str(module_path))
+    except SyntaxError as error:
+        raise AssertionError(
+            f"{description} test module {module_path.name!r} is not valid Python"
+        ) from error
+
+    test_ids: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "load_tests":
+                raise AssertionError(
+                    f"{description} test module {module_path.name!r} uses an "
+                    "unsupported load_tests hook"
+                )
+            if node.name.startswith("test_"):
+                raise AssertionError(
+                    f"{description} test module {module_path.name!r} uses an "
+                    "unsupported module-level test"
+                )
+        if not isinstance(node, ast.ClassDef):
+            continue
+        test_methods = [
+            child
+            for child in node.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and child.name.startswith("test_")
+        ]
+        if not test_methods:
+            continue
+        direct_test_case = (
+            len(node.bases) == 1
+            and isinstance(node.bases[0], ast.Attribute)
+            and isinstance(node.bases[0].value, ast.Name)
+            and node.bases[0].value.id == "unittest"
+            and node.bases[0].attr == "TestCase"
+            and not node.keywords
+        )
+        if not direct_test_case:
+            raise AssertionError(
+                f"{description} test class {node.name!r} in {module_path.name!r} "
+                "must directly extend unittest.TestCase"
+            )
+        if node.decorator_list:
+            raise AssertionError(
+                f"{description} test class {node.name!r} in {module_path.name!r} "
+                "must not use decorators"
+            )
+        for method in test_methods:
+            if isinstance(method, ast.AsyncFunctionDef):
+                raise AssertionError(
+                    f"{description} test {node.name}.{method.name} must be synchronous"
+                )
+            if method.decorator_list:
+                raise AssertionError(
+                    f"{description} test {node.name}.{method.name} must not use "
+                    "decorators"
+                )
+            test_ids.append(f"{node.name}.{method.name}")
+
+    if not test_ids:
+        raise AssertionError(
+            f"{description} test module {module_path.name!r} has no static tests"
+        )
+    if len(test_ids) != len(set(test_ids)):
+        raise AssertionError(
+            f"{description} test module {module_path.name!r} has duplicate test IDs"
+        )
+    return sorted(test_ids)
+
+
+def _inventory_lookup(inventory: list[dict[str, object]]) -> dict[str, list[str]]:
+    lookup: dict[str, list[str]] = {}
+    for entry in inventory:
+        module = entry.get("module")
+        test_ids = entry.get("test_ids")
+        if type(module) is not str or type(test_ids) is not list:
+            raise AssertionError("test inventory entry has an invalid shape")
+        if module in lookup or any(type(test_id) is not str for test_id in test_ids):
+            raise AssertionError("test inventory entry is duplicated or malformed")
+        lookup[module] = test_ids
+    return lookup
+
+
+def _require_expected_test_inventory(
+    expected_inventory: list[dict[str, object]],
+    candidate_inventory: list[dict[str, object]],
+) -> None:
+    expected = _inventory_lookup(expected_inventory)
+    candidate = _inventory_lookup(candidate_inventory)
+    missing: list[str] = []
+    for module, expected_test_ids in expected.items():
+        candidate_test_ids = candidate.get(module)
+        if candidate_test_ids is None:
+            missing.append(module)
+            continue
+        missing.extend(
+            f"{module}::{test_id}"
+            for test_id in expected_test_ids
+            if test_id not in candidate_test_ids
+        )
+    if missing:
+        raise AssertionError(
+            "candidate expected test inventory is incomplete: " + ", ".join(missing)
+        )
+
+
+def _inventory_test_ids(inventory: list[dict[str, object]]) -> list[str]:
+    test_ids: list[str] = []
+    for module_filename, module_test_ids in _inventory_lookup(inventory).items():
+        module_name = Path(module_filename).stem
+        test_ids.extend(f"{module_name}.{test_id}" for test_id in module_test_ids)
+    if not test_ids or len(test_ids) != len(set(test_ids)):
+        raise AssertionError("trusted expected test inventory is empty or duplicated")
+    return sorted(test_ids)
+
+
+def _suite_test_ids(suite: unittest.TestSuite) -> list[str]:
+    test_ids: list[str] = []
+    pending: list[unittest.TestSuite | unittest.TestCase] = [suite]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, unittest.TestSuite):
+            pending.extend(reversed(list(item)))
+            continue
+        test_id = item.id()
+        if type(test_id) is not str:
+            raise AssertionError("loaded trusted test ID is malformed")
+        test_ids.append(test_id)
+    if len(test_ids) != len(set(test_ids)):
+        raise AssertionError("loaded trusted test inventory contains duplicates")
+    return sorted(test_ids)
+
+
+def _assert_candidate_absent_from_sys_path(candidate_root: Path) -> None:
+    resolved_candidate_root = candidate_root.resolve(strict=True)
+    for entry in sys.path:
+        if type(entry) is not str:
+            raise AssertionError("trusted test sys.path contains a non-string entry")
+        path = Path.cwd() if entry == "" else Path(entry)
+        try:
+            resolved_entry = path.resolve(strict=False)
+        except OSError as error:
+            raise AssertionError("trusted test sys.path cannot be resolved") from error
+        if (
+            resolved_entry == resolved_candidate_root
+            or resolved_candidate_root in resolved_entry.parents
+        ):
+            raise AssertionError("candidate checkout must not appear on trusted sys.path")
+
+
+def _trusted_test_suite_receipt(
+    trusted_repo_root: Path, candidate_root: Path
+) -> dict[str, object]:
+    trusted_inventory = _direct_test_inventory(trusted_repo_root, "trusted")
+    expected_test_ids = _inventory_test_ids(trusted_inventory)
+    trusted_tests_root = (
+        trusted_repo_root.resolve(strict=True) / CANDIDATE_TESTS_RELATIVE_PATH
+    )
+    _assert_candidate_absent_from_sys_path(candidate_root)
+
+    loader = unittest.TestLoader()
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
+    runner_output = io.StringIO()
+    with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(
+        captured_stderr
+    ):
+        suite = loader.discover(
+            start_dir=str(trusted_tests_root),
+            pattern="test_*.py",
+            top_level_dir=str(trusted_tests_root),
+        )
+        if loader.errors:
+            raise AssertionError("trusted test loader reported errors")
+        _assert_candidate_absent_from_sys_path(candidate_root)
+        loaded_test_ids = _suite_test_ids(suite)
+        if loaded_test_ids != expected_test_ids:
+            raise AssertionError(
+                "loaded trusted test inventory does not match static inventory"
+            )
+        result = unittest.TextTestRunner(
+            stream=runner_output, verbosity=0
+        ).run(suite)
+    _assert_candidate_absent_from_sys_path(candidate_root)
+
+    result_counts = {
+        "failures": len(result.failures),
+        "errors": len(result.errors),
+        "skipped": len(result.skipped),
+        "expected_failures": len(result.expectedFailures),
+        "unexpected_successes": len(result.unexpectedSuccesses),
+    }
+    if (
+        result.testsRun != len(expected_test_ids)
+        or not result.wasSuccessful()
+        or any(result_counts.values())
+    ):
+        details = _bounded_failure_text(
+            runner_output.getvalue()
+            + captured_stdout.getvalue()
+            + captured_stderr.getvalue()
+        )
+        raise AssertionError(f"trusted test suite did not complete exactly: {details}")
+    if _direct_test_inventory(trusted_repo_root, "trusted") != trusted_inventory:
+        raise AssertionError("trusted expected test inventory changed during execution")
+    return {
+        "schema_version": TRUSTED_TEST_RECEIPT_SCHEMA_VERSION,
+        "status": "completed",
+        "trusted_inventory": trusted_inventory,
+        "expected_test_count": len(expected_test_ids),
+        "executed_test_count": result.testsRun,
+        **result_counts,
+    }
+
+
+def _bounded_failure_text(value: str, limit: int = 2000) -> str:
+    normalized = value.replace("\x00", "\\0")
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + "...[truncated]"
+
+
+def _validated_trusted_child_receipt(
+    completed: subprocess.CompletedProcess[str], trusted_inventory: list[dict[str, object]]
+) -> dict[str, object]:
+    if completed.returncode != TRUSTED_TEST_CHILD_SUCCESS_EXIT:
+        details = _bounded_failure_text(completed.stderr or completed.stdout)
+        raise AssertionError(
+            "trusted Required CI tests did not complete under the isolated child "
+            f"(exit {completed.returncode}): {details}"
+        )
+    if completed.stderr:
+        raise AssertionError("trusted Required CI child wrote unexpected stderr")
+    expected_test_count = len(_inventory_test_ids(trusted_inventory))
+    expected_receipt = {
+        "schema_version": TRUSTED_TEST_RECEIPT_SCHEMA_VERSION,
+        "status": "completed",
+        "trusted_inventory": trusted_inventory,
+        "expected_test_count": expected_test_count,
+        "executed_test_count": expected_test_count,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "expected_failures": 0,
+        "unexpected_successes": 0,
+    }
+    canonical_receipt = json.dumps(
+        expected_receipt, sort_keys=True, separators=(",", ":")
+    )
+    expected_stdout = f"{TRUSTED_TEST_RECEIPT_SENTINEL}{canonical_receipt}\n"
+    if completed.stdout != expected_stdout:
+        raise AssertionError(
+            "trusted Required CI child returned a malformed completion receipt"
+        )
+    try:
+        receipt = json.loads(completed.stdout.removeprefix(TRUSTED_TEST_RECEIPT_SENTINEL))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise AssertionError(
+            "trusted Required CI child returned a malformed completion receipt"
+        ) from error
+    if receipt != expected_receipt:
+        raise AssertionError(
+            "trusted Required CI child completion receipt is not exact"
+        )
+    return receipt
+
+
+def supervise_trusted_required_ci_tests(
+    trusted_repo_root: Path, candidate_root: Path
+) -> dict[str, object]:
+    _assert_candidate_absent_from_sys_path(candidate_root)
+    trusted_inventory = _direct_test_inventory(trusted_repo_root, "trusted")
+    candidate_static_inventory = _direct_test_inventory(candidate_root, "candidate")
+    _require_expected_test_inventory(trusted_inventory, candidate_static_inventory)
+
+    child_environment = os.environ.copy()
+    child_environment.pop("PYTHONHOME", None)
+    child_environment.pop("PYTHONPATH", None)
+    child_environment[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(
+        candidate_root.resolve(strict=True)
+    )
+    trusted_supervisor = Path(__file__).resolve(strict=True)
+    try:
+        trusted_supervisor_source = trusted_supervisor.read_bytes()
+    except OSError as error:
+        raise AssertionError("trusted candidate test supervisor cannot be read") from error
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(trusted_supervisor),
+                TRUSTED_TEST_CHILD_FLAG,
+                str(trusted_repo_root.resolve(strict=True)),
+            ],
+            cwd=trusted_repo_root.resolve(strict=True),
+            env=child_environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=TRUSTED_TEST_SUITE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(
+            "trusted Required CI tests did not complete before the fixed timeout"
+        ) from error
+    receipt = _validated_trusted_child_receipt(completed, trusted_inventory)
+
+    try:
+        final_supervisor_source = trusted_supervisor.read_bytes()
+    except OSError as error:
+        raise AssertionError(
+            "trusted candidate test supervisor became unreadable"
+        ) from error
+    if final_supervisor_source != trusted_supervisor_source:
+        raise AssertionError("trusted candidate test supervisor changed")
+    if _direct_test_inventory(trusted_repo_root, "trusted") != trusted_inventory:
+        raise AssertionError("trusted expected test inventory changed during execution")
+    if (
+        _direct_test_inventory(candidate_root, "candidate")
+        != candidate_static_inventory
+    ):
+        raise AssertionError("candidate static test inventory changed during execution")
+    return receipt
+
+
+def _trusted_test_child_main(trusted_repo_root_value: str) -> int:
+    try:
+        trusted_repo_root = Path(trusted_repo_root_value)
+        if (
+            not trusted_repo_root.is_absolute()
+            or trusted_repo_root.name != ".required-ci"
+        ):
+            raise AssertionError("trusted test root must be an absolute .required-ci path")
+        receipt = _trusted_test_suite_receipt(trusted_repo_root, REPO_ROOT)
+    except BaseException as error:
+        message = _bounded_failure_text(f"{type(error).__name__}: {error}")
+        print(f"trusted Required CI child failed: {message}", file=sys.stderr)
+        return 1
+    canonical_receipt = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    print(f"{TRUSTED_TEST_RECEIPT_SENTINEL}{canonical_receipt}")
+    return TRUSTED_TEST_CHILD_SUCCESS_EXIT
+
+
+def _trusted_test_supervisor_main() -> int:
+    try:
+        receipt = supervise_trusted_required_ci_tests(TRUSTED_REPO_ROOT, REPO_ROOT)
+    except BaseException as error:
+        message = _bounded_failure_text(f"{type(error).__name__}: {error}")
+        print(f"trusted Required CI test supervisor failed: {message}", file=sys.stderr)
+        return 1
+    canonical_receipt = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    print(f"{TRUSTED_TEST_RECEIPT_SENTINEL}{canonical_receipt}")
+    return 0
 
 
 def top_level_job_ids(workflow: str) -> list[str]:
@@ -884,14 +1323,21 @@ def _validate_test_job(
     )
 
     test_step = _require_step_properties(
-        steps[6], step_indent, ["name", "run"], "test step"
+        steps[6], step_indent, ["name", "env", "run"], "test step"
     )
-    _require_scalar(test_step["name"], "Run candidate tests", "test step name")
+    _require_scalar(
+        test_step["name"],
+        "Run trusted Required CI tests",
+        "test step name",
+    )
+    _require_exact_mapping(
+        test_step["env"], TRUSTED_VALIDATOR_ENV, "test supervisor environment"
+    )
     _require_run_block(
         lines,
         test_step["run"],
-        CANDIDATE_TEST_COMMAND,
-        "test step command",
+        TRUSTED_TEST_SUPERVISOR_COMMAND,
+        "test supervisor command",
     )
 
 
@@ -1553,21 +1999,24 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                 "          PYTHONPATH: ${{ github.workspace }}/.candidate\n",
                 1,
             ),
-            "functional discovery lacks isolated mode": workflow.replace(
-                CANDIDATE_TEST_COMMAND,
-                CANDIDATE_TEST_COMMAND.replace("python3 -I", "python3", 1),
+            "functional supervisor lacks isolated mode": workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
+                TRUSTED_TEST_SUPERVISOR_COMMAND.replace(
+                    "python3 -I", "python3", 1
+                ),
                 1,
             ),
-            "functional discovery uses a relative path": workflow.replace(
-                CANDIDATE_TEST_COMMAND,
-                "python3 -I -m unittest discover -s skills/waited-delivery/tests",
+            "functional supervisor uses a relative path": workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
+                "python3 -I skills/waited-delivery/tests/"
+                "test_required_ci_workflow.py --run-trusted-tests",
                 1,
             ),
-            "functional discovery changes candidate cwd": workflow.replace(
-                CANDIDATE_TEST_COMMAND,
+            "functional supervisor changes candidate cwd": workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
                 "cd \"$GITHUB_WORKSPACE/.candidate\" && "
-                "python3 -I -m unittest discover -s "
-                "skills/waited-delivery/tests",
+                "python3 -I ../.required-ci/skills/waited-delivery/tests/"
+                "test_required_ci_workflow.py --run-trusted-tests",
                 1,
             ),
         }
@@ -1575,6 +2024,81 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
         for name, fixture in fixtures.items():
             with self.subTest(name=name):
                 self.assertNotEqual(fixture, workflow)
+                with self.assertRaises(AssertionError):
+                    validate_required_workflow(fixture)
+
+    def test_functional_tests_are_owned_by_the_trusted_supervisor(self) -> None:
+        secure_workflow = self.required_workflow()
+
+        self.assertEqual(len(validate_required_workflow(secure_workflow)), 2)
+
+        fixtures = {
+            "candidate copy owns the supervisor": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
+                TRUSTED_TEST_SUPERVISOR_COMMAND.replace(
+                    "$GITHUB_WORKSPACE/.required-ci/",
+                    "$GITHUB_WORKSPACE/.candidate/",
+                    1,
+                ),
+                1,
+            ),
+            "supervisor lacks isolated mode": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
+                TRUSTED_TEST_SUPERVISOR_COMMAND.replace(
+                    "python3 -I", "python3", 1
+                ),
+                1,
+            ),
+            "supervisor flag is missing": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
+                TRUSTED_TEST_SUPERVISOR_COMMAND.replace(
+                    " --run-trusted-tests", "", 1
+                ),
+                1,
+            ),
+            "candidate root environment is missing": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_STEP,
+                TRUSTED_TEST_SUPERVISOR_STEP.replace(
+                    "        env:\n"
+                    "          REQUIRED_CI_CANDIDATE_ROOT: "
+                    "${{ github.workspace }}/.candidate\n",
+                    "",
+                    1,
+                ),
+                1,
+            ),
+            "candidate root environment is relaxed": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_STEP,
+                TRUSTED_TEST_SUPERVISOR_STEP.replace(
+                    "${{ github.workspace }}/.candidate",
+                    "${{ github.workspace }}",
+                    1,
+                ),
+                1,
+            ),
+            "candidate root environment adds PYTHONPATH": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_STEP,
+                TRUSTED_TEST_SUPERVISOR_STEP.replace(
+                    "          REQUIRED_CI_CANDIDATE_ROOT: "
+                    "${{ github.workspace }}/.candidate\n",
+                    "          REQUIRED_CI_CANDIDATE_ROOT: "
+                    "${{ github.workspace }}/.candidate\n"
+                    "          PYTHONPATH: ${{ github.workspace }}/.candidate\n",
+                    1,
+                ),
+                1,
+            ),
+            "candidate discovery bypasses the supervisor": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
+                'python3 -I -m unittest discover -s "$GITHUB_WORKSPACE/'
+                '.candidate/skills/waited-delivery/tests"',
+                1,
+            ),
+        }
+
+        for name, fixture in fixtures.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(fixture, secure_workflow)
                 with self.assertRaises(AssertionError):
                     validate_required_workflow(fixture)
 
@@ -1646,20 +2170,24 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                 "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
                 "        run: true\n"
                 "      - name: |\n"
-                "          Run candidate tests\n"
-                f"          {CANDIDATE_TEST_COMMAND}\n"
+                "          Run trusted Required CI tests\n"
+                f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
+                "        env:\n"
+                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
                 "        run: true\n"
             ),
             "swapped run steps": (
                 "      - name: Compile candidate Python helpers\n"
                 "        run: |\n"
-                f"          {CANDIDATE_TEST_COMMAND}\n"
+                f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
                 "      - name: Validate Required CI structure\n"
                 "        env:\n"
                 "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
                 "        run: |\n"
                 f"          {TRUSTED_VALIDATOR_COMMAND}\n"
-                "      - name: Run candidate tests\n"
+                "      - name: Run trusted Required CI tests\n"
+                "        env:\n"
+                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
                 "        run: |\n"
                 f"          {CANDIDATE_COMPILE_COMMAND}\n"
             ),
@@ -1684,10 +2212,12 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                 "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
                 "        run: |\n"
                 f"          {TRUSTED_VALIDATOR_COMMAND}\n"
-                "      - name: Run candidate tests\n"
+                "      - name: Run trusted Required CI tests\n"
                 "        continue-on-error: true\n"
+                "        env:\n"
+                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
                 "        run: |\n"
-                f"          {CANDIDATE_TEST_COMMAND}\n"
+                f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
             )
         )
 
@@ -1775,6 +2305,395 @@ class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
             self.assertNotEqual(isolated.returncode, 0)
             self.assertIn("real discovery ran", isolated.stderr)
             self.assertFalse(shadow_marker.exists())
+
+
+class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
+    @staticmethod
+    def write_test_module(repo_root: Path, name: str, content: str) -> None:
+        path = repo_root / "skills/waited-delivery/tests" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def required_module(*, body: str = "        pass\n") -> str:
+        return (
+            "import unittest\n\n"
+            "class RequiredTests(unittest.TestCase):\n"
+            "    def test_one(self):\n"
+            f"{body}"
+            "    def test_two(self):\n"
+            "        pass\n"
+        )
+
+    def prepare_roots(self, temporary_directory: str) -> tuple[Path, Path]:
+        root = Path(temporary_directory).resolve(strict=True)
+        trusted_root = root / ".required-ci"
+        candidate_root = root / ".candidate"
+        self.write_test_module(
+            trusted_root,
+            "test_required.py",
+            self.required_module(),
+        )
+        (candidate_root / "skills/waited-delivery/tests").mkdir(parents=True)
+        return trusted_root, candidate_root
+
+    def test_supervisor_proves_expected_inventory_and_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module()
+                + "\nclass AddedTests(unittest.TestCase):\n"
+                "    def test_added(self):\n"
+                "        pass\n",
+            )
+
+            receipt = supervise_trusted_required_ci_tests(
+                trusted_root, candidate_root
+            )
+
+        self.assertEqual(
+            set(receipt),
+            {
+                "schema_version",
+                "status",
+                "trusted_inventory",
+                "expected_test_count",
+                "executed_test_count",
+                "failures",
+                "errors",
+                "skipped",
+                "expected_failures",
+                "unexpected_successes",
+            },
+        )
+        self.assertEqual(receipt["schema_version"], 1)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["expected_test_count"], 2)
+        self.assertEqual(receipt["executed_test_count"], 2)
+
+    def test_supervisor_child_argv_and_environment_are_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            self.write_test_module(
+                candidate_root, "test_required.py", self.required_module()
+            )
+            actual_run = subprocess.run
+            captured_calls: list[tuple[list[str], dict[str, object]]] = []
+
+            def recording_run(
+                command: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                captured_calls.append((command, kwargs.copy()))
+                return actual_run(command, **kwargs)
+
+            with mock.patch.object(subprocess, "run", side_effect=recording_run):
+                receipt = supervise_trusted_required_ci_tests(
+                    trusted_root, candidate_root
+                )
+
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(len(captured_calls), 1)
+        command, options = captured_calls[0]
+        self.assertEqual(
+            command,
+            [
+                sys.executable,
+                "-I",
+                str(Path(__file__).resolve(strict=True)),
+                TRUSTED_TEST_CHILD_FLAG,
+                str(trusted_root),
+            ],
+        )
+        self.assertEqual(options["cwd"], trusted_root)
+        child_environment = options["env"]
+        self.assertIsInstance(child_environment, dict)
+        self.assertEqual(
+            child_environment[REQUIRED_CI_CANDIDATE_ROOT_ENV], str(candidate_root)
+        )
+        self.assertNotIn("PYTHONHOME", child_environment)
+        self.assertNotIn("PYTHONPATH", child_environment)
+
+    def test_supervisor_rejects_candidate_on_trusted_sys_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            original_sys_path = sys.path.copy()
+            try:
+                sys.path.insert(0, str(candidate_root))
+                with self.assertRaisesRegex(AssertionError, "trusted sys.path"):
+                    _assert_candidate_absent_from_sys_path(candidate_root)
+            finally:
+                sys.path[:] = original_sys_path
+
+    def test_supervisor_does_not_load_candidate_root_unittest_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            canary = Path(temporary_directory) / "unittest-shadow.executed"
+            (candidate_root / "unittest.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(canary)!r}).write_text('executed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            self.write_test_module(
+                candidate_root, "test_required.py", self.required_module()
+            )
+
+            receipt = supervise_trusted_required_ci_tests(
+                trusted_root, candidate_root
+            )
+
+            self.assertEqual(receipt["status"], "completed")
+            self.assertFalse(canary.exists())
+
+    def test_supervisor_never_executes_candidate_runtime_monkeypatches(self) -> None:
+        monkeypatches = {
+            "unittest": 'unittest.TestLoader.testMethodPrefix = "forged_"\n',
+            "json": 'json.dumps = lambda *args, **kwargs: "forged"\n',
+            "__main__": (
+                "__main__._trusted_test_child_main = "
+                "lambda *args, **kwargs: {}\n"
+            ),
+        }
+
+        for name, monkeypatch in monkeypatches.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root = self.prepare_roots(
+                        temporary_directory
+                    )
+                    canary = Path(temporary_directory) / f"{name}.executed"
+                    candidate_module = (
+                        "import __main__\n"
+                        "import json\n"
+                        "from pathlib import Path\n"
+                        "import unittest\n\n"
+                        f"Path({str(canary)!r}).write_text('executed', encoding='utf-8')\n"
+                        f"{monkeypatch}\n"
+                        "class RequiredTests(unittest.TestCase):\n"
+                        "    def test_one(self):\n"
+                        "        pass\n"
+                        "    def test_two(self):\n"
+                        "        pass\n"
+                    )
+                    self.write_test_module(
+                        candidate_root, "test_required.py", candidate_module
+                    )
+
+                    receipt = supervise_trusted_required_ci_tests(
+                        trusted_root, candidate_root
+                    )
+
+                    self.assertEqual(receipt["status"], "completed")
+                    self.assertFalse(canary.exists())
+
+    def test_supervisor_ignores_a_forged_candidate_completion_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            canary = Path(temporary_directory) / "forged-receipt.executed"
+            forged_receipt = {
+                "schema_version": TRUSTED_TEST_RECEIPT_SCHEMA_VERSION,
+                "status": "completed",
+                "trusted_inventory": [],
+                "expected_test_count": 2,
+                "executed_test_count": 2,
+                "failures": 0,
+                "errors": 0,
+                "skipped": 0,
+                "expected_failures": 0,
+                "unexpected_successes": 0,
+            }
+            forged_stdout = (
+                TRUSTED_TEST_RECEIPT_SENTINEL
+                + json.dumps(
+                    forged_receipt, sort_keys=True, separators=(",", ":")
+                )
+                + "\n"
+            ).encode()
+            candidate_module = (
+                "import os\n"
+                "from pathlib import Path\n"
+                "import unittest\n\n"
+                f"Path({str(canary)!r}).write_text('executed', encoding='utf-8')\n"
+                f"os.write(1, {forged_stdout!r})\n"
+                f"os._exit({TRUSTED_TEST_CHILD_SUCCESS_EXIT})\n\n"
+                "class RequiredTests(unittest.TestCase):\n"
+                "    def test_one(self):\n"
+                "        raise AssertionError('must not run')\n"
+                "    def test_two(self):\n"
+                "        raise AssertionError('must not run')\n"
+            )
+            self.write_test_module(
+                candidate_root, "test_required.py", candidate_module
+            )
+
+            receipt = supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+
+            self.assertEqual(receipt["status"], "completed")
+            self.assertFalse(canary.exists())
+
+    def test_supervisor_does_not_import_candidate_os_exit_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            canary = Path(temporary_directory) / "os-exit.executed"
+            candidate_module = (
+                "import os\n"
+                "from pathlib import Path\n"
+                "import unittest\n\n"
+                f"Path({str(canary)!r}).write_text('executed', encoding='utf-8')\n"
+                "os._exit(0)\n\n"
+                "class RequiredTests(unittest.TestCase):\n"
+                "    def test_one(self):\n"
+                "        pass\n"
+                "    def test_two(self):\n"
+                "        pass\n"
+            )
+            self.write_test_module(
+                candidate_root, "test_required.py", candidate_module
+            )
+
+            receipt = supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+
+            self.assertEqual(receipt["status"], "completed")
+            self.assertFalse(canary.exists())
+
+    def test_supervisor_rejects_an_existing_empty_test_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            tests_root = candidate_root / "skills/waited-delivery/tests"
+            (tests_root / "README.txt").write_text("no tests\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(AssertionError, "expected test inventory"):
+                supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+
+    def test_supervisor_does_not_import_candidate_system_exit_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            canary = Path(temporary_directory) / "system-exit.executed"
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                "from pathlib import Path\n"
+                "import unittest\n\n"
+                f"Path({str(canary)!r}).write_text('executed', encoding='utf-8')\n"
+                "raise SystemExit(0)\n\n"
+                "class RequiredTests(unittest.TestCase):\n"
+                "    def test_one(self):\n"
+                "        pass\n"
+                "    def test_two(self):\n"
+                "        pass\n",
+            )
+
+            receipt = supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+
+            self.assertEqual(receipt["status"], "completed")
+            self.assertFalse(canary.exists())
+
+    def test_supervisor_rejects_candidate_load_tests_hook(self) -> None:
+        partial_module = self.required_module() + (
+            "\ndef load_tests(loader, tests, pattern):\n"
+            "    return unittest.TestSuite([RequiredTests('test_one')])\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                partial_module,
+            )
+
+            with self.assertRaisesRegex(AssertionError, "load_tests"):
+                supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+
+    def test_supervisor_does_not_execute_candidate_test_early_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            canary = Path(temporary_directory) / "test-body.executed"
+            candidate_module = (
+                "from pathlib import Path\n"
+                "import unittest\n\n"
+                "class RequiredTests(unittest.TestCase):\n"
+                "    def test_one(self):\n"
+                f"        Path({str(canary)!r}).write_text('executed', encoding='utf-8')\n"
+                "        raise SystemExit(0)\n"
+                "    def test_two(self):\n"
+                "        pass\n"
+            )
+            self.write_test_module(
+                candidate_root, "test_required.py", candidate_module
+            )
+
+            receipt = supervise_trusted_required_ci_tests(trusted_root, candidate_root)
+
+            self.assertEqual(receipt["status"], "completed")
+            self.assertFalse(canary.exists())
+
+    def test_supervisor_rejects_deleted_or_renamed_expected_tests(self) -> None:
+        fixtures = {
+            "deleted module": (
+                "test_other.py",
+                "import unittest\n\n"
+                "class OtherTests(unittest.TestCase):\n"
+                "    def test_other(self):\n"
+                "        pass\n",
+            ),
+            "renamed module": ("test_renamed.py", self.required_module()),
+            "renamed test": (
+                "test_required.py",
+                self.required_module().replace("test_one", "test_renamed", 1),
+            ),
+        }
+
+        for name, (module_name, candidate_module) in fixtures.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root = self.prepare_roots(
+                        temporary_directory
+                    )
+                    self.write_test_module(
+                        candidate_root,
+                        module_name,
+                        candidate_module,
+                    )
+
+                    with self.assertRaisesRegex(
+                        AssertionError, "expected test inventory"
+                    ):
+                        supervise_trusted_required_ci_tests(
+                            trusted_root, candidate_root
+                        )
+
+    def test_supervisor_rejects_skipped_expected_tests(self) -> None:
+        fixtures = {
+            "method decorator": self.required_module().replace(
+                "    def test_one(self):\n",
+                "    @unittest.skip('disabled')\n"
+                "    def test_one(self):\n",
+                1,
+            ),
+            "class decorator": self.required_module().replace(
+                "class RequiredTests(unittest.TestCase):\n",
+                "@unittest.skip('disabled')\n"
+                "class RequiredTests(unittest.TestCase):\n",
+                1,
+            ),
+        }
+        for name, skipped_module in fixtures.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root = self.prepare_roots(
+                        temporary_directory
+                    )
+                    self.write_test_module(
+                        candidate_root,
+                        "test_required.py",
+                        skipped_module,
+                    )
+
+                    with self.assertRaisesRegex(AssertionError, "decorators"):
+                        supervise_trusted_required_ci_tests(
+                            trusted_root, candidate_root
+                        )
 
 
 class RequiredCiCallerRegressionTests(unittest.TestCase):
@@ -2000,4 +2919,8 @@ class RequiredCiWorkflowTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == [TRUSTED_TEST_SUPERVISOR_FLAG]:
+        raise SystemExit(_trusted_test_supervisor_main())
+    if len(sys.argv) == 3 and sys.argv[1] == TRUSTED_TEST_CHILD_FLAG:
+        raise SystemExit(_trusted_test_child_main(sys.argv[2]))
     unittest.main()

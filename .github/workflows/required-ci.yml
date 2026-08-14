@@ -39,6 +39,8 @@ jobs:
           REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate
         run: |
           python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py"
-      - name: Run candidate tests
+      - name: Run trusted Required CI tests
+        env:
+          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate
         run: |
-          python3 -I -m unittest discover -s "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/tests"
+          python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py" --run-trusted-tests
