@@ -4,11 +4,14 @@ import json
 import os
 import pathlib
 import subprocess
-import tempfile
 import textwrap
 import unittest
 
-from required_ci_candidate import candidate_script, run_candidate_python
+from required_ci_candidate import (
+    candidate_fixture_directory,
+    candidate_script,
+    run_candidate_python,
+)
 
 
 BRIDGE_PATH = candidate_script("waited_delivery_bridge.py")
@@ -59,7 +62,7 @@ def git_commit(repo: pathlib.Path, message: str) -> None:
 
 class WaitedDeliveryBridgeTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(prefix="waited-delivery-bridge-")
+        self.tempdir = candidate_fixture_directory("waited-delivery-bridge-")
         self.root = pathlib.Path(self.tempdir.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
@@ -84,7 +87,9 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
         self.tempdir.cleanup()
 
     def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return run_candidate_python(RUNNER_PATH, args)
+        return run_candidate_python(
+            RUNNER_PATH, args, writable_roots=(self.root,)
+        )
 
     def _run_bridge(
         self, *args: str, env: dict[str, str] | None = None
@@ -92,7 +97,12 @@ class WaitedDeliveryBridgeTest(unittest.TestCase):
         bridge_env = os.environ.copy()
         if env:
             bridge_env.update(env)
-        return run_candidate_python(BRIDGE_PATH, args, env=bridge_env)
+        return run_candidate_python(
+            BRIDGE_PATH,
+            args,
+            env=bridge_env,
+            writable_roots=(self.root,),
+        )
 
     def _prepare_run_dir(self) -> pathlib.Path:
         completed = self._run_runner(

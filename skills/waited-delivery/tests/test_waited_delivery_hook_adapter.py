@@ -4,16 +4,15 @@ import ast
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
-import tempfile
 import textwrap
 import unittest
 import zlib
 from collections.abc import Mapping
 
 from required_ci_candidate import (
+    candidate_fixture_directory,
     candidate_script,
     run_candidate_hook_fault_probe,
     run_candidate_python,
@@ -70,7 +69,7 @@ def git_commit(repo: pathlib.Path, message: str) -> None:
 
 class WaitedDeliveryHookAdapterTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(prefix="waited-delivery-hook-")
+        self.tempdir = candidate_fixture_directory("waited-delivery-hook-")
         self.root = pathlib.Path(self.tempdir.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
@@ -116,10 +115,13 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             args,
             env=env,
             input_text=input_text,
+            writable_roots=(self.root,),
         )
 
     def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return run_candidate_python(RUNNER_PATH, args)
+        return run_candidate_python(
+            RUNNER_PATH, args, writable_roots=(self.root,)
+        )
 
     def _commit_implementation(self) -> None:
         self.assertEqual(git(self.repo, "add", "tracked.txt").returncode, 0)
@@ -270,28 +272,31 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             faults,
             env=environment,
             input_text=json.dumps(stop_payload),
+            writable_roots=(self.root,),
         )
         trusted_probe = pathlib.Path(
             run_candidate_hook_fault_probe.__code__.co_filename
         ).resolve(strict=True)
+        isolated_probe = pathlib.Path(completed.args[3])
+        isolated_adapter = pathlib.Path(completed.args[5])
         self.assertEqual(
-            completed.args,
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(trusted_probe),
-                "--hook-fault-probe",
-                str(ADAPTER_PATH),
-                ",".join(faults),
-            ],
+            completed.args[:3], [sys.executable, "-I", "-B"]
         )
+        self.assertEqual(completed.args[4], "--hook-fault-probe")
+        self.assertEqual(completed.args[6], ",".join(faults))
+        self.assertTrue(isolated_probe.is_absolute())
+        self.assertEqual(isolated_probe.name, trusted_probe.name)
+        self.assertNotEqual(isolated_probe, trusted_probe)
+        self.assertTrue(isolated_adapter.is_absolute())
+        self.assertEqual(isolated_adapter.name, ADAPTER_PATH.name)
+        self.assertNotEqual(isolated_adapter, ADAPTER_PATH)
         log_path = self._home_log_dir(home) / "waited-delivery-hooks.jsonl"
-        self.assertTrue(log_path.is_file())
-        events = [
-            json.loads(line)
-            for line in log_path.read_text(encoding="utf-8").splitlines()
-        ]
+        events = []
+        if log_path.is_file():
+            events = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
         return completed, events
 
     def test_terminal_stop_prompts_refuse_missing_child_identity(self) -> None:
@@ -752,9 +757,16 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertGreaterEqual(source.count("path.replace(archive)"), 2)
 
     def test_hook_diagnostics_rotate_and_compress_with_zstd(self) -> None:
-        zstd = shutil.which("zstd")
+        zstd = next(
+            (
+                str(path)
+                for path in (pathlib.Path("/usr/bin/zstd"), pathlib.Path("/bin/zstd"))
+                if path.is_file() and os.access(path, os.X_OK)
+            ),
+            None,
+        )
         if zstd is None:
-            self.skipTest("zstd not available")
+            self.skipTest("zstd not available in the closed candidate PATH")
         fake_home = self.root / "home-rotation"
         adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
         adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -1146,27 +1158,44 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         )
 
     def test_stop_hook_keeps_blocking_when_last_resort_builder_fails(self) -> None:
-        _, source = self._adapter_function("_stop_hook")
-        call_names = self._adapter_call_names("_stop_hook")
-        self.assertLess(
-            call_names.index("_build_stop_last_resort_prompt"),
-            call_names.index("_build_stop_emergency_prompt"),
+        completed, events = self._run_stop_fault_probe(
+            "continuation", "fallback", "last-resort"
         )
-        self.assertIn("except Exception as emergency_error", source)
-        self.assertIn("_record_hook_failure(emergency_error)", source)
-        _, emergency = self._adapter_function("_build_stop_emergency_prompt")
-        self.assertIn("Run this from the repo root:", emergency)
-        self.assertIn("--child-status", emergency)
-        self.assertIn("--child-session-id", emergency)
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("Do not finish yet", completed.stderr)
+        self.assertIn("child-prompt-fault", completed.stderr)
+        self.assertEqual(
+            [event["error_message"] for event in events],
+            [
+                "required-ci injected continuation failure",
+                "required-ci injected fallback failure",
+                "required-ci injected last-resort failure",
+            ],
+        )
+
+    def test_stop_hook_keeps_blocking_when_diagnostic_stderr_fails(self) -> None:
+        completed, events = self._run_stop_fault_probe(
+            "continuation", "diagnostic-log", "diagnostic-stderr"
+        )
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("Do not finish yet", completed.stderr)
+        self.assertIn("child-prompt-fault", completed.stderr)
+        self.assertNotIn("diagnostics write failed", completed.stderr)
+        self.assertEqual(events, [])
 
     def test_stop_hook_fails_open_when_prompt_write_fails(self) -> None:
-        node, source = self._adapter_function("_stop_hook")
-        self.assertIn("print(prompt, file=sys.stderr)", source)
-        self.assertIn('setattr(error, "hook_command", "stop-hook")', source)
-        self.assertIn('setattr(error, "hook_payload", payload)', source)
-        self.assertIn("return _fail_open_hook_response(error)", source)
-        handlers = [child for child in ast.walk(node) if isinstance(child, ast.ExceptHandler)]
-        self.assertGreaterEqual(len(handlers), 5)
+        completed, events = self._run_stop_fault_probe("prompt-stderr")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "{}\n")
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(
+            [event["error_message"] for event in events],
+            ["required-ci injected prompt stderr failure"],
+        )
+        self.assertEqual(events[0]["hook_command"], "stop-hook")
+        self.assertEqual(events[0]["session_id"], "session-prompt-fault")
 
 
 if __name__ == "__main__":

@@ -1,17 +1,25 @@
 import ast
 import contextlib
+import errno
+import fcntl
 import hashlib
 import io
 import importlib.util
+import inspect
 from pathlib import Path
 import json
 import os
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from collections.abc import Iterator, Mapping
 from unittest import mock
 
 
@@ -42,27 +50,80 @@ def _load_trusted_candidate_support():
 _CANDIDATE_SUPPORT = _load_trusted_candidate_support()
 
 
-def distribution_contract_context(skill_root: Path) -> tuple[Path, str]:
+def distribution_contract_context(
+    skill_root: Path,
+) -> tuple[Path, Path, Path, str]:
     if skill_root.parts[-3:] == ("personal_codex", "skills", "waited-delivery"):
-        return skill_root.parents[2], "private"
+        checkout_root = skill_root.parents[2]
+        content_relative_root = Path("personal_codex")
+        return (
+            checkout_root,
+            checkout_root / content_relative_root,
+            content_relative_root,
+            "private",
+        )
     if skill_root.parts[-2:] == ("skills", "waited-delivery"):
-        return skill_root.parents[1], "canonical"
+        checkout_root = skill_root.parents[1]
+        return checkout_root, checkout_root, Path(), "canonical"
     raise AssertionError(f"unsupported waited-delivery skill layout: {skill_root}")
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
-TRUSTED_REPO_ROOT, DISTRIBUTION_PROFILE = distribution_contract_context(SKILL_ROOT)
+(
+    TRUSTED_REPO_ROOT,
+    TRUSTED_CONTENT_ROOT,
+    TRUSTED_CONTENT_RELATIVE_ROOT,
+    DISTRIBUTION_PROFILE,
+) = distribution_contract_context(SKILL_ROOT)
 EXPECTED_REPOSITORY = "Joey-Tools/codex-waited-delivery"
 EXPECTED_TEST_TIMEOUT_MINUTES = "10"
 REQUIRED_CI_CANDIDATE_ROOT_ENV = _CANDIDATE_SUPPORT.CANDIDATE_ROOT_ENV
 REQUIRED_CI_CANDIDATE_SHA_ENV = _CANDIDATE_SUPPORT.CANDIDATE_SHA_ENV
+REQUIRED_CI_ISOLATION_MODE_ENV = "REQUIRED_CI_ISOLATION_MODE"
+REQUIRED_CI_ISOLATION_MODE = "sudo-setpriv-v1"
 CANDIDATE_TESTS_RELATIVE_PATH = Path("skills/waited-delivery/tests")
+
+
+def distribution_content_root(checkout_root: Path) -> Path:
+    return checkout_root / TRUSTED_CONTENT_RELATIVE_ROOT
+
+
+def distribution_tests_root(checkout_root: Path) -> Path:
+    return distribution_content_root(checkout_root) / CANDIDATE_TESTS_RELATIVE_PATH
 TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 180
 TRUSTED_TEST_CHILD_SUCCESS_EXIT = 73
-TRUSTED_TEST_RECEIPT_SCHEMA_VERSION = 2
+TRUSTED_TEST_RECEIPT_SCHEMA_VERSION = 3
 TRUSTED_TEST_RECEIPT_SENTINEL = "REQUIRED_CI_TRUSTED_TESTS_COMPLETED:"
+TRUSTED_STRUCTURE_VALIDATOR_FLAG = "--validate-required-ci-structure"
 TRUSTED_TEST_SUPERVISOR_FLAG = "--run-trusted-tests"
 TRUSTED_TEST_CHILD_FLAG = "--run-trusted-test-suite"
+LOCAL_SUPERVISOR_ISOLATION_ENV = (
+    REQUIRED_CI_ISOLATION_MODE_ENV,
+    "REQUIRED_CI_INTERNAL_ISOLATION_UID",
+    "REQUIRED_CI_INTERNAL_ISOLATION_GID",
+    "REQUIRED_CI_INTERNAL_ISOLATION_LOCK_FD",
+    "REQUIRED_CI_INTERNAL_ISOLATION_REGISTRY",
+    "REQUIRED_CI_INTERNAL_ISOLATION_REGISTRY_TOKEN",
+)
+
+
+@contextlib.contextmanager
+def _local_nonstrict_supervisor_environment() -> Iterator[None]:
+    previous = {
+        key: os.environ[key]
+        for key in LOCAL_SUPERVISOR_ISOLATION_ENV
+        if key in os.environ
+    }
+    try:
+        for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+            os.environ.pop(key, None)
+        yield
+    finally:
+        for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+            os.environ.pop(key, None)
+        os.environ.update(previous)
+
+
 REPOSITORY_GUARD = (
     "      - name: Reject unexpected repository\n"
     f"        if: ${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}\n"
@@ -80,9 +141,13 @@ TRUSTED_CHECKOUT_INPUTS = {
     "path": ".required-ci",
     "persist-credentials": "false",
 }
-TRUSTED_RUNTIME_ENV = {
+TRUSTED_VALIDATOR_ENV = {
     REQUIRED_CI_CANDIDATE_ROOT_ENV: "${{ github.workspace }}/.candidate",
     REQUIRED_CI_CANDIDATE_SHA_ENV: "${{ github.sha }}",
+}
+TRUSTED_RUNTIME_ENV = {
+    **TRUSTED_VALIDATOR_ENV,
+    REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE,
 }
 CANDIDATE_COMPILE_COMMAND = (
     'python3 -I -X pycache_prefix="$RUNNER_TEMP/required-ci-pycache" '
@@ -94,7 +159,7 @@ CANDIDATE_COMPILE_COMMAND = (
 )
 TRUSTED_VALIDATOR_COMMAND = (
     'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
-    'test_required_ci_workflow.py"'
+    f'test_required_ci_workflow.py" {TRUSTED_STRUCTURE_VALIDATOR_FLAG}'
 )
 TRUSTED_TEST_SUPERVISOR_COMMAND = (
     'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
@@ -137,6 +202,7 @@ TRUSTED_TEST_SUPERVISOR_STEP = (
     "        env:\n"
     "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
     "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n"
+    "          REQUIRED_CI_ISOLATION_MODE: sudo-setpriv-v1\n"
     "        run: |\n"
     f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
 )
@@ -202,7 +268,7 @@ def _direct_test_inventory(repo_root: Path, description: str) -> list[dict[str, 
     if resolved_repo_root != repo_root:
         raise AssertionError(f"{description} repository root must not use symlinks")
 
-    tests_root = resolved_repo_root / CANDIDATE_TESTS_RELATIVE_PATH
+    tests_root = distribution_tests_root(resolved_repo_root)
     if tests_root.is_symlink():
         raise AssertionError(f"{description} test root must not be a symlink")
     try:
@@ -406,7 +472,8 @@ def _assert_candidate_absent_from_sys_path(candidate_root: Path) -> None:
 
 
 def _trusted_test_source_manifest(repo_root: Path) -> dict[str, str]:
-    tests_root = repo_root.resolve(strict=True) / CANDIDATE_TESTS_RELATIVE_PATH
+    resolved_repo_root = repo_root.resolve(strict=True)
+    tests_root = distribution_tests_root(resolved_repo_root)
     support_path = tests_root / "required_ci_candidate.py"
     paths = sorted(tests_root.glob("test_*.py")) + [support_path]
     manifest: dict[str, str] = {}
@@ -419,12 +486,14 @@ def _trusted_test_source_manifest(repo_root: Path) -> dict[str, str]:
             raise AssertionError("trusted test source cannot be read") from error
         if not path.is_file() or path.is_symlink() or resolved != path:
             raise AssertionError("trusted test source must be an ordinary file")
-        relative = path.relative_to(repo_root).as_posix()
+        relative = path.relative_to(resolved_repo_root).as_posix()
         manifest[relative] = hashlib.sha256(source).hexdigest()
     if len(manifest) != len(paths):
         raise AssertionError("trusted test source inventory is duplicated")
     support_relative = (
-        CANDIDATE_TESTS_RELATIVE_PATH / "required_ci_candidate.py"
+        TRUSTED_CONTENT_RELATIVE_ROOT
+        / CANDIDATE_TESTS_RELATIVE_PATH
+        / "required_ci_candidate.py"
     ).as_posix()
     if manifest[support_relative] != TRUSTED_CANDIDATE_SUPPORT_SHA256:
         raise AssertionError("trusted candidate support does not match loaded bytes")
@@ -434,11 +503,12 @@ def _trusted_test_source_manifest(repo_root: Path) -> dict[str, str]:
 def _trusted_test_suite_receipt(
     trusted_repo_root: Path, candidate_root: Path
 ) -> dict[str, object]:
+    _CANDIDATE_SUPPORT.strict_isolation_platform_preflight()
     trusted_inventory = _direct_test_inventory(trusted_repo_root, "trusted")
     trusted_source_sha256 = _trusted_test_source_manifest(trusted_repo_root)
     expected_test_ids = _inventory_test_ids(trusted_inventory)
     trusted_tests_root = (
-        trusted_repo_root.resolve(strict=True) / CANDIDATE_TESTS_RELATIVE_PATH
+        distribution_tests_root(trusted_repo_root.resolve(strict=True))
     )
     _assert_candidate_absent_from_sys_path(candidate_root)
     candidate_sha, require_clean = _CANDIDATE_SUPPORT.expected_candidate_sha(
@@ -573,9 +643,31 @@ def _validated_trusted_child_receipt(
     return receipt
 
 
+def _close_and_verify_trusted_isolation(
+    isolation_chain_registry: Mapping[str, object],
+) -> None:
+    cleanup_failures: list[str] = []
+    try:
+        _CANDIDATE_SUPPORT.close_trusted_isolation_chains(
+            isolation_chain_registry
+        )
+    except BaseException as error:
+        cleanup_failures.append(f"registry cleanup: {error}")
+    try:
+        _CANDIDATE_SUPPORT.assert_candidate_isolation_quiescent()
+    except BaseException as error:
+        cleanup_failures.append(f"candidate UID proof: {error}")
+    if cleanup_failures:
+        raise AssertionError(
+            "trusted isolation cleanup was incomplete: "
+            + "; ".join(cleanup_failures)
+        )
+
+
 def supervise_trusted_required_ci_tests(
     trusted_repo_root: Path, candidate_root: Path
 ) -> dict[str, object]:
+    _CANDIDATE_SUPPORT.strict_isolation_platform_preflight()
     _assert_candidate_absent_from_sys_path(candidate_root)
     trusted_inventory = _direct_test_inventory(trusted_repo_root, "trusted")
     trusted_source_sha256 = _trusted_test_source_manifest(trusted_repo_root)
@@ -597,31 +689,52 @@ def supervise_trusted_required_ci_tests(
         candidate_root.resolve(strict=True)
     )
     child_environment[REQUIRED_CI_CANDIDATE_SHA_ENV] = candidate_sha
-    trusted_supervisor = Path(__file__).resolve(strict=True)
+    isolation_chain_registry = (
+        _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+    )
     try:
-        trusted_supervisor_source = trusted_supervisor.read_bytes()
-    except OSError as error:
-        raise AssertionError("trusted candidate test supervisor cannot be read") from error
-    try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                str(trusted_supervisor),
-                TRUSTED_TEST_CHILD_FLAG,
-                str(trusted_repo_root.resolve(strict=True)),
-            ],
-            cwd=trusted_repo_root.resolve(strict=True),
-            env=child_environment,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=TRUSTED_TEST_SUITE_TIMEOUT_SECONDS,
+        registry_environment = isolation_chain_registry["environment"]
+        if not isinstance(registry_environment, dict):
+            raise AssertionError("trusted isolation chain registry is malformed")
+        child_environment.update(registry_environment)
+        child_environment.update(
+            _CANDIDATE_SUPPORT.trusted_isolation_child_environment()
         )
-    except subprocess.TimeoutExpired as error:
-        raise AssertionError(
-            "trusted Required CI tests did not complete before the fixed timeout"
-        ) from error
+        isolation_pass_fds = (
+            _CANDIDATE_SUPPORT.trusted_isolation_child_pass_fds()
+        )
+        trusted_supervisor = Path(__file__).resolve(strict=True)
+        try:
+            trusted_supervisor_source = trusted_supervisor.read_bytes()
+        except OSError as error:
+            raise AssertionError(
+                "trusted candidate test supervisor cannot be read"
+            ) from error
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    str(trusted_supervisor),
+                    TRUSTED_TEST_CHILD_FLAG,
+                    str(trusted_repo_root.resolve(strict=True)),
+                ],
+                cwd=trusted_repo_root.resolve(strict=True),
+                env=child_environment,
+                pass_fds=isolation_pass_fds,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=TRUSTED_TEST_SUITE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(
+                "trusted Required CI tests did not complete before the fixed timeout"
+            ) from error
+    finally:
+        _close_and_verify_trusted_isolation(isolation_chain_registry)
     receipt = _validated_trusted_child_receipt(
         completed,
         trusted_inventory,
@@ -656,8 +769,17 @@ def supervise_trusted_required_ci_tests(
     return receipt
 
 
+def _require_strict_workflow_mode() -> None:
+    if os.environ.get(REQUIRED_CI_ISOLATION_MODE_ENV) != REQUIRED_CI_ISOLATION_MODE:
+        raise AssertionError(
+            "trusted Required CI functional mode requires exact strict isolation"
+        )
+
+
 def _trusted_test_child_main(trusted_repo_root_value: str) -> int:
     try:
+        if os.environ.get(REQUIRED_CI_ISOLATION_MODE_ENV) is not None:
+            _require_strict_workflow_mode()
         trusted_repo_root = Path(trusted_repo_root_value)
         if (
             not trusted_repo_root.is_absolute()
@@ -676,6 +798,7 @@ def _trusted_test_child_main(trusted_repo_root_value: str) -> int:
 
 def _trusted_test_supervisor_main() -> int:
     try:
+        _require_strict_workflow_mode()
         receipt = supervise_trusted_required_ci_tests(TRUSTED_REPO_ROOT, REPO_ROOT)
     except BaseException as error:
         message = _bounded_failure_text(f"{type(error).__name__}: {error}")
@@ -1435,7 +1558,7 @@ def _validate_test_job(
         "validator step name",
     )
     _require_exact_mapping(
-        validator_step["env"], TRUSTED_RUNTIME_ENV, "validator environment"
+        validator_step["env"], TRUSTED_VALIDATOR_ENV, "validator environment"
     )
     _require_run_block(
         lines,
@@ -1632,6 +1755,11 @@ def validate_required_ci_repository(repo_root: Path) -> list[str]:
             "candidate repository must not contain another Required CI caller"
         )
     return checkouts
+
+
+def _trusted_structure_validator_main() -> int:
+    validate_required_ci_repository(REPO_ROOT)
+    return 0
 
 
 class MappingPairParsingTests(unittest.TestCase):
@@ -2095,7 +2223,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
         workflow = self.required_workflow()
         candidate_validator_command = (
             'python3 -I "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/'
-            'tests/test_required_ci_workflow.py"'
+            f'tests/test_required_ci_workflow.py" {TRUSTED_STRUCTURE_VALIDATOR_FLAG}'
         )
         fixtures = {
             "compile lacks isolated mode": workflow.replace(
@@ -2118,7 +2246,8 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             ),
             "validator uses relative path": workflow.replace(
                 TRUSTED_VALIDATOR_COMMAND,
-                "python3 -I skills/waited-delivery/tests/test_required_ci_workflow.py",
+                "python3 -I skills/waited-delivery/tests/test_required_ci_workflow.py "
+                f"{TRUSTED_STRUCTURE_VALIDATOR_FLAG}",
                 1,
             ),
             "validator candidate root env is missing": workflow.replace(
@@ -2141,6 +2270,12 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             "validator candidate SHA env is relaxed": workflow.replace(
                 "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n",
                 "          REQUIRED_CI_CANDIDATE_SHA: ${{ job.workflow_sha }}\n",
+                1,
+            ),
+            "validator isolation mode is unexpectedly enabled": workflow.replace(
+                "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n",
+                "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n"
+                "          REQUIRED_CI_ISOLATION_MODE: sudo-setpriv-v1\n",
                 1,
             ),
             "validator environment has an extra key": workflow.replace(
@@ -2246,6 +2381,24 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                 ),
                 1,
             ),
+            "candidate isolation mode is missing": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_STEP,
+                TRUSTED_TEST_SUPERVISOR_STEP.replace(
+                    "          REQUIRED_CI_ISOLATION_MODE: sudo-setpriv-v1\n",
+                    "",
+                    1,
+                ),
+                1,
+            ),
+            "candidate isolation mode is relaxed": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_STEP,
+                TRUSTED_TEST_SUPERVISOR_STEP.replace(
+                    "          REQUIRED_CI_ISOLATION_MODE: sudo-setpriv-v1\n",
+                    "          REQUIRED_CI_ISOLATION_MODE: local\n",
+                    1,
+                ),
+                1,
+            ),
             "candidate root environment adds PYTHONPATH": secure_workflow.replace(
                 TRUSTED_TEST_SUPERVISOR_STEP,
                 TRUSTED_TEST_SUPERVISOR_STEP.replace(
@@ -2278,7 +2431,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
         secure_workflow = self.required_workflow()
         candidate_validator_command = (
             'python3 -I "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/'
-            'tests/test_required_ci_workflow.py"'
+            f'tests/test_required_ci_workflow.py" {TRUSTED_STRUCTURE_VALIDATOR_FLAG}'
         )
         insecure_workflow = secure_workflow.replace(
             TRUSTED_VALIDATOR_COMMAND, candidate_validator_command, 1
@@ -2515,8 +2668,25 @@ class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
 
 class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     @staticmethod
+    def close_retained_acquisition_descriptors() -> None:
+        session = _CANDIDATE_SUPPORT._STRICT_SESSION
+        if not isinstance(session, dict):
+            return
+        for name in ("acquisition_root_fd", "acquisition_parent_fd"):
+            descriptor = session.get(name)
+            if type(descriptor) is int:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    @staticmethod
     def write_test_module(repo_root: Path, name: str, content: str) -> None:
-        path = repo_root / "skills/waited-delivery/tests" / name
+        path = (
+            distribution_content_root(repo_root)
+            / "skills/waited-delivery/tests"
+            / name
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
@@ -2540,16 +2710,51 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "test_required.py",
             self.required_module(),
         )
-        (candidate_root / "skills/waited-delivery/tests").mkdir(parents=True)
-        trusted_support = trusted_root / CANDIDATE_TESTS_RELATIVE_PATH / (
+        (
+            distribution_content_root(candidate_root)
+            / "skills/waited-delivery/tests"
+        ).mkdir(parents=True)
+        trusted_support = distribution_tests_root(trusted_root) / (
             "required_ci_candidate.py"
         )
         shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, trusted_support)
-        scripts_root = candidate_root / "skills/waited-delivery/scripts"
+        scripts_root = (
+            distribution_content_root(candidate_root)
+            / "skills/waited-delivery/scripts"
+        )
         scripts_root.mkdir(parents=True)
         for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS:
-            (candidate_root / relative_path).write_text("pass\n", encoding="utf-8")
+            (distribution_content_root(candidate_root) / relative_path).write_text(
+                "pass\n", encoding="utf-8"
+            )
         return trusted_root, candidate_root
+
+    @staticmethod
+    def load_candidate_support(path: Path, module_name: str):
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise AssertionError("candidate support fixture cannot be loaded")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def prepare_private_candidate_checkout(
+        self, root: Path
+    ) -> tuple[Path, Path]:
+        checkout_root = root.resolve(strict=True)
+        content_root = checkout_root / "personal_codex"
+        support_path = (
+            content_root
+            / "skills/waited-delivery/tests/required_ci_candidate.py"
+        )
+        support_path.parent.mkdir(parents=True)
+        shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, support_path)
+        for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS:
+            script_path = content_root / relative_path
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text("pass\n", encoding="utf-8")
+        return content_root, support_path
 
     def initialize_candidate_checkout(self, candidate_root: Path) -> str:
         commands = (
@@ -2611,9 +2816,4970 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertRegex(candidate_sha, r"\A[0-9a-f]{40}\Z")
         return candidate_sha
 
+    def test_private_local_binding_uses_git_checkout_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkout_root = Path(temporary_directory).resolve(strict=True)
+            _, support_path = self.prepare_private_candidate_checkout(checkout_root)
+            candidate_sha = self.initialize_candidate_checkout(checkout_root)
+            support = self.load_candidate_support(
+                support_path, "required_ci_candidate_private_local"
+            )
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop(REQUIRED_CI_CANDIDATE_ROOT_ENV, None)
+                os.environ.pop(REQUIRED_CI_CANDIDATE_SHA_ENV, None)
+                os.environ.pop(REQUIRED_CI_ISOLATION_MODE_ENV, None)
+                self.assertEqual(
+                    support.candidate_repository_root(), checkout_root
+                )
+                binding = support.candidate_checkout_binding(
+                    checkout_root, candidate_sha, require_clean=False
+                )
+
+        self.assertEqual(binding["candidate_root"], str(checkout_root))
+        self.assertEqual(binding["candidate_distribution_profile"], "private")
+        self.assertEqual(
+            sorted(binding["candidate_script_sha256"]),
+            sorted(
+                f"personal_codex/{path.as_posix()}"
+                for path in support.CANDIDATE_SCRIPT_RELATIVE_PATHS
+            ),
+        )
+
+    def test_private_required_ci_binding_uses_distribution_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            trusted_root = root / ".trusted-required-ci"
+            candidate_root = root / ".candidate"
+            trusted_root.mkdir()
+            candidate_root.mkdir()
+            _, support_path = self.prepare_private_candidate_checkout(trusted_root)
+            self.prepare_private_candidate_checkout(candidate_root)
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            support = self.load_candidate_support(
+                support_path, "required_ci_candidate_private_split"
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                os.environ.pop(REQUIRED_CI_ISOLATION_MODE_ENV, None)
+                binding = support.candidate_checkout_binding(
+                    candidate_root, candidate_sha, require_clean=True
+                )
+                adapter = support.candidate_script(
+                    "waited_delivery_hook_adapter.py"
+                )
+
+        self.assertEqual(binding["candidate_root"], str(candidate_root))
+        self.assertEqual(binding["candidate_distribution_profile"], "private")
+        self.assertEqual(
+            adapter,
+            candidate_root
+            / "personal_codex/skills/waited-delivery/scripts/"
+            "waited_delivery_hook_adapter.py",
+        )
+
+    def test_strict_primitive_accepts_an_immutable_root_owned_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "python3.12"
+            target.write_text("binary", encoding="utf-8")
+            link = root / "python3"
+            link.symlink_to(target.name)
+            root_owned_file = mock.Mock(
+                st_mode=stat.S_IFREG | 0o755,
+                st_uid=0,
+            )
+            root_owned_directory = mock.Mock(
+                st_mode=stat.S_IFDIR | 0o755,
+                st_uid=0,
+            )
+            root_owned_symlink = mock.Mock(
+                st_mode=stat.S_IFLNK | 0o777,
+                st_uid=0,
+            )
+
+            def fake_lstat(selected: Path):
+                selected_path = Path(selected)
+                if selected_path.name == link.name:
+                    return root_owned_symlink
+                if selected_path.name == target.name:
+                    return root_owned_file
+                return root_owned_directory
+
+            with mock.patch.object(
+                Path, "lstat", autospec=True, side_effect=fake_lstat
+            ), mock.patch.object(Path, "stat", return_value=root_owned_file):
+                _CANDIDATE_SUPPORT._validate_strict_primitive(
+                    link, "Noble Python symlink"
+                )
+
+    def test_candidate_environment_never_trusts_every_git_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            environment = _CANDIDATE_SUPPORT._closed_candidate_environment(
+                {}, home=root, temporary_root=root
+            )
+
+        self.assertNotIn("*", environment.values())
+
+    def test_strict_non_linux_preflight_runs_before_git_or_candidate_popen(
+        self,
+    ) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE},
+            clear=False,
+        ), mock.patch.object(sys, "platform", "darwin"), mock.patch.object(
+            subprocess, "run"
+        ) as run_process, mock.patch.object(
+            subprocess, "Popen"
+        ) as popen_process:
+            with self.assertRaisesRegex(
+                AssertionError, "requires Linux procfs before any subprocess"
+            ):
+                _CANDIDATE_SUPPORT.run_candidate_python(
+                    _CANDIDATE_SUPPORT.candidate_script(
+                        "waited_delivery_runner.py"
+                    )
+                )
+
+        run_process.assert_not_called()
+        popen_process.assert_not_called()
+
+    def test_pidfd_syscall_probe_fails_before_any_subprocess(self) -> None:
+        previous_validated = _CANDIDATE_SUPPORT._STRICT_PLATFORM_VALIDATED
+        _CANDIDATE_SUPPORT._STRICT_PLATFORM_VALIDATED = False
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE},
+                clear=False,
+            ), mock.patch.object(sys, "platform", "linux"), mock.patch.object(
+                Path, "is_file", return_value=True
+            ), mock.patch.object(
+                os,
+                "pidfd_open",
+                side_effect=PermissionError("injected pidfd denial"),
+                create=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.signal, "pidfd_send_signal", create=True
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_validate_strict_primitive"
+            ) as validate_primitive, mock.patch.object(
+                subprocess, "run"
+            ) as run_process, mock.patch.object(
+                subprocess, "Popen"
+            ) as popen_process:
+                with self.assertRaisesRegex(
+                    AssertionError, "cannot use pidfd signaling"
+                ):
+                    _CANDIDATE_SUPPORT.strict_isolation_platform_preflight()
+        finally:
+            _CANDIDATE_SUPPORT._STRICT_PLATFORM_VALIDATED = previous_validated
+
+        validate_primitive.assert_not_called()
+        run_process.assert_not_called()
+        popen_process.assert_not_called()
+
+    def test_root_controller_reprobes_pidfd_before_first_child_popen(self) -> None:
+        source = inspect.getsource(_CANDIDATE_SUPPORT._root_controller_main)
+
+        self.assertLess(
+            source.index("_probe_pidfd_capability()"),
+            source.index("subprocess.Popen("),
+        )
+
+    def test_root_controller_cleanup_is_mandatory_on_every_exit(self) -> None:
+        controller_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_controller_main
+        )
+        outer_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._invoke_strict_controller
+        )
+        registered_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
+        )
+        cleanup_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._invoke_registered_session_cleanup
+        )
+        self.assertIn("finally:", controller_source)
+        self.assertIn("_root_close_candidate_realm", controller_source)
+        self.assertIn("_run_registered_sudo", outer_source)
+        self.assertIn("finally:", registered_source)
+        self.assertIn("_recover_registered_entry", registered_source)
+        self.assertIn("recovery_broker=True", cleanup_source)
+        self.assertIn("--isolation-cleanup", cleanup_source)
+
+    def test_sudo_monitor_topology_uses_a_root_identity_handshake(self) -> None:
+        binder_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._bind_root_controller_parent
+        )
+        controller_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_controller_main
+        )
+        outer_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._invoke_strict_controller
+        )
+        cleanup_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._invoke_registered_session_cleanup
+        )
+        cleanup_main_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_cleanup_main
+        )
+
+        self.assertNotIn("expected_parent_pid", binder_source)
+        self.assertNotIn("expected_parent_value", controller_source)
+        self.assertIn("_write_root_controller_handshake", controller_source)
+        self.assertIn('config.get("handshake_path")', controller_source)
+        self.assertIn('"handshake_path"', outer_source)
+        self.assertIn("_run_registered_sudo", outer_source)
+        self.assertIn("str(entry_path)", cleanup_source)
+        self.assertIn("_root_close_registered_host_session", cleanup_main_source)
+        self.assertIn("_root_close_candidate_realm", cleanup_main_source)
+
+    def test_root_cleanup_signals_only_validated_pidfds(self) -> None:
+        candidate_signal_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_signal_identity
+        )
+        root_signal_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_signal_host_identity
+        )
+
+        for source in (candidate_signal_source, root_signal_source):
+            self.assertIn("os.pidfd_open", source)
+            self.assertIn("signal.pidfd_send_signal", source)
+            self.assertNotIn("os.kill(", source)
+
+    def test_trusted_parent_holds_the_candidate_realm_through_child_exit(
+        self,
+    ) -> None:
+        supervisor_source = inspect.getsource(
+            supervise_trusted_required_ci_tests
+        )
+        close_source = inspect.getsource(
+            _close_and_verify_trusted_isolation
+        )
+
+        self.assertIn("trusted_isolation_child_environment", supervisor_source)
+        self.assertIn("pass_fds=", supervisor_source)
+        self.assertIn("finally:", supervisor_source)
+        self.assertIn("_close_and_verify_trusted_isolation", supervisor_source)
+        self.assertIn("assert_candidate_isolation_quiescent", close_source)
+
+    def test_registry_watchdog_replays_on_owner_eof_or_heartbeat_timeout(
+        self,
+    ) -> None:
+        token = "c" * 32
+        registry_token = "d" * 32
+        identity = (123, 456, 123, 123, 123, (os.getuid(),) * 4)
+        session = {
+            "environment": {
+                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV: "/tmp/entries",
+                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV: registry_token,
+            },
+            "watchdog_authorized": True,
+        }
+        for failure_mode in ("eof", "timeout"):
+            with self.subTest(failure_mode=failure_mode):
+                input_stream = mock.Mock()
+                input_stream.fileno.return_value = 42
+                readable = ([42], [], []) if failure_mode == "eof" else ([], [], [])
+                read_result = b"" if failure_mode == "eof" else b"unused"
+                captured = io.StringIO()
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "strict_isolation_platform_preflight",
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_active_strict_session",
+                    return_value=session,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_process_identity",
+                    return_value=identity,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_root_signal_host_identity"
+                ) as signal_parent, mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_watchdog_close_runner_clients"
+                ) as close_clients, mock.patch.object(
+                    _CANDIDATE_SUPPORT, "close_trusted_isolation_chains"
+                ) as close_registry, mock.patch.object(
+                    _CANDIDATE_SUPPORT.select,
+                    "select",
+                    return_value=readable,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.os,
+                    "read",
+                    return_value=read_result,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.sys, "stdin", input_stream
+                ), contextlib.redirect_stdout(captured):
+                    returncode = _CANDIDATE_SUPPORT._registry_watchdog_main(
+                        ("123", "456", "123", "123", token)
+                    )
+
+                self.assertEqual(returncode, 0, captured.getvalue())
+                signal_parent.assert_called_once_with(
+                    identity, _CANDIDATE_SUPPORT.signal.SIGKILL
+                )
+                close_clients.assert_called_once_with(
+                    Path("/tmp/entries"), registry_token
+                )
+                close_registry.assert_called_once_with(session)
+                self.assertIn(
+                    f"{_CANDIDATE_SUPPORT._WATCHDOG_RESULT_PREFIX}",
+                    captured.getvalue(),
+                )
+
+    def test_watchdog_ready_broken_pipe_replays_after_bootstrap_acceptance(
+        self,
+    ) -> None:
+        root = Path("/tmp/required-ci-watchdog-ready-broken-fixture")
+        token = "a" * 32
+        owner = (61001, 777, 42, 61001, 61001, (os.getuid(),) * 4)
+        session = {
+            "watchdog_authorized": True,
+            "environment": {
+                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV: str(root),
+                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV: token,
+            },
+        }
+        gate_read_fd, gate_write_fd = os.pipe()
+        os.write(gate_write_fd, b"G")
+        os.close(gate_write_fd)
+        printed = mock.Mock(
+            side_effect=(BrokenPipeError("injected READY loss"), None)
+        )
+        try:
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_active_strict_session",
+                return_value=session,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                return_value=owner,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_root_signal_host_identity"
+            ) as signal_owner, mock.patch.object(
+                _CANDIDATE_SUPPORT, "_watchdog_close_runner_clients"
+            ) as close_clients, mock.patch.object(
+                _CANDIDATE_SUPPORT, "close_trusted_isolation_chains"
+            ) as close_registry, mock.patch.object(
+                _CANDIDATE_SUPPORT, "print", printed, create=True
+            ):
+                returncode = _CANDIDATE_SUPPORT._registry_watchdog_main(
+                    [
+                        str(owner[0]),
+                        str(owner[1]),
+                        str(owner[3]),
+                        str(owner[4]),
+                        token,
+                        str(gate_read_fd),
+                    ]
+                )
+        finally:
+            try:
+                os.close(gate_read_fd)
+            except OSError:
+                pass
+
+        self.assertEqual(returncode, 1)
+        signal_owner.assert_called_once_with(owner, signal.SIGKILL)
+        close_clients.assert_called_once_with(root, token)
+        close_registry.assert_called_once_with(session)
+
+    def test_registry_watchdog_is_durable_before_registry_acquisition_returns(
+        self,
+    ) -> None:
+        acquire_source = inspect.getsource(
+            _CANDIDATE_SUPPORT.trusted_isolation_chain_registry
+        )
+        initialize_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._initialize_bound_registry_acquisition
+        )
+        watchdog_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._registry_watchdog_main
+        )
+        watchdog_replay_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._registry_watchdog_replay
+        )
+        close_source = inspect.getsource(
+            _CANDIDATE_SUPPORT.close_trusted_isolation_chains
+        )
+
+        self.assertLess(
+            initialize_source.index("_start_registry_watchdog"),
+            initialize_source.index("_active_strict_session"),
+        )
+        self.assertIn(
+            "return _initialize_bound_registry_acquisition", acquire_source
+        )
+        self.assertIn("select.select", watchdog_source)
+        self.assertIn("_STRICT_WATCHDOG_TIMEOUT_SECONDS", watchdog_source)
+        self.assertIn("_registry_watchdog_replay", watchdog_source)
+        self.assertIn("_watchdog_close_runner_clients", watchdog_replay_source)
+        self.assertIn("close_trusted_isolation_chains(session)", watchdog_source)
+        self.assertIn("_close_registry_through_watchdog", close_source)
+
+    def test_watchdog_owner_pid_reuse_skips_signal_but_still_replays(self) -> None:
+        token = "e" * 32
+        registry_token = "f" * 32
+        replacement = (123, 999, 123, 123, 123, (os.getuid(),) * 4)
+        session = {
+            "environment": {
+                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV: "/tmp/entries",
+                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV: registry_token,
+            },
+            "watchdog_authorized": True,
+        }
+        input_stream = mock.Mock()
+        input_stream.fileno.return_value = 42
+        captured = io.StringIO()
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_active_strict_session",
+            return_value=session,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            return_value=replacement,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_root_signal_host_identity"
+        ) as signal_parent, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_watchdog_close_runner_clients"
+        ) as close_clients, mock.patch.object(
+            _CANDIDATE_SUPPORT, "close_trusted_isolation_chains"
+        ) as close_registry, mock.patch.object(
+            _CANDIDATE_SUPPORT.select,
+            "select",
+            return_value=([42], [], []),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os, "read", return_value=b""
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.sys, "stdin", input_stream
+        ), contextlib.redirect_stdout(captured):
+            returncode = _CANDIDATE_SUPPORT._registry_watchdog_main(
+                ("123", "456", "123", "123", token)
+            )
+
+        self.assertEqual(returncode, 0, captured.getvalue())
+        signal_parent.assert_not_called()
+        close_clients.assert_called_once_with(
+            Path("/tmp/entries"), registry_token
+        )
+        close_registry.assert_called_once_with(session)
+
+    def test_watchdog_owner_loss_replay_persists_until_success(self) -> None:
+        parent_identity = (123, 456, 123, 123)
+        session: dict[str, object] = {"root": Path("/tmp/registry")}
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_registry_watchdog_replay",
+            side_effect=(
+                AssertionError("injected first replay failure"),
+                AssertionError("injected second replay failure"),
+                None,
+            ),
+        ) as replay, mock.patch.object(
+            _CANDIDATE_SUPPORT.time, "sleep"
+        ) as sleep:
+            _CANDIDATE_SUPPORT._registry_watchdog_replay_until_complete(
+                parent_identity, session
+            )
+
+        self.assertEqual(replay.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [
+                _CANDIDATE_SUPPORT._STRICT_WATCHDOG_REPLAY_BACKOFF_INITIAL_SECONDS,
+                _CANDIDATE_SUPPORT._STRICT_WATCHDOG_REPLAY_BACKOFF_INITIAL_SECONDS
+                * 2,
+            ],
+        )
+        main_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._registry_watchdog_main
+        )
+        self.assertGreaterEqual(
+            main_source.count("_registry_watchdog_replay_until_complete"), 2
+        )
+
+    def test_watchdog_pidfd_failure_reaps_gated_launch_by_eof(
+        self,
+    ) -> None:
+        real_popen = subprocess.Popen
+
+        class GatedFixtureProcess(real_popen):
+            instances: list["GatedFixtureProcess"] = []
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = 62001
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.returncode: int | None = None
+                self.waited = False
+                self.gate_fd = os.dup(kwargs["pass_fds"][-1])
+                type(self).instances.append(self)
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.waited = True
+                if self.gate_fd >= 0:
+                    os.close(self.gate_fd)
+                    self.gate_fd = -1
+                self.returncode = 0
+                return 0
+
+        session: dict[str, object] = {
+            "controller_path": Path("/tmp/controller.py"),
+            "environment": {},
+            "watchdog_token": "a" * 32,
+        }
+        stderr = io.BytesIO()
+        parent_identity = (
+            os.getpid(),
+            111,
+            os.getpid(),
+            os.getpid(),
+            os.getpid(),
+            (os.getuid(),) * 4,
+        )
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_registry_watchdog_lock_descriptor",
+            return_value=41,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "pipe2",
+            side_effect=lambda _flags: os.pipe(),
+            create=True,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_realm",
+            return_value={"uid": 60000, "gid": 60000},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_minimal_supervisor_environment",
+            return_value={},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            return_value=parent_identity,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.tempfile,
+            "TemporaryFile",
+            return_value=stderr,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess,
+            "Popen",
+            GatedFixtureProcess,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "pidfd_open",
+            side_effect=OSError("injected pidfd exhaustion"),
+            create=True,
+        ):
+            with self.assertRaisesRegex(OSError, "pidfd exhaustion"):
+                _CANDIDATE_SUPPORT._start_registry_watchdog(session)
+
+        self.assertEqual(len(GatedFixtureProcess.instances), 1)
+        process = GatedFixtureProcess.instances[0]
+        self.assertTrue(process.waited)
+        self.assertEqual(process.returncode, 0)
+        self.assertTrue(stderr.closed)
+        self.assertNotIn("watchdog_launch", session)
+        self.assertNotIn("watchdog_process", session)
+
+    def test_watchdog_popen_return_window_backfills_exact_launch_state(
+        self,
+    ) -> None:
+        real_popen = subprocess.Popen
+
+        class GatedFixtureProcess(real_popen):
+            instance: "GatedFixtureProcess | None" = None
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = 62004
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.returncode: int | None = None
+                self.waited = False
+                self.gate_fd = os.dup(kwargs["pass_fds"][-1])
+                type(self).instance = self
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.waited = True
+                if self.gate_fd >= 0:
+                    os.close(self.gate_fd)
+                    self.gate_fd = -1
+                self.returncode = 0
+                return 0
+
+        session: dict[str, object] = {
+            "controller_path": Path("/tmp/controller.py"),
+            "environment": {},
+            "watchdog_token": "d" * 32,
+        }
+        stderr = io.BytesIO()
+        parent_identity = (
+            os.getpid(),
+            111,
+            os.getpid(),
+            os.getpid(),
+            os.getpid(),
+            (os.getuid(),) * 4,
+        )
+        function = _CANDIDATE_SUPPORT._start_registry_watchdog
+        source_lines, source_start = inspect.getsourcelines(function)
+        publication_line = source_start + next(
+            index
+            for index, line in enumerate(source_lines)
+            if 'launch["process"] = process' in line
+        )
+
+        def inject_after_popen(frame, event: str, argument):
+            if (
+                frame.f_code is function.__code__
+                and event == "line"
+                and frame.f_lineno == publication_line
+            ):
+                raise RuntimeError("injected post-Popen publication fault")
+            return inject_after_popen
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_registry_watchdog_lock_descriptor",
+            return_value=41,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "pipe2",
+            side_effect=lambda _flags: os.pipe(),
+            create=True,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_realm",
+            return_value={"uid": 60000, "gid": 60000},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_minimal_supervisor_environment",
+            return_value={},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            return_value=parent_identity,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.tempfile,
+            "TemporaryFile",
+            return_value=stderr,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess,
+            "Popen",
+            GatedFixtureProcess,
+        ):
+            sys.settrace(inject_after_popen)
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError, "post-Popen publication fault"
+                ):
+                    function(session)
+            finally:
+                sys.settrace(None)
+
+        process = GatedFixtureProcess.instance
+        self.assertIsNotNone(process)
+        self.assertTrue(process.waited)
+        self.assertEqual(process.returncode, 0)
+        self.assertTrue(stderr.closed)
+        self.assertNotIn("watchdog_launch", session)
+
+    def test_authorized_watchdog_launch_abort_uses_drain_not_owner_loss(
+        self,
+    ) -> None:
+        real_popen = subprocess.Popen
+
+        class AbortFixtureProcess(real_popen):
+            def __init__(self) -> None:
+                self.pid = 62003
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.returncode = 0
+                return 0
+
+        process = AbortFixtureProcess()
+        identity = (
+            process.pid,
+            222,
+            process.pid,
+            process.pid,
+            process.pid,
+            (os.getuid(),) * 4,
+        )
+        launch = {
+            "process": process,
+            "pidfd": 42,
+            "identity": identity,
+            "stop_event": threading.Event(),
+            "write_lock": threading.Lock(),
+            "heartbeat": None,
+        }
+        token = "e" * 32
+        result = (
+            _CANDIDATE_SUPPORT._WATCHDOG_RESULT_PREFIX
+            + json.dumps({"status": "complete", "token": token})
+            + "\n"
+        ).encode("ascii")
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess,
+            "Popen",
+            AbortFixtureProcess,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            return_value=identity,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.signal,
+            "pidfd_send_signal",
+            create=True,
+        ) as pidfd_signal, mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_read_watchdog_line",
+            return_value=result,
+        ):
+            _CANDIDATE_SUPPORT._drain_authorized_watchdog_launch(
+                launch, token
+            )
+
+        self.assertEqual(process.stdin.getvalue(), b"D\n")
+        self.assertEqual(process.returncode, 0)
+        pidfd_signal.assert_called_once_with(42, 0, None, 0)
+
+    def test_watchdog_gate_release_is_monotonic_before_post_write_fault(
+        self,
+    ) -> None:
+        real_popen = subprocess.Popen
+
+        class GateFixtureProcess(real_popen):
+            instance: "GateFixtureProcess | None" = None
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = 62008
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.returncode: int | None = None
+                self.gate_fd = os.dup(kwargs["pass_fds"][-1])
+                type(self).instance = self
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.returncode = 0
+                return 0
+
+        session: dict[str, object] = {
+            "controller_path": Path("/tmp/controller.py"),
+            "environment": {},
+            "watchdog_token": "d" * 32,
+        }
+        stderr = io.BytesIO()
+        parent_identity = (
+            os.getpid(),
+            111,
+            os.getpid(),
+            os.getpid(),
+            os.getpid(),
+            (os.getuid(),) * 4,
+        )
+        child_identity = (
+            62008,
+            222,
+            62008,
+            62008,
+            62008,
+            (os.getuid(),) * 4,
+        )
+        pidfd_read, pidfd_write = os.pipe()
+        terminate_values: list[bool] = []
+        function = _CANDIDATE_SUPPORT._start_registry_watchdog
+        source_lines, source_start = inspect.getsourcelines(function)
+        post_write_line = source_start + next(
+            index
+            for index, line in enumerate(source_lines)
+            if "os.close(gate_write_fd)" in line
+        )
+
+        def inject_after_gate_write(frame, event: str, argument):
+            if (
+                frame.f_code is function.__code__
+                and event == "line"
+                and frame.f_lineno == post_write_line
+            ):
+                raise RuntimeError("injected post-gate-write fault")
+            return inject_after_gate_write
+
+        def finish_process() -> None:
+            process = GateFixtureProcess.instance
+            self.assertIsNotNone(process)
+            if process.gate_fd >= 0:
+                os.close(process.gate_fd)
+                process.gate_fd = -1
+            process.returncode = 0
+
+        def drain_authorized(
+            _launch: Mapping[str, object], _token: str
+        ) -> None:
+            finish_process()
+
+        def retire(
+            _session: dict[str, object], *, terminate: bool
+        ) -> list[str]:
+            terminate_values.append(terminate)
+            finish_process()
+            return []
+
+        try:
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_registry_watchdog_lock_descriptor",
+                return_value=41,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "pipe2",
+                side_effect=lambda _flags: os.pipe(),
+                create=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_realm",
+                return_value={"uid": 60000, "gid": 60000},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_minimal_supervisor_environment",
+                return_value={},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                side_effect=(parent_identity, child_identity),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.tempfile,
+                "TemporaryFile",
+                return_value=stderr,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.subprocess,
+                "Popen",
+                GateFixtureProcess,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "pidfd_open",
+                return_value=pidfd_read,
+                create=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_drain_authorized_watchdog_launch",
+                side_effect=drain_authorized,
+            ) as drain:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_retire_registry_watchdog_handles",
+                    side_effect=retire,
+                ):
+                    sys.settrace(inject_after_gate_write)
+                    try:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "post-gate-write fault"
+                        ):
+                            function(session)
+                    finally:
+                        sys.settrace(None)
+        finally:
+            os.close(pidfd_read)
+            os.close(pidfd_write)
+            stderr.close()
+
+        drain.assert_called_once()
+        self.assertEqual(terminate_values, [False])
+
+    def test_watchdog_heartbeat_start_failure_stops_published_thread(
+        self,
+    ) -> None:
+        real_popen = subprocess.Popen
+        real_thread = threading.Thread
+
+        class ReadyFixtureProcess(real_popen):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = 62002
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.returncode: int | None = None
+                self.gate_fd = os.dup(kwargs["pass_fds"][-1])
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.gate_fd >= 0:
+                    os.close(self.gate_fd)
+                    self.gate_fd = -1
+                self.returncode = 0
+                return 0
+
+        class FailingHeartbeat(real_thread):
+            instance: "FailingHeartbeat | None" = None
+
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.fixture_args = kwargs.get("args", ())
+                self.fixture_alive = False
+                self.joined = False
+                type(self).instance = self
+
+            def start(self) -> None:
+                self.fixture_alive = True
+                raise RuntimeError("injected heartbeat start failure")
+
+            def is_alive(self) -> bool:
+                return self.fixture_alive
+
+            def join(self, timeout: float | None = None) -> None:
+                self.joined = True
+                self.fixture_alive = False
+
+        session: dict[str, object] = {
+            "controller_path": Path("/tmp/controller.py"),
+            "environment": {},
+            "watchdog_token": "b" * 32,
+        }
+        stderr = io.BytesIO()
+        parent_identity = (
+            os.getpid(),
+            111,
+            os.getpid(),
+            os.getpid(),
+            os.getpid(),
+            (os.getuid(),) * 4,
+        )
+        child_identity = (
+            62002,
+            222,
+            62002,
+            62002,
+            62002,
+            (os.getuid(),) * 4,
+        )
+        pidfd_read, pidfd_write = os.pipe()
+        try:
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_registry_watchdog_lock_descriptor",
+                return_value=41,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "pipe2",
+                side_effect=lambda _flags: os.pipe(),
+                create=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_realm",
+                return_value={"uid": 60000, "gid": 60000},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_minimal_supervisor_environment",
+                return_value={},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                side_effect=(parent_identity, child_identity),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.tempfile,
+                "TemporaryFile",
+                return_value=stderr,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.subprocess,
+                "Popen",
+                ReadyFixtureProcess,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "pidfd_open",
+                return_value=pidfd_read,
+                create=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_read_watchdog_line",
+                return_value=(
+                    f"{_CANDIDATE_SUPPORT._WATCHDOG_READY_PREFIX}"
+                    f"{'b' * 32}\n"
+                ).encode("ascii"),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.threading,
+                "Thread",
+                FailingHeartbeat,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_drain_authorized_watchdog_launch",
+            ) as drain_authorized:
+                with self.assertRaisesRegex(
+                    RuntimeError, "heartbeat start failure"
+                ):
+                    _CANDIDATE_SUPPORT._start_registry_watchdog(session)
+        finally:
+            os.close(pidfd_write)
+
+        heartbeat = FailingHeartbeat.instance
+        self.assertIsNotNone(heartbeat)
+        self.assertTrue(heartbeat.joined)
+        stop_event = heartbeat.fixture_args[1]
+        self.assertIsInstance(stop_event, threading.Event)
+        self.assertTrue(stop_event.is_set())
+        self.assertTrue(stderr.closed)
+        self.assertNotIn("watchdog_launch", session)
+        drain_authorized.assert_called_once()
+
+    def test_watchdog_post_heartbeat_publication_failure_drains_authority(
+        self,
+    ) -> None:
+        real_popen = subprocess.Popen
+
+        class ReadyFixtureProcess(real_popen):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.pid = 62005
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.returncode: int | None = None
+                self.gate_fd = os.dup(kwargs["pass_fds"][-1])
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.gate_fd >= 0:
+                    os.close(self.gate_fd)
+                    self.gate_fd = -1
+                self.returncode = 0
+                return 0
+
+        class FailingSession(dict[str, object]):
+            def update(self, *args: object, **kwargs: object) -> None:
+                values = dict(*args, **kwargs)
+                if "watchdog_process" in values:
+                    raise RuntimeError(
+                        "injected post-heartbeat publication failure"
+                    )
+                super().update(values)
+
+        session: dict[str, object] = FailingSession(
+            {
+                "controller_path": Path("/tmp/controller.py"),
+                "environment": {},
+                "watchdog_token": "f" * 32,
+            }
+        )
+        stderr = io.BytesIO()
+        parent_identity = (
+            os.getpid(),
+            111,
+            os.getpid(),
+            os.getpid(),
+            os.getpid(),
+            (os.getuid(),) * 4,
+        )
+        child_identity = (
+            62005,
+            222,
+            62005,
+            62005,
+            62005,
+            (os.getuid(),) * 4,
+        )
+        pidfd_read, pidfd_write = os.pipe()
+        try:
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_registry_watchdog_lock_descriptor",
+                return_value=41,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "pipe2",
+                side_effect=lambda _flags: os.pipe(),
+                create=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_realm",
+                return_value={"uid": 60000, "gid": 60000},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_minimal_supervisor_environment",
+                return_value={},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                side_effect=(parent_identity, child_identity),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.tempfile,
+                "TemporaryFile",
+                return_value=stderr,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.subprocess,
+                "Popen",
+                ReadyFixtureProcess,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "pidfd_open",
+                return_value=pidfd_read,
+                create=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_read_watchdog_line",
+                return_value=(
+                    f"{_CANDIDATE_SUPPORT._WATCHDOG_READY_PREFIX}"
+                    f"{'f' * 32}\n"
+                ).encode("ascii"),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_drain_authorized_watchdog_launch",
+            ) as drain_authorized:
+                with self.assertRaisesRegex(
+                    RuntimeError, "post-heartbeat publication failure"
+                ):
+                    _CANDIDATE_SUPPORT._start_registry_watchdog(session)
+        finally:
+            os.close(pidfd_write)
+
+        drain_authorized.assert_called_once()
+        self.assertTrue(stderr.closed)
+        self.assertNotIn("watchdog_launch", session)
+        self.assertNotIn("watchdog_process", session)
+
+    def test_watchdog_partial_frame_obeys_monotonic_deadline(self) -> None:
+        stream = mock.Mock()
+        stream.fileno.return_value = 42
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.time,
+            "monotonic",
+            side_effect=(10.0, 10.0, 10.02),
+        ) as monotonic, mock.patch.object(
+            _CANDIDATE_SUPPORT.select,
+            "select",
+            return_value=([42], [], []),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "read",
+            return_value=b"X",
+        ):
+            with self.assertRaisesRegex(AssertionError, "timed out"):
+                _CANDIDATE_SUPPORT._read_watchdog_line(
+                    stream, 0.01, "partial-frame"
+                )
+        self.assertEqual(monotonic.call_count, 3)
+
+    def test_dead_watchdog_does_not_block_owner_close_recovery(self) -> None:
+        root = Path("/tmp/required-ci-dead-watchdog-fixture")
+        session = {
+            "root": root,
+            "watchdog_process": mock.Mock(),
+            "watchdog_authorized": False,
+            "inherited": False,
+        }
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_current_strict_session_unchecked",
+            return_value=session,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_active_strict_session",
+            side_effect=AssertionError("injected dead watchdog health failure"),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_close_registry_through_watchdog"
+        ) as close_watchdog:
+            _CANDIDATE_SUPPORT.close_trusted_isolation_chains(
+                {"root": root}
+            )
+
+        close_watchdog.assert_called_once_with(session)
+
+    def test_owner_session_without_watchdog_fails_health_check(self) -> None:
+        session = {
+            "root": Path("/tmp/required-ci-missing-watchdog-fixture"),
+            "inherited": False,
+            "closed": False,
+            "watchdog_authorized": False,
+        }
+
+        with self.assertRaisesRegex(
+            AssertionError, "watchdog.*state|watchdog.*active"
+        ):
+            _CANDIDATE_SUPPORT._assert_registry_watchdog_alive(session)
+
+        malformed = dict(session)
+        malformed.pop("inherited")
+        with self.assertRaisesRegex(
+            AssertionError, "ownership.*malformed"
+        ):
+            _CANDIDATE_SUPPORT._assert_registry_watchdog_alive(malformed)
+
+    def test_unreaped_watchdog_is_never_restarted_or_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            process = mock.Mock(spec=subprocess.Popen)
+            process.poll.return_value = None
+            process.stdin = mock.Mock()
+            process.stdin.write.side_effect = BrokenPipeError(
+                "injected watchdog control failure"
+            )
+            process.stdout = io.BytesIO()
+            heartbeat = threading.Thread(target=lambda: None)
+            heartbeat.start()
+            heartbeat.join()
+            session = {
+                "root": root,
+                "watchdog_process": process,
+                "watchdog_pidfd": 42,
+                "watchdog_identity": (
+                    123,
+                    456,
+                    123,
+                    123,
+                    123,
+                    (os.getuid(),) * 4,
+                ),
+                "watchdog_stderr": io.BytesIO(),
+                "watchdog_stop": threading.Event(),
+                "watchdog_write_lock": threading.Lock(),
+                "watchdog_failures": [],
+                "watchdog_heartbeat": heartbeat,
+                "watchdog_closing": False,
+                "watchdog_token": "a" * 32,
+            }
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_retire_registry_watchdog_handles",
+                return_value=["watchdog reap: injected timeout"],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_start_registry_watchdog"
+            ) as restart:
+                with self.assertRaisesRegex(
+                    AssertionError, "watchdog close failed"
+                ):
+                    _CANDIDATE_SUPPORT._close_registry_through_watchdog(
+                        session
+                    )
+
+            restart.assert_not_called()
+            self.assertIs(session["watchdog_process"], process)
+            self.assertEqual(session["watchdog_pidfd"], 42)
+
+    def test_terminal_watchdog_cleanup_never_starts_unfenced_successor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            process = mock.Mock(spec=subprocess.Popen)
+            process.poll.return_value = None
+            process.stdin = mock.Mock()
+            process.stdin.write.side_effect = BrokenPipeError(
+                "injected watchdog control failure"
+            )
+            process.stdout = io.BytesIO()
+            heartbeat = threading.Thread(target=lambda: None)
+            heartbeat.start()
+            heartbeat.join()
+            session = {
+                "root": root,
+                "watchdog_process": process,
+                "watchdog_pidfd": 42,
+                "watchdog_identity": (
+                    123,
+                    456,
+                    123,
+                    123,
+                    123,
+                    (os.getuid(),) * 4,
+                ),
+                "watchdog_stderr": io.BytesIO(),
+                "watchdog_stop": threading.Event(),
+                "watchdog_write_lock": threading.Lock(),
+                "watchdog_failures": [],
+                "watchdog_heartbeat": heartbeat,
+                "watchdog_closing": False,
+                "watchdog_token": "a" * 32,
+            }
+
+            def retire(
+                selected: dict[str, object], *, terminate: bool
+            ) -> list[str]:
+                self.assertFalse(terminate)
+                for key in tuple(selected):
+                    if str(key).startswith("watchdog_") and key not in (
+                        "watchdog_authorized",
+                        "watchdog_token",
+                    ):
+                        selected.pop(key, None)
+                return ["watchdog stderr close: injected diagnostic"]
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_retire_registry_watchdog_handles",
+                side_effect=retire,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_start_registry_watchdog"
+            ) as restart:
+                with self.assertRaisesRegex(
+                    AssertionError, "watchdog close failed"
+                ):
+                    _CANDIDATE_SUPPORT._close_registry_through_watchdog(
+                        session, retry=False
+                    )
+
+            restart.assert_not_called()
+
+    def test_owner_close_rejects_missing_watchdog_without_unfenced_restart(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            session = {
+                "root": root,
+                "inherited": False,
+                "watchdog_authorized": False,
+                "closed": False,
+            }
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_current_strict_session_unchecked",
+                return_value=session,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_start_registry_watchdog"
+            ) as restart, mock.patch.object(
+                _CANDIDATE_SUPPORT, "_close_registry_through_watchdog"
+            ) as close_watchdog, mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_close_trusted_isolation_chains_under_gate",
+            ) as synchronous_close:
+                with self.assertRaisesRegex(
+                    AssertionError, "watchdog.*unavailable|watchdog.*missing"
+                ):
+                    _CANDIDATE_SUPPORT.close_trusted_isolation_chains(session)
+
+            restart.assert_not_called()
+            close_watchdog.assert_not_called()
+            synchronous_close.assert_not_called()
+
+    def test_parent_registry_exists_before_backend_or_child_environment(self) -> None:
+        supervisor_source = inspect.getsource(
+            supervise_trusted_required_ci_tests
+        )
+        backend_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._ensure_strict_backend
+        )
+
+        self.assertLess(
+            supervisor_source.index("trusted_isolation_chain_registry"),
+            supervisor_source.index("trusted_isolation_child_environment"),
+        )
+        self.assertLess(
+            backend_source.index("_active_strict_session"),
+            backend_source.index("_run_registered_sudo"),
+        )
+
+    def test_structure_step_does_not_request_strict_mode_without_a_registry(
+        self,
+    ) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/required-ci.yml").read_text(
+            encoding="utf-8"
+        )
+        structure_step = workflow.split(
+            "      - name: Validate Required CI structure\n", 1
+        )[1].split("      - name: Run trusted Required CI tests\n", 1)[0]
+        supervisor_source = inspect.getsource(_trusted_test_supervisor_main)
+        child_source = inspect.getsource(_trusted_test_child_main)
+
+        self.assertNotIn(REQUIRED_CI_ISOLATION_MODE_ENV, structure_step)
+        self.assertIn("_require_strict_workflow_mode", supervisor_source)
+        self.assertIn("_require_strict_workflow_mode", child_source)
+
+    def test_structure_step_uses_a_dedicated_static_validator_entry(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/required-ci.yml").read_text(
+            encoding="utf-8"
+        )
+        structure_step = workflow.split(
+            "      - name: Validate Required CI structure\n", 1
+        )[1].split("      - name: Run trusted Required CI tests\n", 1)[0]
+
+        self.assertIn("--validate-required-ci-structure", structure_step)
+        self.assertNotIn(TRUSTED_TEST_SUPERVISOR_FLAG, structure_step)
+        with mock.patch.object(
+            sys.modules[__name__],
+            "validate_required_ci_repository",
+            return_value=[],
+        ) as validate_repository, mock.patch.object(unittest, "main") as unittest_main:
+            self.assertEqual(_trusted_structure_validator_main(), 0)
+
+        validate_repository.assert_called_once_with(REPO_ROOT)
+        unittest_main.assert_not_called()
+
+    def test_structure_validator_cli_does_not_enter_unittest(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(Path(__file__).resolve(strict=True)),
+                "--validate-required-ci-structure",
+            ],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "")
+
+    def test_production_supervisor_still_requires_exact_strict_mode(self) -> None:
+        captured_stderr = io.StringIO()
+        with _local_nonstrict_supervisor_environment(), mock.patch.object(
+            sys.modules[__name__], "supervise_trusted_required_ci_tests"
+        ) as supervise, contextlib.redirect_stderr(captured_stderr):
+            self.assertEqual(_trusted_test_supervisor_main(), 1)
+
+        supervise.assert_not_called()
+        self.assertIn("requires exact strict isolation", captured_stderr.getvalue())
+
+    def test_registry_acquisition_rejects_noop_watchdog_before_backend_validation(
+        self,
+    ) -> None:
+        previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+        previous_validated = _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED
+        _CANDIDATE_SUPPORT._STRICT_SESSION = None
+        _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = False
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            acquired_root = (
+                Path(temporary_directory).resolve(strict=True) / "registry"
+            )
+            acquired_root.mkdir(mode=0o700)
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_isolation_requested",
+                    return_value=True,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_session_from_environment",
+                    return_value=None,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_realm",
+                    return_value={"uid": 60000, "gid": 60000},
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.tempfile,
+                    "mkdtemp",
+                    return_value=str(acquired_root),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_ensure_strict_backend",
+                    side_effect=AssertionError("injected backend failure"),
+                ) as ensure_backend, mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_start_registry_watchdog",
+                ) as start_watchdog:
+                    with self.assertRaisesRegex(
+                        AssertionError, "abandoned without path mutation"
+                    ):
+                        _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+
+                    start_watchdog.assert_called_once()
+                    ensure_backend.assert_not_called()
+                    self.assertTrue(acquired_root.is_dir())
+                    self.assertIsNone(_CANDIDATE_SUPPORT._STRICT_SESSION)
+                    self.assertEqual(
+                        _CANDIDATE_SUPPORT._ABANDONED_REGISTRY_ACQUISITIONS[-1][
+                            "path"
+                        ],
+                        str(acquired_root),
+                    )
+            finally:
+                self.close_retained_acquisition_descriptors()
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+                _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = previous_validated
+
+    def test_partial_registry_attempt_is_never_reused_or_overwritten(
+        self,
+    ) -> None:
+        previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+        previous_validated = _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED
+        _CANDIDATE_SUPPORT._STRICT_SESSION = None
+        _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = False
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            first_root = root / "registry-first"
+            second_root = root / "registry-second"
+            first_root.mkdir(mode=0o700)
+            second_root.mkdir(mode=0o700)
+            original_write = (
+                _CANDIDATE_SUPPORT._write_registry_acquisition_file_at
+            )
+            injected = False
+
+            def fail_after_first_lock_write(
+                directory_fd: int, name: str, source: bytes, mode: int
+            ) -> None:
+                nonlocal injected
+                original_write(directory_fd, name, source, mode)
+                if name == ".session.lock" and not injected:
+                    injected = True
+                    raise AssertionError("injected setup failure")
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_isolation_requested",
+                    return_value=True,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_session_from_environment",
+                    return_value=None,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_realm",
+                    return_value={"uid": 60000, "gid": 60000},
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.tempfile,
+                    "mkdtemp",
+                    side_effect=[str(first_root), str(second_root)],
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_write_registry_acquisition_file_at",
+                    side_effect=fail_after_first_lock_write,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_start_registry_watchdog",
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_active_strict_session",
+                    side_effect=lambda: _CANDIDATE_SUPPORT._STRICT_SESSION,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "abandoned without path mutation"
+                    ):
+                        _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+
+                    self.assertIsNone(_CANDIDATE_SUPPORT._STRICT_SESSION)
+                    first_lock = first_root / ".session.lock"
+                    first_lock.write_bytes(b"abandoned-sentinel")
+                    resumed = (
+                        _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+                    )
+
+                self.assertEqual(first_lock.read_bytes(), b"abandoned-sentinel")
+                self.assertEqual(resumed["root"], second_root)
+                self.assertTrue((second_root / ".session.lock").is_file())
+            finally:
+                self.close_retained_acquisition_descriptors()
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+                _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = previous_validated
+
+    def test_registry_acquisition_binds_root_before_fd_relative_setup(self) -> None:
+        previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+        previous_validated = _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED
+        _CANDIDATE_SUPPORT._STRICT_SESSION = None
+        _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = False
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry_root = Path(temporary_directory) / "registry"
+            registry_root.mkdir(mode=0o700)
+            actual = registry_root.lstat()
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_isolation_requested",
+                    return_value=True,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "strict_isolation_platform_preflight",
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_session_from_environment",
+                    return_value=None,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_realm",
+                    return_value={"uid": 60000, "gid": 60000},
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.tempfile,
+                    "mkdtemp",
+                    return_value=str(registry_root),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_configure_registry_acquisition_at",
+                    side_effect=AssertionError("injected fd setup failure"),
+                ) as configure:
+                    with self.assertRaisesRegex(
+                        AssertionError, "abandoned without path mutation"
+                    ):
+                        _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+
+                configure.assert_called_once()
+                self.assertTrue(registry_root.is_dir())
+                self.assertEqual(
+                    (registry_root.stat().st_dev, registry_root.stat().st_ino),
+                    (actual.st_dev, actual.st_ino),
+                )
+                self.assertIsNone(_CANDIDATE_SUPPORT._STRICT_SESSION)
+            finally:
+                self.close_retained_acquisition_descriptors()
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+                _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = previous_validated
+
+    def test_registry_acquisition_replacement_retains_both_objects_without_delete(
+        self,
+    ) -> None:
+        previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+        previous_validated = _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED
+        _CANDIDATE_SUPPORT._STRICT_SESSION = None
+        _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = False
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry_root = Path(temporary_directory) / "registry"
+            detached_root = Path(temporary_directory) / "detached-registry"
+            registry_root.mkdir(mode=0o700)
+            bound_identity = registry_root.stat().st_dev, registry_root.stat().st_ino
+            original_configure = (
+                _CANDIDATE_SUPPORT._configure_registry_acquisition_at
+            )
+
+            def replace_after_fd_setup(
+                root_fd: int, *, watchdog_token: str
+            ) -> None:
+                original_configure(root_fd, watchdog_token=watchdog_token)
+                registry_root.rename(detached_root)
+                registry_root.mkdir(mode=0o700)
+                (registry_root / "replacement-marker").write_bytes(b"replacement")
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_isolation_requested",
+                    return_value=True,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "strict_isolation_platform_preflight",
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_session_from_environment",
+                    return_value=None,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_realm",
+                    return_value={"uid": 60000, "gid": 60000},
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.tempfile,
+                    "mkdtemp",
+                    return_value=str(registry_root),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_configure_registry_acquisition_at",
+                    side_effect=replace_after_fd_setup,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "abandoned without path mutation"
+                    ):
+                        _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+
+                self.assertIsNone(_CANDIDATE_SUPPORT._STRICT_SESSION)
+                self.assertTrue(registry_root.is_dir())
+                self.assertTrue(detached_root.is_dir())
+                self.assertNotEqual(registry_root.stat().st_ino, bound_identity[1])
+                self.assertEqual(
+                    (detached_root.stat().st_dev, detached_root.stat().st_ino),
+                    bound_identity,
+                )
+                self.assertEqual(
+                    (registry_root / "replacement-marker").read_bytes(),
+                    b"replacement",
+                )
+                self.assertFalse((registry_root / "entries").exists())
+                self.assertTrue((detached_root / "entries").is_dir())
+            finally:
+                self.close_retained_acquisition_descriptors()
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+                _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = previous_validated
+
+    def test_registry_bind_failure_abandons_old_root_and_retries_fresh(self) -> None:
+        previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+        previous_validated = _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED
+        _CANDIDATE_SUPPORT._STRICT_SESSION = None
+        _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = False
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            first_root = root / "registry-first"
+            second_root = root / "registry-second"
+            first_root.mkdir(mode=0o700)
+            second_root.mkdir(mode=0o700)
+            original_bind = (
+                _CANDIDATE_SUPPORT._bind_empty_registry_acquisition_root
+            )
+            bind_attempt = 0
+
+            def fail_first_bind(path: Path):
+                nonlocal bind_attempt
+                bind_attempt += 1
+                if bind_attempt == 1:
+                    raise OSError("injected descriptor exhaustion")
+                return original_bind(path)
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_isolation_requested",
+                    return_value=True,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "strict_isolation_platform_preflight",
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_session_from_environment",
+                    return_value=None,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_realm",
+                    return_value={"uid": 60000, "gid": 60000},
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.tempfile,
+                    "mkdtemp",
+                    side_effect=[str(first_root), str(second_root)],
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_bind_empty_registry_acquisition_root",
+                    side_effect=fail_first_bind,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_start_registry_watchdog",
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_active_strict_session",
+                    side_effect=lambda: _CANDIDATE_SUPPORT._STRICT_SESSION,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "abandoned without path mutation",
+                    ):
+                        _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+
+                    self.assertIsNone(_CANDIDATE_SUPPORT._STRICT_SESSION)
+                    resumed = (
+                        _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+                    )
+
+                self.assertEqual(bind_attempt, 2)
+                self.assertEqual(resumed["root"], second_root)
+                self.assertEqual(list(first_root.iterdir()), [])
+                self.assertTrue((second_root / ".session.lock").is_file())
+            finally:
+                self.close_retained_acquisition_descriptors()
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+                _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = previous_validated
+
+    def test_registry_acquisition_recovery_never_mutates_abandoned_namespace(
+        self,
+    ) -> None:
+        acquire_source = inspect.getsource(
+            _CANDIDATE_SUPPORT.trusted_isolation_chain_registry
+        )
+        initialize_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._initialize_bound_registry_acquisition
+        )
+        consumer_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._consume_retained_registry_acquisition
+        )
+
+        self.assertLess(
+            initialize_source.index("_start_registry_watchdog"),
+            initialize_source.index("_active_strict_session"),
+        )
+        self.assertIn("_configure_registry_acquisition_at", initialize_source)
+        self.assertNotIn("_resume_registry_acquisition", acquire_source)
+        for forbidden_call in (
+            "_bind_empty_registry_acquisition_root",
+            "os.stat",
+            ".resolve",
+            ".mkdir",
+            "_write_single_link_file",
+            "os.unlink",
+            "os.rmdir",
+            "os.rename",
+            "shutil.rmtree",
+        ):
+            self.assertNotIn(forbidden_call, consumer_source)
+
+    def test_unresolved_watchdog_blocks_fresh_registry_acquisition(self) -> None:
+        previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+        previous_validated = _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED
+        retained = {
+            "root": Path("/tmp/abandoned-registry"),
+            "closed": False,
+            "inherited": False,
+            "watchdog_authorized": False,
+            "acquisition_retained": {
+                "phase": "watchdog-unresolved",
+                "device": 1,
+                "inode": 2,
+            },
+        }
+        _CANDIDATE_SUPPORT._STRICT_SESSION = retained
+        _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = False
+        try:
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_isolation_requested",
+                return_value=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "strict_isolation_platform_preflight",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_retire_registry_watchdog_handles",
+                return_value=["injected unreaped watchdog"],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.tempfile,
+                "mkdtemp",
+            ) as mkdtemp:
+                with self.assertRaisesRegex(
+                    AssertionError, "watchdog is still unresolved"
+                ):
+                    _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+
+            mkdtemp.assert_not_called()
+            self.assertIs(_CANDIDATE_SUPPORT._STRICT_SESSION, retained)
+        finally:
+            _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+            _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = previous_validated
+
+    def test_live_heartbeat_retirement_retains_every_watchdog_handle(self) -> None:
+        class TerminalProcess(subprocess.Popen[bytes]):
+            def __init__(self) -> None:
+                self.pid = 62006
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.returncode = 0
+
+            def poll(self) -> int:
+                return 0
+
+        class StickyHeartbeat(threading.Thread):
+            def __init__(self) -> None:
+                self.join_count = 0
+                self.alive = True
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def join(self, timeout: float | None = None) -> None:
+                self.join_count += 1
+                if self.join_count >= 2:
+                    self.alive = False
+
+        process = TerminalProcess()
+        heartbeat = StickyHeartbeat()
+        stop_event = threading.Event()
+        stderr = io.BytesIO()
+        session: dict[str, object] = {
+            "watchdog_process": process,
+            "watchdog_stderr": stderr,
+            "watchdog_stop": stop_event,
+            "watchdog_write_lock": threading.Lock(),
+            "watchdog_heartbeat": heartbeat,
+            "watchdog_closing": True,
+            "watchdog_token": "a" * 32,
+        }
+
+        first_failures = (
+            _CANDIDATE_SUPPORT._retire_registry_watchdog_handles(
+                session, terminate=True
+            )
+        )
+
+        self.assertEqual(first_failures, ["watchdog heartbeat did not stop"])
+        self.assertTrue(stop_event.is_set())
+        self.assertIs(session["watchdog_process"], process)
+        self.assertIs(session["watchdog_heartbeat"], heartbeat)
+        self.assertIs(session["watchdog_stderr"], stderr)
+        self.assertFalse(process.stdin.closed)
+        self.assertFalse(process.stdout.closed)
+        self.assertFalse(stderr.closed)
+
+        second_failures = (
+            _CANDIDATE_SUPPORT._retire_registry_watchdog_handles(
+                session, terminate=True
+            )
+        )
+
+        self.assertEqual(second_failures, [])
+        self.assertFalse(heartbeat.is_alive())
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(stderr.closed)
+        self.assertNotIn("watchdog_process", session)
+        self.assertNotIn("watchdog_heartbeat", session)
+
+    def test_watchdog_retirement_never_reuses_a_closed_pidfd_number(
+        self,
+    ) -> None:
+        class FailOnceStream:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            def close(self) -> None:
+                self.close_count += 1
+                if self.close_count == 1:
+                    raise OSError("injected stream close failure")
+
+        class TerminalProcess(subprocess.Popen[bytes]):
+            def __init__(self, failing_stream: FailOnceStream) -> None:
+                self.pid = 62007
+                self.stdin = failing_stream
+                self.stdout = io.BytesIO()
+                self.returncode = 0
+
+            def poll(self) -> int:
+                return 0
+
+        pidfd, pidfd_peer = os.pipe()
+        replacement_read: int | None = None
+        replacement_write: int | None = None
+        failing_stream = FailOnceStream()
+        process = TerminalProcess(failing_stream)
+        launch: dict[str, object] = {
+            "process": process,
+            "pidfd": pidfd,
+            "stderr": io.BytesIO(),
+        }
+        session: dict[str, object] = {
+            "watchdog_launch": launch,
+            "watchdog_process": process,
+            "watchdog_pidfd": pidfd,
+            "watchdog_stderr": launch["stderr"],
+            "watchdog_closing": True,
+            "watchdog_token": "a" * 32,
+        }
+        try:
+            first_failures = (
+                _CANDIDATE_SUPPORT._retire_registry_watchdog_handles(
+                    session, terminate=True
+                )
+            )
+            self.assertEqual(
+                first_failures,
+                ["watchdog stdin close: injected stream close failure"],
+            )
+
+            replacement_read, replacement_write = os.pipe()
+            self.assertEqual(replacement_read, pidfd)
+
+            second_failures = (
+                _CANDIDATE_SUPPORT._retire_registry_watchdog_handles(
+                    session, terminate=True
+                )
+            )
+
+            self.assertEqual(second_failures, [])
+            os.fstat(replacement_read)
+            self.assertEqual(failing_stream.close_count, 2)
+        finally:
+            for descriptor in (
+                pidfd_peer,
+                replacement_read,
+                replacement_write,
+            ):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError as error:
+                        if error.errno != errno.EBADF:
+                            raise
+
+    def test_watchdog_pidfd_authority_is_retired_before_close_interrupt(
+        self,
+    ) -> None:
+        class TerminalProcess(subprocess.Popen[bytes]):
+            def __init__(self) -> None:
+                self.pid = 62009
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.returncode = 0
+
+            def poll(self) -> int:
+                return 0
+
+        pidfd, pidfd_peer = os.pipe()
+        replacement_read: int | None = None
+        replacement_write: int | None = None
+        process = TerminalProcess()
+        launch: dict[str, object] = {
+            "process": process,
+            "pidfd": pidfd,
+            "stderr": io.BytesIO(),
+        }
+        session: dict[str, object] = {
+            "watchdog_launch": launch,
+            "watchdog_process": process,
+            "watchdog_pidfd": pidfd,
+            "watchdog_stderr": launch["stderr"],
+            "watchdog_closing": True,
+            "watchdog_token": "a" * 32,
+        }
+        real_close = os.close
+        interrupted = False
+
+        def close_then_interrupt(descriptor: int) -> None:
+            nonlocal interrupted
+            real_close(descriptor)
+            if descriptor == pidfd and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("injected post-close interrupt")
+
+        try:
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "close",
+                side_effect=close_then_interrupt,
+            ):
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt, "post-close interrupt"
+                ):
+                    _CANDIDATE_SUPPORT._retire_registry_watchdog_handles(
+                        session, terminate=True
+                    )
+
+            replacement_read, replacement_write = os.pipe()
+            self.assertEqual(replacement_read, pidfd)
+
+            self.assertEqual(
+                _CANDIDATE_SUPPORT._retire_registry_watchdog_handles(
+                    session, terminate=True
+                ),
+                [],
+            )
+            os.fstat(replacement_read)
+        finally:
+            for descriptor in (
+                pidfd_peer,
+                replacement_read,
+                replacement_write,
+            ):
+                if descriptor is not None:
+                    try:
+                        real_close(descriptor)
+                    except OSError as error:
+                        if error.errno != errno.EBADF:
+                            raise
+
+    def test_supervisor_enters_cleanup_scope_immediately_after_registry_acquire(
+        self,
+    ) -> None:
+        source = inspect.getsource(supervise_trusted_required_ci_tests)
+        post_acquire = source.split(
+            "trusted_isolation_chain_registry()", 1
+        )[1]
+
+        self.assertLess(
+            post_acquire.index("try:"),
+            post_acquire.index('registry_environment ='),
+        )
+
+    def test_execution_snapshot_registers_cleanup_before_first_mutation(
+        self,
+    ) -> None:
+        source = inspect.getsource(_CANDIDATE_SUPPORT._execution_snapshot)
+
+        self.assertIn("_register_trusted_root_chain", source)
+        self.assertLess(
+            source.index("_register_trusted_root_chain"),
+            source.index("_write_single_link_file"),
+        )
+        self.assertLess(
+            source.index("try:"),
+            source.index("_write_single_link_file"),
+        )
+        self.assertIn("_recover_registered_entry", source)
+
+    def test_strict_execution_root_allows_only_runner_and_realm_traversal(
+        self,
+    ) -> None:
+        snapshot_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._execution_snapshot
+        )
+        broker_source = inspect.getsource(_CANDIDATE_SUPPORT._root_tree_main)
+
+        self.assertIn('"own-root"', snapshot_source)
+        self.assertIn('"execution-root"', snapshot_source)
+        self.assertIn("os.getuid()", snapshot_source)
+        self.assertIn('operation == "own-root"', broker_source)
+        self.assertIn("os.fchown(descriptor, owner_uid, owner_gid)", broker_source)
+        self.assertIn("os.fchmod(descriptor, 0o710)", broker_source)
+        self.assertIn("_prepare_isolation_resource_ancestors", snapshot_source)
+        self.assertLess(
+            snapshot_source.index("_prepare_isolation_resource_ancestors"),
+            snapshot_source.index("tempfile.mkdtemp"),
+        )
+
+    def test_durable_deletion_receipt_is_fd_bound_and_runner_readable(self) -> None:
+        reader_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._read_durable_deletion_receipt_file
+        )
+        broker_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_seal_execution_root_main
+        )
+        self.assertIn("os.O_NOFOLLOW", reader_source)
+        self.assertGreaterEqual(reader_source.count("os.fstat"), 2)
+        self.assertIn("os.read", reader_source)
+        self.assertNotIn("read_bytes", reader_source)
+        self.assertIn("metadata.st_gid", reader_source)
+        self.assertIn("0o640", reader_source)
+        self.assertIn("expected_file_group", broker_source)
+        self.assertIn("expected_file_mode=0o640", broker_source)
+
+    def test_incomplete_root_receipt_staging_is_retired_for_tombstone_replay(
+        self,
+    ) -> None:
+        envelopes = (
+            (0, 0o600, b""),
+            (os.getgid(), 0o600, b'{"schema_version"'),
+            (os.getgid(), 0o640, b"not-json"),
+        )
+        for selected_gid, selected_mode, content in envelopes:
+            with self.subTest(
+                gid=selected_gid, mode=oct(selected_mode)
+            ), tempfile.TemporaryDirectory() as temporary_directory:
+                entries = Path(temporary_directory).resolve(strict=True)
+                staged_path = entries / (
+                    f"..chain-{'a' * 32}.delete-{'b' * 32}.json."
+                    f"tmp-{'c' * 32}"
+                )
+                staged_path.write_bytes(content)
+                original_lstat = Path.lstat
+                actual = staged_path.lstat()
+                root_owned_metadata = mock.Mock(
+                    st_mode=stat.S_IFREG | selected_mode,
+                    st_uid=0,
+                    st_gid=selected_gid,
+                    st_nlink=1,
+                    st_size=len(content),
+                    st_dev=actual.st_dev,
+                    st_ino=actual.st_ino,
+                )
+
+                def selected_lstat(path: Path):
+                    if path == staged_path:
+                        return root_owned_metadata
+                    return original_lstat(path)
+
+                with mock.patch.object(
+                    Path, "lstat", selected_lstat
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_read_durable_deletion_receipt_file",
+                    side_effect=AssertionError("injected partial receipt"),
+                ):
+                    _CANDIDATE_SUPPORT._recover_deletion_receipt_staging(
+                        entries
+                    )
+
+                self.assertFalse(staged_path.exists())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            entries = Path(temporary_directory).resolve(strict=True)
+            staged_path = entries / (
+                f"..chain-{'d' * 32}.delete-{'e' * 32}.json."
+                f"tmp-{'f' * 32}"
+            )
+            staged_path.write_bytes(b"runner-owned")
+            original_lstat = Path.lstat
+            actual = staged_path.lstat()
+            unsafe_metadata = mock.Mock(
+                st_mode=stat.S_IFREG | 0o600,
+                st_uid=12345,
+                st_gid=os.getgid(),
+                st_nlink=1,
+                st_size=12,
+                st_dev=actual.st_dev,
+                st_ino=actual.st_ino,
+            )
+
+            def unsafe_lstat(path: Path):
+                if path == staged_path:
+                    return unsafe_metadata
+                return original_lstat(path)
+
+            with mock.patch.object(
+                Path, "lstat", unsafe_lstat
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_read_durable_deletion_receipt_file",
+                side_effect=AssertionError("injected forged receipt"),
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "staging is unsafe"
+                ):
+                    _CANDIDATE_SUPPORT._recover_deletion_receipt_staging(
+                        entries
+                    )
+
+            self.assertTrue(staged_path.is_file())
+
+    def test_complete_receipt_staging_is_never_promoted_as_durable_proof(
+        self,
+    ) -> None:
+        session_id = "a" * 32
+        delete_nonce = "b" * 32
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            entries = Path(temporary_directory).resolve(strict=True)
+            final_path = entries / (
+                f".chain-{session_id}.delete-{delete_nonce}.json"
+            )
+            staged_path = entries / (
+                f".{final_path.name}.tmp-{'c' * 32}"
+            )
+            staged_path.write_bytes(b'{"complete":true}')
+            original_lstat = Path.lstat
+            actual = staged_path.lstat()
+            root_owned_metadata = mock.Mock(
+                st_mode=stat.S_IFREG | 0o640,
+                st_uid=0,
+                st_gid=os.getgid(),
+                st_nlink=1,
+                st_size=actual.st_size,
+                st_dev=actual.st_dev,
+                st_ino=actual.st_ino,
+            )
+
+            def selected_lstat(path: Path):
+                if path == staged_path:
+                    return root_owned_metadata
+                return original_lstat(path)
+
+            with mock.patch.object(
+                Path, "lstat", selected_lstat
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_read_durable_deletion_receipt_file",
+                return_value={
+                    "session_id": session_id,
+                    "delete_nonce": delete_nonce,
+                },
+            ) as read_receipt:
+                _CANDIDATE_SUPPORT._recover_deletion_receipt_staging(entries)
+
+            read_receipt.assert_not_called()
+            self.assertFalse(staged_path.exists())
+            self.assertFalse(final_path.exists())
+
+    def test_all_privileged_launches_use_the_registered_outer_gate(self) -> None:
+        support_source = TRUSTED_CANDIDATE_SUPPORT_PATH.read_text(
+            encoding="utf-8"
+        )
+        command_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._registered_sudo_command
+        )
+        launcher_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._run_registered_sudo
+        )
+        gated_launcher_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
+        )
+
+        self.assertEqual(support_source.count('_STRICT_PRIMITIVES["sudo"]'), 1)
+        self.assertIn('_STRICT_PRIMITIVES["sudo"]', command_source)
+        self.assertNotIn("def _run_sudo", support_source)
+        self.assertIn("_registry_session_gate", launcher_source)
+        self.assertIn("_REGISTERED_SUDO_WRAPPER_SOURCE", gated_launcher_source)
+        self.assertIn("start_new_session=True", gated_launcher_source)
+
+    def test_privileged_tree_changes_are_fd_anchored_and_never_recursive_by_path(
+        self,
+    ) -> None:
+        support_source = TRUSTED_CANDIDATE_SUPPORT_PATH.read_text(encoding="utf-8")
+
+        self.assertNotIn('"-hR"', support_source)
+        self.assertTrue(
+            hasattr(_CANDIDATE_SUPPORT, "_root_fd_tree_operation")
+        )
+        walker_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_fd_tree_operation
+        )
+        self.assertIn("os.O_NOFOLLOW", walker_source)
+        self.assertIn("st_nlink != 1", walker_source)
+        self.assertIn("os.fchown", walker_source)
+        self.assertNotIn("os.chown", walker_source)
+
+    def test_fd_tree_walker_never_changes_a_hardlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "root"
+            root.mkdir()
+            outside = parent / "outside"
+            outside.write_text("outside", encoding="utf-8")
+            alias = root / "alias"
+            os.link(outside, alias)
+            original = outside.stat()
+            descriptor = os.open(
+                root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            try:
+                with mock.patch.object(os, "fchown"), mock.patch.object(
+                    os, "fchmod"
+                ):
+                    with self.assertRaisesRegex(AssertionError, "hardlink"):
+                        _CANDIDATE_SUPPORT._root_fd_tree_operation(
+                            descriptor, os.getuid(), os.getgid(), "fixture-shared"
+                        )
+                    _CANDIDATE_SUPPORT._root_fd_tree_operation(
+                        descriptor, os.getuid(), os.getgid(), "fixture-restore"
+                    )
+            finally:
+                os.close(descriptor)
+
+            self.assertFalse(alias.exists())
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+            final = outside.stat()
+            self.assertEqual(
+                (final.st_dev, final.st_ino, final.st_mode),
+                (original.st_dev, original.st_ino, original.st_mode),
+            )
+
+    def test_fixture_prepare_preflights_all_roots_and_rolls_back_partial_ownership(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve(strict=True)
+            roots = (parent / "first", parent / "second")
+            for root in roots:
+                root.mkdir()
+            previous_roots = dict(_CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS)
+            _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS.clear()
+            for root in roots:
+                metadata = root.lstat()
+                _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS[root] = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                )
+            trace: list[str] = []
+
+            def preflight(root: Path) -> list[Path]:
+                trace.append(f"preflight:{root.name}")
+                return [root]
+
+            def mutate(
+                _controller: Path,
+                operation: str,
+                root: Path,
+                _owner_uid: int,
+                _owner_gid: int,
+                profile: str,
+            ) -> dict[str, object]:
+                self.assertEqual(operation, "own")
+                trace.append(f"{profile}:{root.name}")
+                if profile == "fixture-shared" and root == roots[1]:
+                    raise AssertionError("injected second-root failure")
+                return {"status": "complete"}
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_realm",
+                    return_value={"uid": 60000, "gid": 60000},
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_fixture_tree_paths",
+                    side_effect=preflight,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_root_tree_operation",
+                    side_effect=mutate,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "injected second-root failure"
+                    ):
+                        _CANDIDATE_SUPPORT._prepare_strict_fixture_roots(
+                            parent / "controller.py", roots, None
+                        )
+            finally:
+                _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS.clear()
+                _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS.update(previous_roots)
+
+        self.assertEqual(
+            trace,
+            [
+                "preflight:first",
+                "preflight:second",
+                "fixture-shared:first",
+                "fixture-shared:second",
+                "fixture-restore:second",
+                "fixture-restore:first",
+            ],
+        )
+
+    def test_uid_realm_lock_name_is_persistent_after_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lock_path = Path(temporary_directory) / "uid-60000.lock"
+            lock_file = lock_path.open("a+b")
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            _CANDIDATE_SUPPORT._release_realm_lock(lock_file, lock_path)
+
+            self.assertTrue(lock_path.is_file())
+            replacement = lock_path.open("a+b")
+            try:
+                fcntl.flock(
+                    replacement.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+            finally:
+                replacement.close()
+
+    def test_uid_realm_lock_rejects_a_symlink_without_touching_its_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            target = root / "target"
+            target.write_text("unchanged", encoding="utf-8")
+            lock_path = root / "uid-60000.lock"
+            lock_path.symlink_to(target.name)
+
+            with self.assertRaisesRegex(AssertionError, "lock is unsafe"):
+                _CANDIDATE_SUPPORT._open_realm_lock(lock_path)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+
+    def test_candidate_git_safe_directory_ignores_global_pollution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory).resolve(strict=True)
+            allowed = home / "allowed"
+            allowed.mkdir()
+            (home / ".gitconfig").write_text(
+                "[safe]\n\tdirectory = *\n\tdirectory = /unexpected\n",
+                encoding="utf-8",
+            )
+            environment = _CANDIDATE_SUPPORT._closed_candidate_environment(
+                {},
+                home=home,
+                temporary_root=home,
+                safe_git_directories=(allowed,),
+            )
+            completed = subprocess.run(
+                [
+                    _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                    "config",
+                    "--show-origin",
+                    "--get-all",
+                    "safe.directory",
+                ],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 0)
+        values = [
+            line.split("\t", 1)[1] for line in completed.stdout.splitlines()
+        ]
+        self.assertEqual(values, ["", str(allowed)])
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_ATTR_NOSYSTEM"], "1")
+
+    def test_candidate_git_ignores_global_and_xdg_attributes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            repository = root / "repository"
+            repository.mkdir()
+            xdg = root / "xdg"
+            attributes = xdg / "git/attributes"
+            attributes.parent.mkdir(parents=True)
+            attributes.write_text(
+                "*.py required-ci-poison=set\n", encoding="utf-8"
+            )
+            environment = _CANDIDATE_SUPPORT._candidate_git_environment()
+            environment.update({"HOME": str(root), "XDG_CONFIG_HOME": str(xdg)})
+            initialized = subprocess.run(
+                _CANDIDATE_SUPPORT.candidate_git_argv(repository, "init"),
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            checked = subprocess.run(
+                _CANDIDATE_SUPPORT.candidate_git_argv(
+                    repository,
+                    "check-attr",
+                    "required-ci-poison",
+                    "--",
+                    "candidate.py",
+                ),
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            closed = _CANDIDATE_SUPPORT._closed_candidate_environment(
+                {}, home=root, temporary_root=root
+            )
+
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(
+            checked.stdout.strip(), "candidate.py: required-ci-poison: unspecified"
+        )
+        self.assertIn("core.attributesFile=/dev/null", _CANDIDATE_SUPPORT._GIT_SAFE_ARGUMENTS)
+        count = int(closed["GIT_CONFIG_COUNT"])
+        config_pairs = [
+            (
+                closed[f"GIT_CONFIG_KEY_{index}"],
+                closed[f"GIT_CONFIG_VALUE_{index}"],
+            )
+            for index in range(count)
+        ]
+        self.assertEqual(config_pairs.count(("core.attributesFile", "/dev/null")), 1)
+
+    def test_root_wrapper_is_bound_before_unshare_can_exec(self) -> None:
+        self.assertTrue(hasattr(_CANDIDATE_SUPPORT, "_ROOT_WRAPPER_SOURCE"))
+        wrapper_source = _CANDIDATE_SUPPORT._ROOT_WRAPPER_SOURCE
+        outer_wrapper_source = (
+            _CANDIDATE_SUPPORT._REGISTERED_SUDO_WRAPPER_SOURCE
+        )
+        controller_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_controller_main
+        )
+        registered_sudo_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
+        )
+
+        self.assertIn("PR_SET_PDEATHSIG", wrapper_source)
+        self.assertIn("controller_start_time", wrapper_source)
+        self.assertIn("barrier", wrapper_source)
+        self.assertIn("PR_SET_PDEATHSIG", outer_wrapper_source)
+        self.assertIn("parent_start_time", outer_wrapper_source)
+        self.assertIn("barrier", outer_wrapper_source)
+        self.assertIn("wrapper_pidfd", controller_source)
+        self.assertIn("_write_root_controller_handshake", controller_source)
+        self.assertLess(
+            controller_source.rindex("_write_root_controller_handshake"),
+            controller_source.index("release_wrapper_barrier"),
+        )
+        self.assertLess(
+            registered_sudo_source.index('"outer-bound"'),
+            registered_sudo_source.index('"root-authorized"'),
+        )
+        self.assertLess(
+            registered_sudo_source.index('"root-authorized"'),
+            registered_sudo_source.index("_release_wrapper_barrier"),
+        )
+
+    def test_prebound_outer_marker_is_recoverable_before_outer_binding(self) -> None:
+        registered_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
+        )
+        recovery_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._recover_registered_entry
+        )
+        discovery_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._discover_prepared_outer
+        )
+        wrapper_source = _CANDIDATE_SUPPORT._REGISTERED_SUDO_WRAPPER_SOURCE
+
+        self.assertLess(
+            registered_source.index("outer_marker=outer_marker"),
+            registered_source.index("process = subprocess.Popen("),
+        )
+        self.assertIn("outer_marker = sys.argv[7]", wrapper_source)
+        self.assertLess(
+            recovery_source.index("_discover_prepared_outer"),
+            recovery_source.index('"closing"'),
+        )
+        self.assertIn('process_path / "cmdline"', discovery_source)
+        self.assertIn("identity[0] != identity[4]", discovery_source)
+        self.assertIn("identity[5] != (os.getuid(),) * 4", discovery_source)
+
+    def test_registered_sudo_pipe_failure_replays_published_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entry_path = root / f"chain-{'a' * 32}.json"
+            controller_path = root / "controller.py"
+            session = {
+                "root": root,
+                "entries": root,
+                "controller_path": controller_path,
+                "token": "b" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            trace: list[str] = []
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+
+            def register(*_args: object, **_kwargs: object) -> Path:
+                trace.append("register")
+                return entry_path
+
+            def update(*_args: object, **_kwargs: object) -> dict[str, object]:
+                trace.append("bind-marker")
+                return {}
+
+            def fail_pipe(_flags: int) -> tuple[int, int]:
+                trace.append("pipe")
+                raise OSError("injected pipe acquisition failure")
+
+            def recover(*_args: object, **_kwargs: object) -> None:
+                trace.append("recover")
+
+            identity = (123, 456, 123, 123, 123, (os.getuid(),) * 4)
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_process_identity",
+                    return_value=identity,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_register_trusted_root_chain",
+                    side_effect=register,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_update_trusted_root_chain",
+                    side_effect=update,
+                ), mock.patch.object(
+                    os, "pipe2", side_effect=fail_pipe, create=True
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_recover_registered_entry",
+                    side_effect=recover,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "registered sudo launch failed"
+                    ):
+                        _CANDIDATE_SUPPORT._run_registered_sudo_under_gate(
+                            ["/usr/bin/true"], session_id="a" * 32
+                        )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+        self.assertEqual(trace, ["register", "bind-marker", "pipe", "recover"])
+
+    def test_registered_sudo_post_publish_failure_replays_only_owned_entry(
+        self,
+    ) -> None:
+        for publication_state in ("final-owned", "final-unmarked", "staging"):
+            with self.subTest(publication_state=publication_state), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory).resolve(strict=True)
+                session_id = "a" * 32
+                entry_path = root / f"chain-{session_id}.json"
+                staging_path = root / f".{entry_path.name}.tmp-{'c' * 32}"
+                controller_path = root / "controller.py"
+                session = {
+                    "root": root,
+                    "entries": root,
+                    "controller_path": controller_path,
+                    "token": "b" * 32,
+                    "target_uid": 60000,
+                    "closed": False,
+                    "inherited": True,
+                    "watchdog_authorized": True,
+                }
+                trace: list[str] = []
+                previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+                _CANDIDATE_SUPPORT._STRICT_SESSION = session
+
+                def register(*_args: object, **kwargs: object) -> Path:
+                    trace.append("register")
+                    selected = (
+                        entry_path
+                        if publication_state.startswith("final-")
+                        else staging_path
+                    )
+                    selected.write_text("published", encoding="ascii")
+                    if publication_state == "final-owned":
+                        callback = kwargs.get("published_callback")
+                        self.assertTrue(callable(callback))
+                        callback()
+                    raise AssertionError("injected post-publish failure")
+
+                def matches(*_args: object, **_kwargs: object) -> bool:
+                    trace.append("attempt")
+                    return publication_state == "final-unmarked"
+
+                def recover(*_args: object, **_kwargs: object) -> None:
+                    trace.append("recover")
+
+                identity = (123, 456, 123, 123, 123, (os.getuid(),) * 4)
+                try:
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        return_value=identity,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_register_trusted_root_chain",
+                        side_effect=register,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_recover_registered_entry",
+                        side_effect=recover,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_registered_entry_matches_publication_attempt",
+                        side_effect=matches,
+                        create=True,
+                    ):
+                        with self.assertRaises(AssertionError):
+                            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate(
+                                ["/usr/bin/true"], session_id=session_id
+                            )
+                finally:
+                    _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+                self.assertEqual(
+                    trace,
+                    ["register", "recover"]
+                    if publication_state == "final-owned"
+                    else ["register", "attempt", "recover"]
+                    if publication_state == "final-unmarked"
+                    else ["register", "attempt"],
+                )
+
+    def test_registered_sudo_collision_never_replays_unowned_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            session_id = "a" * 32
+            controller_path = root / "controller.py"
+            session = {
+                "root": root,
+                "entries": root,
+                "controller_path": controller_path,
+                "token": "b" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            identity = (123, 456, 123, 123, 123, (os.getuid(),) * 4)
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=root,
+                    session_id=session_id,
+                )
+                original_bytes = entry_path.read_bytes()
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_process_identity",
+                    return_value=identity,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_recover_registered_entry",
+                ) as recover:
+                    with self.assertRaises(AssertionError):
+                        _CANDIDATE_SUPPORT._run_registered_sudo_under_gate(
+                            ["/usr/bin/true"], session_id=session_id
+                        )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+            self.assertEqual(entry_path.read_bytes(), original_bytes)
+            recover.assert_not_called()
+
+    def test_publication_attempt_nonce_binds_the_exact_final_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            execution_root = root / "execution"
+            execution_root.mkdir()
+            controller_path = root / "controller.py"
+            session = {
+                "root": root,
+                "entries": entries,
+                "controller_path": controller_path,
+                "token": "b" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            publication_nonce = "c" * 32
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                    session_id="a" * 32,
+                    publication_nonce=publication_nonce,
+                )
+                binding = _CANDIDATE_SUPPORT._execution_root_binding(
+                    execution_root
+                )
+                self.assertTrue(
+                    _CANDIDATE_SUPPORT._registered_entry_matches_publication_attempt(
+                        entry_path,
+                        session=session,
+                        publication_nonce=publication_nonce,
+                        execution_root_binding=binding,
+                        cleanup_execution_root=False,
+                    )
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "collided with an unowned entry"
+                ):
+                    _CANDIDATE_SUPPORT._registered_entry_matches_publication_attempt(
+                        entry_path,
+                        session=session,
+                        publication_nonce="d" * 32,
+                        execution_root_binding=binding,
+                        cleanup_execution_root=False,
+                    )
+                document = json.loads(entry_path.read_text(encoding="ascii"))
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+        self.assertEqual(document["publication_nonce"], publication_nonce)
+
+    def test_missing_session_leader_never_signals_numeric_sid_members(self) -> None:
+        outer = (60001, 1234, 60001, 60001)
+        member = (60002, 1235, 60001, 60001, 60001, (0, 0, 0, 0))
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_assert_registered_session_not_reused",
+            return_value=False,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_host_session_inventory",
+            return_value={member[0]: member},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_root_signal_host_identity"
+        ) as signal_identity:
+            with self.assertRaisesRegex(
+                AssertionError, "lost its generation anchor"
+            ):
+                _CANDIDATE_SUPPORT._root_close_registered_host_session(outer)
+
+        signal_identity.assert_not_called()
+
+    def test_reappearing_numeric_sid_after_zero_never_signals(self) -> None:
+        outer = (60001, 1234, 60001, 60001)
+        member = (60002, 1235, 60001, 60001, 60001, (0, 0, 0, 0))
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_assert_registered_session_not_reused",
+            return_value=True,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_host_session_inventory",
+            side_effect=({}, {member[0]: member}),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_root_signal_host_identity"
+        ) as signal_identity, mock.patch.object(time, "sleep"):
+            with self.assertRaisesRegex(
+                AssertionError, "reappeared after zero inventory"
+            ):
+                _CANDIDATE_SUPPORT._root_close_registered_host_session(outer)
+
+        signal_identity.assert_not_called()
+
+    def test_registered_session_anchor_is_never_killed_after_members(self) -> None:
+        outer = (60001, 1234, 60001, 60001)
+        leader = (60001, 1234, 1, 60001, 60001, (0, 0, 0, 0))
+        member = (60002, 1235, 60001, 60001, 60001, (0, 0, 0, 0))
+        inventories = (
+            {leader[0]: leader, member[0]: member},
+            {leader[0]: leader},
+            {},
+            {},
+            {},
+        )
+        signaled: list[tuple[int, int]] = []
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_assert_registered_session_not_reused",
+            return_value=True,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_host_session_inventory",
+            side_effect=inventories,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            return_value=leader,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_root_signal_host_identity",
+            side_effect=lambda identity, selected_signal: signaled.append(
+                (identity[0], selected_signal)
+            ),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_registered_anchor_is_terminal",
+            return_value=True,
+        ), mock.patch.object(time, "sleep"):
+            closed = _CANDIDATE_SUPPORT._root_close_registered_host_session(
+                outer
+            )
+
+        self.assertIn((member[0], signal.SIGKILL), signaled)
+        self.assertNotIn((leader[0], signal.SIGKILL), signaled)
+        self.assertEqual(closed, 1)
+
+    def test_registered_outer_is_a_persistent_subreaper_anchor(self) -> None:
+        source = _CANDIDATE_SUPPORT._REGISTERED_SUDO_WRAPPER_SOURCE
+
+        self.assertIn("PR_SET_CHILD_SUBREAPER", source)
+        self.assertIn("os.fork()", source)
+        self.assertIn("os.waitpid(-1, 0)", source)
+        self.assertIn("PR_SET_PDEATHSIG, 0", source)
+        self.assertLess(source.index("os.fork()"), source.index("os.execve"))
+
+    def test_root_cleanup_drains_target_uid_before_waiting_for_anchor(self) -> None:
+        source = inspect.getsource(_CANDIDATE_SUPPORT._root_cleanup_main)
+
+        self.assertLess(
+            source.index("_root_close_candidate_realm"),
+            source.index("_root_close_registered_host_session"),
+        )
+
+    def test_live_backend_exercises_every_outer_launch_fault_boundary(self) -> None:
+        source = inspect.getsource(_CANDIDATE_SUPPORT._ensure_strict_backend)
+        probe_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
+        )
+        for boundary in (
+            "after-outer-popen",
+            "after-outer-bound",
+            "after-root-authorized",
+            "after-root-authorized-barrier",
+        ):
+            with self.subTest(boundary=boundary):
+                self.assertIn(f'"{boundary}"', source)
+        self.assertIn("signal.SIGKILL", source)
+        self.assertIn("signal.SIGSTOP", source)
+        self.assertIn("_probe_independent_outer_owner_fault", source)
+        self.assertNotIn("_invoke_strict_controller", probe_source)
+
+    def test_outer_fault_probe_uses_an_independent_owner_and_pidfd_only(
+        self,
+    ) -> None:
+        owner_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._outer_owner_fault_probe_main
+        )
+        parent_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
+        )
+        pause_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._pause_at_outer_owner_fault_boundary
+        )
+
+        self.assertIn("trusted_isolation_chain_registry()", owner_source)
+        self.assertLess(
+            owner_source.index('bootstrap != b"G"'),
+            owner_source.index("trusted_isolation_chain_registry()"),
+        )
+        self.assertIn("--outer-owner-fault-probe", parent_source)
+        self.assertIn("start_new_session=True", parent_source)
+        self.assertIn("os.pidfd_open", parent_source)
+        self.assertLess(
+            parent_source.index("owner_pidfd = os.pidfd_open"),
+            parent_source.index('os.write(bootstrap_write_fd, b"G")'),
+        )
+        self.assertIn("_signal_process_pidfd", parent_source)
+        self.assertIn("process.returncode != -signal.SIGKILL", parent_source)
+        self.assertIn("os.read(pause_descriptor, 1)", pause_source)
+        self.assertNotIn("signal.pause", pause_source)
+        self.assertNotIn("_recover_registered_entry", parent_source)
+        self.assertNotIn("close_trusted_isolation_chains", parent_source)
+        self.assertNotIn("os.kill(", parent_source)
+
+    def test_outer_fault_ack_binds_every_recovery_identity(self) -> None:
+        publish_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._publish_outer_owner_fault_ack
+        )
+        validate_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._validate_outer_owner_fault_ack
+        )
+        for field in (
+            '"nonce"',
+            '"boundary"',
+            '"owner"',
+            '"registry_root"',
+            '"entry"',
+            '"outer"',
+            '"watchdog"',
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, publish_source)
+                self.assertIn(field, validate_source)
+        self.assertIn("_load_chain_registry_entry", publish_source)
+        self.assertIn("root_metadata.st_dev", publish_source)
+        self.assertIn("root_metadata.st_ino", publish_source)
+        self.assertIn("watchdog_identity", publish_source)
+        self.assertIn("_chain_registry_lock(entry_path)", publish_source)
+        parent_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
+        )
+        absence_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._wait_exact_registry_root_absent
+        )
+        self.assertIn("os.O_DIRECTORY | os.O_NOFOLLOW", parent_source)
+        self.assertIn("bound_metadata.st_nlink != 0", absence_source)
+
+    def test_registered_wrapper_waits_for_post_gate_continuation_before_sudo(
+        self,
+    ) -> None:
+        source = _CANDIDATE_SUPPORT._REGISTERED_SUDO_WRAPPER_SOURCE
+        compile(source, "<registered-sudo-wrapper>", "exec")
+
+        self.assertIn("continuation_fd", source)
+        self.assertIn("ready_fd", source)
+        self.assertIn("os.isatty", source)
+        self.assertIn('os.open("/dev/tty"', source)
+        self.assertIn("os.write(ready_fd, b\"R\")", source)
+        self.assertIn("continuation = os.read(continuation_fd, 1)", source)
+        self.assertIn("if continuation != b\"C\"", source)
+        self.assertLess(
+            source.index("os.write(ready_fd, b\"R\")"),
+            source.index("continuation = os.read(continuation_fd, 1)"),
+        )
+        self.assertLess(
+            source.index("continuation = os.read(continuation_fd, 1)"),
+            source.index("os.fork()"),
+        )
+
+    def test_outer_fault_registry_disappearance_rejects_path_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry_root = Path(temporary_directory) / "registry"
+            registry_root.mkdir(mode=0o700)
+            metadata = registry_root.lstat()
+            original_identity = (metadata.st_dev, metadata.st_ino)
+            registry_root.rmdir()
+            registry_root.mkdir(mode=0o700)
+
+            with self.assertRaisesRegex(AssertionError, "identity.*changed"):
+                _CANDIDATE_SUPPORT._wait_exact_registry_root_absent(
+                    registry_root,
+                    original_identity,
+                    timeout_seconds=0.05,
+                )
+
+    def test_outer_fault_probe_reaches_real_target_active_boundary(self) -> None:
+        ensure_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._ensure_strict_backend
+        )
+        registered_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
+        )
+        controller_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_controller_main
+        )
+        owner_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._outer_owner_fault_probe_main
+        )
+        parent_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
+        )
+
+        self.assertIn('"after-target-active"', ensure_source)
+        self.assertLess(
+            registered_source.index(
+                "_release_registered_wrapper_continuation"
+            ),
+            registered_source.index("_wait_registered_root_active"),
+        )
+        self.assertLess(
+            registered_source.index("_wait_registered_root_active"),
+            registered_source.index(
+                '"after-target-active"',
+                registered_source.index("_wait_registered_root_active"),
+            ),
+        )
+        self.assertIn("_write_root_controller_handshake", controller_source)
+        self.assertIn("_wait_root_target_active", controller_source)
+        self.assertIn("_publish_root_target_active", controller_source)
+        self.assertIn("active_owner_pidfd", controller_source)
+        self.assertIn("_mark_root_active_completed", controller_source)
+        self.assertIn("_TARGET_ACTIVE_PROBE_SOURCE", owner_source)
+        self.assertIn("_execution_snapshot", owner_source)
+        self.assertIn("_invoke_strict_controller", owner_source)
+        self.assertIn("root_active_pidfds", parent_source)
+        self.assertIn('description="root-active', parent_source)
+        self.assertIn("_assert_outer_owner_sentinel", parent_source)
+        self.assertEqual(
+            parent_source.count("_signal_process_pidfd(owner_pidfd"), 2
+        )
+
+    def test_root_active_ack_requires_exact_full_ancestry(self) -> None:
+        outer = (61000, 100, 61000, 61000)
+        target_uid = 60000
+        nonce = "a" * 32
+        identities = {
+            61001: (61001, 101, 61000, 61001, 61000, (501, 0, 0, 0)),
+            61002: (61002, 102, 61001, 61002, 61000, (0, 0, 0, 0)),
+            61003: (61003, 103, 61002, 61003, 61000, (0, 0, 0, 0)),
+            61004: (
+                61004,
+                104,
+                61003,
+                61004,
+                61004,
+                (target_uid,) * 4,
+            ),
+        }
+        root_handshake = {
+            "schema_version": 2,
+            "phase": "wrapper-bound",
+            "nonce": nonce,
+            "session_id": "b" * 32,
+            "target_uid": target_uid,
+            "controller": [61002, 102, 61002, 61000],
+            "sudo_parent": [61001, 101, 61001, 61000],
+            "wrapper": [61003, 103, 61003, 61000],
+        }
+        document = {
+            "schema_version": 1,
+            "nonce": nonce,
+            "root_handshake": root_handshake,
+            "target_marker": {
+                "schema_version": 1,
+                "nonce": nonce,
+                "uid": target_uid,
+                "gid": target_uid,
+            },
+            "sudo_parent": _CANDIDATE_SUPPORT._process_identity_document(
+                identities[61001]
+            ),
+            "controller": _CANDIDATE_SUPPORT._process_identity_document(
+                identities[61002]
+            ),
+            "wrapper": _CANDIDATE_SUPPORT._process_identity_document(
+                identities[61003]
+            ),
+            "target": _CANDIDATE_SUPPORT._process_identity_document(
+                identities[61004]
+            ),
+        }
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            side_effect=lambda path: identities.get(int(path.name)),
+        ):
+            accepted = _CANDIDATE_SUPPORT._validate_registered_root_active(
+                document,
+                nonce=nonce,
+                outer=outer,
+                target_uid=target_uid,
+                expected_session_id="b" * 32,
+            )
+            forged = dict(document)
+            forged_target = dict(document["target"])
+            forged_target["parent_pid"] = 99999
+            forged["target"] = forged_target
+            with self.assertRaisesRegex(AssertionError, "ancestry"):
+                _CANDIDATE_SUPPORT._validate_registered_root_active(
+                    forged,
+                    nonce=nonce,
+                    outer=outer,
+                    target_uid=target_uid,
+                    expected_session_id="b" * 32,
+                )
+            forged_session = dict(document)
+            forged_handshake = dict(root_handshake)
+            forged_handshake["session_id"] = "c" * 32
+            forged_session["root_handshake"] = forged_handshake
+            with self.assertRaisesRegex(AssertionError, "handshake"):
+                _CANDIDATE_SUPPORT._validate_registered_root_active(
+                    forged_session,
+                    nonce=nonce,
+                    outer=outer,
+                    target_uid=target_uid,
+                    expected_session_id="b" * 32,
+                )
+
+        self.assertEqual(
+            tuple(identity[0] for identity in accepted),
+            (61001, 61002, 61003, 61004),
+        )
+
+    def test_namespace_process_cleanup_never_uses_a_bare_pid_kill(self) -> None:
+        controller_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_controller_main
+        )
+        test_cleanup_source = inspect.getsource(
+            type(self)._terminate_marked_process
+        )
+        pidfd_signal_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._signal_process_pidfd
+        )
+
+        self.assertNotIn("os.kill(process.pid", controller_source)
+        self.assertNotIn("os.kill(", test_cleanup_source)
+        self.assertIn("_signal_process_pidfd", controller_source)
+        self.assertIn("pidfd_send_signal", pidfd_signal_source)
+
+    def test_trusted_parent_closes_registered_root_chains_before_receipt(self) -> None:
+        supervisor_source = inspect.getsource(
+            supervise_trusted_required_ci_tests
+        )
+        close_source = inspect.getsource(
+            _close_and_verify_trusted_isolation
+        )
+
+        self.assertIn("trusted_isolation_chain_registry", supervisor_source)
+        self.assertIn("_close_and_verify_trusted_isolation", supervisor_source)
+        self.assertIn("finally:", supervisor_source)
+        self.assertIn("close_trusted_isolation_chains", close_source)
+        self.assertIn("assert_candidate_isolation_quiescent", close_source)
+        self.assertLess(
+            supervisor_source.index("_close_and_verify_trusted_isolation"),
+            supervisor_source.index("_validated_trusted_child_receipt"),
+        )
+
+    def test_parent_uid_proof_runs_even_when_registry_cleanup_fails(self) -> None:
+        calls: list[str] = []
+
+        def fail_registry(_registry: Mapping[str, object]) -> None:
+            calls.append("registry")
+            raise AssertionError("injected registry cleanup failure")
+
+        def fail_uid_proof() -> None:
+            calls.append("uid")
+            raise AssertionError("injected UID proof failure")
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "close_trusted_isolation_chains",
+            side_effect=fail_registry,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "assert_candidate_isolation_quiescent",
+            side_effect=fail_uid_proof,
+        ):
+            with self.assertRaisesRegex(
+                AssertionError,
+                "registry cleanup.*candidate UID proof",
+            ):
+                _close_and_verify_trusted_isolation({})
+
+        self.assertEqual(calls, ["registry", "uid"])
+
+    def test_chain_registry_entry_remains_registered_until_cleanup_completes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            token = "a" * 32
+            controller_path = root / "controller.py"
+            handshake_path = root / "handshake.json"
+            execution_root = root / "execution"
+            execution_root.mkdir()
+            session = {
+                "root": root,
+                "entries": entries,
+                "controller_path": controller_path,
+                "token": token,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    handshake_path,
+                    60000,
+                    execution_root=execution_root,
+                )
+                prepared = json.loads(entry_path.read_text(encoding="ascii"))
+                self.assertEqual(prepared["schema_version"], 2)
+                self.assertEqual(prepared["state"], "prepared")
+                self.assertEqual(prepared["target_uid"], 60000)
+                self.assertEqual(prepared["handshake_path"], str(handshake_path))
+                outer = [60001, 1, 60001, 60001]
+                _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                    entry_path, ("prepared",), "outer-bound", outer=outer
+                )
+                _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                    entry_path, ("outer-bound",), "root-authorized"
+                )
+                _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                    entry_path, ("root-authorized",), "closing"
+                )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_host_session_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ):
+                    _CANDIDATE_SUPPORT._mark_trusted_root_chain_closed(
+                        entry_path
+                    )
+                closed = json.loads(entry_path.read_text(encoding="ascii"))
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+            self.assertEqual(closed["state"], "closed")
+            self.assertEqual(
+                (entry_path.stat().st_nlink, stat.S_IMODE(entry_path.stat().st_mode)),
+                (1, 0o600),
+            )
+
+    def test_atomic_registry_update_failure_preserves_the_prior_document(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entry_path = root / "chain.json"
+            original = {"schema_version": 2, "state": "prepared"}
+            replacement = {"schema_version": 2, "state": "outer-bound"}
+            _CANDIDATE_SUPPORT._write_chain_registry_entry(
+                entry_path, original, create=True
+            )
+            original_bytes = entry_path.read_bytes()
+
+            with mock.patch.object(
+                os,
+                "replace",
+                side_effect=OSError("injected pre-rename failure"),
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "durable document cannot be written"
+                ):
+                    _CANDIDATE_SUPPORT._write_chain_registry_entry(
+                        entry_path, replacement, create=False
+                    )
+
+            self.assertEqual(entry_path.read_bytes(), original_bytes)
+            self.assertEqual(
+                sorted(path.name for path in root.iterdir()), ["chain.json"]
+            )
+            handshake_source = inspect.getsource(
+                _CANDIDATE_SUPPORT._write_root_controller_handshake
+            )
+            self.assertIn("_atomic_json_document", handshake_source)
+            self.assertNotIn("O_TRUNC", handshake_source)
+
+    def test_atomic_create_reports_ownership_only_after_noreplace_publish(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            path = root / "document.json"
+            trace: list[str] = []
+
+            def publish(
+                source: Path,
+                destination: Path,
+                *,
+                published_callback: object = None,
+            ) -> None:
+                trace.append("publish")
+                os.link(source, destination, follow_symlinks=False)
+                self.assertTrue(callable(published_callback))
+                published_callback()
+                source.unlink()
+
+            def mark_owned() -> None:
+                self.assertTrue(path.is_file())
+                trace.append("owned")
+
+            def fail_directory_fsync(_directory: Path) -> None:
+                trace.append("fsync")
+                raise OSError("injected post-publish fsync failure")
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_rename_noreplace",
+                side_effect=publish,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_fsync_directory",
+                side_effect=fail_directory_fsync,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "durable document cannot be written"
+                ):
+                    _CANDIDATE_SUPPORT._atomic_json_document(
+                        path,
+                        {"value": "published"},
+                        expected_owner=os.getuid(),
+                        create=True,
+                        published_callback=mark_owned,
+                    )
+
+            self.assertEqual(trace, ["publish", "owned", "fsync"])
+            self.assertTrue(path.is_file())
+
+            callback = mock.Mock()
+            second = root / "pre-publish.json"
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_rename_noreplace",
+                side_effect=OSError("injected pre-publish failure"),
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "durable document cannot be written"
+                ):
+                    _CANDIDATE_SUPPORT._atomic_json_document(
+                        second,
+                        {"value": "staged"},
+                        expected_owner=os.getuid(),
+                        create=True,
+                        published_callback=callback,
+                    )
+            callback.assert_not_called()
+            self.assertFalse(second.exists())
+
+            fallback_source = root / "fallback-source.json"
+            fallback_destination = root / "fallback-destination.json"
+            fallback_source.write_text("fallback", encoding="ascii")
+            fallback_owned = mock.Mock()
+            original_unlink = Path.unlink
+
+            def fail_source_unlink(path: Path, *args: object, **kwargs: object) -> None:
+                if path == fallback_source:
+                    raise OSError("injected linked-staging unlink failure")
+                original_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT.sys, "platform", "darwin"
+            ), mock.patch.object(Path, "unlink", fail_source_unlink):
+                with self.assertRaisesRegex(
+                    OSError, "linked-staging unlink failure"
+                ):
+                    _CANDIDATE_SUPPORT._rename_noreplace(
+                        fallback_source,
+                        fallback_destination,
+                        published_callback=fallback_owned,
+                    )
+
+            fallback_owned.assert_called_once_with()
+            self.assertEqual(
+                (fallback_source.stat().st_dev, fallback_source.stat().st_ino),
+                (
+                    fallback_destination.stat().st_dev,
+                    fallback_destination.stat().st_ino,
+                ),
+            )
+
+    def test_execution_snapshot_registration_failure_recovers_only_owned_root(
+        self,
+    ) -> None:
+        for publication_state in ("unpublished", "callback", "final-unmarked"):
+            with self.subTest(publication_state=publication_state), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory).resolve(strict=True)
+                resources = root / "resources"
+                resources.mkdir()
+                session = {
+                    "root": root,
+                    "entries": root,
+                    "resources": resources,
+                    "controller_path": root / "controller.py",
+                    "token": "b" * 32,
+                    "target_uid": 60000,
+                    "closed": False,
+                }
+                trace: list[str] = []
+
+                def register(*_args: object, **kwargs: object) -> Path:
+                    trace.append("register")
+                    if publication_state == "callback":
+                        callback = kwargs.get("published_callback")
+                        self.assertTrue(callable(callback))
+                        callback()
+                    raise AssertionError("injected resource publication failure")
+
+                def matches(*_args: object, **_kwargs: object) -> bool:
+                    trace.append("attempt")
+                    return publication_state == "final-unmarked"
+
+                def recover(*_args: object, **_kwargs: object) -> None:
+                    trace.append("recover")
+
+                original_rmtree = shutil.rmtree
+
+                def remove(path: Path) -> None:
+                    trace.append("rmtree")
+                    original_rmtree(path)
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_isolation_requested",
+                    return_value=True,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_registry_session_gate",
+                    return_value=contextlib.nullcontext(),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_active_strict_session",
+                    return_value=session,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_prepare_isolation_resource_ancestors",
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_register_trusted_root_chain",
+                    side_effect=register,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_recover_registered_entry",
+                    side_effect=recover,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_registered_entry_matches_publication_attempt",
+                    side_effect=matches,
+                    create=True,
+                ), mock.patch.object(
+                    shutil,
+                    "rmtree",
+                    side_effect=remove,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "resource publication failure"
+                    ):
+                        with _CANDIDATE_SUPPORT._execution_snapshot(
+                            root, "a" * 40, probe_source=b"pass\n"
+                        ):
+                            self.fail("snapshot unexpectedly yielded")
+
+                self.assertEqual(
+                    trace,
+                    ["register", "recover"]
+                    if publication_state == "callback"
+                    else ["register", "attempt", "recover"]
+                    if publication_state == "final-unmarked"
+                    else ["register", "attempt", "rmtree"],
+                )
+
+    def test_execution_snapshot_recovers_exact_staged_resource_intent_before_delete(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            resources = root / "resources"
+            resources.mkdir(mode=0o700)
+            controller_path = root / "controller.py"
+            session = {
+                "root": root,
+                "entries": entries,
+                "resources": resources,
+                "controller_path": controller_path,
+                "token": "b" * 32,
+                "target_uid": 60000,
+                "closed": False,
+            }
+            original_rename = _CANDIDATE_SUPPORT._rename_noreplace
+            original_unlink = Path.unlink
+            rename_calls = 0
+            staging_unlink_failures = 0
+
+            def fail_first_publish(
+                source: Path,
+                destination: Path,
+                *,
+                published_callback: object = None,
+            ) -> None:
+                nonlocal rename_calls
+                rename_calls += 1
+                if rename_calls == 1:
+                    raise OSError("injected pre-publish failure")
+                original_rename(
+                    source,
+                    destination,
+                    published_callback=published_callback,
+                )
+
+            def fail_first_staging_unlink(
+                path: Path, *args: object, **kwargs: object
+            ) -> None:
+                nonlocal staging_unlink_failures
+                if (
+                    staging_unlink_failures == 0
+                    and _CANDIDATE_SUPPORT._CHAIN_STAGING_NAME_PATTERN.fullmatch(
+                        path.name
+                    )
+                ):
+                    staging_unlink_failures += 1
+                    raise OSError("injected staged-intent retirement failure")
+                original_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_isolation_requested",
+                return_value=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_registry_session_gate",
+                return_value=contextlib.nullcontext(),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_active_strict_session",
+                return_value=session,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_prepare_isolation_resource_ancestors",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_rename_noreplace",
+                side_effect=fail_first_publish,
+            ), mock.patch.object(
+                Path,
+                "unlink",
+                fail_first_staging_unlink,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_recover_registered_entry",
+            ) as recover:
+                with self.assertRaisesRegex(
+                    AssertionError, "durable document cannot be written"
+                ):
+                    with _CANDIDATE_SUPPORT._execution_snapshot(
+                        root, "a" * 40, probe_source=b"pass\n"
+                    ):
+                        self.fail("snapshot unexpectedly yielded")
+
+            final_entries = sorted(entries.glob("chain-*.json"))
+            staged_entries = sorted(entries.glob(".chain-*.json.tmp-*"))
+            resource_roots = list(resources.iterdir())
+            self.assertEqual(rename_calls, 2)
+            self.assertEqual(staging_unlink_failures, 1)
+            self.assertEqual(len(final_entries), 1)
+            self.assertEqual(staged_entries, [])
+            self.assertEqual(len(resource_roots), 1)
+            recover.assert_called_once_with(
+                final_entries[0], allow_recovery_broker=True
+            )
+
+    def test_execution_snapshot_never_claims_an_unowned_staged_resource_intent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            resources = root / "resources"
+            resources.mkdir(mode=0o700)
+            controller_path = root / "controller.py"
+            session = {
+                "root": root,
+                "entries": entries,
+                "resources": resources,
+                "controller_path": controller_path,
+                "token": "b" * 32,
+                "target_uid": 60000,
+                "closed": False,
+            }
+            original_register = (
+                _CANDIDATE_SUPPORT._register_trusted_root_chain
+            )
+
+            def stage_another_attempt(
+                *args: object, **kwargs: object
+            ) -> Path:
+                selected_kwargs = dict(kwargs)
+                selected_kwargs["publication_nonce"] = "c" * 32
+                selected_kwargs.pop("published_callback", None)
+                final_path = original_register(*args, **selected_kwargs)
+                staged_path = (
+                    entries / f".{final_path.name}.tmp-{'d' * 32}"
+                )
+                final_path.rename(staged_path)
+                raise AssertionError("injected unowned staged intent")
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_isolation_requested",
+                return_value=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_registry_session_gate",
+                return_value=contextlib.nullcontext(),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_active_strict_session",
+                return_value=session,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_prepare_isolation_resource_ancestors",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_register_trusted_root_chain",
+                side_effect=stage_another_attempt,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_recover_registered_entry",
+            ) as recover, mock.patch.object(
+                shutil,
+                "rmtree",
+            ) as remove:
+                with self.assertRaisesRegex(
+                    AssertionError, "belongs to another attempt"
+                ):
+                    with _CANDIDATE_SUPPORT._execution_snapshot(
+                        root, "a" * 40, probe_source=b"pass\n"
+                    ):
+                        self.fail("snapshot unexpectedly yielded")
+
+            self.assertEqual(list(entries.glob("chain-*.json")), [])
+            self.assertEqual(
+                len(list(entries.glob(".chain-*.json.tmp-*"))), 1
+            )
+            self.assertEqual(len(list(resources.iterdir())), 1)
+            recover.assert_not_called()
+            remove.assert_not_called()
+
+    def test_parent_registry_replays_cleanup_and_uid_zero_proof(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            resources = root / "resources"
+            resources.mkdir(mode=0o700)
+            tombstones = root / ".tombstones"
+            tombstones.mkdir(mode=0o710)
+            session_lock = root / ".session.lock"
+            session_lock.write_bytes(b"")
+            session_lock.chmod(0o600)
+            controller_path = root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            execution_root = root / "execution"
+            execution_root.mkdir()
+            token = "b" * 32
+            registry = {
+                "root": root,
+                "entries": entries,
+                "resources": resources,
+                "tombstones": tombstones,
+                "controller_path": controller_path,
+                "token": token,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            calls: list[str] = []
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = registry
+            try:
+                _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                )
+
+                def cleanup_uid(
+                    _selected_controller: Path, _target_uid: int
+                ) -> None:
+                    calls.append("uid")
+
+                def stable_uid(_target_uid: int) -> None:
+                    calls.append("stable")
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_root_uid_cleanup",
+                    side_effect=cleanup_uid,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_stable_uid_zero",
+                    side_effect=stable_uid,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+                ):
+                    _CANDIDATE_SUPPORT.close_trusted_isolation_chains(
+                        registry
+                    )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+            self.assertEqual(calls, ["stable", "uid", "stable"])
+            self.assertFalse(root.exists())
+
+    def test_owner_replay_orders_process_uid_and_resource_to_a_fixpoint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True) / "registry"
+            root.mkdir()
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            resources = root / "resources"
+            resources.mkdir(mode=0o700)
+            tombstones = root / ".tombstones"
+            tombstones.mkdir(mode=0o710)
+            controller_path = root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            resource_path = entries / f"chain-{'0' * 32}.json"
+            process_path = entries / f"chain-{'f' * 32}.json"
+            spawned_path = entries / f"chain-{'e' * 32}.json"
+            documents: dict[Path, dict[str, object]] = {
+                resource_path: {
+                    "state": "closing",
+                    "cleanup_execution_root": True,
+                    "outer": None,
+                    "execution_root_delete_nonce": None,
+                    "execution_root_deleted": None,
+                },
+                process_path: {
+                    "state": "prepared",
+                    "cleanup_execution_root": False,
+                    "outer": None,
+                    "execution_root_delete_nonce": None,
+                    "execution_root_deleted": None,
+                },
+            }
+            session = {
+                "root": root,
+                "entries": entries,
+                "resources": resources,
+                "tombstones": tombstones,
+                "controller_path": controller_path,
+                "token": "a" * 32,
+                "target_uid": 60000,
+                "closed": False,
+            }
+            trace: list[str] = []
+            spawned = False
+
+            def inventory(
+                _entries: Path, *, recover_staging: bool = False
+            ) -> list[Path]:
+                self.assertTrue(recover_staging)
+                return sorted(documents)
+
+            def load(entry_path: Path) -> dict[str, object]:
+                return documents[entry_path]
+
+            def recover(
+                entry_path: Path, *, allow_recovery_broker: bool
+            ) -> None:
+                nonlocal spawned
+                self.assertTrue(allow_recovery_broker)
+                document = documents[entry_path]
+                if document["state"] == "closed":
+                    return
+                label = (
+                    "resource"
+                    if entry_path == resource_path
+                    else "spawned"
+                    if entry_path == spawned_path
+                    else "process"
+                )
+                trace.append(label)
+                document["state"] = "closed"
+                if entry_path == resource_path and not spawned:
+                    spawned = True
+                    documents[spawned_path] = {
+                        "state": "prepared",
+                        "cleanup_execution_root": False,
+                        "outer": None,
+                        "execution_root_delete_nonce": None,
+                        "execution_root_deleted": None,
+                    }
+
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_chain_registry_entries",
+                    side_effect=inventory,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_load_chain_registry_entry",
+                    side_effect=load,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_recover_registered_entry",
+                    side_effect=recover,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_root_uid_cleanup",
+                    side_effect=lambda *_args: trace.append("uid"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_stable_uid_zero",
+                    side_effect=lambda *_args: trace.append("stable"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_cleanup_orphan_resource_roots"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+                ):
+                    _CANDIDATE_SUPPORT._close_trusted_isolation_chains_under_gate(
+                        session
+                    )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+        self.assertEqual(
+            trace,
+            [
+                "process",
+                "uid",
+                "stable",
+                "resource",
+                "spawned",
+                "uid",
+                "stable",
+            ],
+        )
+
+    def test_resource_recovery_failure_restarts_at_process_and_uid_phases(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True) / "registry"
+            root.mkdir()
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            resources = root / "resources"
+            resources.mkdir(mode=0o700)
+            tombstones = root / ".tombstones"
+            tombstones.mkdir(mode=0o710)
+            controller_path = root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            first_resource = entries / f"chain-{'0' * 32}.json"
+            second_resource = entries / f"chain-{'1' * 32}.json"
+            spawned_process = entries / f"chain-{'f' * 32}.json"
+            documents: dict[Path, dict[str, object]] = {
+                first_resource: {
+                    "state": "closing",
+                    "cleanup_execution_root": True,
+                    "outer": None,
+                    "execution_root_delete_nonce": None,
+                    "execution_root_deleted": None,
+                },
+                second_resource: {
+                    "state": "closing",
+                    "cleanup_execution_root": True,
+                    "outer": None,
+                    "execution_root_delete_nonce": None,
+                    "execution_root_deleted": None,
+                },
+            }
+            session = {
+                "root": root,
+                "entries": entries,
+                "resources": resources,
+                "tombstones": tombstones,
+                "controller_path": controller_path,
+                "token": "a" * 32,
+                "target_uid": 60000,
+                "closed": False,
+            }
+            trace: list[str] = []
+            injected_failure = False
+
+            def inventory(
+                _entries: Path, *, recover_staging: bool = False
+            ) -> list[Path]:
+                self.assertTrue(recover_staging)
+                return sorted(documents)
+
+            def load(entry_path: Path) -> dict[str, object]:
+                return documents[entry_path]
+
+            def recover(
+                entry_path: Path, *, allow_recovery_broker: bool
+            ) -> None:
+                nonlocal injected_failure
+                self.assertTrue(allow_recovery_broker)
+                document = documents[entry_path]
+                if document["state"] == "closed":
+                    return
+                if entry_path == first_resource and not injected_failure:
+                    injected_failure = True
+                    trace.append("first-resource-failed")
+                    documents[spawned_process] = {
+                        "state": "prepared",
+                        "cleanup_execution_root": False,
+                        "outer": None,
+                        "execution_root_delete_nonce": None,
+                        "execution_root_deleted": None,
+                    }
+                    raise AssertionError(
+                        "injected nested broker recovery failure"
+                    )
+                label = (
+                    "first-resource"
+                    if entry_path == first_resource
+                    else "second-resource"
+                    if entry_path == second_resource
+                    else "spawned-process"
+                )
+                trace.append(label)
+                document["state"] = "closed"
+
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_chain_registry_entries",
+                    side_effect=inventory,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_load_chain_registry_entry",
+                    side_effect=load,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_recover_registered_entry",
+                    side_effect=recover,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_root_uid_cleanup",
+                    side_effect=lambda *_args: trace.append("uid"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_stable_uid_zero",
+                    side_effect=lambda *_args: trace.append("stable"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_cleanup_orphan_resource_roots"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+                ):
+                    _CANDIDATE_SUPPORT._close_trusted_isolation_chains_under_gate(
+                        session
+                    )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+        self.assertEqual(
+            trace,
+            [
+                "uid",
+                "stable",
+                "first-resource-failed",
+                "spawned-process",
+                "uid",
+                "stable",
+                "first-resource",
+                "second-resource",
+            ],
+        )
+
+    def test_parent_registry_retains_recovery_state_on_cleanup_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            session_lock = root / ".session.lock"
+            session_lock.write_bytes(b"")
+            session_lock.chmod(0o600)
+            controller_path = root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            execution_root = root / "execution"
+            execution_root.mkdir()
+            registry = {
+                "root": root,
+                "entries": entries,
+                "controller_path": controller_path,
+                "token": "c" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = registry
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                )
+                calls: list[str] = []
+
+                def fail_recovery(
+                    _entry_path: Path, *, allow_recovery_broker: bool
+                ) -> None:
+                    self.assertTrue(allow_recovery_broker)
+                    calls.append("entry")
+                    raise AssertionError("injected entry recovery failure")
+
+                def cleanup_uid(
+                    _selected_controller: Path, _target_uid: int
+                ) -> None:
+                    calls.append("uid")
+
+                def stable_uid(_target_uid: int) -> None:
+                    calls.append("stable")
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_recover_registered_entry",
+                    side_effect=fail_recovery,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_root_uid_cleanup",
+                    side_effect=cleanup_uid,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_stable_uid_zero",
+                    side_effect=stable_uid,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "recovery state retained"
+                    ):
+                        _CANDIDATE_SUPPORT.close_trusted_isolation_chains(
+                            registry
+                        )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+            self.assertGreaterEqual(calls.count("entry"), 2)
+            self.assertEqual(calls.count("entry"), calls.count("uid"))
+            self.assertEqual(calls.count("uid"), calls.count("stable"))
+            self.assertEqual(
+                calls,
+                ["entry", "uid", "stable"] * calls.count("entry"),
+            )
+            self.assertTrue(root.is_dir())
+            retained = json.loads(entry_path.read_text(encoding="ascii"))
+            self.assertEqual(retained["state"], "prepared")
+
+    def test_execution_root_delete_failure_retains_closing_state_for_replay(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            registry_root = fixture_root / "registry"
+            entries = registry_root / "entries"
+            entries.mkdir(parents=True, mode=0o700)
+            resources = registry_root / "resources"
+            resources.mkdir()
+            tombstones = registry_root / ".tombstones"
+            tombstones.mkdir()
+            execution_root = resources / "execution"
+            execution_root.mkdir()
+            controller_path = registry_root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            registry = {
+                "root": registry_root,
+                "entries": entries,
+                "resources": resources,
+                "tombstones": tombstones,
+                "controller_path": controller_path,
+                "token": "d" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = registry
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                    cleanup_execution_root=True,
+                )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_registered_resource_seal",
+                    side_effect=AssertionError("injected delete failure"),
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "injected delete failure"
+                    ):
+                        _CANDIDATE_SUPPORT._recover_registered_entry(
+                            entry_path, allow_recovery_broker=True
+                        )
+
+                retained = json.loads(entry_path.read_text(encoding="ascii"))
+                self.assertEqual(retained["state"], "deleting")
+                self.assertRegex(
+                    retained["execution_root_delete_nonce"], r"^[0-9a-f]{32}$"
+                )
+                self.assertTrue(execution_root.is_dir())
+
+                durable_receipts: list[dict[str, object]] = []
+
+                def seal_execution_root(
+                    _controller: Path,
+                    _entry_path: Path,
+                    document: Mapping[str, object],
+                ) -> None:
+                    metadata = execution_root.lstat()
+                    execution_root.rmdir()
+                    vault_metadata = tombstones.lstat()
+                    session_id = str(document["session_id"])
+                    delete_nonce = str(document["execution_root_delete_nonce"])
+                    durable_receipts.append(
+                        {
+                            "schema_version": 2,
+                            "kind": "sealed-empty-tombstone",
+                            "token": document["token"],
+                            "session_id": session_id,
+                            "delete_nonce": delete_nonce,
+                            "path": str(execution_root),
+                            "device": metadata.st_dev,
+                            "inode": metadata.st_ino,
+                            "vault_device": vault_metadata.st_dev,
+                            "vault_inode": vault_metadata.st_ino,
+                            "tombstone_name": (
+                                f"sealed-{session_id}-{delete_nonce}"
+                            ),
+                            "origin_absent": True,
+                            "tombstone_empty": True,
+                            "tombstone_owner_uid": 0,
+                            "tombstone_owner_gid": os.getgid(),
+                            "tombstone_mode": 0o710,
+                        }
+                    )
+
+                def read_durable_receipt(_path: Path) -> dict[str, object]:
+                    if not durable_receipts:
+                        raise AssertionError("durable receipt is absent")
+                    return durable_receipts[-1]
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_registered_resource_seal",
+                    side_effect=seal_execution_root,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_read_durable_deletion_receipt_file",
+                    side_effect=read_durable_receipt,
+                ):
+                    _CANDIDATE_SUPPORT._recover_registered_entry(
+                        entry_path, allow_recovery_broker=True
+                    )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+            replayed = json.loads(entry_path.read_text(encoding="ascii"))
+            self.assertEqual(replayed["state"], "closed")
+            self.assertFalse(execution_root.exists())
+
+    def test_crash_after_tombstone_rename_replays_exact_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry_root = Path(temporary_directory).resolve(strict=True)
+            entries = registry_root / "entries"
+            resources = registry_root / "resources"
+            tombstones = registry_root / ".tombstones"
+            entries.mkdir(mode=0o700)
+            resources.mkdir()
+            tombstones.mkdir()
+            execution_root = resources / "execution"
+            execution_root.mkdir()
+            original = execution_root.lstat()
+            controller_path = registry_root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            session_id = "a" * 32
+            delete_nonce = "b" * 32
+            session = {
+                "root": registry_root,
+                "entries": entries,
+                "resources": resources,
+                "tombstones": tombstones,
+                "controller_path": controller_path,
+                "token": "c" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                    cleanup_execution_root=True,
+                    session_id=session_id,
+                )
+                _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                    entry_path, ("prepared",), "closing"
+                )
+                document = _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                    entry_path,
+                    ("closing",),
+                    "deleting",
+                    execution_root_delete_nonce=delete_nonce,
+                )
+                tombstone = tombstones / f"sealed-{session_id}-{delete_nonce}"
+                execution_root.rename(tombstone)
+                vault_metadata = tombstones.lstat()
+                durable_receipt = {
+                    "schema_version": 2,
+                    "kind": "sealed-empty-tombstone",
+                    "token": document["token"],
+                    "session_id": session_id,
+                    "delete_nonce": delete_nonce,
+                    "path": str(execution_root),
+                    "device": original.st_dev,
+                    "inode": original.st_ino,
+                    "vault_device": vault_metadata.st_dev,
+                    "vault_inode": vault_metadata.st_ino,
+                    "tombstone_name": tombstone.name,
+                    "origin_absent": True,
+                    "tombstone_empty": True,
+                    "tombstone_owner_uid": 0,
+                    "tombstone_owner_gid": os.getgid(),
+                    "tombstone_mode": 0o710,
+                }
+
+                def replay_seal(
+                    _controller: Path,
+                    selected_entry: Path,
+                    _document: Mapping[str, object],
+                ) -> None:
+                    self.assertEqual(selected_entry, entry_path)
+                    self.assertFalse(execution_root.exists())
+                    selected = tombstone.lstat()
+                    self.assertEqual(
+                        (selected.st_dev, selected.st_ino),
+                        (original.st_dev, original.st_ino),
+                    )
+                    tombstone.rmdir()
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_registered_resource_seal",
+                    side_effect=replay_seal,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_exact_durable_deletion_receipt",
+                    return_value=durable_receipt,
+                ):
+                    _CANDIDATE_SUPPORT._recover_registered_entry(
+                        entry_path, allow_recovery_broker=True
+                    )
+                replayed = json.loads(entry_path.read_text(encoding="ascii"))
+                self.assertEqual(replayed["state"], "closed")
+                self.assertFalse(tombstone.exists())
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+    def test_stale_authorizer_cannot_resurrect_a_recovered_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            execution_root = root / "execution"
+            execution_root.mkdir()
+            controller_path = root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            session = {
+                "root": root,
+                "entries": entries,
+                "controller_path": controller_path,
+                "token": "e" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                )
+                original_load = _CANDIDATE_SUPPORT._load_chain_registry_entry
+                authorizer_loaded = threading.Event()
+                release_authorizer = threading.Event()
+                recovery_finished = threading.Event()
+                authorizer_errors: list[BaseException] = []
+                recovery_errors: list[BaseException] = []
+                paused = False
+
+                def pausing_load(path: Path):
+                    nonlocal paused
+                    document = original_load(path)
+                    if (
+                        threading.current_thread().name == "stale-authorizer"
+                        and document.get("state") == "prepared"
+                        and not paused
+                    ):
+                        paused = True
+                        authorizer_loaded.set()
+                        if not release_authorizer.wait(2):
+                            raise AssertionError("authorizer fixture timed out")
+                    return document
+
+                def authorize() -> None:
+                    try:
+                        _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                            entry_path,
+                            ("prepared",),
+                            "outer-bound",
+                            outer=[60001, 1, 60001, 60001],
+                        )
+                    except BaseException as error:
+                        authorizer_errors.append(error)
+
+                def recover() -> None:
+                    try:
+                        _CANDIDATE_SUPPORT._recover_registered_entry(
+                            entry_path, allow_recovery_broker=True
+                        )
+                    except BaseException as error:
+                        recovery_errors.append(error)
+                    finally:
+                        recovery_finished.set()
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_load_chain_registry_entry",
+                    side_effect=pausing_load,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_host_session_inventory",
+                    return_value={},
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_host_session_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ):
+                    authorizer = threading.Thread(
+                        target=authorize, name="stale-authorizer"
+                    )
+                    recovery = threading.Thread(
+                        target=recover, name="chain-recovery"
+                    )
+                    authorizer.start()
+                    self.assertTrue(authorizer_loaded.wait(1))
+                    recovery.start()
+                    recovery_finished.wait(0.25)
+                    release_authorizer.set()
+                    authorizer.join(2)
+                    recovery.join(2)
+
+                self.assertFalse(authorizer.is_alive())
+                self.assertFalse(recovery.is_alive())
+                self.assertEqual(authorizer_errors, [])
+                self.assertEqual(recovery_errors, [])
+                recovered = original_load(entry_path)
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+            self.assertEqual(recovered["state"], "closed")
+
+    def test_durable_document_create_never_replaces_a_racing_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entry_path = root / "chain.json"
+            sentinel = b"concurrent-entry"
+            original_exists = Path.exists
+            selected_calls = 0
+
+            def racing_exists(path: Path) -> bool:
+                nonlocal selected_calls
+                if path == entry_path:
+                    selected_calls += 1
+                    if selected_calls == 2:
+                        entry_path.write_bytes(sentinel)
+                        return False
+                return original_exists(path)
+
+            with mock.patch.object(Path, "exists", racing_exists):
+                with self.assertRaisesRegex(
+                    AssertionError, "appeared|already exists"
+                ):
+                    _CANDIDATE_SUPPORT._atomic_json_document(
+                        entry_path,
+                        {"schema_version": 2, "state": "prepared"},
+                        expected_owner=os.getuid(),
+                        create=True,
+                    )
+
+            self.assertEqual(entry_path.read_bytes(), sentinel)
+
+    def test_inherited_child_cannot_close_the_parent_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            controller_path = root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            registry = {
+                "root": root,
+                "entries": entries,
+                "controller_path": controller_path,
+                "token": "f" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = registry
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_invoke_root_uid_cleanup"
+                ) as cleanup_uid, mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ) as stable_uid:
+                    with self.assertRaisesRegex(
+                        AssertionError, "inherited.*cannot close"
+                    ):
+                        _CANDIDATE_SUPPORT.close_trusted_isolation_chains(
+                            registry
+                        )
+                cleanup_uid.assert_not_called()
+                stable_uid.assert_not_called()
+                self.assertTrue(root.is_dir())
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+    def test_registry_entry_must_match_the_active_session_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            execution_root = root / "execution"
+            execution_root.mkdir()
+            controller_path = root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            session = {
+                "root": root,
+                "entries": entries,
+                "controller_path": controller_path,
+                "token": "1" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                )
+                document = json.loads(entry_path.read_text(encoding="ascii"))
+                document["token"] = "2" * 32
+                _CANDIDATE_SUPPORT._write_chain_registry_entry(
+                    entry_path, document, create=False
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "active session binding"
+                ):
+                    _CANDIDATE_SUPPORT._load_chain_registry_entry(entry_path)
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+    def test_missing_execution_root_is_not_a_deletion_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            registry_root = fixture_root / "registry"
+            entries = registry_root / "entries"
+            entries.mkdir(parents=True, mode=0o700)
+            resources = registry_root / "resources"
+            resources.mkdir()
+            tombstones = registry_root / ".tombstones"
+            tombstones.mkdir()
+            execution_root = resources / "execution"
+            execution_root.mkdir()
+            controller_path = registry_root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            session = {
+                "root": registry_root,
+                "entries": entries,
+                "resources": resources,
+                "tombstones": tombstones,
+                "controller_path": controller_path,
+                "token": "3" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                    cleanup_execution_root=True,
+                )
+                execution_root.rmdir()
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_registered_resource_seal",
+                    side_effect=AssertionError(
+                        "sealed tombstone recovery state is ambiguous"
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "recovery state is ambiguous"
+                    ):
+                        _CANDIDATE_SUPPORT._recover_registered_entry(
+                            entry_path, allow_recovery_broker=True
+                        )
+                retained = json.loads(entry_path.read_text(encoding="ascii"))
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+            self.assertEqual(retained["state"], "deleting")
+
+    def test_renamed_execution_root_is_not_a_deletion_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            registry_root = fixture_root / "registry"
+            entries = registry_root / "entries"
+            entries.mkdir(parents=True, mode=0o700)
+            resources = registry_root / "resources"
+            resources.mkdir()
+            tombstones = registry_root / ".tombstones"
+            tombstones.mkdir()
+            execution_root = resources / "execution"
+            execution_root.mkdir()
+            original = execution_root.lstat()
+            moved_root = fixture_root / "moved-execution"
+            controller_path = registry_root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            session = {
+                "root": registry_root,
+                "entries": entries,
+                "resources": resources,
+                "tombstones": tombstones,
+                "controller_path": controller_path,
+                "token": "4" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                    cleanup_execution_root=True,
+                )
+                execution_root.rename(moved_root)
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_registered_resource_seal",
+                    side_effect=AssertionError(
+                        "sealed tombstone recovery state is ambiguous"
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "recovery state is ambiguous"
+                    ):
+                        _CANDIDATE_SUPPORT._recover_registered_entry(
+                            entry_path, allow_recovery_broker=True
+                        )
+                retained = json.loads(entry_path.read_text(encoding="ascii"))
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+            moved = moved_root.lstat()
+            self.assertEqual(
+                (moved.st_dev, moved.st_ino),
+                (original.st_dev, original.st_ino),
+            )
+            self.assertGreater(moved.st_nlink, 0)
+            self.assertEqual(retained["state"], "deleting")
+            self.assertIsNone(retained["execution_root_deleted"])
+
+    def test_interrupted_entry_create_is_reconciled_before_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            entries.mkdir(mode=0o700)
+            execution_root = root / "execution"
+            execution_root.mkdir()
+            controller_path = root / "controller.py"
+            controller_path.write_text("pass\n", encoding="utf-8")
+            session_id = "5" * 32
+            session = {
+                "root": root,
+                "entries": entries,
+                "controller_path": controller_path,
+                "token": "6" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    60000,
+                    execution_root=execution_root,
+                    session_id=session_id,
+                )
+                staged_path = entries / f".{entry_path.name}.tmp-{'7' * 32}"
+                entry_path.rename(staged_path)
+                self.assertFalse(entry_path.exists())
+                self.assertTrue(staged_path.is_file())
+                recovered = _CANDIDATE_SUPPORT._chain_registry_entries(
+                    entries, recover_staging=True
+                )
+                document = _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                    recovered[0]
+                )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+        self.assertEqual(recovered, [entries / f"chain-{session_id}.json"])
+        self.assertEqual(document["state"], "prepared")
+        self.assertEqual(document["session_id"], session_id)
+
+    def test_root_deletion_receipt_separates_directory_and_file_ownership(
+        self,
+    ) -> None:
+        atomic_source = inspect.getsource(_CANDIDATE_SUPPORT._atomic_json_document)
+        broker_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_seal_execution_root_main
+        )
+        reader_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._read_durable_deletion_receipt_file
+        )
+
+        self.assertIn("expected_file_owner", atomic_source)
+        self.assertIn("expected_owner=runner_uid", broker_source)
+        self.assertIn("expected_file_owner=0", broker_source)
+        self.assertIn("expected_file_group=runner_gid", broker_source)
+        self.assertIn("expected_file_mode=0o640", broker_source)
+        self.assertIn("metadata.st_uid != 0", reader_source)
+
+    def test_root_seal_holds_bound_fd_through_receipt_and_optional_gc(self) -> None:
+        delete_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_fd_delete_contents
+        )
+        broker_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_seal_execution_root_main
+        )
+        gc_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._gc_bound_sealed_tombstone
+        )
+
+        self.assertLess(
+            delete_source.index("os.rmdir"),
+            delete_source.index("os.close(child_fd)"),
+        )
+        self.assertLess(
+            broker_source.index("_atomic_json_document"),
+            broker_source.index("_gc_bound_sealed_tombstone"),
+        )
+        self.assertLess(
+            gc_source.index("_fsync_directory(receipt_path.parent)"),
+            gc_source.index("os.rmdir(tombstone_name"),
+        )
+        self.assertIn("os.fstat(tombstone_fd)", gc_source)
+        self.assertIn("st_nlink", gc_source)
+
+    def test_receipt_directory_fsync_failure_keeps_exact_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entries = root / "entries"
+            vault = root / "vault"
+            entries.mkdir()
+            vault.mkdir()
+            receipt_path = entries / "receipt.json"
+            tombstone = vault / "sealed-entry"
+            tombstone.mkdir()
+            tombstone_metadata = tombstone.lstat()
+            vault_fd = os.open(vault, os.O_RDONLY | os.O_DIRECTORY)
+            tombstone_fd = os.open(
+                tombstone,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_fsync_directory",
+                    side_effect=OSError("injected receipt directory fsync failure"),
+                ):
+                    with self.assertRaisesRegex(
+                        OSError, "receipt directory fsync failure"
+                    ):
+                        _CANDIDATE_SUPPORT._gc_bound_sealed_tombstone(
+                            receipt_path,
+                            vault_fd,
+                            tombstone.name,
+                            tombstone_fd,
+                            expected_identity=(
+                                tombstone_metadata.st_dev,
+                                tombstone_metadata.st_ino,
+                            ),
+                            expected_uid=os.getuid(),
+                            expected_gid=os.getgid(),
+                            expected_mode=stat.S_IMODE(
+                                tombstone_metadata.st_mode
+                            ),
+                        )
+
+                rebound = tombstone.lstat()
+                self.assertEqual(
+                    (rebound.st_dev, rebound.st_ino),
+                    (tombstone_metadata.st_dev, tombstone_metadata.st_ino),
+                )
+                self.assertEqual(os.listdir(tombstone_fd), [])
+            finally:
+                os.close(tombstone_fd)
+                os.close(vault_fd)
+
+        helper_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._gc_bound_sealed_tombstone
+        )
+        self.assertLess(
+            helper_source.index("_fsync_directory(receipt_path.parent)"),
+            helper_source.index("os.rmdir(tombstone_name"),
+        )
+
+    def test_tombstone_identity_mismatch_is_not_treated_as_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            resources = root / "resources"
+            vault = root / "vault"
+            resources.mkdir()
+            vault.mkdir()
+            origin = resources / "origin"
+            origin.mkdir()
+            wrong_tombstone = vault / "sealed-entry"
+            wrong_tombstone.mkdir()
+            origin_metadata = origin.lstat()
+            wrong_metadata = wrong_tombstone.lstat()
+            resources_fd = os.open(resources, os.O_RDONLY | os.O_DIRECTORY)
+            vault_fd = os.open(vault, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                self.assertIsNone(
+                    _CANDIDATE_SUPPORT._open_optional_bound_directory_entry(
+                        vault_fd,
+                        "missing",
+                        origin_metadata.st_dev,
+                        origin_metadata.st_ino,
+                    )
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "identity changed"
+                ):
+                    _CANDIDATE_SUPPORT._open_optional_bound_directory_entry(
+                        vault_fd,
+                        wrong_tombstone.name,
+                        origin_metadata.st_dev,
+                        origin_metadata.st_ino,
+                    )
+            finally:
+                os.close(resources_fd)
+                os.close(vault_fd)
+
+            self.assertEqual(
+                (origin.lstat().st_dev, origin.lstat().st_ino),
+                (origin_metadata.st_dev, origin_metadata.st_ino),
+            )
+            self.assertEqual(
+                (
+                    wrong_tombstone.lstat().st_dev,
+                    wrong_tombstone.lstat().st_ino,
+                ),
+                (wrong_metadata.st_dev, wrong_metadata.st_ino),
+            )
+            broker_source = inspect.getsource(
+                _CANDIDATE_SUPPORT._root_seal_execution_root_main
+            )
+            self.assertIn("_open_optional_bound_directory_entry", broker_source)
+            self.assertIn("_rename_directory_entry_noreplace", broker_source)
+            self.assertNotIn("os.rename(", broker_source)
+
+    def test_root_python_entrypoints_are_isolated_without_site_loading(self) -> None:
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._ROOT_PYTHON_ARGUMENTS,
+            ("-I", "-B", "-S"),
+        )
+        command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+            {
+                "uid": 60000,
+                "gid": 60000,
+                "environment": {},
+                "candidate_argv": ["/usr/bin/python3", "-I", "/candidate.py"],
+                "trusted_root": "/trusted",
+                "trusted_sentinel": "/trusted/sentinel",
+            },
+            1234,
+        )
+        bootstrap_index = command.index("-c")
+        self.assertEqual(
+            command[bootstrap_index - 4 : bootstrap_index],
+            ["/usr/bin/python3", "-I", "-B", "-S"],
+        )
+
     def supervise(self, trusted_root: Path, candidate_root: Path) -> dict[str, object]:
         candidate_sha = self.initialize_candidate_checkout(candidate_root)
-        with mock.patch.dict(
+        with _local_nonstrict_supervisor_environment(), mock.patch.dict(
             os.environ,
             {
                 REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
@@ -2624,6 +7790,39 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             return supervise_trusted_required_ci_tests(
                 trusted_root, candidate_root
             )
+
+    def test_local_supervisor_harness_clears_inherited_strict_registry(
+        self,
+    ) -> None:
+        inherited_environment = {
+            REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE,
+            "REQUIRED_CI_INTERNAL_ISOLATION_UID": "60000",
+            "REQUIRED_CI_INTERNAL_ISOLATION_GID": "60000",
+            "REQUIRED_CI_INTERNAL_ISOLATION_LOCK_FD": "19",
+            "REQUIRED_CI_INTERNAL_ISOLATION_REGISTRY": "/parent/entries",
+            "REQUIRED_CI_INTERNAL_ISOLATION_REGISTRY_TOKEN": "a" * 32,
+        }
+        observed_environment: dict[str, str] = {}
+
+        def record_environment(
+            _trusted_root: Path, _candidate_root: Path
+        ) -> dict[str, str]:
+            observed_environment.update(os.environ)
+            return {"status": "completed"}
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            with mock.patch.dict(
+                os.environ, inherited_environment, clear=False
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "supervise_trusted_required_ci_tests",
+                side_effect=record_environment,
+            ):
+                self.supervise(trusted_root, candidate_root)
+
+        for key in inherited_environment:
+            self.assertNotIn(key, observed_environment)
 
     @staticmethod
     def readme_test_commands(repo_root: Path) -> list[str]:
@@ -2641,9 +7840,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         root = Path(temporary_directory).resolve(strict=True)
         trusted_root = root / ".required-ci"
         candidate_root = root / ".candidate"
-        source_tests_root = TRUSTED_REPO_ROOT / CANDIDATE_TESTS_RELATIVE_PATH
+        source_tests_root = TRUSTED_CONTENT_ROOT / CANDIDATE_TESTS_RELATIVE_PATH
         for repository_root in (trusted_root, candidate_root):
-            tests_root = repository_root / CANDIDATE_TESTS_RELATIVE_PATH
+            tests_root = distribution_tests_root(repository_root)
             tests_root.mkdir(parents=True)
             shutil.copyfile(
                 source_tests_root / "test_waited_delivery_hook_adapter.py",
@@ -2651,14 +7850,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
         shutil.copyfile(
             TRUSTED_CANDIDATE_SUPPORT_PATH,
-            trusted_root / CANDIDATE_TESTS_RELATIVE_PATH / "required_ci_candidate.py",
+            distribution_tests_root(trusted_root) / "required_ci_candidate.py",
         )
-        candidate_scripts_root = candidate_root / "skills/waited-delivery/scripts"
+        candidate_scripts_root = (
+            distribution_content_root(candidate_root)
+            / "skills/waited-delivery/scripts"
+        )
         candidate_scripts_root.mkdir(parents=True)
         for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS:
             shutil.copyfile(
-                TRUSTED_REPO_ROOT / relative_path,
-                candidate_root / relative_path,
+                TRUSTED_CONTENT_ROOT / relative_path,
+                distribution_content_root(candidate_root) / relative_path,
             )
         return trusted_root, candidate_root
 
@@ -2668,7 +7870,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 temporary_directory
             )
             adapter_path = (
-                candidate_root
+                distribution_content_root(candidate_root)
                 / "skills/waited-delivery/scripts/waited_delivery_hook_adapter.py"
             )
             source = adapter_path.read_text(encoding="utf-8")
@@ -2694,6 +7896,48 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             ):
                 self.supervise(trusted_root, candidate_root)
 
+    def test_supervisor_rejects_deep_fault_paths_replaced_by_success_stubs(
+        self,
+    ) -> None:
+        mutations = {
+            "last resort bypass": (
+                "                _record_hook_failure(fallback_error)\n"
+                "                try:\n",
+                "                _record_hook_failure(fallback_error)\n"
+                "                return _success_hook_response()\n"
+                "                try:\n",
+            ),
+            "prompt write bypass": (
+                "        try:\n"
+                "            print(prompt, file=sys.stderr)\n",
+                "        try:\n"
+                "            return _success_hook_response()\n"
+                "            print(prompt, file=sys.stderr)\n",
+            ),
+        }
+        for name, (live_source, dead_source) in mutations.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root = self.prepare_hook_adapter_split(
+                        temporary_directory
+                    )
+                    adapter_path = (
+                        distribution_content_root(candidate_root)
+                        / "skills/waited-delivery/scripts/"
+                        "waited_delivery_hook_adapter.py"
+                    )
+                    source = adapter_path.read_text(encoding="utf-8")
+                    self.assertIn(live_source, source)
+                    adapter_path.write_text(
+                        source.replace(live_source, dead_source, 1),
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(
+                        AssertionError, "trusted Required CI tests did not complete"
+                    ):
+                        self.supervise(trusted_root, candidate_root)
+
     def test_hook_fault_probe_rejects_invalid_targets_and_sequences(self) -> None:
         adapter_path = _CANDIDATE_SUPPORT.candidate_script(
             "waited_delivery_hook_adapter.py"
@@ -2713,6 +7957,22 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ("continuation",),
                 input_text="{}",
             )
+
+    def test_hook_fault_probe_executes_an_isolated_trusted_snapshot(self) -> None:
+        adapter_path = _CANDIDATE_SUPPORT.candidate_script(
+            "waited_delivery_hook_adapter.py"
+        )
+        completed = _CANDIDATE_SUPPORT.run_candidate_hook_fault_probe(
+            adapter_path,
+            ("continuation",),
+            input_text="{}",
+        )
+        original_support = Path(
+            _CANDIDATE_SUPPORT.run_candidate_hook_fault_probe.__code__.co_filename
+        ).resolve(strict=True)
+
+        self.assertNotEqual(Path(completed.args[3]), original_support)
+        self.assertNotIn(original_support.parent, Path(completed.args[3]).parents)
 
     def test_readme_test_commands_are_isolated_and_ordered(self) -> None:
         if DISTRIBUTION_PROFILE == "private":
@@ -2766,7 +8026,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            with mock.patch.dict(
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
                 os.environ,
                 {
                     REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
@@ -2806,6 +8066,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "schema_version",
                 "status",
                 "candidate_root",
+                "candidate_distribution_profile",
                 "candidate_sha",
                 "candidate_script_sha256",
                 "trusted_inventory",
@@ -2819,7 +8080,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "unexpected_successes",
             },
         )
-        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["schema_version"], 3)
         self.assertEqual(receipt["status"], "completed")
         self.assertEqual(receipt["expected_test_count"], 2)
         self.assertEqual(receipt["executed_test_count"], 2)
@@ -2832,7 +8093,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             trusted_root = root / ".required-ci"
             candidate_root = root / ".candidate"
             source_tests_root = (
-                TRUSTED_REPO_ROOT / "skills/waited-delivery/tests"
+                TRUSTED_CONTENT_ROOT / "skills/waited-delivery/tests"
             )
             functional_test_modules = (
                 "test_skill_contract.py",
@@ -2847,10 +8108,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
             for repository_root in (trusted_root, candidate_root):
                 for relative_path in copied_paths:
-                    destination = repository_root / relative_path
+                    destination = distribution_content_root(repository_root) / relative_path
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(TRUSTED_REPO_ROOT / relative_path, destination)
-                tests_root = repository_root / CANDIDATE_TESTS_RELATIVE_PATH
+                    shutil.copyfile(TRUSTED_CONTENT_ROOT / relative_path, destination)
+                tests_root = distribution_tests_root(repository_root)
                 tests_root.mkdir(parents=True, exist_ok=True)
                 for module_name in functional_test_modules:
                     shutil.copyfile(
@@ -2864,15 +8125,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     )
 
             trusted_scripts_root = (
-                trusted_root / "skills/waited-delivery/scripts"
+                distribution_content_root(trusted_root)
+                / "skills/waited-delivery/scripts"
             )
             candidate_scripts_root = (
-                candidate_root / "skills/waited-delivery/scripts"
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/scripts"
             )
             trusted_scripts_root.mkdir(parents=True)
             candidate_scripts_root.mkdir(parents=True)
             for source_script in sorted(
-                (TRUSTED_REPO_ROOT / "skills/waited-delivery/scripts").glob("*.py")
+                (TRUSTED_CONTENT_ROOT / "skills/waited-delivery/scripts").glob("*.py")
             ):
                 shutil.copyfile(source_script, trusted_scripts_root / source_script.name)
                 (candidate_scripts_root / source_script.name).write_text(
@@ -2900,7 +8163,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 return actual_run(command, **kwargs)
 
             candidate_sha = self.initialize_candidate_checkout(candidate_root)
-            with mock.patch.dict(
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
                 os.environ,
                 {
                     REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
@@ -2926,12 +8189,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             [
                 sys.executable,
                 "-I",
+                "-B",
+                "-S",
                 str(Path(__file__).resolve(strict=True)),
                 TRUSTED_TEST_CHILD_FLAG,
                 str(trusted_root),
             ],
         )
         self.assertEqual(options["cwd"], trusted_root)
+        self.assertEqual(
+            options["pass_fds"], (), "local nonstrict harness must not pass a realm fd"
+        )
         child_environment = options["env"]
         self.assertIsInstance(child_environment, dict)
         self.assertEqual(
@@ -2942,6 +8210,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         )
         self.assertNotIn("PYTHONHOME", child_environment)
         self.assertNotIn("PYTHONPATH", child_environment)
+        for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+            self.assertNotIn(key, child_environment)
 
     def test_supervisor_rejects_candidate_on_trusted_sys_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2965,8 +8235,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         candidate_root, "test_required.py", self.required_module()
                     )
                     support_path = (
-                        trusted_root
-                        / CANDIDATE_TESTS_RELATIVE_PATH
+                        distribution_tests_root(trusted_root)
                         / "required_ci_candidate.py"
                     )
                     if state == "missing":
@@ -3115,7 +8384,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     def test_supervisor_rejects_an_existing_empty_test_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             trusted_root, candidate_root = self.prepare_roots(temporary_directory)
-            tests_root = candidate_root / "skills/waited-delivery/tests"
+            tests_root = (
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/tests"
+            )
             (tests_root / "README.txt").write_text("no tests\n", encoding="utf-8")
 
             with self.assertRaisesRegex(AssertionError, "expected test inventory"):
@@ -3323,11 +8595,88 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         candidate_root, candidate_sha, require_clean=True
                     )
 
+    def test_execution_snapshot_reads_the_frozen_candidate_sha_not_head(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            content_root = distribution_content_root(candidate_root)
+            bridge_relative = Path(
+                "skills/waited-delivery/scripts/waited_delivery_bridge.py"
+            )
+            bridge_path = content_root / bridge_relative
+            bridge_path.write_text("print('frozen-a')\n", encoding="utf-8")
+            frozen_sha = self.initialize_candidate_checkout(candidate_root)
+            bridge_path.write_text("print('moving-b')\n", encoding="utf-8")
+            for command in (
+                [
+                    _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                    "-C",
+                    str(candidate_root),
+                    "add",
+                    "--all",
+                ],
+                [
+                    _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                    "-C",
+                    str(candidate_root),
+                    "-c",
+                    "user.name=Required CI Test",
+                    "-c",
+                    "user.email=required-ci@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "moving head",
+                ],
+            ):
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            with _CANDIDATE_SUPPORT._execution_snapshot(
+                candidate_root, frozen_sha
+            ) as snapshot:
+                candidate_paths = snapshot["candidate_paths"]
+                self.assertIsInstance(candidate_paths, dict)
+                if not isinstance(candidate_paths, dict):
+                    raise AssertionError("candidate snapshot fixture is malformed")
+                snapshot_bridge = Path(
+                    candidate_paths["waited_delivery_bridge.py"]
+                )
+                snapshot_bytes = snapshot_bridge.read_bytes()
+
+            self.assertEqual(snapshot_bytes, b"print('frozen-a')\n")
+            self.assertEqual(bridge_path.read_bytes(), b"print('moving-b')\n")
+
+    def test_capability_probe_snapshot_never_reads_candidate_git(self) -> None:
+        probe_source = b"print('probe')\n"
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_tracked_candidate_script_bytes",
+            side_effect=AssertionError("candidate Git must not be read"),
+        ):
+            with _CANDIDATE_SUPPORT._execution_snapshot(
+                Path("/not-used"), "a" * 40, probe_source=probe_source
+            ) as snapshot:
+                candidate_paths = snapshot["candidate_paths"]
+                self.assertIsInstance(candidate_paths, dict)
+                if not isinstance(candidate_paths, dict):
+                    raise AssertionError("capability probe snapshot is malformed")
+                probe_path = Path(candidate_paths["strict-capability-probe.py"])
+                self.assertEqual(probe_path.read_bytes(), probe_source)
+
     def test_candidate_script_persistent_mutation_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             _, candidate_root = self.prepare_roots(temporary_directory)
             runner_path = (
-                candidate_root
+                distribution_content_root(candidate_root)
                 / "skills/waited-delivery/scripts/waited_delivery_runner.py"
             )
             runner_path.write_text(
@@ -3345,15 +8694,25 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                with self.assertRaisesRegex(
-                    AssertionError, "candidate implementation bytes|candidate checkout"
-                ):
-                    _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+                completed = _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("Permission denied", completed.stderr)
+            self.assertEqual(
+                (
+                    distribution_content_root(candidate_root)
+                    / "skills/waited-delivery/scripts/waited_delivery_bridge.py"
+                ).read_text(encoding="utf-8"),
+                "pass\n",
+            )
 
     def test_candidate_script_restore_is_isolated_before_next_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             _, candidate_root = self.prepare_roots(temporary_directory)
-            scripts_root = candidate_root / "skills/waited-delivery/scripts"
+            scripts_root = (
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/scripts"
+            )
             runner_path = scripts_root / "waited_delivery_runner.py"
             bridge_path = scripts_root / "waited_delivery_bridge.py"
             runner_path.write_text(
@@ -3375,13 +8734,153 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                restored = _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+                rejected = _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
                 subsequent = _CANDIDATE_SUPPORT.run_candidate_python(bridge_path)
 
-            self.assertEqual(restored.returncode, 0, restored.stderr)
-            self.assertEqual(restored.stdout, "restored\n")
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("Permission denied", rejected.stderr)
             self.assertEqual(subsequent.returncode, 0, subsequent.stderr)
             self.assertEqual(subsequent.stdout, "original\n")
+
+    def test_candidate_cannot_use_runner_environment_for_trusted_source_aba(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            trusted_root = root / ".required-ci"
+            trusted_root.mkdir()
+            trusted_control = trusted_root / "control.py"
+            trusted_control.write_text("VALUE = 'trusted'\n", encoding="utf-8")
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            canary = root / "trusted-aba.executed"
+            runner_path = (
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            runner_path.write_text(
+                "import os\n"
+                "from pathlib import Path\n"
+                "import runpy\n\n"
+                "trusted = Path(os.environ['GITHUB_WORKSPACE']) / "
+                "'.required-ci/control.py'\n"
+                "original = trusted.read_bytes()\n"
+                "try:\n"
+                f"    trusted.write_text(\"from pathlib import Path\\nPath({str(canary)!r}).write_text('executed', encoding='utf-8')\\n\", encoding='utf-8')\n"
+                "    runpy.run_path(str(trusted), run_name='_required_ci_aba')\n"
+                "finally:\n"
+                "    trusted.write_bytes(original)\n",
+                encoding="utf-8",
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            candidate_environment = os.environ.copy()
+            candidate_environment["GITHUB_WORKSPACE"] = str(root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                completed = _CANDIDATE_SUPPORT.run_candidate_python(
+                    runner_path,
+                    env=candidate_environment,
+                )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(canary.exists())
+            self.assertEqual(
+                trusted_control.read_text(encoding="utf-8"), "VALUE = 'trusted'\n"
+            )
+
+    @staticmethod
+    def _terminate_marked_process(marker: Path, lock_path: Path) -> None:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.02)
+        if not marker.exists():
+            return
+        if sys.platform == "linux":
+            realm = _CANDIDATE_SUPPORT._strict_realm()
+            _CANDIDATE_SUPPORT._invoke_root_uid_cleanup(
+                TRUSTED_CANDIDATE_SUPPORT_PATH,
+                int(realm["uid"]),
+            )
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_candidate_setsid_descendant_cannot_outlive_success_receipt(self) -> None:
+        with _CANDIDATE_SUPPORT.candidate_fixture_directory(
+            "required-ci-setsid-"
+        ) as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            marker = root / "setsid-descendant.pid"
+            lock_path = root / "setsid-descendant.lock"
+            token = f"required-ci-setsid-{root.name}"
+            daemon = root / "setsid_daemon.py"
+            daemon.write_text(
+                "from pathlib import Path\n"
+                "import fcntl\n"
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "lock_file = Path(sys.argv[2]).open('a+b')\n"
+                "fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)\n"
+                "Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            runner_path = (
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            runner_path.write_text(
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "subprocess.Popen(\n"
+                f"    [sys.executable, '-I', {str(daemon)!r}, {str(marker)!r}, {str(lock_path)!r}, {token!r}],\n"
+                "    stdin=subprocess.DEVNULL,\n"
+                "    stdout=subprocess.DEVNULL,\n"
+                "    stderr=subprocess.DEVNULL,\n"
+                "    start_new_session=True,\n"
+                ")\n"
+                "time.sleep(0.2)\n",
+                encoding="utf-8",
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                        REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                        REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE,
+                    },
+                    clear=False,
+                ):
+                    if sys.platform != "linux":
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            "requires Linux procfs before any subprocess",
+                        ):
+                            _CANDIDATE_SUPPORT.run_candidate_python(
+                                runner_path, writable_roots=(root,)
+                            )
+                        self.assertFalse(marker.exists())
+                        return
+                    completed = _CANDIDATE_SUPPORT.run_candidate_python(
+                        runner_path, writable_roots=(root,)
+                    )
+                    self.assertEqual(completed.returncode, 0)
+                    _CANDIDATE_SUPPORT.assert_candidate_isolation_quiescent()
+                    with lock_path.open("a+b") as lock_file:
+                        fcntl.flock(
+                            lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+            finally:
+                self._terminate_marked_process(marker, lock_path)
 
     def test_candidate_stdout_cannot_form_the_trusted_parent_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3390,7 +8889,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 candidate_root, "test_required.py", self.required_module()
             )
             runner_path = (
-                candidate_root
+                distribution_content_root(candidate_root)
                 / "skills/waited-delivery/scripts/waited_delivery_runner.py"
             )
             runner_path.write_text(
@@ -3446,7 +8945,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "    stdout=subprocess.DEVNULL,\n"
                 "    stderr=subprocess.DEVNULL,\n"
                 ")\n",
-                "active process group",
+                "active descendant",
             ),
         }
         for name, (source, message) in fixtures.items():
@@ -3454,7 +8953,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temporary_directory:
                     _, candidate_root = self.prepare_roots(temporary_directory)
                     runner_path = (
-                        candidate_root
+                        distribution_content_root(candidate_root)
                         / "skills/waited-delivery/scripts/waited_delivery_runner.py"
                     )
                     runner_path.write_text(source, encoding="utf-8")
@@ -3477,8 +8976,27 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             else contextlib.nullcontext()
                         )
                         with timeout:
-                            with self.assertRaisesRegex(AssertionError, message):
-                                _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+                            strict = (
+                                os.environ.get(REQUIRED_CI_ISOLATION_MODE_ENV)
+                                == REQUIRED_CI_ISOLATION_MODE
+                            )
+                            if name == "lingering process group" and strict:
+                                completed = (
+                                    _CANDIDATE_SUPPORT.run_candidate_python(
+                                        runner_path
+                                    )
+                                )
+                                self.assertEqual(
+                                    completed.returncode, 0, completed.stderr
+                                )
+                                _CANDIDATE_SUPPORT.assert_candidate_isolation_quiescent()
+                            else:
+                                with self.assertRaisesRegex(
+                                    AssertionError, message
+                                ):
+                                    _CANDIDATE_SUPPORT.run_candidate_python(
+                                        runner_path
+                                    )
 
 
 class RequiredCiCallerRegressionTests(unittest.TestCase):
@@ -3666,11 +9184,83 @@ class RequiredCiWorkflowTests(unittest.TestCase):
     def test_private_distribution_is_identified_without_repository_files(self) -> None:
         root = Path("/example/repository")
         self.assertEqual(
-            (root, "private"),
+            (
+                root,
+                root / "personal_codex",
+                Path("personal_codex"),
+                "private",
+            ),
             distribution_contract_context(
                 root / "personal_codex/skills/waited-delivery"
             ),
         )
+
+    def test_private_workflow_harness_separates_checkout_and_content_roots(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkout_root = Path(temporary_directory).resolve(strict=True)
+            tests_root = (
+                checkout_root
+                / "personal_codex/skills/waited-delivery/tests"
+            )
+            tests_root.mkdir(parents=True)
+            workflow_test_path = tests_root / "test_required_ci_workflow.py"
+            support_path = tests_root / "required_ci_candidate.py"
+            shutil.copyfile(Path(__file__).resolve(strict=True), workflow_test_path)
+            shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, support_path)
+            workflows_root = checkout_root / ".github/workflows"
+            workflows_root.mkdir(parents=True)
+            (workflows_root / "caller.yml").write_text(
+                "jobs:\n"
+                "  required:\n"
+                "    uses: ./.github/workflows/required-ci.yml\n",
+                encoding="utf-8",
+            )
+            module_name = "_required_ci_private_workflow_harness"
+            support_module_name = "required_ci_candidate"
+            support_module_was_loaded = support_module_name in sys.modules
+            previous_required_candidate = sys.modules.get("required_ci_candidate")
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    module_name, workflow_test_path
+                )
+                if spec is None or spec.loader is None:
+                    raise AssertionError("private workflow harness cannot be loaded")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    for key in (
+                        REQUIRED_CI_CANDIDATE_ROOT_ENV,
+                        REQUIRED_CI_CANDIDATE_SHA_ENV,
+                        REQUIRED_CI_ISOLATION_MODE_ENV,
+                    ):
+                        os.environ.pop(key, None)
+                    spec.loader.exec_module(module)
+
+                inventory = module._direct_test_inventory(
+                    checkout_root, "private trusted"
+                )
+                manifest = module._trusted_test_source_manifest(checkout_root)
+                callers = module.required_ci_callers_in_repository(checkout_root)
+            finally:
+                sys.modules.pop(module_name, None)
+                if support_module_was_loaded:
+                    sys.modules[support_module_name] = previous_required_candidate
+                else:
+                    sys.modules.pop(support_module_name, None)
+
+            self.assertIs(
+                sys.modules.get("required_ci_candidate"),
+                previous_required_candidate,
+            )
+
+        self.assertTrue(inventory)
+        self.assertIn(
+            "personal_codex/skills/waited-delivery/tests/required_ci_candidate.py",
+            manifest,
+        )
+        self.assertEqual(callers[0][0], Path(".github/workflows/caller.yml"))
 
     def test_entry_wraps_only_the_required_linux_helper_tests(self) -> None:
         if DISTRIBUTION_PROFILE == "private":
@@ -3704,6 +9294,8 @@ class RequiredCiWorkflowTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == [TRUSTED_STRUCTURE_VALIDATOR_FLAG]:
+        raise SystemExit(_trusted_structure_validator_main())
     if sys.argv[1:] == [TRUSTED_TEST_SUPERVISOR_FLAG]:
         raise SystemExit(_trusted_test_supervisor_main())
     if len(sys.argv) == 3 and sys.argv[1] == TRUSTED_TEST_CHILD_FLAG:

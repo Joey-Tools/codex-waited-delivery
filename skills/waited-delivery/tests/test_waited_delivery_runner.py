@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import pathlib
 import subprocess
-import tempfile
 import textwrap
 import unittest
 
-from required_ci_candidate import candidate_script, run_candidate_python
+from required_ci_candidate import (
+    candidate_fixture_directory,
+    candidate_script,
+    run_candidate_python,
+)
 
 
 SCRIPT_PATH = candidate_script("waited_delivery_runner.py")
@@ -57,7 +60,7 @@ def git_commit(repo: pathlib.Path, message: str) -> None:
 
 class WaitedDeliveryRunnerTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(prefix="waited-delivery-test-")
+        self.tempdir = candidate_fixture_directory("waited-delivery-test-")
         self.root = pathlib.Path(self.tempdir.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
@@ -111,7 +114,9 @@ class WaitedDeliveryRunnerTest(unittest.TestCase):
         return pathlib.Path(completed.stdout.strip())
 
     def _run_runner(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return run_candidate_python(SCRIPT_PATH, args)
+        return run_candidate_python(
+            SCRIPT_PATH, args, writable_roots=(self.root,)
+        )
 
     def _commit_implementation(self) -> None:
         self.assertEqual(

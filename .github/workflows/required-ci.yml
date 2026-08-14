@@ -40,10 +40,11 @@ jobs:
           REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate
           REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}
         run: |
-          python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py"
+          python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py" --validate-required-ci-structure
       - name: Run trusted Required CI tests
         env:
           REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate
           REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}
+          REQUIRED_CI_ISOLATION_MODE: sudo-setpriv-v1
         run: |
           python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py" --run-trusted-tests
