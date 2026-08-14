@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import re
+import tempfile
 import unittest
 
 
@@ -15,6 +16,7 @@ def distribution_contract_context(skill_root: Path) -> tuple[Path, str]:
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT, DISTRIBUTION_PROFILE = distribution_contract_context(SKILL_ROOT)
 EXPECTED_REPOSITORY = "Joey-Tools/codex-waited-delivery"
+EXPECTED_TEST_TIMEOUT_MINUTES = "10"
 REPOSITORY_GUARD = (
     "      - name: Reject unexpected repository\n"
     f"        if: ${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}\n"
@@ -382,6 +384,67 @@ def _reject_yaml_indirection(content: str, line_number: int) -> None:
         )
 
 
+_REQUIRED_CI_LOCAL_CALL = "./.github/workflows/required-ci.yml"
+_REQUIRED_CI_REMOTE_REPOSITORY_PREFIX = f"{EXPECTED_REPOSITORY}/"
+_REQUIRED_CI_REMOTE_WORKFLOW_PREFIX = ".github/workflows/required-ci.yml@"
+
+
+def _is_required_ci_call_target(uses: str) -> bool:
+    if uses == _REQUIRED_CI_LOCAL_CALL:
+        return True
+    repository_prefix = uses[: len(_REQUIRED_CI_REMOTE_REPOSITORY_PREFIX)]
+    if (
+        repository_prefix.casefold()
+        != _REQUIRED_CI_REMOTE_REPOSITORY_PREFIX.casefold()
+    ):
+        return False
+    workflow_ref = uses[len(_REQUIRED_CI_REMOTE_REPOSITORY_PREFIX) :]
+    return (
+        workflow_ref.startswith(_REQUIRED_CI_REMOTE_WORKFLOW_PREFIX)
+        and len(workflow_ref) > len(_REQUIRED_CI_REMOTE_WORKFLOW_PREFIX)
+    )
+
+
+def _workflow_job_uses_values(workflow: str) -> list[tuple[int, str]]:
+    _, jobs = _workflow_job_blocks(workflow)
+    uses_values: list[tuple[int, str]] = []
+    for job_id, job_entries in jobs:
+        properties = _mapping_blocks(job_entries[1:], f"job {job_id!r} property")
+        for key, value, line_number, block in properties:
+            if key != "uses":
+                continue
+            if len(block) != 1:
+                raise AssertionError(
+                    f"job {job_id!r} uses must be a scalar on line {line_number}"
+                )
+            uses_values.append((line_number, _plain_scalar(value, line_number)))
+    return uses_values
+
+
+def required_ci_callers_in_repository(
+    repo_root: Path,
+) -> list[tuple[Path, int, str]]:
+    workflows_root = repo_root / ".github/workflows"
+    canonical_leaf = workflows_root / "required-ci.yml"
+    workflow_paths = sorted(
+        {
+            *workflows_root.rglob("*.yml"),
+            *workflows_root.rglob("*.yaml"),
+        }
+    )
+    callers: list[tuple[Path, int, str]] = []
+    for workflow_path in workflow_paths:
+        if workflow_path == canonical_leaf or not workflow_path.is_file():
+            continue
+        workflow = workflow_path.read_text(encoding="utf-8")
+        for line_number, uses in _workflow_job_uses_values(workflow):
+            if _is_required_ci_call_target(uses):
+                callers.append(
+                    (workflow_path.relative_to(repo_root), line_number, uses)
+                )
+    return callers
+
+
 def _checkout_from_step(entries: list[tuple[int, int, str]], step_indent: int) -> bool:
     first_index, _, first_content = entries[0]
     if not first_content.startswith("- "):
@@ -600,9 +663,14 @@ def _validate_test_job(
     lines: list[str], job_entries: list[tuple[int, int, str]]
 ) -> None:
     properties = _mapping_blocks(job_entries[1:], "job 'test' property")
-    if [key for key, _, _, _ in properties] != ["runs-on", "steps"]:
+    if [key for key, _, _, _ in properties] != [
+        "runs-on",
+        "timeout-minutes",
+        "steps",
+    ]:
         raise AssertionError(
-            "test job properties must be exactly runs-on and steps in order"
+            "test job properties must be exactly runs-on, timeout-minutes, "
+            "and steps in order"
         )
     runs_key, runs_value, runs_line, runs_block = properties[0]
     if runs_key != "runs-on" or len(runs_block) != 1:
@@ -610,7 +678,18 @@ def _validate_test_job(
     if _plain_scalar(runs_value, runs_line) != "ubuntu-latest":
         raise AssertionError("test job must run on ubuntu-latest")
 
-    steps_key, steps_value, steps_line, steps_property = properties[1]
+    timeout_key, timeout_value, timeout_line, timeout_block = properties[1]
+    if (
+        timeout_key != "timeout-minutes"
+        or len(timeout_block) != 1
+        or timeout_value != EXPECTED_TEST_TIMEOUT_MINUTES
+    ):
+        raise AssertionError(
+            "test job timeout-minutes must be the exact unquoted integer literal "
+            f"{EXPECTED_TEST_TIMEOUT_MINUTES} on line {timeout_line}"
+        )
+
+    steps_key, steps_value, steps_line, steps_property = properties[2]
     if steps_key != "steps" or steps_value:
         raise AssertionError(
             f"test job steps must use a block sequence on line {steps_line}"
@@ -1118,6 +1197,7 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
             "  # release: this remains a comment\n"
             "  test: # the only real job\n"
             "    runs-on: ubuntu-latest\n"
+            "    timeout-minutes: 10\n"
             "    steps:\n"
             f"{REPOSITORY_GUARD}\n"
             "      - uses: actions/checkout@v4\n"
@@ -1151,8 +1231,14 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
         *,
         job_properties: str = "",
         runner: str = "ubuntu-latest",
+        timeout_minutes: str | None = EXPECTED_TEST_TIMEOUT_MINUTES,
         trailing_steps: str = "",
     ) -> str:
+        timeout_line = (
+            ""
+            if timeout_minutes is None
+            else f"    timeout-minutes: {timeout_minutes}\n"
+        )
         return (
             "name: Required CI\n"
             "on:\n"
@@ -1163,6 +1249,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             "  test:\n"
             f"{job_properties}"
             f"    runs-on: {runner}\n"
+            f"{timeout_line}"
             "    steps:\n"
             f"{REPOSITORY_GUARD}\n"
             "      - uses: actions/checkout@v4\n"
@@ -1176,10 +1263,43 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             f"{trailing_steps}"
         )
 
+    def test_test_job_requires_the_exact_literal_timeout(self) -> None:
+        trailing_steps = (
+            "      - name: Compile Python helpers\n"
+            "        run: |\n"
+            "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
+            "      - name: Run tests\n"
+            "        run: |\n"
+            "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
+        )
+        valid_workflow = self.required_workflow(trailing_steps=trailing_steps)
+        self.assertEqual(len(validate_required_workflow(valid_workflow)), 1)
+
+        invalid_timeouts = {
+            "missing": None,
+            "zero": "0",
+            "noninteger word": "ten",
+            "noninteger decimal": "10.5",
+            "quoted integer": '"10"',
+            "expression": "${{ vars.REQUIRED_CI_TIMEOUT_MINUTES }}",
+            "over GitHub maximum": "361",
+            "different positive integer": "11",
+        }
+        for name, timeout_minutes in invalid_timeouts.items():
+            with self.subTest(name=name):
+                with self.assertRaises(AssertionError):
+                    validate_required_workflow(
+                        self.required_workflow(
+                            timeout_minutes=timeout_minutes,
+                            trailing_steps=trailing_steps,
+                        )
+                    )
+
     def test_test_job_cannot_be_skipped_or_suppress_errors(self) -> None:
         fixtures = {
             "job condition": "    if: false\n",
             "job error suppression": "    continue-on-error: true\n",
+            "unrelated job property": "    name: Hidden wrapper\n",
         }
 
         for name, job_properties in fixtures.items():
@@ -1290,6 +1410,92 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
 
         with self.assertRaises(AssertionError):
             validate_required_workflow(workflow)
+
+
+class RequiredCiCallerRegressionTests(unittest.TestCase):
+    @staticmethod
+    def write_workflow(repo_root: Path, relative_path: str, workflow: str) -> None:
+        path = repo_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(workflow, encoding="utf-8")
+
+    def test_workflow_inventory_rejects_local_and_same_repository_callers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo_root = Path(temporary_directory)
+            fixtures = {
+                ".github/workflows/required-ci.yml": (
+                    "jobs:\n"
+                    "  ignored-canonical-self-reference:\n"
+                    "    uses: ./.github/workflows/required-ci.yml\n"
+                ),
+                ".github/workflows/local-caller.yml": (
+                    "jobs:\n"
+                    "  required:\n"
+                    "    uses: ./.github/workflows/required-ci.yml\n"
+                ),
+                ".github/workflows/remote-caller.yaml": (
+                    "jobs:\n"
+                    "  required:\n"
+                    "    uses: 'Joey-Tools/codex-waited-delivery/.github/workflows/required-ci.yml@master'\n"
+                ),
+                ".github/workflows/near-misses.yaml": (
+                    "# uses: ./.github/workflows/required-ci.yml\n"
+                    "jobs:\n"
+                    "  yaml-leaf:\n"
+                    "    uses: ./.github/workflows/required-ci.yaml\n"
+                    "  other-repository:\n"
+                    "    uses: Joey-Tools/example/.github/workflows/required-ci.yml@master\n"
+                    "  suffixed-path:\n"
+                    "    uses: ./.github/workflows/required-ci.yml.disabled\n"
+                    "  case-variant-path:\n"
+                    "    uses: Joey-Tools/codex-waited-delivery/.github/workflows/Required-CI.yml@master\n"
+                    "  ordinary-string:\n"
+                    "    runs-on: ubuntu-latest\n"
+                    "    steps:\n"
+                    "      - run: |\n"
+                    "          echo 'uses: ./.github/workflows/required-ci.yml'\n"
+                    "  action-input-named-uses:\n"
+                    "    runs-on: ubuntu-latest\n"
+                    "    steps:\n"
+                    "      - uses: example/action@v1\n"
+                    "        with:\n"
+                    "          uses: ./.github/workflows/required-ci.yml\n"
+                ),
+            }
+            for relative_path, workflow in fixtures.items():
+                self.write_workflow(repo_root, relative_path, workflow)
+
+            callers = required_ci_callers_in_repository(repo_root)
+
+        self.assertEqual(
+            [
+                (path.as_posix(), line_number, uses)
+                for path, line_number, uses in callers
+            ],
+            [
+                (
+                    ".github/workflows/local-caller.yml",
+                    3,
+                    "./.github/workflows/required-ci.yml",
+                ),
+                (
+                    ".github/workflows/remote-caller.yaml",
+                    3,
+                    "Joey-Tools/codex-waited-delivery/.github/workflows/required-ci.yml@master",
+                ),
+            ],
+        )
+
+    def test_repository_has_no_duplicate_required_ci_caller(self) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "repository workflows are not packaged in the private skill-only "
+                "distribution"
+            )
+
+        self.assertEqual(required_ci_callers_in_repository(REPO_ROOT), [])
 
 
 class RequiredCiWorkflowTests(unittest.TestCase):

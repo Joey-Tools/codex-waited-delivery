@@ -9,6 +9,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Reject unexpected repository
         if: ${{ github.repository != 'Joey-Tools/codex-waited-delivery' }}
