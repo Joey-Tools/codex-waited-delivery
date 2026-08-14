@@ -8,6 +8,6 @@ compatibility/diagnostic dependency used by external lane-readiness smoke.
 ## Test
 
 ```bash
-python3 -m py_compile skills/waited-delivery/scripts/*.py
-python3 -m unittest discover -s skills/waited-delivery/tests
+python3 -I -X pycache_prefix=/tmp/codex-waited-delivery-pycache -m py_compile skills/waited-delivery/scripts/*.py
+python3 -I -m unittest discover -s skills/waited-delivery/tests
 ```

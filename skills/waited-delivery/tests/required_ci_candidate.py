@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -374,9 +375,20 @@ def _read_bounded_output(output_file, description: str) -> str:
         raise AssertionError(f"candidate {description} is not valid UTF-8") from error
 
 
-def run_candidate_python(
+def _validated_candidate_script(root: Path, script: Path) -> None:
+    try:
+        relative_script = script.relative_to(root)
+    except ValueError as error:
+        raise AssertionError("candidate subprocess script escapes the candidate root") from error
+    if relative_script not in CANDIDATE_SCRIPT_RELATIVE_PATHS:
+        raise AssertionError("candidate subprocess script is not in the fixed inventory")
+    if _ordinary_candidate_file(root, relative_script) != script:
+        raise AssertionError("candidate subprocess script path is not canonical")
+
+
+def _run_candidate_process(
     script: Path,
-    arguments: Sequence[str] = (),
+    command: Sequence[str],
     *,
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
@@ -387,16 +399,9 @@ def run_candidate_python(
     before = candidate_checkout_binding(
         root, candidate_sha, require_clean=require_clean
     )
-    try:
-        relative_script = script.relative_to(root)
-    except ValueError as error:
-        raise AssertionError("candidate subprocess script escapes the candidate root") from error
-    if relative_script not in CANDIDATE_SCRIPT_RELATIVE_PATHS:
-        raise AssertionError("candidate subprocess script is not in the fixed inventory")
-    if _ordinary_candidate_file(root, relative_script) != script:
-        raise AssertionError("candidate subprocess script path is not canonical")
+    _validated_candidate_script(root, script)
 
-    command = [sys.executable, "-I", str(script), *arguments]
+    exact_command = list(command)
     child_environment = dict(os.environ if env is None else env)
     child_environment.pop("PYTHONHOME", None)
     child_environment.pop("PYTHONPATH", None)
@@ -407,7 +412,7 @@ def run_candidate_python(
         child_cwd = Path(neutral_cwd) if cwd is None else cwd
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
             process = subprocess.Popen(
-                command,
+                exact_command,
                 cwd=str(child_cwd),
                 env=child_environment,
                 stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
@@ -442,4 +447,118 @@ def run_candidate_python(
         raise AssertionError("candidate subprocess left an active process group")
     if type(returncode) is not int:
         raise AssertionError("candidate subprocess did not produce a return code")
-    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+    return subprocess.CompletedProcess(exact_command, returncode, stdout, stderr)
+
+
+def run_candidate_python(
+    script: Path,
+    arguments: Sequence[str] = (),
+    *,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, "-I", str(script), *arguments]
+    return _run_candidate_process(
+        script,
+        command,
+        cwd=cwd,
+        env=env,
+        input_text=input_text,
+    )
+
+
+def run_candidate_hook_fault_probe(
+    script: Path,
+    faults: Sequence[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    input_text: str,
+) -> subprocess.CompletedProcess[str]:
+    if script.name != "waited_delivery_hook_adapter.py":
+        raise AssertionError("candidate hook fault probe requires the hook adapter")
+    exact_faults = tuple(faults)
+    if exact_faults not in (("continuation",), ("continuation", "fallback")):
+        raise AssertionError("candidate hook fault probe has an invalid fault sequence")
+    trusted_probe = Path(__file__).resolve(strict=True)
+    try:
+        trusted_probe_source = trusted_probe.read_bytes()
+    except OSError as error:
+        raise AssertionError("trusted hook fault probe cannot be read") from error
+    command = [
+        sys.executable,
+        "-I",
+        "-B",
+        str(trusted_probe),
+        "--hook-fault-probe",
+        str(script),
+        ",".join(exact_faults),
+    ]
+    completed = _run_candidate_process(
+        script,
+        command,
+        env=env,
+        input_text=input_text,
+    )
+    try:
+        final_probe_source = trusted_probe.read_bytes()
+    except OSError as error:
+        raise AssertionError("trusted hook fault probe became unreadable") from error
+    if final_probe_source != trusted_probe_source:
+        raise AssertionError("trusted hook fault probe changed during execution")
+    return completed
+
+
+def _hook_fault_probe_main(adapter_value: str, fault_value: str) -> int:
+    adapter_path = Path(adapter_value)
+    if (
+        not adapter_path.is_absolute()
+        or adapter_path.name != "waited_delivery_hook_adapter.py"
+    ):
+        raise AssertionError("candidate hook fault probe requires an absolute script path")
+    faults = tuple(fault_value.split(","))
+    if faults not in (("continuation",), ("continuation", "fallback")):
+        raise AssertionError("candidate hook fault probe has an invalid fault sequence")
+    spec = importlib.util.spec_from_file_location(
+        "_required_ci_candidate_hook_adapter", adapter_path
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("candidate hook adapter cannot be loaded for the fault probe")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    observed_faults: list[str] = []
+
+    def injected_continuation_failure(*_args, **_kwargs):
+        observed_faults.append("continuation")
+        raise RuntimeError("required-ci injected continuation failure")
+
+    def injected_fallback_failure(*_args, **_kwargs):
+        observed_faults.append("fallback")
+        raise RuntimeError("required-ci injected fallback failure")
+
+    module._build_stop_continuation_prompt = injected_continuation_failure
+    if "fallback" in faults:
+        module._build_stop_fallback_prompt = injected_fallback_failure
+    original_argv = sys.argv
+    try:
+        sys.argv = [str(adapter_path), "stop-hook"]
+        try:
+            result = module.main()
+        except SystemExit as error:
+            raise AssertionError(
+                "candidate hook adapter bypassed the trusted probe return path"
+            ) from error
+    finally:
+        sys.argv = original_argv
+    if tuple(observed_faults) != faults:
+        raise AssertionError("candidate hook adapter skipped the injected fault sequence")
+    if type(result) is not int:
+        raise AssertionError("candidate hook adapter returned a non-integer status")
+    return result
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--hook-fault-probe":
+        raise SystemExit(_hook_fault_probe_main(sys.argv[2], sys.argv[3]))
+    raise SystemExit("required_ci_candidate.py is a trusted support module")

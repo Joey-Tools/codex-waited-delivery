@@ -19,7 +19,7 @@ jobs:
           python-version: "3.x"
       - name: Compile Python helpers
         run: |
-          python3 -m py_compile skills/waited-delivery/scripts/*.py
+          python3 -I -X pycache_prefix="$RUNNER_TEMP/waited-delivery-pycache" -m py_compile skills/waited-delivery/scripts/*.py
       - name: Run tests
         run: |
-          python3 -m unittest discover -s skills/waited-delivery/tests
+          python3 -I -m unittest discover -s skills/waited-delivery/tests

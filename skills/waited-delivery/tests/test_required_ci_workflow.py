@@ -100,6 +100,14 @@ TRUSTED_TEST_SUPERVISOR_COMMAND = (
     'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
     f'test_required_ci_workflow.py" {TRUSTED_TEST_SUPERVISOR_FLAG}'
 )
+README_COMPILE_COMMAND = (
+    "python3 -I -X pycache_prefix=/tmp/codex-waited-delivery-pycache "
+    "-m py_compile "
+    'skills/waited-delivery/scripts/*.py'
+)
+README_DISCOVERY_COMMAND = (
+    "python3 -I -m unittest discover -s skills/waited-delivery/tests"
+)
 CANDIDATE_CHECKOUT_STEP = (
     "      - name: Check out candidate\n"
     "        uses: actions/checkout@v4\n"
@@ -2616,6 +2624,167 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             return supervise_trusted_required_ci_tests(
                 trusted_root, candidate_root
             )
+
+    @staticmethod
+    def readme_test_commands(repo_root: Path) -> list[str]:
+        readme = (repo_root / "README.md").read_text(encoding="utf-8")
+        if sum(line == "## Test" for line in readme.splitlines()) != 1:
+            raise AssertionError("README must contain exactly one Test heading")
+        match = re.search(r"\n## Test\n\n```bash\n(?P<body>[^`]*)\n```\n?\Z", readme)
+        if match is None:
+            raise AssertionError("README test command block is missing or malformed")
+        return match.group("body").splitlines()
+
+    def prepare_hook_adapter_split(
+        self, temporary_directory: str
+    ) -> tuple[Path, Path]:
+        root = Path(temporary_directory).resolve(strict=True)
+        trusted_root = root / ".required-ci"
+        candidate_root = root / ".candidate"
+        source_tests_root = TRUSTED_REPO_ROOT / CANDIDATE_TESTS_RELATIVE_PATH
+        for repository_root in (trusted_root, candidate_root):
+            tests_root = repository_root / CANDIDATE_TESTS_RELATIVE_PATH
+            tests_root.mkdir(parents=True)
+            shutil.copyfile(
+                source_tests_root / "test_waited_delivery_hook_adapter.py",
+                tests_root / "test_waited_delivery_hook_adapter.py",
+            )
+        shutil.copyfile(
+            TRUSTED_CANDIDATE_SUPPORT_PATH,
+            trusted_root / CANDIDATE_TESTS_RELATIVE_PATH / "required_ci_candidate.py",
+        )
+        candidate_scripts_root = candidate_root / "skills/waited-delivery/scripts"
+        candidate_scripts_root.mkdir(parents=True)
+        for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS:
+            shutil.copyfile(
+                TRUSTED_REPO_ROOT / relative_path,
+                candidate_root / relative_path,
+            )
+        return trusted_root, candidate_root
+
+    def test_supervisor_rejects_dead_prompt_fallback_with_success_stub(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_hook_adapter_split(
+                temporary_directory
+            )
+            adapter_path = (
+                candidate_root
+                / "skills/waited-delivery/scripts/waited_delivery_hook_adapter.py"
+            )
+            source = adapter_path.read_text(encoding="utf-8")
+            live_fallback = (
+                "            _record_hook_failure(error)\n"
+                "            try:\n"
+                "                prompt = _build_stop_fallback_prompt("
+            )
+            dead_fallback = (
+                "            _record_hook_failure(error)\n"
+                "            return _success_hook_response()\n"
+                "            try:\n"
+                "                prompt = _build_stop_fallback_prompt("
+            )
+            self.assertIn(live_fallback, source)
+            adapter_path.write_text(
+                source.replace(live_fallback, dead_fallback, 1),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                AssertionError, "trusted Required CI tests did not complete"
+            ):
+                self.supervise(trusted_root, candidate_root)
+
+    def test_hook_fault_probe_rejects_invalid_targets_and_sequences(self) -> None:
+        adapter_path = _CANDIDATE_SUPPORT.candidate_script(
+            "waited_delivery_hook_adapter.py"
+        )
+        runner_path = _CANDIDATE_SUPPORT.candidate_script(
+            "waited_delivery_runner.py"
+        )
+        with self.assertRaisesRegex(AssertionError, "invalid fault sequence"):
+            _CANDIDATE_SUPPORT.run_candidate_hook_fault_probe(
+                adapter_path,
+                ("fallback",),
+                input_text="{}",
+            )
+        with self.assertRaisesRegex(AssertionError, "requires the hook adapter"):
+            _CANDIDATE_SUPPORT.run_candidate_hook_fault_probe(
+                runner_path,
+                ("continuation",),
+                input_text="{}",
+            )
+
+    def test_readme_test_commands_are_isolated_and_ordered(self) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "canonical repository documentation is not shipped in private distribution"
+            )
+        self.assertEqual(
+            self.readme_test_commands(REPO_ROOT),
+            [README_COMPILE_COMMAND, README_DISCOVERY_COMMAND],
+        )
+
+    def test_readme_compile_preserves_candidate_binding_and_supervisor(self) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "canonical repository documentation is not shipped in private distribution"
+            )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            shutil.copyfile(REPO_ROOT / "README.md", candidate_root / "README.md")
+            self.write_test_module(
+                candidate_root, "test_required.py", self.required_module()
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            commands = self.readme_test_commands(candidate_root)
+            self.assertEqual(
+                commands,
+                [README_COMPILE_COMMAND, README_DISCOVERY_COMMAND],
+            )
+            external_tmp = Path(temporary_directory).resolve(strict=True) / "external-tmp"
+            external_tmp.mkdir()
+            pycache_prefix = external_tmp / "required-ci-readme-pycache"
+            self.assertNotIn(candidate_root, pycache_prefix.parents)
+            compile_argv = [
+                sys.executable,
+                "-I",
+                "-X",
+                f"pycache_prefix={pycache_prefix}",
+                "-m",
+                "py_compile",
+                *[
+                    str(candidate_root / relative_path)
+                    for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS
+                ],
+            ]
+            completed = subprocess.run(
+                compile_argv,
+                cwd=candidate_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                before = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                    candidate_root, candidate_sha, require_clean=True
+                )
+                receipt = supervise_trusted_required_ci_tests(
+                    trusted_root, candidate_root
+                )
+                after = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                    candidate_root, candidate_sha, require_clean=True
+                )
+            self.assertEqual(before, after)
+            self.assertEqual(receipt["status"], "completed")
 
     def test_supervisor_proves_expected_inventory_and_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

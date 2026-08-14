@@ -6,13 +6,18 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 import zlib
 from collections.abc import Mapping
 
-from required_ci_candidate import candidate_script, run_candidate_python
+from required_ci_candidate import (
+    candidate_script,
+    run_candidate_hook_fault_probe,
+    run_candidate_python,
+)
 
 
 ADAPTER_PATH = candidate_script("waited_delivery_hook_adapter.py")
@@ -205,6 +210,89 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             elif isinstance(node.func, ast.Attribute):
                 calls.append(node.func.attr)
         return calls
+
+    def _run_stop_fault_probe(
+        self, *faults: str
+    ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+        session_id = "session-prompt-fault"
+        child_session_id = "child-prompt-fault"
+        home = self.root / "fault-probe-home"
+        home.mkdir()
+        environment = os.environ.copy()
+        environment.pop("CODEX_THREAD_ID", None)
+        environment["HOME"] = str(home)
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+            env_overrides={"HOME": str(home)},
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        prepared = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Exercise stop-hook fault fallback",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            "--session-id",
+            session_id,
+            env_overrides={"HOME": str(home)},
+        )
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        run_dir = json.loads(prepared.stdout)["run_dir"]
+        attached = self._run_adapter(
+            "attach-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dir,
+            "--child-session-id",
+            child_session_id,
+            "--session-id",
+            session_id,
+            env_overrides={"HOME": str(home)},
+        )
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        stop_payload = {
+            "session_id": session_id,
+            "transcript_path": "/tmp/prompt-fault-transcript.jsonl",
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "I am about to stop",
+        }
+        completed = run_candidate_hook_fault_probe(
+            ADAPTER_PATH,
+            faults,
+            env=environment,
+            input_text=json.dumps(stop_payload),
+        )
+        trusted_probe = pathlib.Path(
+            run_candidate_hook_fault_probe.__code__.co_filename
+        ).resolve(strict=True)
+        self.assertEqual(
+            completed.args,
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(trusted_probe),
+                "--hook-fault-probe",
+                str(ADAPTER_PATH),
+                ",".join(faults),
+            ],
+        )
+        log_path = self._home_log_dir(home) / "waited-delivery-hooks.jsonl"
+        self.assertTrue(log_path.is_file())
+        events = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+        ]
+        return completed, events
 
     def test_terminal_stop_prompts_refuse_missing_child_identity(self) -> None:
         for name in (
@@ -1000,16 +1088,17 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertIn("--child-session-id child-3", completed.stderr)
 
     def test_stop_hook_keeps_blocking_when_prompt_render_fails(self) -> None:
-        node, source = self._adapter_function("_stop_hook")
-        call_names = self._adapter_call_names("_stop_hook")
-        continuation_index = call_names.index("_build_stop_continuation_prompt")
-        fallback_index = call_names.index("_build_stop_fallback_prompt")
-        self.assertLess(continuation_index, fallback_index)
-        self.assertIn("except Exception as error", source)
-        self.assertIn("_record_hook_failure(error)", source)
-        self.assertGreaterEqual(
-            sum(isinstance(child, ast.Try) for child in ast.walk(node)), 5
+        completed, events = self._run_stop_fault_probe("continuation")
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("Do not finish yet", completed.stderr)
+        self.assertIn("child-prompt-fault", completed.stderr)
+        self.assertEqual(
+            [event["error_message"] for event in events],
+            ["required-ci injected continuation failure"],
         )
+        self.assertEqual(events[0]["hook_command"], "stop-hook")
+        self.assertEqual(events[0]["session_id"], "session-prompt-fault")
 
     def test_stop_hook_fallback_prompt_preserves_terminal_child_status(self) -> None:
         _, source = self._adapter_function("_build_stop_fallback_prompt")
@@ -1033,17 +1122,28 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         )
 
     def test_stop_hook_keeps_blocking_when_fallback_builder_fails(self) -> None:
-        _, source = self._adapter_function("_stop_hook")
-        call_names = self._adapter_call_names("_stop_hook")
-        self.assertLess(
-            call_names.index("_build_stop_fallback_prompt"),
-            call_names.index("_build_stop_last_resort_prompt"),
+        completed, events = self._run_stop_fault_probe(
+            "continuation", "fallback"
         )
-        self.assertIn("except Exception as fallback_error", source)
-        self.assertIn("_record_hook_failure(fallback_error)", source)
-        _, last_resort = self._adapter_function("_build_stop_last_resort_prompt")
-        self.assertIn("--child-status", last_resort)
-        self.assertIn("--child-session-id", last_resort)
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("Do not finish yet", completed.stderr)
+        self.assertIn("child-prompt-fault", completed.stderr)
+        self.assertEqual(
+            [event["error_message"] for event in events],
+            [
+                "required-ci injected continuation failure",
+                "required-ci injected fallback failure",
+            ],
+        )
+        self.assertEqual(
+            [event["hook_command"] for event in events],
+            ["stop-hook", "stop-hook"],
+        )
+        self.assertEqual(
+            [event["session_id"] for event in events],
+            ["session-prompt-fault", "session-prompt-fault"],
+        )
 
     def test_stop_hook_keeps_blocking_when_last_resort_builder_fails(self) -> None:
         _, source = self._adapter_function("_stop_hook")
