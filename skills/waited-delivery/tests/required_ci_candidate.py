@@ -15,6 +15,7 @@ import pwd
 import re
 import resource
 import select
+import selectors
 import shutil
 import signal
 import stat
@@ -25,7 +26,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import IO, Iterator
 
 
@@ -44,6 +45,8 @@ CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES = 1024 * 1024
 CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS = 5
 CANDIDATE_GIT_TIMEOUT_SECONDS = 15
 CANDIDATE_GIT_OUTPUT_LIMIT_BYTES = 1024 * 1024
+CANDIDATE_GIT_REAP_TIMEOUT_SECONDS = 5
+_CANDIDATE_GIT_PIPE_READ_BYTES = 64 * 1024
 CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES = 4 * 1024 * 1024
 _STRICT_PROCESS_LIMIT = 64
 _STRICT_CPU_LIMIT_SECONDS = 20
@@ -283,34 +286,255 @@ def candidate_git_argv(root: Path, *arguments: str) -> list[str]:
     ]
 
 
+class _CandidateGitOutputLimit(Exception):
+    def __init__(self, description: str) -> None:
+        super().__init__(description)
+        self.description = description
+
+
+def _candidate_git_process_group_has_live_members(process_group: int) -> bool:
+    if sys.platform.startswith("linux") and Path("/proc").is_dir():
+        try:
+            process_entries = os.scandir("/proc")
+        except OSError as error:
+            raise AssertionError(
+                "candidate Git process inventory is unreadable"
+            ) from error
+        with process_entries:
+            for entry in process_entries:
+                if not entry.name.isascii() or not entry.name.isdecimal():
+                    continue
+                try:
+                    descriptor = os.open(
+                        f"/proc/{entry.name}/stat",
+                        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    )
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue
+                try:
+                    status = os.read(descriptor, 4097)
+                finally:
+                    os.close(descriptor)
+                if len(status) > 4096:
+                    raise AssertionError(
+                        "candidate Git process inventory entry is oversized"
+                    )
+                fields = status[status.rfind(b") ") + 2 :].split()
+                if len(fields) < 3:
+                    raise AssertionError(
+                        "candidate Git process inventory entry is malformed"
+                    )
+                try:
+                    member_group = int(fields[2])
+                except ValueError as error:
+                    raise AssertionError(
+                        "candidate Git process inventory entry is malformed"
+                    ) from error
+                if member_group == process_group and fields[0] != b"Z":
+                    return True
+        return False
+    try:
+        os.killpg(process_group, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _terminate_candidate_git_process_tree(
+    process: subprocess.Popen[bytes], process_group: int
+) -> None:
+    cleanup_failures: list[str] = []
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # Darwin reports EPERM for a process group whose only remaining member
+        # is the already-exited session leader. The still-unreaped leader below
+        # pins the numeric process-group generation while live members are
+        # inventoried, so this is not permission to signal a replacement group.
+        pass
+    except OSError as error:
+        cleanup_failures.append(f"signal: {error}")
+    deadline = time.monotonic() + CANDIDATE_GIT_REAP_TIMEOUT_SECONDS
+    try:
+        _wait_candidate_git_exit_without_reaping(process, deadline)
+    except BaseException as error:
+        cleanup_failures.append(f"leader exit: {error}")
+    while not cleanup_failures and time.monotonic() < deadline:
+        try:
+            if not _candidate_git_process_group_has_live_members(process_group):
+                break
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            break
+        except OSError as error:
+            cleanup_failures.append(f"live-member cleanup: {error}")
+            break
+        time.sleep(0.01)
+    else:
+        if not cleanup_failures:
+            cleanup_failures.append("live process-group members remained active")
+    try:
+        process.wait(timeout=max(0.001, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as error:
+        cleanup_failures.append(f"reap: {error}")
+    if cleanup_failures:
+        raise AssertionError(
+            "candidate Git process tree cleanup is incomplete: "
+            + "; ".join(cleanup_failures)
+        )
+
+
+def _wait_candidate_git_exit_without_reaping(
+    process: subprocess.Popen[bytes], deadline: float
+) -> None:
+    while True:
+        try:
+            status = os.waitid(
+                os.P_PID,
+                process.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError as error:
+            raise AssertionError(
+                "candidate Git exit identity became unavailable"
+            ) from error
+        if status is not None:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("candidate Git process deadline expired")
+        time.sleep(min(0.01, remaining))
+
+
+def _drain_candidate_git_pipes(
+    process: subprocess.Popen[bytes],
+    *,
+    output_limit: int,
+    deadline: float,
+) -> tuple[bytes, bytes]:
+    if process.stdout is None or process.stderr is None:
+        raise AssertionError("candidate Git output pipes are unavailable")
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    selector = selectors.DefaultSelector()
+    try:
+        for description, stream in streams.items():
+            descriptor = stream.fileno()
+            os.set_blocking(descriptor, False)
+            selector.register(descriptor, selectors.EVENT_READ, description)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("candidate Git output deadline expired")
+            ready = selector.select(remaining)
+            if not ready:
+                raise TimeoutError("candidate Git output deadline expired")
+            for key, _ in ready:
+                description = str(key.data)
+                buffer = buffers[description]
+                total_size = sum(len(value) for value in buffers.values())
+                stream_remaining = output_limit - len(buffer)
+                aggregate_remaining = output_limit - total_size
+                read_size = min(
+                    _CANDIDATE_GIT_PIPE_READ_BYTES,
+                    stream_remaining + 1,
+                    aggregate_remaining + 1,
+                )
+                try:
+                    chunk = os.read(key.fd, max(1, read_size))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fd)
+                    streams[description].close()
+                    continue
+                if len(buffer) + len(chunk) > output_limit:
+                    raise _CandidateGitOutputLimit(description)
+                if total_size + len(chunk) > output_limit:
+                    raise _CandidateGitOutputLimit("combined output")
+                buffer.extend(chunk)
+        _wait_candidate_git_exit_without_reaping(process, deadline)
+    finally:
+        for key in tuple(selector.get_map().values()):
+            try:
+                selector.unregister(key.fd)
+            except BaseException:
+                pass
+        selector.close()
+        for stream in streams.values():
+            if not stream.closed:
+                stream.close()
+    return bytes(buffers["stdout"]), bytes(buffers["stderr"])
+
+
 def _run_candidate_git(
     root: Path,
     *arguments: str,
     output_limit: int = CANDIDATE_GIT_OUTPUT_LIMIT_BYTES,
 ) -> bytes:
     strict_isolation_platform_preflight()
+    if (
+        type(output_limit) is not int
+        or output_limit < 0
+        or output_limit > CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES
+    ):
+        raise AssertionError("candidate Git output limit is invalid")
     command = candidate_git_argv(root, *arguments)
+    deadline = time.monotonic() + CANDIDATE_GIT_TIMEOUT_SECONDS
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             env=_candidate_git_environment(),
-            check=False,
-            capture_output=True,
-            timeout=CANDIDATE_GIT_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as error:
-        raise AssertionError("candidate Git validation exceeded its fixed timeout") from error
-    if completed.returncode != 0:
-        stderr = completed.stderr[:2000].decode("utf-8", errors="replace")
+    except OSError as error:
+        raise AssertionError("candidate Git validation could not start") from error
+    process_group = process.pid
+    try:
+        stdout, stderr_bytes = _drain_candidate_git_pipes(
+            process,
+            output_limit=output_limit,
+            deadline=deadline,
+        )
+    except BaseException as error:
+        try:
+            _terminate_candidate_git_process_tree(process, process_group)
+        except BaseException as cleanup_error:
+            raise AssertionError(
+                "candidate Git process tree cleanup is incomplete: "
+                f"{cleanup_error}"
+            ) from error
+        if isinstance(error, _CandidateGitOutputLimit):
+            raise AssertionError(
+                "candidate Git validation exceeded its "
+                f"{error.description} limit"
+            ) from error
+        if isinstance(error, TimeoutError):
+            raise AssertionError(
+                "candidate Git validation exceeded its fixed timeout"
+            ) from error
+        raise
+    try:
+        _terminate_candidate_git_process_tree(process, process_group)
+    except BaseException as cleanup_error:
         raise AssertionError(
-            f"candidate Git validation failed with exit {completed.returncode}: {stderr}"
+            "candidate Git process tree cleanup is incomplete: "
+            f"{cleanup_error}"
+        ) from cleanup_error
+    if process.returncode != 0:
+        stderr = stderr_bytes[:2000].decode("utf-8", errors="replace")
+        raise AssertionError(
+            f"candidate Git validation failed with exit {process.returncode}: {stderr}"
         )
-    if completed.stderr:
-        stderr = completed.stderr[:2000].decode("utf-8", errors="replace")
+    if stderr_bytes:
+        stderr = stderr_bytes[:2000].decode("utf-8", errors="replace")
         raise AssertionError(f"candidate Git validation wrote stderr: {stderr}")
-    if len(completed.stdout) > output_limit:
-        raise AssertionError("candidate Git validation exceeded its output limit")
-    return completed.stdout
+    return stdout
 
 
 def _parse_candidate_sha(value: str, description: str) -> str:
@@ -358,6 +582,245 @@ def _ordinary_candidate_file(root: Path, relative_path: Path) -> Path:
     return path
 
 
+def _candidate_script_sources(root: Path) -> dict[Path, bytes]:
+    if not root.is_absolute() or root.anchor != os.path.sep:
+        raise AssertionError("candidate checkout root must be an absolute POSIX path")
+    try:
+        initial_root_metadata = root.lstat()
+        canonical_root = root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError("candidate checkout root cannot be bound") from error
+    if (
+        not stat.S_ISDIR(initial_root_metadata.st_mode)
+        or canonical_root != root
+    ):
+        raise AssertionError("candidate checkout root path binding changed")
+    initial_root_identity = (
+        initial_root_metadata.st_dev,
+        initial_root_metadata.st_ino,
+    )
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    file_flags = (
+        os.O_RDONLY
+        | os.O_NONBLOCK
+        | os.O_NOCTTY
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC
+    )
+    scripts_relative = (
+        _TRUSTED_CONTENT_RELATIVE_ROOT
+        / "skills/waited-delivery/scripts"
+    )
+    expected_names = sorted(path.name for path in CANDIDATE_SCRIPT_RELATIVE_PATHS)
+    with ExitStack() as descriptor_stack:
+        anchor_descriptor = os.open(root.anchor, directory_flags)
+        descriptor_stack.callback(os.close, anchor_descriptor)
+        anchor_metadata = os.fstat(anchor_descriptor)
+        if not stat.S_ISDIR(anchor_metadata.st_mode):
+            raise AssertionError("candidate content path binding changed")
+
+        directory_bindings: list[
+            tuple[int, str, int, tuple[int, int]]
+        ] = []
+        parent_descriptor = anchor_descriptor
+        directory_components = (*root.parts[1:], *scripts_relative.parts)
+        root_component_index = len(root.parts) - 2
+        for component_index, component in enumerate(directory_components):
+            try:
+                component_metadata = os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                component_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=parent_descriptor,
+                )
+            except OSError as error:
+                raise AssertionError(
+                    "candidate script directory cannot be bound safely"
+                ) from error
+            descriptor_stack.callback(os.close, component_descriptor)
+            opened_component = os.fstat(component_descriptor)
+            component_identity = (
+                component_metadata.st_dev,
+                component_metadata.st_ino,
+            )
+            if component_index == root_component_index and (
+                not stat.S_ISDIR(component_metadata.st_mode)
+                or not stat.S_ISDIR(opened_component.st_mode)
+                or component_identity != initial_root_identity
+                or (opened_component.st_dev, opened_component.st_ino)
+                != initial_root_identity
+            ):
+                raise AssertionError("candidate checkout root path binding changed")
+            if (
+                not stat.S_ISDIR(component_metadata.st_mode)
+                or not stat.S_ISDIR(opened_component.st_mode)
+                or (opened_component.st_dev, opened_component.st_ino)
+                != component_identity
+            ):
+                raise AssertionError(
+                    "candidate script directory path binding changed"
+                )
+            directory_bindings.append(
+                (
+                    parent_descriptor,
+                    component,
+                    component_descriptor,
+                    component_identity,
+                )
+            )
+            parent_descriptor = component_descriptor
+
+        scripts_descriptor = parent_descriptor
+        try:
+            initial_names = sorted(os.listdir(scripts_descriptor))
+        except OSError as error:
+            raise AssertionError(
+                "candidate scripts directory cannot be enumerated"
+            ) from error
+        if initial_names != expected_names:
+            raise AssertionError("candidate scripts directory inventory is not exact")
+
+        sources: dict[Path, bytes] = {}
+        file_bindings: list[
+            tuple[str, int, tuple[int, int], int, bytes]
+        ] = []
+        for relative_path in CANDIDATE_SCRIPT_RELATIVE_PATHS:
+            name = relative_path.name
+            try:
+                path_metadata = os.stat(
+                    name,
+                    dir_fd=scripts_descriptor,
+                    follow_symlinks=False,
+                )
+                descriptor = os.open(
+                    name,
+                    file_flags,
+                    dir_fd=scripts_descriptor,
+                )
+            except OSError as error:
+                raise AssertionError(
+                    f"candidate file cannot be opened safely: {relative_path}"
+                ) from error
+            descriptor_stack.callback(os.close, descriptor)
+            opened_metadata = os.fstat(descriptor)
+            expected_identity = (
+                path_metadata.st_dev,
+                path_metadata.st_ino,
+            )
+            if (
+                not stat.S_ISREG(path_metadata.st_mode)
+                or not stat.S_ISREG(opened_metadata.st_mode)
+                or path_metadata.st_nlink != 1
+                or opened_metadata.st_nlink != 1
+                or path_metadata.st_size < 0
+                or opened_metadata.st_size != path_metadata.st_size
+                or opened_metadata.st_size > CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES
+                or (opened_metadata.st_dev, opened_metadata.st_ino)
+                != expected_identity
+            ):
+                raise AssertionError(
+                    f"candidate file identity is unsafe: {relative_path}"
+                )
+
+            def read_once() -> bytes:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                remaining = opened_metadata.st_size + 1
+                chunks: list[bytes] = []
+                while remaining:
+                    chunk = os.read(descriptor, min(remaining, 65536))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                return b"".join(chunks)
+
+            first = read_once()
+            second = read_once()
+            if len(first) != opened_metadata.st_size or first != second:
+                raise AssertionError(
+                    f"candidate file content changed during capture: {relative_path}"
+                )
+            sources[relative_path] = first
+            file_bindings.append(
+                (
+                    name,
+                    descriptor,
+                    expected_identity,
+                    opened_metadata.st_size,
+                    first,
+                )
+            )
+
+        try:
+            final_names = sorted(os.listdir(scripts_descriptor))
+            final_anchor = os.fstat(anchor_descriptor)
+            if (
+                not stat.S_ISDIR(final_anchor.st_mode)
+                or (final_anchor.st_dev, final_anchor.st_ino)
+                != (anchor_metadata.st_dev, anchor_metadata.st_ino)
+            ):
+                raise AssertionError(
+                    "candidate script directory path binding changed"
+                )
+            for (
+                bound_parent_descriptor,
+                component,
+                component_descriptor,
+                component_identity,
+            ) in directory_bindings:
+                final_component = os.fstat(component_descriptor)
+                linked_component = os.stat(
+                    component,
+                    dir_fd=bound_parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(final_component.st_mode)
+                    or not stat.S_ISDIR(linked_component.st_mode)
+                    or (final_component.st_dev, final_component.st_ino)
+                    != component_identity
+                    or (linked_component.st_dev, linked_component.st_ino)
+                    != component_identity
+                ):
+                    raise AssertionError(
+                        "candidate script directory path binding changed"
+                    )
+            for name, descriptor, identity, expected_size, source in file_bindings:
+                final_opened = os.fstat(descriptor)
+                final_path = os.stat(
+                    name,
+                    dir_fd=scripts_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(final_opened.st_mode)
+                    or not stat.S_ISREG(final_path.st_mode)
+                    or (final_opened.st_dev, final_opened.st_ino) != identity
+                    or (final_path.st_dev, final_path.st_ino) != identity
+                    or final_opened.st_nlink != 1
+                    or final_path.st_nlink != 1
+                    or final_opened.st_size != expected_size
+                    or final_path.st_size != expected_size
+                    or len(source) != expected_size
+                ):
+                    raise AssertionError(
+                        f"candidate file changed during stable capture: {name}"
+                    )
+        except OSError as error:
+            raise AssertionError(
+                "candidate script path could not be revalidated"
+            ) from error
+        if final_names != expected_names:
+            raise AssertionError("candidate scripts directory inventory changed")
+        return sources
+
+
 def candidate_path(relative_path: str | Path) -> Path:
     root = candidate_content_root()
     relative = Path(relative_path)
@@ -383,72 +846,73 @@ def candidate_script(name: str) -> Path:
 
 
 def _candidate_script_manifest(
-    checkout_root: Path, candidate_sha: str
-) -> dict[str, str]:
-    content_root = _candidate_content_root_for_checkout(checkout_root)
-    scripts_root = content_root / "skills/waited-delivery/scripts"
-    try:
-        entries = sorted(scripts_root.iterdir(), key=lambda entry: entry.name)
-    except OSError as error:
-        raise AssertionError("candidate scripts directory cannot be enumerated") from error
-    expected_names = sorted(path.name for path in CANDIDATE_SCRIPT_RELATIVE_PATHS)
-    if [entry.name for entry in entries] != expected_names:
-        raise AssertionError("candidate scripts directory inventory is not exact")
+    checkout_root: Path,
+    candidate_sha: str,
+    *,
+    require_clean: bool,
+) -> tuple[dict[str, str], dict[Path, bytes]]:
+    _candidate_content_root_for_checkout(checkout_root)
+    captured_sources = _candidate_script_sources(checkout_root)
+    execution_sources = dict(captured_sources)
 
     manifest: dict[str, str] = {}
     for content_relative_path in CANDIDATE_SCRIPT_RELATIVE_PATHS:
         checkout_relative_path = _candidate_checkout_relative_path(
             content_relative_path
         )
-        path = _ordinary_candidate_file(content_root, content_relative_path)
-        size_output = _run_candidate_git(
-            checkout_root,
-            "cat-file",
-            "-s",
-            f"{candidate_sha}:{checkout_relative_path.as_posix()}",
-            output_limit=128,
-        )
-        try:
-            tracked_size = int(size_output.decode("ascii").removesuffix("\n"))
-        except (UnicodeDecodeError, ValueError) as error:
-            raise AssertionError(
-                f"candidate tracked size is malformed: {checkout_relative_path}"
-            ) from error
-        if tracked_size < 0 or tracked_size > CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES:
-            raise AssertionError(
-                "candidate tracked file exceeds its size limit: "
-                f"{checkout_relative_path}"
+        working_bytes = captured_sources[content_relative_path]
+        if require_clean:
+            size_output = _run_candidate_git(
+                checkout_root,
+                "cat-file",
+                "-s",
+                f"{candidate_sha}:{checkout_relative_path.as_posix()}",
+                output_limit=128,
             )
-        tracked_bytes = _run_candidate_git(
-            checkout_root,
-            "cat-file",
-            "blob",
-            f"{candidate_sha}:{checkout_relative_path.as_posix()}",
-            output_limit=CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES,
-        )
-        try:
-            working_bytes = path.read_bytes()
-        except OSError as error:
-            raise AssertionError(
-                f"candidate file cannot be read: {content_relative_path}"
-            ) from error
-        if len(tracked_bytes) != tracked_size or working_bytes != tracked_bytes:
-            raise AssertionError(
-                "candidate implementation bytes do not match the frozen commit: "
-                f"{checkout_relative_path}"
+            try:
+                tracked_size = int(
+                    size_output.decode("ascii").removesuffix("\n")
+                )
+            except (UnicodeDecodeError, ValueError) as error:
+                raise AssertionError(
+                    f"candidate tracked size is malformed: {checkout_relative_path}"
+                ) from error
+            if (
+                tracked_size < 0
+                or tracked_size > CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES
+            ):
+                raise AssertionError(
+                    "candidate tracked file exceeds its size limit: "
+                    f"{checkout_relative_path}"
+                )
+            tracked_bytes = _run_candidate_git(
+                checkout_root,
+                "cat-file",
+                "blob",
+                f"{candidate_sha}:{checkout_relative_path.as_posix()}",
+                output_limit=CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES,
             )
+            if (
+                len(tracked_bytes) != tracked_size
+                or working_bytes != tracked_bytes
+            ):
+                raise AssertionError(
+                    "candidate implementation bytes do not match the frozen commit: "
+                    f"{checkout_relative_path}"
+                )
+            execution_sources[content_relative_path] = tracked_bytes
         manifest[checkout_relative_path.as_posix()] = hashlib.sha256(
             working_bytes
         ).hexdigest()
-    return manifest
+    return manifest, execution_sources
 
 
-def candidate_checkout_binding(
+def _candidate_checkout_binding_with_sources(
     root: Path,
     candidate_sha: str,
     *,
     require_clean: bool,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], dict[Path, bytes]]:
     canonical_root = candidate_repository_root()
     if root.resolve(strict=True) != canonical_root:
         raise AssertionError("candidate checkout binding root is not canonical")
@@ -475,7 +939,9 @@ def candidate_checkout_binding(
         if status_before:
             raise AssertionError("candidate checkout is not exactly clean before execution")
 
-    script_manifest = _candidate_script_manifest(canonical_root, candidate_sha)
+    script_manifest, captured_sources = _candidate_script_manifest(
+        canonical_root, candidate_sha, require_clean=require_clean
+    )
     head_after = _run_candidate_git(
         canonical_root, "rev-parse", "--verify", "HEAD^{commit}"
     )
@@ -493,12 +959,29 @@ def candidate_checkout_binding(
         )
         if status_after:
             raise AssertionError("candidate checkout changed during validation")
-    return {
-        "candidate_root": str(canonical_root),
-        "candidate_distribution_profile": _TRUSTED_DISTRIBUTION_PROFILE,
-        "candidate_sha": candidate_sha,
-        "candidate_script_sha256": script_manifest,
-    }
+    return (
+        {
+            "candidate_root": str(canonical_root),
+            "candidate_distribution_profile": _TRUSTED_DISTRIBUTION_PROFILE,
+            "candidate_sha": candidate_sha,
+            "candidate_script_sha256": script_manifest,
+        },
+        captured_sources,
+    )
+
+
+def candidate_checkout_binding(
+    root: Path,
+    candidate_sha: str,
+    *,
+    require_clean: bool,
+) -> dict[str, object]:
+    binding, _ = _candidate_checkout_binding_with_sources(
+        root,
+        candidate_sha,
+        require_clean=require_clean,
+    )
+    return binding
 
 
 def _strict_isolation_requested() -> bool:
@@ -6980,6 +7463,18 @@ def _tracked_candidate_script_bytes(
     return sources
 
 
+def _candidate_snapshot_script_bytes(
+    checkout_root: Path,
+    candidate_sha: str,
+    *,
+    require_clean: bool,
+) -> dict[Path, bytes]:
+    if require_clean:
+        return _tracked_candidate_script_bytes(checkout_root, candidate_sha)
+    _candidate_content_root_for_checkout(checkout_root)
+    return _candidate_script_sources(checkout_root)
+
+
 def _write_single_link_file(path: Path, source: bytes, mode: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(source)
@@ -7096,8 +7591,15 @@ def _execution_snapshot(
     checkout_root: Path,
     candidate_sha: str,
     *,
+    require_clean: bool = True,
+    expected_script_manifest: Mapping[str, str] | None = None,
+    candidate_sources: Mapping[Path, bytes] | None = None,
     probe_source: bytes | None = None,
 ) -> Iterator[dict[str, object]]:
+    if candidate_sources is not None and probe_source is not None:
+        raise AssertionError(
+            "candidate sources and a capability probe are mutually exclusive"
+        )
     strict = _strict_isolation_requested()
     temporary: tempfile.TemporaryDirectory[str] | None = None
     resource_entry_path: Path | None = None
@@ -7213,9 +7715,34 @@ def _execution_snapshot(
             _write_single_link_file(handshake_path, b"", 0o600)
             candidate_paths: dict[str, str] = {}
             if probe_source is None:
-                sources = _tracked_candidate_script_bytes(
-                    checkout_root, candidate_sha
-                )
+                if candidate_sources is None:
+                    sources = _candidate_snapshot_script_bytes(
+                        checkout_root,
+                        candidate_sha,
+                        require_clean=require_clean,
+                    )
+                else:
+                    sources = dict(candidate_sources)
+                    if set(sources) != set(CANDIDATE_SCRIPT_RELATIVE_PATHS):
+                        raise AssertionError(
+                            "candidate captured source inventory is not exact"
+                        )
+                    if not all(isinstance(source, bytes) for source in sources.values()):
+                        raise AssertionError(
+                            "candidate captured source bytes are malformed"
+                        )
+                snapshot_manifest = {
+                    _candidate_checkout_relative_path(relative_path).as_posix():
+                    hashlib.sha256(source).hexdigest()
+                    for relative_path, source in sources.items()
+                }
+                if (
+                    expected_script_manifest is not None
+                    and snapshot_manifest != dict(expected_script_manifest)
+                ):
+                    raise AssertionError(
+                        "candidate implementation changed before snapshot capture"
+                    )
                 for relative_path, source in sources.items():
                     path = candidate_content_root / relative_path
                     _write_single_link_file(path, source, 0o440)
@@ -8614,8 +9141,15 @@ def _run_candidate_process(
 ) -> subprocess.CompletedProcess[str]:
     strict_isolation_platform_preflight()
     root = candidate_repository_root()
+    strict = _strict_isolation_requested()
+    if strict:
+        _active_strict_session()
     candidate_sha, require_clean = expected_candidate_sha(root)
-    before = candidate_checkout_binding(
+    if strict and not require_clean:
+        raise AssertionError(
+            "strict candidate isolation requires an explicit frozen candidate SHA"
+        )
+    before, captured_sources = _candidate_checkout_binding_with_sources(
         root, candidate_sha, require_clean=require_clean
     )
     _validated_candidate_script(root, script)
@@ -8629,7 +9163,6 @@ def _run_candidate_process(
         if requested_home_value is not None
         else None
     )
-    strict = _strict_isolation_requested()
     if strict:
         _ensure_strict_backend()
         if requested_home is not None:
@@ -8647,7 +9180,19 @@ def _run_candidate_process(
     stdout = ""
     stderr = ""
     exact_command: list[str] = []
-    with _execution_snapshot(root, candidate_sha) as snapshot, _prepared_candidate_fixtures(
+    expected_script_manifest = before.get("candidate_script_sha256")
+    if not isinstance(expected_script_manifest, dict) or not all(
+        isinstance(path, str) and isinstance(digest, str)
+        for path, digest in expected_script_manifest.items()
+    ):
+        raise AssertionError("candidate script manifest is malformed")
+    with _execution_snapshot(
+        root,
+        candidate_sha,
+        require_clean=require_clean,
+        expected_script_manifest=expected_script_manifest,
+        candidate_sources=captured_sources,
+    ) as snapshot, _prepared_candidate_fixtures(
         Path(snapshot["controller_path"]),
         tuple(Path(path) for path in writable_roots),
         requested_home,

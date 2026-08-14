@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ast
 import contextlib
 import errno
@@ -8,6 +10,7 @@ import importlib.util
 import inspect
 from pathlib import Path
 import json
+import math
 import os
 import re
 import shutil
@@ -76,7 +79,14 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
     DISTRIBUTION_PROFILE,
 ) = distribution_contract_context(SKILL_ROOT)
 EXPECTED_REPOSITORY = "Joey-Tools/codex-waited-delivery"
-EXPECTED_TEST_TIMEOUT_MINUTES = "10"
+EXPECTED_TEST_TIMEOUT_MINUTES = "35"
+TRUSTED_REPOSITORY_GUARD_TIMEOUT_MINUTES = 1
+TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES = 3
+TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES = 3
+TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES = 3
+TRUSTED_COMPILE_TIMEOUT_MINUTES = 2
+TRUSTED_STRUCTURE_TIMEOUT_MINUTES = 3
+TRUSTED_TEST_STEP_TIMEOUT_MINUTES = 15
 REQUIRED_CI_CANDIDATE_ROOT_ENV = _CANDIDATE_SUPPORT.CANDIDATE_ROOT_ENV
 REQUIRED_CI_CANDIDATE_SHA_ENV = _CANDIDATE_SUPPORT.CANDIDATE_SHA_ENV
 REQUIRED_CI_ISOLATION_MODE_ENV = "REQUIRED_CI_ISOLATION_MODE"
@@ -90,13 +100,35 @@ def distribution_content_root(checkout_root: Path) -> Path:
 
 def distribution_tests_root(checkout_root: Path) -> Path:
     return distribution_content_root(checkout_root) / CANDIDATE_TESTS_RELATIVE_PATH
-TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 180
+
+
+TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES = (
+    TRUSTED_REPOSITORY_GUARD_TIMEOUT_MINUTES
+    + TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES
+    + TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES
+    + TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES
+    + TRUSTED_COMPILE_TIMEOUT_MINUTES
+    + TRUSTED_STRUCTURE_TIMEOUT_MINUTES
+)
+TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 8 * 60
+TRUSTED_TEST_CLEANUP_RESERVE_SECONDS = 2 * 60
+TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS = (
+    TRUSTED_TEST_SUITE_TIMEOUT_SECONDS + TRUSTED_TEST_CLEANUP_RESERVE_SECONDS
+)
+TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS = 5 * 60
+TRUSTED_JOB_RUNNER_MARGIN_MINUTES = 5
+TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS = 1
+TRUSTED_TEST_CHILD_REAP_TIMEOUT_SECONDS = 5
+TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES = 2 * 1024 * 1024
+TRUSTED_WORKFLOW_INVENTORY_LIMIT = 256
+TRUSTED_WORKFLOW_TOTAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024
 TRUSTED_TEST_CHILD_SUCCESS_EXIT = 73
 TRUSTED_TEST_RECEIPT_SCHEMA_VERSION = 3
 TRUSTED_TEST_RECEIPT_SENTINEL = "REQUIRED_CI_TRUSTED_TESTS_COMPLETED:"
 TRUSTED_STRUCTURE_VALIDATOR_FLAG = "--validate-required-ci-structure"
 TRUSTED_TEST_SUPERVISOR_FLAG = "--run-trusted-tests"
 TRUSTED_TEST_CHILD_FLAG = "--run-trusted-test-suite"
+TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV = "REQUIRED_CI_SUPERVISOR_DEADLINE"
 LOCAL_SUPERVISOR_ISOLATION_ENV = (
     REQUIRED_CI_ISOLATION_MODE_ENV,
     "REQUIRED_CI_INTERNAL_ISOLATION_UID",
@@ -124,9 +156,20 @@ def _local_nonstrict_supervisor_environment() -> Iterator[None]:
         os.environ.update(previous)
 
 
+def _snapshot_permission_probe_is_meaningful() -> bool:
+    mode = os.environ.get(REQUIRED_CI_ISOLATION_MODE_ENV)
+    if mode is not None and mode != REQUIRED_CI_ISOLATION_MODE:
+        raise AssertionError(
+            f"{REQUIRED_CI_ISOLATION_MODE_ENV} must be exactly "
+            f"{REQUIRED_CI_ISOLATION_MODE!r}"
+        )
+    return mode == REQUIRED_CI_ISOLATION_MODE or os.geteuid() != 0
+
+
 REPOSITORY_GUARD = (
     "      - name: Reject unexpected repository\n"
     f"        if: ${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}\n"
+    f"        timeout-minutes: {TRUSTED_REPOSITORY_GUARD_TIMEOUT_MINUTES}\n"
     "        run: exit 1"
 )
 CANDIDATE_CHECKOUT_INPUTS = {
@@ -161,9 +204,19 @@ TRUSTED_VALIDATOR_COMMAND = (
     'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
     f'test_required_ci_workflow.py" {TRUSTED_STRUCTURE_VALIDATOR_FLAG}'
 )
+TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE = (
+    "import os,sys,time; environment=os.environ.copy(); "
+    f'environment["{TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV}"]='
+    f'f"{{time.monotonic()+{TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS}:.9f}}"; '
+    "os.execve(sys.executable,[sys.executable,\"-I\",\"-B\",\"-S\","
+    'environment["GITHUB_WORKSPACE"]+"/.required-ci/skills/waited-delivery/'
+    f'tests/test_required_ci_workflow.py","{TRUSTED_TEST_SUPERVISOR_FLAG}"],'
+    "environment)"
+)
 TRUSTED_TEST_SUPERVISOR_COMMAND = (
-    'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
-    f'test_required_ci_workflow.py" {TRUSTED_TEST_SUPERVISOR_FLAG}'
+    "python3 -I -B -S -c '"
+    f"{TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE}"
+    "'"
 )
 README_COMPILE_COMMAND = (
     "python3 -I -X pycache_prefix=/tmp/codex-waited-delivery-pycache "
@@ -176,6 +229,7 @@ README_DISCOVERY_COMMAND = (
 CANDIDATE_CHECKOUT_STEP = (
     "      - name: Check out candidate\n"
     "        uses: actions/checkout@v4\n"
+    f"        timeout-minutes: {TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES}\n"
     "        with:\n"
     f"          repository: {EXPECTED_REPOSITORY}\n"
     "          ref: ${{ github.sha }}\n"
@@ -185,6 +239,7 @@ CANDIDATE_CHECKOUT_STEP = (
 TRUSTED_CHECKOUT_STEP = (
     "      - name: Check out trusted Required CI source\n"
     "        uses: actions/checkout@v4\n"
+    f"        timeout-minutes: {TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES}\n"
     "        with:\n"
     "          # GitHub.com job workflow identity pins this reusable leaf's own source.\n"
     "          repository: ${{ job.workflow_repository }}\n"
@@ -194,11 +249,13 @@ TRUSTED_CHECKOUT_STEP = (
 )
 PYTHON_SETUP_STEP = (
     "      - uses: actions/setup-python@v5\n"
+    f"        timeout-minutes: {TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES}\n"
     "        with:\n"
     '          python-version: "3.x"\n'
 )
 TRUSTED_TEST_SUPERVISOR_STEP = (
     "      - name: Run trusted Required CI tests\n"
+    f"        timeout-minutes: {TRUSTED_TEST_STEP_TIMEOUT_MINUTES}\n"
     "        env:\n"
     "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
     "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n"
@@ -208,9 +265,11 @@ TRUSTED_TEST_SUPERVISOR_STEP = (
 )
 REQUIRED_EXECUTION_STEPS = (
     "      - name: Compile candidate Python helpers\n"
+    f"        timeout-minutes: {TRUSTED_COMPILE_TIMEOUT_MINUTES}\n"
     "        run: |\n"
     f"          {CANDIDATE_COMPILE_COMMAND}\n"
     "      - name: Validate Required CI structure\n"
+    f"        timeout-minutes: {TRUSTED_STRUCTURE_TIMEOUT_MINUTES}\n"
     "        env:\n"
     "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
     "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n"
@@ -220,8 +279,40 @@ REQUIRED_EXECUTION_STEPS = (
 )
 
 
+def _trusted_required_ci_cli_mode() -> str | None:
+    if sys.argv[1:] == [TRUSTED_STRUCTURE_VALIDATOR_FLAG]:
+        return "structure"
+    if sys.argv[1:] == [TRUSTED_TEST_SUPERVISOR_FLAG]:
+        return "supervisor"
+    if len(sys.argv) == 3 and sys.argv[1] == TRUSTED_TEST_CHILD_FLAG:
+        return "child"
+    return None
+
+
 def required_ci_repository_root(trusted_repo_root: Path) -> Path:
+    cli_mode = _trusted_required_ci_cli_mode()
     candidate_root_value = os.environ.get(REQUIRED_CI_CANDIDATE_ROOT_ENV)
+    candidate_sha_value = os.environ.get(REQUIRED_CI_CANDIDATE_SHA_ENV)
+    if cli_mode is not None and (
+        candidate_root_value is None or candidate_sha_value is None
+    ):
+        raise AssertionError(
+            "trusted Required CI entry requires candidate root and SHA together"
+        )
+    if cli_mode is not None:
+        github_sha_value = os.environ.get("GITHUB_SHA")
+        if github_sha_value is None:
+            raise AssertionError(
+                "trusted Required CI entry requires the GitHub candidate SHA binding"
+            )
+        candidate_sha = _CANDIDATE_SUPPORT._parse_candidate_sha(
+            candidate_sha_value, REQUIRED_CI_CANDIDATE_SHA_ENV
+        )
+        github_sha = _CANDIDATE_SUPPORT._parse_candidate_sha(
+            github_sha_value, "GITHUB_SHA"
+        )
+        if candidate_sha != github_sha:
+            raise AssertionError("candidate SHA must equal GITHUB_SHA")
     if candidate_root_value is None:
         if trusted_repo_root.name == ".required-ci":
             raise AssertionError(
@@ -234,6 +325,54 @@ def required_ci_repository_root(trusted_repo_root: Path) -> Path:
         raise AssertionError(
             f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must be an absolute .candidate path"
         )
+    try:
+        canonical_trusted_root = trusted_repo_root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            "trusted Required CI checkout must be an existing directory"
+        ) from error
+    if (
+        not trusted_repo_root.is_absolute()
+        or trusted_repo_root.is_symlink()
+        or canonical_trusted_root != trusted_repo_root
+        or not canonical_trusted_root.is_dir()
+    ):
+        raise AssertionError(
+            "trusted Required CI checkout must be an absolute canonical directory"
+        )
+    github_workspace_value = os.environ.get("GITHUB_WORKSPACE")
+    if cli_mode is not None and github_workspace_value is None:
+        raise AssertionError(
+            "trusted Required CI entry requires the GitHub workspace binding"
+        )
+    if github_workspace_value is None:
+        mandated_candidate_root = canonical_trusted_root.parent / ".candidate"
+    else:
+        github_workspace = Path(github_workspace_value)
+        if not github_workspace.is_absolute() or github_workspace.is_symlink():
+            raise AssertionError(
+                "GITHUB_WORKSPACE must be an absolute canonical directory"
+            )
+        try:
+            canonical_workspace = github_workspace.resolve(strict=True)
+        except OSError as error:
+            raise AssertionError("GITHUB_WORKSPACE is unreadable") from error
+        mandated_trusted_root = canonical_workspace / ".required-ci"
+        mandated_candidate_root = canonical_workspace / ".candidate"
+        if (
+            canonical_workspace != github_workspace
+            or not canonical_workspace.is_dir()
+            or canonical_trusted_root != mandated_trusted_root
+        ):
+            raise AssertionError(
+                "trusted checkout must be the mandated .required-ci directory "
+                "in the GitHub workspace"
+            )
+    if candidate_root != mandated_candidate_root:
+        raise AssertionError(
+            f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must select the mandated "
+            "candidate checkout beside the trusted checkout"
+        )
     if candidate_root.is_symlink():
         raise AssertionError(
             f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must not select a symlink"
@@ -244,14 +383,23 @@ def required_ci_repository_root(trusted_repo_root: Path) -> Path:
         raise AssertionError(
             f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must select an existing directory"
         ) from error
-    if not resolved.is_dir():
+    if resolved != mandated_candidate_root or not resolved.is_dir():
         raise AssertionError(
-            f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must select a directory"
+            f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must select the canonical "
+            "mandated candidate checkout"
         )
     return resolved
 
 
-REPO_ROOT = required_ci_repository_root(TRUSTED_REPO_ROOT)
+def _trusted_test_child_invocation() -> bool:
+    return _trusted_required_ci_cli_mode() == "child"
+
+
+REPO_ROOT = (
+    TRUSTED_REPO_ROOT
+    if _trusted_test_child_invocation()
+    else required_ci_repository_root(TRUSTED_REPO_ROOT)
+)
 
 
 def _direct_test_inventory(repo_root: Path, description: str) -> list[dict[str, object]]:
@@ -664,10 +812,190 @@ def _close_and_verify_trusted_isolation(
         )
 
 
+def _validated_trusted_test_supervisor_deadline(value: float) -> float:
+    if type(value) is not float or not math.isfinite(value):
+        raise AssertionError("trusted test supervisor deadline is invalid")
+    return value
+
+
+def _trusted_test_supervisor_deadline_from_environment() -> float:
+    encoded = os.environ.pop(TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV, None)
+    if (
+        encoded is None
+        or len(encoded) > 32
+        or re.fullmatch(r"(?:0|[1-9][0-9]*)\.[0-9]{9}", encoded) is None
+    ):
+        raise AssertionError(
+            "trusted test supervisor launcher deadline is missing or malformed"
+        )
+    deadline = _validated_trusted_test_supervisor_deadline(float(encoded))
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise AssertionError("trusted test supervisor launcher deadline has expired")
+    if remaining > TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS + 0.001:
+        raise AssertionError(
+            "trusted test supervisor launcher deadline exceeds the fixed budget"
+        )
+    return deadline
+
+
+def _require_trusted_test_cleanup_reserve(
+    supervisor_deadline: float, description: str
+) -> None:
+    remaining = supervisor_deadline - time.monotonic()
+    required = (
+        TRUSTED_TEST_CLEANUP_RESERVE_SECONDS
+        + TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS
+    )
+    if remaining < required:
+        raise AssertionError(
+            "trusted Required CI supervisor has insufficient budget "
+            f"{description}"
+        )
+
+
+def _remaining_trusted_test_child_timeout(supervisor_deadline: float) -> float:
+    remaining = (
+        supervisor_deadline
+        - time.monotonic()
+        - TRUSTED_TEST_CLEANUP_RESERVE_SECONDS
+    )
+    timeout = min(float(TRUSTED_TEST_SUITE_TIMEOUT_SECONDS), remaining)
+    if timeout < TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS:
+        raise AssertionError(
+            "trusted Required CI supervisor has insufficient budget before child launch"
+        )
+    return timeout
+
+
+def _terminate_trusted_test_child(process: subprocess.Popen[str]) -> None:
+    failures: list[str] = []
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except BaseException as error:
+        failures.append(
+            "process-group signal: "
+            + _bounded_failure_text(f"{type(error).__name__}: {error}")
+        )
+    try:
+        process.communicate(timeout=TRUSTED_TEST_CHILD_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        failures.append(
+            "direct child reap timeout: "
+            + _bounded_failure_text(f"{type(error).__name__}: {error}")
+        )
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        except BaseException as kill_error:
+            failures.append(
+                "direct child signal: "
+                + _bounded_failure_text(
+                    f"{type(kill_error).__name__}: {kill_error}"
+                )
+            )
+        try:
+            process.communicate(timeout=TRUSTED_TEST_CHILD_REAP_TIMEOUT_SECONDS)
+        except BaseException as reap_error:
+            failures.append(
+                "direct child final reap: "
+                + _bounded_failure_text(
+                    f"{type(reap_error).__name__}: {reap_error}"
+                )
+            )
+    except BaseException as error:
+        failures.append(
+            "direct child reap: "
+            + _bounded_failure_text(f"{type(error).__name__}: {error}")
+        )
+    if process.poll() is None:
+        failures.append("direct child is still active")
+    if failures:
+        raise AssertionError(
+            "trusted test child cleanup was incomplete: " + "; ".join(failures)
+        )
+
+
+def _run_trusted_test_child(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    pass_fds: tuple[int, ...],
+    supervisor_deadline: float,
+) -> subprocess.CompletedProcess[str]:
+    _remaining_trusted_test_child_timeout(supervisor_deadline)
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=environment,
+            pass_fds=pass_fds,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise AssertionError("trusted Required CI child could not be started") from error
+    try:
+        child_timeout = _remaining_trusted_test_child_timeout(supervisor_deadline)
+    except BaseException:
+        _terminate_trusted_test_child(process)
+        raise
+    try:
+        stdout, stderr = process.communicate(timeout=child_timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_trusted_test_child(process)
+        raise
+    except BaseException:
+        _terminate_trusted_test_child(process)
+        raise
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout,
+        stderr,
+    )
+
+
 def supervise_trusted_required_ci_tests(
-    trusted_repo_root: Path, candidate_root: Path
+    trusted_repo_root: Path,
+    candidate_root: Path,
+    *,
+    supervisor_deadline: float,
 ) -> dict[str, object]:
+    supervisor_deadline = _validated_trusted_test_supervisor_deadline(
+        supervisor_deadline
+    )
+    _require_trusted_test_cleanup_reserve(
+        supervisor_deadline, "before platform preflight"
+    )
     _CANDIDATE_SUPPORT.strict_isolation_platform_preflight()
+    try:
+        canonical_trusted_root = trusted_repo_root.resolve(strict=True)
+        canonical_candidate_root = candidate_root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            "trusted supervisor split roots are unreadable"
+        ) from error
+    if (
+        trusted_repo_root.is_symlink()
+        or candidate_root.is_symlink()
+        or canonical_trusted_root != trusted_repo_root
+        or canonical_candidate_root != candidate_root
+        or canonical_trusted_root.name != ".required-ci"
+        or canonical_candidate_root.name != ".candidate"
+        or canonical_trusted_root.parent != canonical_candidate_root.parent
+    ):
+        raise AssertionError(
+            "trusted supervisor requires canonical sibling split roots"
+        )
+    split_workspace_root = canonical_trusted_root.parent
     _assert_candidate_absent_from_sys_path(candidate_root)
     trusted_inventory = _direct_test_inventory(trusted_repo_root, "trusted")
     trusted_source_sha256 = _trusted_test_source_manifest(trusted_repo_root)
@@ -685,10 +1013,16 @@ def supervise_trusted_required_ci_tests(
     child_environment = os.environ.copy()
     child_environment.pop("PYTHONHOME", None)
     child_environment.pop("PYTHONPATH", None)
+    child_environment.pop(TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV, None)
     child_environment[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(
         candidate_root.resolve(strict=True)
     )
     child_environment[REQUIRED_CI_CANDIDATE_SHA_ENV] = candidate_sha
+    child_environment["GITHUB_SHA"] = candidate_sha
+    child_environment["GITHUB_WORKSPACE"] = str(split_workspace_root)
+    _require_trusted_test_cleanup_reserve(
+        supervisor_deadline, "before isolation registry acquisition"
+    )
     isolation_chain_registry = (
         _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
     )
@@ -700,6 +1034,7 @@ def supervise_trusted_required_ci_tests(
         child_environment.update(
             _CANDIDATE_SUPPORT.trusted_isolation_child_environment()
         )
+        child_environment.pop(TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV, None)
         isolation_pass_fds = (
             _CANDIDATE_SUPPORT.trusted_isolation_child_pass_fds()
         )
@@ -711,7 +1046,7 @@ def supervise_trusted_required_ci_tests(
                 "trusted candidate test supervisor cannot be read"
             ) from error
         try:
-            completed = subprocess.run(
+            completed = _run_trusted_test_child(
                 [
                     sys.executable,
                     "-I",
@@ -722,12 +1057,9 @@ def supervise_trusted_required_ci_tests(
                     str(trusted_repo_root.resolve(strict=True)),
                 ],
                 cwd=trusted_repo_root.resolve(strict=True),
-                env=child_environment,
+                environment=child_environment,
                 pass_fds=isolation_pass_fds,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=TRUSTED_TEST_SUITE_TIMEOUT_SECONDS,
+                supervisor_deadline=supervisor_deadline,
             )
         except subprocess.TimeoutExpired as error:
             raise AssertionError(
@@ -784,9 +1116,19 @@ def _trusted_test_child_main(trusted_repo_root_value: str) -> int:
         if (
             not trusted_repo_root.is_absolute()
             or trusted_repo_root.name != ".required-ci"
+            or trusted_repo_root.is_symlink()
         ):
             raise AssertionError("trusted test root must be an absolute .required-ci path")
-        receipt = _trusted_test_suite_receipt(trusted_repo_root, REPO_ROOT)
+        try:
+            canonical_trusted_root = trusted_repo_root.resolve(strict=True)
+        except OSError as error:
+            raise AssertionError("trusted test root is unreadable") from error
+        if canonical_trusted_root != trusted_repo_root:
+            raise AssertionError("trusted test root must be canonical")
+        candidate_root = required_ci_repository_root(canonical_trusted_root)
+        receipt = _trusted_test_suite_receipt(
+            canonical_trusted_root, candidate_root
+        )
     except BaseException as error:
         message = _bounded_failure_text(f"{type(error).__name__}: {error}")
         print(f"trusted Required CI child failed: {message}", file=sys.stderr)
@@ -799,7 +1141,12 @@ def _trusted_test_child_main(trusted_repo_root_value: str) -> int:
 def _trusted_test_supervisor_main() -> int:
     try:
         _require_strict_workflow_mode()
-        receipt = supervise_trusted_required_ci_tests(TRUSTED_REPO_ROOT, REPO_ROOT)
+        supervisor_deadline = _trusted_test_supervisor_deadline_from_environment()
+        receipt = supervise_trusted_required_ci_tests(
+            TRUSTED_REPO_ROOT,
+            REPO_ROOT,
+            supervisor_deadline=supervisor_deadline,
+        )
     except BaseException as error:
         message = _bounded_failure_text(f"{type(error).__name__}: {error}")
         print(f"trusted Required CI test supervisor failed: {message}", file=sys.stderr)
@@ -1173,13 +1520,18 @@ def _reject_yaml_indirection(content: str, line_number: int) -> None:
         )
 
 
-_REQUIRED_CI_LOCAL_CALL = "./.github/workflows/required-ci.yml"
+_REQUIRED_CI_LOCAL_CALLS = frozenset(
+    (
+        "./.github/workflows/required-ci.yml",
+        "$/.github/workflows/required-ci.yml",
+    )
+)
 _REQUIRED_CI_REMOTE_REPOSITORY_PREFIX = f"{EXPECTED_REPOSITORY}/"
 _REQUIRED_CI_REMOTE_WORKFLOW_PREFIX = ".github/workflows/required-ci.yml@"
 
 
 def _is_required_ci_call_target(uses: str) -> bool:
-    if uses == _REQUIRED_CI_LOCAL_CALL:
+    if uses in _REQUIRED_CI_LOCAL_CALLS:
         return True
     repository_prefix = uses[: len(_REQUIRED_CI_REMOTE_REPOSITORY_PREFIX)]
     if (
@@ -1210,6 +1562,26 @@ def _workflow_job_uses_values(workflow: str) -> list[tuple[int, str]]:
     return uses_values
 
 
+def _required_ci_callers_in_workflow_sources(
+    workflow_sources: Mapping[Path, bytes],
+) -> list[tuple[Path, int, str]]:
+    canonical_leaf = Path(".github/workflows/required-ci.yml")
+    callers: list[tuple[Path, int, str]] = []
+    for relative_path in sorted(workflow_sources):
+        if relative_path == canonical_leaf:
+            continue
+        try:
+            workflow = workflow_sources[relative_path].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise AssertionError(
+                f"candidate workflow is not UTF-8: {relative_path}"
+            ) from error
+        for line_number, uses in _workflow_job_uses_values(workflow):
+            if _is_required_ci_call_target(uses):
+                callers.append((relative_path, line_number, uses))
+    return callers
+
+
 def required_ci_callers_in_repository(
     repo_root: Path,
 ) -> list[tuple[Path, int, str]]:
@@ -1221,17 +1593,18 @@ def required_ci_callers_in_repository(
             *workflows_root.rglob("*.yaml"),
         }
     )
-    callers: list[tuple[Path, int, str]] = []
+    workflow_sources: dict[Path, bytes] = {}
     for workflow_path in workflow_paths:
         if workflow_path == canonical_leaf or not workflow_path.is_file():
             continue
-        workflow = workflow_path.read_text(encoding="utf-8")
-        for line_number, uses in _workflow_job_uses_values(workflow):
-            if _is_required_ci_call_target(uses):
-                callers.append(
-                    (workflow_path.relative_to(repo_root), line_number, uses)
-                )
-    return callers
+        try:
+            source = workflow_path.read_bytes()
+        except OSError as error:
+            raise AssertionError(
+                f"candidate workflow is unreadable: {workflow_path}"
+            ) from error
+        workflow_sources[workflow_path.relative_to(repo_root)] = source
+    return _required_ci_callers_in_workflow_sources(workflow_sources)
 
 
 def _checkout_from_step(entries: list[tuple[int, int, str]], step_indent: int) -> bool:
@@ -1327,6 +1700,7 @@ def _validate_repository_guard(
     expected = {
         "name": "Reject unexpected repository",
         "if": f"${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}",
+        "timeout-minutes": str(TRUSTED_REPOSITORY_GUARD_TIMEOUT_MINUTES),
         "run": "exit 1",
     }
     actual: dict[str, str] = {}
@@ -1390,6 +1764,19 @@ def _require_scalar(
     if len(block) != 1 or _plain_scalar(value, line_number) != expected:
         raise AssertionError(
             f"{description} must equal {expected!r} on line {line_number}"
+        )
+
+
+def _require_exact_timeout(
+    property_entry: tuple[str, int, list[tuple[int, int, str]]],
+    expected_minutes: int,
+    description: str,
+) -> None:
+    value, line_number, block = property_entry
+    if len(block) != 1 or value != str(expected_minutes):
+        raise AssertionError(
+            f"{description} must be the exact unquoted integer literal "
+            f"{expected_minutes} on line {line_number}"
         )
 
 
@@ -1482,7 +1869,10 @@ def _validate_test_job(
         raise AssertionError("test job must contain exactly the seven required steps")
 
     guard = _require_step_properties(
-        steps[0], step_indent, ["name", "if", "run"], "repository guard"
+        steps[0],
+        step_indent,
+        ["name", "if", "timeout-minutes", "run"],
+        "repository guard",
     )
     _require_scalar(guard["name"], "Reject unexpected repository", "guard name")
     _require_scalar(
@@ -1490,16 +1880,29 @@ def _validate_test_job(
         f"${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}",
         "guard condition",
     )
+    _require_exact_timeout(
+        guard["timeout-minutes"],
+        TRUSTED_REPOSITORY_GUARD_TIMEOUT_MINUTES,
+        "repository guard timeout",
+    )
     _require_scalar(guard["run"], "exit 1", "guard command")
 
     candidate_checkout = _require_step_properties(
-        steps[1], step_indent, ["name", "uses", "with"], "candidate checkout step"
+        steps[1],
+        step_indent,
+        ["name", "uses", "timeout-minutes", "with"],
+        "candidate checkout step",
     )
     _require_scalar(
         candidate_checkout["name"], "Check out candidate", "candidate checkout name"
     )
     _require_scalar(
         candidate_checkout["uses"], "actions/checkout@v4", "candidate checkout action"
+    )
+    _require_exact_timeout(
+        candidate_checkout["timeout-minutes"],
+        TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES,
+        "candidate checkout timeout",
     )
     _require_exact_mapping(
         candidate_checkout["with"],
@@ -1508,7 +1911,10 @@ def _validate_test_job(
     )
 
     trusted_checkout = _require_step_properties(
-        steps[2], step_indent, ["name", "uses", "with"], "trusted checkout step"
+        steps[2],
+        step_indent,
+        ["name", "uses", "timeout-minutes", "with"],
+        "trusted checkout step",
     )
     _require_scalar(
         trusted_checkout["name"],
@@ -1520,6 +1926,11 @@ def _validate_test_job(
         "actions/checkout@v4",
         "trusted checkout action",
     )
+    _require_exact_timeout(
+        trusted_checkout["timeout-minutes"],
+        TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES,
+        "trusted checkout timeout",
+    )
     _require_exact_mapping(
         trusted_checkout["with"],
         TRUSTED_CHECKOUT_INPUTS,
@@ -1527,20 +1938,36 @@ def _validate_test_job(
     )
 
     setup = _require_step_properties(
-        steps[3], step_indent, ["uses", "with"], "Python setup step"
+        steps[3],
+        step_indent,
+        ["uses", "timeout-minutes", "with"],
+        "Python setup step",
     )
     _require_scalar(setup["uses"], "actions/setup-python@v5", "Python setup action")
+    _require_exact_timeout(
+        setup["timeout-minutes"],
+        TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES,
+        "Python setup timeout",
+    )
     _require_exact_mapping(
         setup["with"], {"python-version": "3.x"}, "Python setup inputs"
     )
 
     compile_step = _require_step_properties(
-        steps[4], step_indent, ["name", "run"], "compile step"
+        steps[4],
+        step_indent,
+        ["name", "timeout-minutes", "run"],
+        "compile step",
     )
     _require_scalar(
         compile_step["name"],
         "Compile candidate Python helpers",
         "compile step name",
+    )
+    _require_exact_timeout(
+        compile_step["timeout-minutes"],
+        TRUSTED_COMPILE_TIMEOUT_MINUTES,
+        "compile step timeout",
     )
     _require_run_block(
         lines,
@@ -1550,12 +1977,20 @@ def _validate_test_job(
     )
 
     validator_step = _require_step_properties(
-        steps[5], step_indent, ["name", "env", "run"], "validator step"
+        steps[5],
+        step_indent,
+        ["name", "timeout-minutes", "env", "run"],
+        "validator step",
     )
     _require_scalar(
         validator_step["name"],
         "Validate Required CI structure",
         "validator step name",
+    )
+    _require_exact_timeout(
+        validator_step["timeout-minutes"],
+        TRUSTED_STRUCTURE_TIMEOUT_MINUTES,
+        "validator step timeout",
     )
     _require_exact_mapping(
         validator_step["env"], TRUSTED_VALIDATOR_ENV, "validator environment"
@@ -1568,12 +2003,20 @@ def _validate_test_job(
     )
 
     test_step = _require_step_properties(
-        steps[6], step_indent, ["name", "env", "run"], "test step"
+        steps[6],
+        step_indent,
+        ["name", "timeout-minutes", "env", "run"],
+        "test step",
     )
     _require_scalar(
         test_step["name"],
         "Run trusted Required CI tests",
         "test step name",
+    )
+    _require_exact_timeout(
+        test_step["timeout-minutes"],
+        TRUSTED_TEST_STEP_TIMEOUT_MINUTES,
+        "test step timeout",
     )
     _require_exact_mapping(
         test_step["env"], TRUSTED_RUNTIME_ENV, "test supervisor environment"
@@ -1718,38 +2161,446 @@ def validate_required_workflow(workflow: str) -> list[str]:
     return checkouts
 
 
-def validate_required_ci_repository(repo_root: Path) -> list[str]:
-    workflow_path = repo_root / ".github/workflows/required-ci.yml"
-    if workflow_path.is_symlink() or not workflow_path.is_file():
-        raise AssertionError(
-            "candidate repository must contain an ordinary required-ci.yml"
-        )
+def _read_bound_repository_file(
+    repo_root: Path,
+    relative_path: Path,
+    description: str,
+) -> bytes:
+    if (
+        not repo_root.is_absolute()
+        or relative_path.is_absolute()
+        or not relative_path.parts
+        or ".." in relative_path.parts
+    ):
+        raise AssertionError(f"{description} path binding changed")
     try:
-        workflow = workflow_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise AssertionError("candidate required-ci.yml cannot be read") from error
-    support_path = (
-        repo_root
-        / "skills/waited-delivery/tests/required_ci_candidate.py"
+        initial_root_metadata = repo_root.lstat()
+        canonical_root = repo_root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(f"{description} repository root is unreadable") from error
+    if (
+        not stat.S_ISDIR(initial_root_metadata.st_mode)
+        or canonical_root != repo_root
+    ):
+        raise AssertionError(f"{description} path binding changed")
+    if canonical_root.anchor != os.path.sep:
+        raise AssertionError(f"{description} path binding changed")
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    file_flags = (
+        os.O_RDONLY
+        | os.O_NONBLOCK
+        | os.O_NOCTTY
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC
     )
     try:
-        support_source = support_path.read_bytes()
-        resolved_support = support_path.resolve(strict=True)
+        with contextlib.ExitStack() as descriptor_stack:
+            initial_root_identity = (
+                initial_root_metadata.st_dev,
+                initial_root_metadata.st_ino,
+            )
+            anchor_descriptor = os.open(canonical_root.anchor, directory_flags)
+            descriptor_stack.callback(os.close, anchor_descriptor)
+            anchor_metadata = os.fstat(anchor_descriptor)
+            if not stat.S_ISDIR(anchor_metadata.st_mode):
+                raise AssertionError(f"{description} path binding changed")
+
+            directory_bindings: list[
+                tuple[int, str, int, tuple[int, int]]
+            ] = []
+            parent_descriptor = anchor_descriptor
+            directory_components = (
+                *canonical_root.parts[1:],
+                *relative_path.parts[:-1],
+            )
+            absolute_component_count = len(canonical_root.parts) - 1
+            repository_chain_descriptor = (
+                anchor_descriptor if absolute_component_count == 0 else None
+            )
+            for component_index, component in enumerate(directory_components):
+                component_metadata = os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(component_metadata.st_mode):
+                    raise AssertionError(f"{description} path binding changed")
+                try:
+                    component_descriptor = os.open(
+                        component,
+                        directory_flags,
+                        dir_fd=parent_descriptor,
+                    )
+                except FileNotFoundError as error:
+                    raise AssertionError(
+                        f"{description} disappeared during binding"
+                    ) from error
+                except OSError as error:
+                    if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                        raise AssertionError(
+                            f"{description} path binding changed during binding"
+                        ) from error
+                    raise AssertionError(
+                        f"{description} is unreadable during binding"
+                    ) from error
+                descriptor_stack.callback(os.close, component_descriptor)
+                opened_component = os.fstat(component_descriptor)
+                component_identity = (
+                    component_metadata.st_dev,
+                    component_metadata.st_ino,
+                )
+                if (
+                    not stat.S_ISDIR(opened_component.st_mode)
+                    or (opened_component.st_dev, opened_component.st_ino)
+                    != component_identity
+                ):
+                    raise AssertionError(
+                        f"{description} path binding changed during binding"
+                    )
+                directory_bindings.append(
+                    (
+                        parent_descriptor,
+                        component,
+                        component_descriptor,
+                        component_identity,
+                    )
+                )
+                parent_descriptor = component_descriptor
+                if component_index == absolute_component_count - 1:
+                    if component_identity != initial_root_identity:
+                        raise AssertionError(
+                            f"{description} path binding changed"
+                        )
+                    repository_chain_descriptor = component_descriptor
+
+            if repository_chain_descriptor is None:
+                raise AssertionError(f"{description} path binding changed")
+
+            leaf_name = relative_path.parts[-1]
+            path_metadata = os.stat(
+                leaf_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(path_metadata.st_mode)
+                or path_metadata.st_nlink != 1
+                or path_metadata.st_size < 0
+                or path_metadata.st_size
+                > TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES
+            ):
+                raise AssertionError(f"{description} path binding changed")
+            try:
+                descriptor = os.open(
+                    leaf_name,
+                    file_flags,
+                    dir_fd=parent_descriptor,
+                )
+            except FileNotFoundError as error:
+                raise AssertionError(
+                    f"{description} disappeared during binding"
+                ) from error
+            except OSError as error:
+                if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise AssertionError(
+                        f"{description} path binding changed during binding"
+                    ) from error
+                raise AssertionError(
+                    f"{description} is unreadable during binding"
+                ) from error
+            descriptor_stack.callback(os.close, descriptor)
+            opened = os.fstat(descriptor)
+            opened_identity = (opened.st_dev, opened.st_ino)
+            path_identity = (path_metadata.st_dev, path_metadata.st_ino)
+            if (
+                opened_identity != path_identity
+                or not stat.S_ISREG(opened.st_mode)
+            ):
+                raise AssertionError(
+                    f"{description} object changed or was replaced during binding"
+                )
+            if opened.st_nlink != 1:
+                raise AssertionError(
+                    f"{description} access policy changed during binding"
+                )
+            if (
+                opened.st_size != path_metadata.st_size
+                or opened.st_size > TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES
+            ):
+                raise AssertionError(
+                    f"{description} content stability changed during binding"
+                )
+
+            def read_once() -> bytes:
+                chunks: list[bytes] = []
+                remaining = opened.st_size + 1
+                while remaining > 0:
+                    chunk = os.read(descriptor, min(remaining, 64 * 1024))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                return b"".join(chunks)
+
+            first = read_once()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            second = read_once()
+            try:
+                revalidated = os.fstat(descriptor)
+                revalidated_path = os.stat(
+                    leaf_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+
+                final_anchor = os.fstat(anchor_descriptor)
+                final_chain_root = os.fstat(repository_chain_descriptor)
+                if (
+                    not stat.S_ISDIR(final_anchor.st_mode)
+                    or (final_anchor.st_dev, final_anchor.st_ino)
+                    != (anchor_metadata.st_dev, anchor_metadata.st_ino)
+                    or not stat.S_ISDIR(final_chain_root.st_mode)
+                    or (final_chain_root.st_dev, final_chain_root.st_ino)
+                    != initial_root_identity
+                ):
+                    raise AssertionError(
+                        f"{description} path binding changed during revalidation"
+                    )
+                for (
+                    bound_parent_descriptor,
+                    component,
+                    component_descriptor,
+                    component_identity,
+                ) in directory_bindings:
+                    final_component = os.fstat(component_descriptor)
+                    linked_component = os.stat(
+                        component,
+                        dir_fd=bound_parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        not stat.S_ISDIR(final_component.st_mode)
+                        or not stat.S_ISDIR(linked_component.st_mode)
+                        or (final_component.st_dev, final_component.st_ino)
+                        != component_identity
+                        or (linked_component.st_dev, linked_component.st_ino)
+                        != component_identity
+                    ):
+                        raise AssertionError(
+                            f"{description} path binding changed during "
+                            "revalidation"
+                        )
+            except FileNotFoundError as error:
+                raise AssertionError(
+                    f"{description} disappeared during revalidation"
+                ) from error
+            except OSError as error:
+                raise AssertionError(
+                    f"{description} is unreadable during revalidation"
+                ) from error
+
+            if (
+                (revalidated.st_dev, revalidated.st_ino)
+                != opened_identity
+                or not stat.S_ISREG(revalidated.st_mode)
+            ):
+                raise AssertionError(
+                    f"{description} object changed or was replaced during "
+                    "revalidation"
+                )
+            if revalidated.st_nlink != 1:
+                raise AssertionError(
+                    f"{description} access policy changed during revalidation"
+                )
+            if (
+                first != second
+                or len(first) != opened.st_size
+                or revalidated.st_size != opened.st_size
+            ):
+                raise AssertionError(
+                    f"{description} content stability changed during revalidation"
+                )
+            if (
+                (revalidated_path.st_dev, revalidated_path.st_ino)
+                != opened_identity
+                or not stat.S_ISREG(revalidated_path.st_mode)
+            ):
+                raise AssertionError(
+                    f"{description} object changed or was replaced during "
+                    "revalidation"
+                )
+            if revalidated_path.st_nlink != 1:
+                raise AssertionError(
+                    f"{description} access policy changed during revalidation"
+                )
+            if revalidated_path.st_size != opened.st_size:
+                raise AssertionError(
+                    f"{description} content stability changed during revalidation"
+                )
+    except FileNotFoundError as error:
+        raise AssertionError(f"{description} is missing") from error
     except OSError as error:
+        raise AssertionError(f"{description} is unreadable") from error
+    return first
+
+
+def _frozen_candidate_file_bytes(
+    repo_root: Path,
+    candidate_sha: str,
+    relative_path: Path,
+) -> bytes:
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise AssertionError("frozen candidate path must be repository-relative")
+    object_spec = f"{candidate_sha}:{relative_path.as_posix()}"
+    size_output = _CANDIDATE_SUPPORT._run_candidate_git(
+        repo_root,
+        "cat-file",
+        "-s",
+        object_spec,
+        output_limit=128,
+    )
+    try:
+        size = int(size_output.decode("ascii").removesuffix("\n"))
+    except (UnicodeDecodeError, ValueError) as error:
         raise AssertionError(
-            "candidate repository must contain trusted candidate support"
+            f"frozen candidate size is malformed: {relative_path}"
         ) from error
-    if (
-        support_path.is_symlink()
-        or not support_path.is_file()
-        or resolved_support != support_path
-        or support_source != TRUSTED_CANDIDATE_SUPPORT_SOURCE
-    ):
+    if size < 0 or size > TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES:
+        raise AssertionError(
+            f"frozen candidate file exceeds its size limit: {relative_path}"
+        )
+    source = _CANDIDATE_SUPPORT._run_candidate_git(
+        repo_root,
+        "cat-file",
+        "blob",
+        object_spec,
+        output_limit=TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES,
+    )
+    if len(source) != size:
+        raise AssertionError(
+            f"frozen candidate file size changed: {relative_path}"
+        )
+    return source
+
+
+def _frozen_candidate_workflow_sources(
+    repo_root: Path, candidate_sha: str
+) -> dict[Path, bytes]:
+    tree_output = _CANDIDATE_SUPPORT._run_candidate_git(
+        repo_root,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        candidate_sha,
+        "--",
+        ".github/workflows",
+        output_limit=TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES,
+    )
+    workflow_paths: list[Path] = []
+    for raw_entry in tree_output.split(b"\0"):
+        if not raw_entry:
+            continue
+        metadata, separator, raw_path = raw_entry.partition(b"\t")
+        fields = metadata.split(b" ")
+        if separator != b"\t" or len(fields) != 3:
+            raise AssertionError("frozen candidate workflow tree is malformed")
+        mode, object_type, object_id = fields
+        try:
+            relative_path = Path(raw_path.decode("utf-8"))
+        except UnicodeDecodeError as error:
+            raise AssertionError(
+                "frozen candidate workflow path is not UTF-8"
+            ) from error
+        if relative_path.suffix not in (".yml", ".yaml"):
+            continue
+        if (
+            mode not in (b"100644", b"100755")
+            or object_type != b"blob"
+            or re.fullmatch(rb"[0-9a-f]{40}", object_id) is None
+            or relative_path.is_absolute()
+            or relative_path.parts[:2] != (".github", "workflows")
+            or ".." in relative_path.parts
+        ):
+            raise AssertionError(
+                f"frozen candidate workflow object is unsafe: {relative_path}"
+            )
+        workflow_paths.append(relative_path)
+    if len(workflow_paths) > TRUSTED_WORKFLOW_INVENTORY_LIMIT:
+        raise AssertionError("frozen candidate workflow inventory is too large")
+    sources: dict[Path, bytes] = {}
+    total_size = 0
+    for relative_path in sorted(workflow_paths):
+        source = _frozen_candidate_file_bytes(
+            repo_root, candidate_sha, relative_path
+        )
+        total_size += len(source)
+        if total_size > TRUSTED_WORKFLOW_TOTAL_SIZE_LIMIT_BYTES:
+            raise AssertionError("frozen candidate workflows exceed their total limit")
+        sources[relative_path] = source
+    return sources
+
+
+def validate_required_ci_repository(
+    repo_root: Path,
+    *,
+    candidate_sha: str | None = None,
+) -> list[str]:
+    workflow_relative_path = Path(".github/workflows/required-ci.yml")
+    try:
+        workflow_source = _read_bound_repository_file(
+            repo_root,
+            workflow_relative_path,
+            "candidate required-ci.yml",
+        )
+        workflow = workflow_source.decode("utf-8")
+    except UnicodeError as error:
+        raise AssertionError("candidate required-ci.yml cannot be read") from error
+    support_relative_path = (
+        TRUSTED_CONTENT_RELATIVE_ROOT
+        / "skills/waited-delivery/tests/required_ci_candidate.py"
+    )
+    support_source = _read_bound_repository_file(
+        repo_root,
+        support_relative_path,
+        "candidate trusted support",
+    )
+    frozen_workflows: dict[Path, bytes] | None = None
+    if candidate_sha is not None:
+        candidate_sha = _CANDIDATE_SUPPORT._parse_candidate_sha(
+            candidate_sha, "candidate SHA"
+        )
+        frozen_workflows = _frozen_candidate_workflow_sources(
+            repo_root, candidate_sha
+        )
+        frozen_workflow_source = frozen_workflows.get(workflow_relative_path)
+        if frozen_workflow_source is None:
+            raise AssertionError(
+                "frozen candidate commit is missing required-ci.yml"
+            )
+        frozen_support_source = _frozen_candidate_file_bytes(
+            repo_root, candidate_sha, support_relative_path
+        )
+        if workflow_source != frozen_workflow_source:
+            raise AssertionError(
+                "candidate required-ci.yml does not match the frozen commit"
+            )
+        if support_source != frozen_support_source:
+            raise AssertionError(
+                "candidate trusted support does not match the frozen commit"
+            )
+    if support_source != TRUSTED_CANDIDATE_SUPPORT_SOURCE:
         raise AssertionError(
             "candidate trusted support must match the Required CI source"
         )
     checkouts = validate_required_workflow(workflow)
-    callers = required_ci_callers_in_repository(repo_root)
+    callers = (
+        required_ci_callers_in_repository(repo_root)
+        if frozen_workflows is None
+        else _required_ci_callers_in_workflow_sources(frozen_workflows)
+    )
     if callers:
         raise AssertionError(
             "candidate repository must not contain another Required CI caller"
@@ -1758,7 +2609,24 @@ def validate_required_ci_repository(repo_root: Path) -> list[str]:
 
 
 def _trusted_structure_validator_main() -> int:
-    validate_required_ci_repository(REPO_ROOT)
+    candidate_sha, require_clean = _CANDIDATE_SUPPORT.expected_candidate_sha(
+        REPO_ROOT
+    )
+    if not require_clean:
+        raise AssertionError(
+            "trusted structure validation requires an explicit frozen candidate SHA"
+        )
+    before = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+        REPO_ROOT, candidate_sha, require_clean=True
+    )
+    validate_required_ci_repository(REPO_ROOT, candidate_sha=candidate_sha)
+    after = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+        REPO_ROOT, candidate_sha, require_clean=True
+    )
+    if after != before:
+        raise AssertionError(
+            "candidate checkout binding changed during structure validation"
+        )
     return 0
 
 
@@ -2087,7 +2955,7 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
             "  # release: this remains a comment\n"
             "  test: # the only real job\n"
             "    runs-on: ubuntu-latest\n"
-            "    timeout-minutes: 10\n"
+            f"    timeout-minutes: {EXPECTED_TEST_TIMEOUT_MINUTES}\n"
             "    steps:\n"
             f"{REPOSITORY_GUARD}\n"
             f"{CANDIDATE_CHECKOUT_STEP}"
@@ -2148,10 +3016,10 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             "zero": "0",
             "noninteger word": "ten",
             "noninteger decimal": "10.5",
-            "quoted integer": '"10"',
+            "quoted integer": '"35"',
             "expression": "${{ vars.REQUIRED_CI_TIMEOUT_MINUTES }}",
             "over GitHub maximum": "361",
-            "different positive integer": "11",
+            "different positive integer": "36",
         }
         for name, timeout_minutes in invalid_timeouts.items():
             with self.subTest(name=name):
@@ -2162,6 +3030,77 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                             trailing_steps=trailing_steps,
                         )
                     )
+
+    def test_every_required_step_has_an_exact_literal_timeout(self) -> None:
+        workflow = self.required_workflow()
+        step_contracts = (
+            (
+                "repository guard",
+                "      - name: Reject unexpected repository\n",
+                "      - name: Check out candidate\n",
+                TRUSTED_REPOSITORY_GUARD_TIMEOUT_MINUTES,
+            ),
+            (
+                "candidate checkout",
+                "      - name: Check out candidate\n",
+                "      - name: Check out trusted Required CI source\n",
+                TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES,
+            ),
+            (
+                "trusted checkout",
+                "      - name: Check out trusted Required CI source\n",
+                "      - uses: actions/setup-python@v5\n",
+                TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES,
+            ),
+            (
+                "Python setup",
+                "      - uses: actions/setup-python@v5\n",
+                "      - name: Compile candidate Python helpers\n",
+                TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES,
+            ),
+            (
+                "compile",
+                "      - name: Compile candidate Python helpers\n",
+                "      - name: Validate Required CI structure\n",
+                TRUSTED_COMPILE_TIMEOUT_MINUTES,
+            ),
+            (
+                "structure",
+                "      - name: Validate Required CI structure\n",
+                "      - name: Run trusted Required CI tests\n",
+                TRUSTED_STRUCTURE_TIMEOUT_MINUTES,
+            ),
+            (
+                "trusted tests",
+                "      - name: Run trusted Required CI tests\n",
+                None,
+                TRUSTED_TEST_STEP_TIMEOUT_MINUTES,
+            ),
+        )
+        for description, marker, next_marker, expected in step_contracts:
+            start = workflow.index(marker)
+            end = len(workflow) if next_marker is None else workflow.index(
+                next_marker, start + len(marker)
+            )
+            block = workflow[start:end]
+            timeout_line = f"        timeout-minutes: {expected}\n"
+            self.assertEqual(block.count(timeout_line), 1)
+            variants = {
+                "missing": "",
+                "zero": "        timeout-minutes: 0\n",
+                "quoted": f'        timeout-minutes: "{expected}"\n',
+                "expression": (
+                    "        timeout-minutes: "
+                    "${{ vars.REQUIRED_CI_STEP_TIMEOUT }}\n"
+                ),
+                "wrong": f"        timeout-minutes: {expected + 1}\n",
+            }
+            for variant, replacement in variants.items():
+                with self.subTest(step=description, variant=variant):
+                    mutated_block = block.replace(timeout_line, replacement, 1)
+                    mutated = workflow[:start] + mutated_block + workflow[end:]
+                    with self.assertRaisesRegex(AssertionError, "timeout|properties"):
+                        validate_required_workflow(mutated)
 
     def test_test_job_cannot_be_skipped_or_suppress_errors(self) -> None:
         fixtures = {
@@ -2323,8 +3262,8 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             "candidate copy owns the supervisor": secure_workflow.replace(
                 TRUSTED_TEST_SUPERVISOR_COMMAND,
                 TRUSTED_TEST_SUPERVISOR_COMMAND.replace(
-                    "$GITHUB_WORKSPACE/.required-ci/",
-                    "$GITHUB_WORKSPACE/.candidate/",
+                    'environment["GITHUB_WORKSPACE"]+"/.required-ci/',
+                    'environment["GITHUB_WORKSPACE"]+"/.candidate/',
                     1,
                 ),
                 1,
@@ -2339,9 +3278,35 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             "supervisor flag is missing": secure_workflow.replace(
                 TRUSTED_TEST_SUPERVISOR_COMMAND,
                 TRUSTED_TEST_SUPERVISOR_COMMAND.replace(
-                    " --run-trusted-tests", "", 1
+                    ',"--run-trusted-tests"', "", 1
                 ),
                 1,
+            ),
+            "supervisor deadline uses wall clock": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
+                TRUSTED_TEST_SUPERVISOR_COMMAND.replace(
+                    "time.monotonic()", "time.time()", 1
+                ),
+                1,
+            ),
+            "supervisor deadline is extended": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
+                TRUSTED_TEST_SUPERVISOR_COMMAND.replace("+600", "+601", 1),
+                1,
+            ),
+            "supervisor launcher does not exec": secure_workflow.replace(
+                TRUSTED_TEST_SUPERVISOR_COMMAND,
+                TRUSTED_TEST_SUPERVISOR_COMMAND.replace(
+                    "os.execve", "os.spawnve", 1
+                ),
+                1,
+            ),
+            "supervisor launcher has a second shell action": (
+                secure_workflow.replace(
+                    TRUSTED_TEST_SUPERVISOR_COMMAND,
+                    TRUSTED_TEST_SUPERVISOR_COMMAND + "\n          echo unexpected",
+                    1,
+                )
             ),
             "candidate root environment is missing": secure_workflow.replace(
                 TRUSTED_TEST_SUPERVISOR_STEP,
@@ -2502,6 +3467,717 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                         AssertionError, "trusted candidate support|trusted support"
                     ):
                         validate_required_ci_repository(candidate_root)
+
+    def test_candidate_workflow_rejects_symlinked_ancestor_directories(
+        self,
+    ) -> None:
+        secure_workflow = self.required_workflow()
+        for ancestor in (".github", ".github/workflows"):
+            with self.subTest(ancestor=ancestor):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    root = Path(temporary_directory).resolve(strict=True)
+                    candidate_root = root / ".candidate"
+                    outside_root = root / "outside"
+                    candidate_root.mkdir()
+                    outside_workflows = outside_root / "workflows"
+                    outside_workflows.mkdir(parents=True)
+                    (outside_workflows / "required-ci.yml").write_text(
+                        secure_workflow, encoding="utf-8"
+                    )
+                    if ancestor == ".github":
+                        (candidate_root / ".github").symlink_to(
+                            outside_root, target_is_directory=True
+                        )
+                    else:
+                        github_root = candidate_root / ".github"
+                        github_root.mkdir()
+                        (github_root / "workflows").symlink_to(
+                            outside_workflows, target_is_directory=True
+                        )
+                    support_path = (
+                        candidate_root
+                        / "skills/waited-delivery/tests/required_ci_candidate.py"
+                    )
+                    support_path.parent.mkdir(parents=True)
+                    shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, support_path)
+
+                    with self.assertRaisesRegex(
+                        AssertionError, "required-ci.yml path binding"
+                    ):
+                        validate_required_ci_repository(candidate_root)
+
+    def test_candidate_support_rejects_symlinked_ancestor_directories(
+        self,
+    ) -> None:
+        secure_workflow = self.required_workflow()
+        for ancestor in ("skills", "skills/waited-delivery/tests"):
+            with self.subTest(ancestor=ancestor), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory).resolve(strict=True)
+                candidate_root = root / ".candidate"
+                candidate_root.mkdir()
+                workflow_path = (
+                    candidate_root / ".github/workflows/required-ci.yml"
+                )
+                workflow_path.parent.mkdir(parents=True)
+                workflow_path.write_text(secure_workflow, encoding="utf-8")
+                outside_root = root / "outside"
+                if ancestor == "skills":
+                    outside_support = (
+                        outside_root
+                        / "waited-delivery/tests/required_ci_candidate.py"
+                    )
+                    outside_support.parent.mkdir(parents=True)
+                    (candidate_root / "skills").symlink_to(
+                        outside_root, target_is_directory=True
+                    )
+                else:
+                    outside_support = outside_root / "required_ci_candidate.py"
+                    outside_support.parent.mkdir(parents=True)
+                    tests_parent = candidate_root / "skills/waited-delivery"
+                    tests_parent.mkdir(parents=True)
+                    (tests_parent / "tests").symlink_to(
+                        outside_root, target_is_directory=True
+                    )
+                outside_support.write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
+
+                with self.assertRaisesRegex(
+                    AssertionError, "trusted support path binding"
+                ):
+                    validate_required_ci_repository(candidate_root)
+
+    def test_bound_repository_reader_rejects_open_window_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            detached = path.with_name("detached.yml")
+            replacement = path.with_name("replacement.yml")
+            replacement.write_bytes(b"replacement\n")
+            original_open = os.open
+            replaced = False
+
+            def replace_before_open(
+                selected_path: object, flags: int, *args: object, **kwargs: object
+            ) -> int:
+                nonlocal replaced
+                selected = Path(selected_path)
+                if not replaced and (
+                    selected == path
+                    or (selected == Path(path.name) and "dir_fd" in kwargs)
+                ):
+                    path.rename(detached)
+                    replacement.rename(path)
+                    replaced = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=replace_before_open):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "object changed or was replaced during binding",
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertEqual(detached.read_bytes(), b"original\n")
+            self.assertEqual(path.read_bytes(), b"replacement\n")
+
+    def test_bound_repository_reader_never_blocks_on_fifo_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            detached = path.with_name("detached.yml")
+            original_open = os.open
+            guard_descriptor: int | None = None
+            leaf_open_flags: int | None = None
+            replaced = False
+
+            def replace_with_fifo_before_open(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal guard_descriptor, leaf_open_flags, replaced
+                if (
+                    not replaced
+                    and Path(selected_path) == Path(path.name)
+                    and "dir_fd" in kwargs
+                ):
+                    path.rename(detached)
+                    os.mkfifo(path)
+                    guard_descriptor = original_open(
+                        path, os.O_RDWR | os.O_NONBLOCK
+                    )
+                    leaf_open_flags = flags
+                    replaced = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    os, "open", side_effect=replace_with_fifo_before_open
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "object changed or was replaced during binding",
+                    ):
+                        _read_bound_repository_file(
+                            root, relative_path, "probe"
+                        )
+            finally:
+                if guard_descriptor is not None:
+                    os.close(guard_descriptor)
+
+            self.assertTrue(replaced, "the FIFO replacement fixture must execute")
+            self.assertIsNotNone(leaf_open_flags)
+            assert leaf_open_flags is not None
+            self.assertTrue(
+                leaf_open_flags & os.O_NONBLOCK,
+                "leaf open must not block on a special-file replacement",
+            )
+            self.assertTrue(stat.S_ISFIFO(path.lstat().st_mode))
+            self.assertEqual(detached.read_bytes(), b"original\n")
+
+    def test_bound_repository_reader_rejects_ancestor_symlink_open_race(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            github_root = root / ".github"
+            detached_github_root = root / "detached-github"
+            original_open = os.open
+            swapped = False
+
+            def swap_ancestor_before_open(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal swapped
+                selected = Path(selected_path)
+                if not swapped and (
+                    selected == path
+                    or (selected == Path(path.name) and "dir_fd" in kwargs)
+                ):
+                    github_root.rename(detached_github_root)
+                    github_root.symlink_to(
+                        detached_github_root, target_is_directory=True
+                    )
+                    swapped = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=swap_ancestor_before_open):
+                with self.assertRaisesRegex(
+                    AssertionError, "path binding changed"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertTrue(swapped, "the ancestor race fixture must execute")
+            self.assertTrue(github_root.is_symlink())
+            self.assertEqual(path.read_bytes(), b"original\n")
+
+    def test_bound_repository_reader_rejects_repository_root_symlink_open_race(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory).resolve(strict=True)
+            root = workspace / "candidate-root"
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            detached_root = workspace / "detached-candidate-root"
+            original_open = os.open
+            swapped = False
+
+            def swap_root_before_open(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal swapped
+                if (
+                    not swapped
+                    and Path(selected_path) == Path(root.name)
+                    and "dir_fd" in kwargs
+                ):
+                    root.rename(detached_root)
+                    root.symlink_to(detached_root, target_is_directory=True)
+                    swapped = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=swap_root_before_open):
+                with self.assertRaisesRegex(
+                    AssertionError, "path binding changed during binding"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertTrue(swapped, "the root race fixture must execute")
+            self.assertTrue(root.is_symlink())
+            self.assertEqual(path.read_bytes(), b"original\n")
+
+    def test_bound_repository_reader_rejects_whole_root_swap_before_anchor_open(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory).resolve(strict=True)
+            root = workspace / "candidate-root"
+            replacement_root = workspace / "replacement-candidate-root"
+            detached_root = workspace / "detached-candidate-root"
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            replacement_path = replacement_root / relative_path
+            path.parent.mkdir(parents=True)
+            replacement_path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            replacement_path.write_bytes(b"decoy\n")
+            original_open = os.open
+            swapped = False
+
+            def swap_root_before_anchor_open(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal swapped
+                if (
+                    not swapped
+                    and Path(selected_path) == Path(root.anchor)
+                    and "dir_fd" not in kwargs
+                ):
+                    root.rename(detached_root)
+                    replacement_root.rename(root)
+                    swapped = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "open", side_effect=swap_root_before_anchor_open
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "path binding changed"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertTrue(swapped, "the whole-root race fixture must execute")
+            self.assertEqual(path.read_bytes(), b"decoy\n")
+            self.assertEqual(
+                (detached_root / relative_path).read_bytes(), b"original\n"
+            )
+
+    def test_bound_repository_reader_never_opens_absolute_root_through_symlink(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            container = Path(temporary_directory).resolve(strict=True)
+            workspace = container / "workspace"
+            root = workspace / "candidate-root"
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            detached_workspace = container / "detached-workspace"
+            original_open = os.open
+            transient_symlink_followed = False
+
+            def restore_ancestor_after_absolute_open(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal transient_symlink_followed
+                if (
+                    not transient_symlink_followed
+                    and Path(selected_path) == root
+                    and "dir_fd" not in kwargs
+                ):
+                    workspace.rename(detached_workspace)
+                    workspace.symlink_to(
+                        detached_workspace, target_is_directory=True
+                    )
+                    try:
+                        descriptor = original_open(
+                            selected_path, flags, *args, **kwargs
+                        )
+                        transient_symlink_followed = True
+                    finally:
+                        workspace.unlink()
+                        detached_workspace.rename(workspace)
+                    return descriptor
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "open", side_effect=restore_ancestor_after_absolute_open
+            ):
+                source = _read_bound_repository_file(
+                    root, relative_path, "probe"
+                )
+
+            self.assertFalse(
+                transient_symlink_followed,
+                "repository files must be reached only through the no-follow "
+                "component chain",
+            )
+            self.assertEqual(source, b"original\n")
+            self.assertFalse(workspace.is_symlink())
+
+    def test_bound_repository_reader_allows_benign_sibling_directory_churn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            sibling = path.parent / "benign-child"
+            original_open = os.open
+            churned = False
+
+            def add_sibling_before_open(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal churned
+                selected = Path(selected_path)
+                if not churned and (
+                    selected == path
+                    or (selected == Path(path.name) and "dir_fd" in kwargs)
+                ):
+                    sibling.mkdir()
+                    churned = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=add_sibling_before_open):
+                source = _read_bound_repository_file(
+                    root, relative_path, "probe"
+                )
+
+            self.assertTrue(churned, "the benign churn fixture must execute")
+            self.assertEqual(source, b"original\n")
+            self.assertTrue(sibling.is_dir())
+
+    def test_bound_repository_reader_rejects_same_inode_content_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"first\n")
+            original_lseek = os.lseek
+            changed = False
+
+            def mutate_before_second_read(
+                descriptor: int, offset: int, whence: int
+            ) -> int:
+                nonlocal changed
+                result = original_lseek(descriptor, offset, whence)
+                if not changed:
+                    path.write_bytes(b"other\n")
+                    changed = True
+                return result
+
+            with mock.patch.object(os, "lseek", side_effect=mutate_before_second_read):
+                with self.assertRaisesRegex(
+                    AssertionError, "content stability changed"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+    def test_bound_repository_reader_rejects_final_same_inode_size_change(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"first\n")
+            original_stat = os.stat
+            leaf_stats = 0
+            changed = False
+
+            def mutate_before_final_path_stat(
+                selected_path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal changed, leaf_stats
+                if (
+                    Path(selected_path) == Path(path.name)
+                    and "dir_fd" in kwargs
+                ):
+                    leaf_stats += 1
+                    if leaf_stats == 2:
+                        path.write_bytes(b"longer\n")
+                        changed = True
+                return original_stat(selected_path, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "stat", side_effect=mutate_before_final_path_stat
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "content stability changed"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertTrue(changed, "the final-size fixture must execute")
+            self.assertEqual(path.read_bytes(), b"longer\n")
+
+    def test_bound_repository_reader_reports_leaf_disappearance_during_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            original_open = os.open
+            removed = False
+
+            def remove_leaf_before_open(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal removed
+                if (
+                    not removed
+                    and Path(selected_path) == Path(path.name)
+                    and "dir_fd" in kwargs
+                ):
+                    path.unlink()
+                    removed = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=remove_leaf_before_open):
+                with self.assertRaisesRegex(
+                    AssertionError, "disappeared during binding"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertTrue(removed, "the binding disappearance fixture must execute")
+            self.assertFalse(path.exists())
+
+    def test_bound_repository_reader_reports_initial_leaf_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            (root / relative_path).parent.mkdir(parents=True)
+
+            with self.assertRaisesRegex(AssertionError, r"^probe is missing$"):
+                _read_bound_repository_file(root, relative_path, "probe")
+
+    def test_bound_repository_reader_reports_final_leaf_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"first\n")
+            replacement = path.with_name("replacement.yml")
+            detached = path.with_name("detached.yml")
+            replacement.write_bytes(b"other\n")
+            original_stat = os.stat
+            leaf_stats = 0
+            replaced = False
+
+            def replace_before_final_path_stat(
+                selected_path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal leaf_stats, replaced
+                if (
+                    Path(selected_path) == Path(path.name)
+                    and "dir_fd" in kwargs
+                ):
+                    leaf_stats += 1
+                    if leaf_stats == 2:
+                        path.rename(detached)
+                        replacement.rename(path)
+                        replaced = True
+                return original_stat(selected_path, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "stat", side_effect=replace_before_final_path_stat
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "object changed or was replaced during revalidation"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertTrue(replaced, "the final replacement fixture must execute")
+            self.assertEqual(path.read_bytes(), b"other\n")
+            self.assertEqual(detached.read_bytes(), b"first\n")
+
+    def test_bound_repository_reader_reports_final_leaf_disappearance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            original_stat = os.stat
+            leaf_stats = 0
+
+            def lose_leaf_during_revalidation(
+                selected_path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal leaf_stats
+                if (
+                    Path(selected_path) == Path(path.name)
+                    and "dir_fd" in kwargs
+                ):
+                    leaf_stats += 1
+                    if leaf_stats == 2:
+                        raise FileNotFoundError(errno.ENOENT, "injected")
+                return original_stat(selected_path, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "stat", side_effect=lose_leaf_during_revalidation
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "disappeared during revalidation"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertEqual(leaf_stats, 2)
+
+    def test_bound_repository_reader_reports_final_ancestor_disappearance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            original_stat = os.stat
+            github_stats = 0
+
+            def lose_ancestor_during_revalidation(
+                selected_path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal github_stats
+                if (
+                    Path(selected_path) == Path(".github")
+                    and "dir_fd" in kwargs
+                ):
+                    github_stats += 1
+                    if github_stats == 2:
+                        raise FileNotFoundError(errno.ENOENT, "injected")
+                return original_stat(selected_path, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "stat", side_effect=lose_ancestor_during_revalidation
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "disappeared during revalidation"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertEqual(github_stats, 2)
+
+    def test_bound_repository_reader_reports_final_revalidation_unreadable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            original_stat = os.stat
+            leaf_stats = 0
+
+            def deny_leaf_revalidation(
+                selected_path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal leaf_stats
+                if (
+                    Path(selected_path) == Path(path.name)
+                    and "dir_fd" in kwargs
+                ):
+                    leaf_stats += 1
+                    if leaf_stats == 2:
+                        raise PermissionError(errno.EACCES, "injected")
+                return original_stat(selected_path, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "stat", side_effect=deny_leaf_revalidation
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "unreadable during revalidation"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertEqual(leaf_stats, 2)
+
+    def test_bound_repository_reader_reports_final_hardlink_policy_change(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            relative_path = Path(".github/workflows/probe.yml")
+            path = root / relative_path
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"original\n")
+            alias = path.with_name("alias.yml")
+            original_stat = os.stat
+            leaf_stats = 0
+            linked = False
+
+            def link_before_final_path_stat(
+                selected_path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal leaf_stats, linked
+                if (
+                    Path(selected_path) == Path(path.name)
+                    and "dir_fd" in kwargs
+                ):
+                    leaf_stats += 1
+                    if leaf_stats == 2:
+                        os.link(path, alias)
+                        linked = True
+                return original_stat(selected_path, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "stat", side_effect=link_before_final_path_stat
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "access policy changed during revalidation"
+                ):
+                    _read_bound_repository_file(root, relative_path, "probe")
+
+            self.assertTrue(linked, "the hardlink policy fixture must execute")
+            self.assertEqual(path.stat().st_ino, alias.stat().st_ino)
+            self.assertEqual(path.stat().st_nlink, 2)
 
     def test_runner_text_in_a_fake_node_does_not_satisfy_the_contract(self) -> None:
         workflow = self.required_workflow(
@@ -2728,6 +4404,29 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "pass\n", encoding="utf-8"
             )
         return trusted_root, candidate_root
+
+    def prepare_structure_cli_split(
+        self, temporary_directory: str
+    ) -> tuple[Path, Path, str]:
+        trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+        trusted_test_path = (
+            distribution_tests_root(trusted_root)
+            / "test_required_ci_workflow.py"
+        )
+        shutil.copyfile(Path(__file__).resolve(strict=True), trusted_test_path)
+        candidate_support_path = (
+            distribution_tests_root(candidate_root)
+            / "required_ci_candidate.py"
+        )
+        shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, candidate_support_path)
+        workflow_path = candidate_root / ".github/workflows/required-ci.yml"
+        workflow_path.parent.mkdir(parents=True)
+        workflow_path.write_text(
+            RequiredJobExecutionRegressionTests().required_workflow(),
+            encoding="utf-8",
+        )
+        candidate_sha = self.initialize_candidate_checkout(candidate_root)
+        return trusted_root, candidate_root, candidate_sha
 
     @staticmethod
     def load_candidate_support(path: Path, module_name: str):
@@ -4199,6 +5898,324 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             backend_source.index("_run_registered_sudo"),
         )
 
+    def test_supervisor_entry_consumes_the_launcher_absolute_deadline(
+        self,
+    ) -> None:
+        captured_stdout = io.StringIO()
+        with mock.patch.dict(
+            os.environ,
+            {
+                REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE,
+                TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV: "700.000000000",
+            },
+            clear=False,
+        ), mock.patch.object(
+            time, "monotonic", return_value=400.0
+        ) as monotonic, mock.patch.object(
+            sys.modules[__name__],
+            "supervise_trusted_required_ci_tests",
+            return_value={"status": "completed"},
+        ) as supervise, contextlib.redirect_stdout(captured_stdout):
+            self.assertEqual(_trusted_test_supervisor_main(), 0)
+            self.assertNotIn(TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV, os.environ)
+
+        monotonic.assert_called_once_with()
+        supervise.assert_called_once_with(
+            TRUSTED_REPO_ROOT,
+            REPO_ROOT,
+            supervisor_deadline=700.0,
+        )
+
+    def test_launcher_deadline_rejects_noncanonical_or_extended_values(
+        self,
+    ) -> None:
+        fixtures = {
+            "missing": None,
+            "whitespace": " 700.000000000",
+            "exponent": "7e2",
+            "nonfinite": "nan",
+            "expired": "100.000000000",
+            "extended": "1000.002000000",
+        }
+        for name, encoded in fixtures.items():
+            environment = {}
+            if encoded is not None:
+                environment[TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV] = encoded
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ, environment, clear=True
+            ), mock.patch.object(time, "monotonic", return_value=400.0):
+                with self.assertRaisesRegex(
+                    AssertionError, "deadline.*missing|deadline.*malformed|expired|exceeds"
+                ):
+                    _trusted_test_supervisor_deadline_from_environment()
+                self.assertNotIn(
+                    TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV, os.environ
+                )
+
+    def test_child_timeout_deducts_preflight_time_and_cleanup_reserve(
+        self,
+    ) -> None:
+        deadline = 700.0
+        cases = {
+            "full child maximum": (100.0, 480.0),
+            "45 seconds spent before launch": (145.0, 435.0),
+            "479 seconds spent since launcher": (579.0, 1.0),
+        }
+        for name, (now, expected) in cases.items():
+            with self.subTest(name=name), mock.patch.object(
+                time, "monotonic", return_value=now
+            ):
+                self.assertEqual(
+                    _remaining_trusted_test_child_timeout(deadline), expected
+                )
+
+        with mock.patch.object(time, "monotonic", return_value=580.0):
+            with self.assertRaisesRegex(
+                AssertionError, "insufficient budget before child launch"
+            ):
+                _remaining_trusted_test_child_timeout(deadline)
+
+    def test_child_timeout_depends_only_on_monotonic_time(self) -> None:
+        with mock.patch.object(
+            time, "monotonic", return_value=579.0
+        ), mock.patch.object(
+            time, "time", side_effect=(1.0, 10_000_000.0)
+        ) as wall_clock:
+            self.assertEqual(
+                _remaining_trusted_test_child_timeout(700.0), 1.0
+            )
+
+        wall_clock.assert_not_called()
+
+    def test_insufficient_child_budget_fails_before_popen_and_still_cleans(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            self.write_test_module(
+                candidate_root, "test_required.py", self.required_module()
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_run_trusted_test_child",
+                side_effect=AssertionError(
+                    "trusted Required CI supervisor has insufficient budget "
+                    "before child launch"
+                ),
+            ) as run_child, mock.patch.object(
+                sys.modules[__name__], "_close_and_verify_trusted_isolation"
+            ) as cleanup:
+                with self.assertRaisesRegex(
+                    AssertionError, "insufficient budget before child launch"
+                ):
+                    supervise_trusted_required_ci_tests(
+                        trusted_root,
+                        candidate_root,
+                        supervisor_deadline=(
+                            time.monotonic()
+                            + TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS
+                        ),
+                    )
+
+        run_child.assert_called_once()
+        cleanup.assert_called_once()
+
+    def test_popen_startup_time_is_deducted_before_communicate(self) -> None:
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_remaining_trusted_test_child_timeout",
+            side_effect=AssertionError(
+                "trusted Required CI supervisor has insufficient budget "
+                "before child launch"
+            ),
+        ), mock.patch.object(subprocess, "Popen") as unstarted:
+            with self.assertRaisesRegex(
+                AssertionError, "insufficient budget before child launch"
+            ):
+                _run_trusted_test_child(
+                    ["trusted-child"],
+                    cwd=Path("/tmp"),
+                    environment={},
+                    pass_fds=(),
+                    supervisor_deadline=700.0,
+                )
+        unstarted.assert_not_called()
+
+        class FixtureProcess:
+            pid = 424242
+            returncode = 0
+
+            def __init__(self) -> None:
+                self.communicate_timeouts: list[float] = []
+
+            def communicate(self, *, timeout: float):
+                self.communicate_timeouts.append(timeout)
+                return "stdout", "stderr"
+
+        allowed_process = FixtureProcess()
+        with mock.patch.object(
+            time, "monotonic", side_effect=(100.0, 579.0)
+        ), mock.patch.object(
+            subprocess, "Popen", return_value=allowed_process
+        ) as popen:
+            completed = _run_trusted_test_child(
+                ["trusted-child"],
+                cwd=Path("/tmp"),
+                environment={},
+                pass_fds=(),
+                supervisor_deadline=700.0,
+            )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(allowed_process.communicate_timeouts, [1.0])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+        rejected_process = FixtureProcess()
+        with mock.patch.object(
+            time, "monotonic", side_effect=(100.0, 580.0)
+        ), mock.patch.object(
+            subprocess, "Popen", return_value=rejected_process
+        ), mock.patch.object(
+            sys.modules[__name__], "_terminate_trusted_test_child"
+        ) as terminate:
+            with self.assertRaisesRegex(
+                AssertionError, "insufficient budget before child launch"
+            ):
+                _run_trusted_test_child(
+                    ["trusted-child"],
+                    cwd=Path("/tmp"),
+                    environment={},
+                    pass_fds=(),
+                    supervisor_deadline=700.0,
+                )
+
+        terminate.assert_called_once_with(rejected_process)
+        self.assertEqual(rejected_process.communicate_timeouts, [])
+
+    def test_trusted_child_abort_kills_its_exact_session_and_reaps(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        child_pid = process.pid
+        try:
+            _terminate_trusted_test_child(process)
+            self.assertEqual(process.returncode, -signal.SIGKILL)
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(child_pid, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=TRUSTED_TEST_CHILD_REAP_TIMEOUT_SECONDS)
+
+    def test_popen_startup_budget_failure_still_cleans_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            self.write_test_module(
+                candidate_root, "test_required.py", self.required_module()
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            process = mock.Mock(spec=subprocess.Popen)
+            process.pid = 424242
+            actual_run = _run_trusted_test_child
+            popen_started: list[bool] = []
+
+            def run_with_delayed_popen(*args: object, **kwargs: object):
+                with mock.patch.object(
+                    subprocess, "Popen", return_value=process
+                ):
+                    popen_started.append(True)
+                    return actual_run(*args, **kwargs)
+
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_remaining_trusted_test_child_timeout",
+                side_effect=(321.5, AssertionError(
+                    "trusted Required CI supervisor has insufficient budget "
+                    "before child launch"
+                )),
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_run_trusted_test_child",
+                side_effect=run_with_delayed_popen,
+            ), mock.patch.object(
+                sys.modules[__name__], "_terminate_trusted_test_child"
+            ) as terminate, mock.patch.object(
+                sys.modules[__name__], "_close_and_verify_trusted_isolation"
+            ) as cleanup:
+                with self.assertRaisesRegex(
+                    AssertionError, "insufficient budget before child launch"
+                ):
+                    supervise_trusted_required_ci_tests(
+                        trusted_root,
+                        candidate_root,
+                        supervisor_deadline=(
+                            time.monotonic()
+                            + TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS
+                        ),
+                    )
+
+        self.assertEqual(popen_started, [True])
+        terminate.assert_called_once_with(process)
+        process.communicate.assert_not_called()
+        cleanup.assert_called_once()
+
+    def test_child_timeout_failure_still_cleans_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(temporary_directory)
+            self.write_test_module(
+                candidate_root, "test_required.py", self.required_module()
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            timeout = 321.5
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_run_trusted_test_child",
+                side_effect=subprocess.TimeoutExpired("trusted child", timeout),
+            ) as run_child, mock.patch.object(
+                sys.modules[__name__], "_close_and_verify_trusted_isolation"
+            ) as cleanup:
+                with self.assertRaisesRegex(
+                    AssertionError, "did not complete before the fixed timeout"
+                ):
+                    supervise_trusted_required_ci_tests(
+                        trusted_root,
+                        candidate_root,
+                        supervisor_deadline=(
+                            time.monotonic()
+                            + TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS
+                        ),
+                    )
+
+        run_child.assert_called_once()
+        cleanup.assert_called_once()
+
     def test_structure_step_does_not_request_strict_mode_without_a_registry(
         self,
     ) -> None:
@@ -4226,33 +6243,216 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertIn("--validate-required-ci-structure", structure_step)
         self.assertNotIn(TRUSTED_TEST_SUPERVISOR_FLAG, structure_step)
         with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "expected_candidate_sha",
+            return_value=("a" * 40, True),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+            return_value={"binding": "exact"},
+        ) as binding, mock.patch.object(
             sys.modules[__name__],
             "validate_required_ci_repository",
             return_value=[],
         ) as validate_repository, mock.patch.object(unittest, "main") as unittest_main:
             self.assertEqual(_trusted_structure_validator_main(), 0)
 
-        validate_repository.assert_called_once_with(REPO_ROOT)
+        self.assertEqual(binding.call_count, 2)
+        validate_repository.assert_called_once_with(
+            REPO_ROOT, candidate_sha="a" * 40
+        )
         unittest_main.assert_not_called()
 
     def test_structure_validator_cli_does_not_enter_unittest(self) -> None:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                str(Path(__file__).resolve(strict=True)),
-                "--validate-required-ci-structure",
-            ],
-            cwd=REPO_ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root, candidate_sha = (
+                self.prepare_structure_cli_split(temporary_directory)
+            )
+            trusted_test_path = (
+                distribution_tests_root(trusted_root)
+                / "test_required_ci_workflow.py"
+            )
+            environment = os.environ.copy()
+            environment["GITHUB_WORKSPACE"] = str(trusted_root.parent)
+            environment["GITHUB_SHA"] = candidate_sha
+            environment[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(candidate_root)
+            environment[REQUIRED_CI_CANDIDATE_SHA_ENV] = candidate_sha
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(trusted_test_path),
+                    "--validate-required-ci-structure",
+                ],
+                cwd=trusted_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "")
         self.assertEqual(completed.stderr, "")
+
+    def test_structure_cli_rejects_renamed_trusted_checkout_without_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory).resolve(strict=True) / "workspace"
+            moved_trusted_root = workspace / ".trusted"
+            moved_tests_root = distribution_tests_root(moved_trusted_root)
+            moved_tests_root.mkdir(parents=True)
+            moved_test_path = moved_tests_root / "test_required_ci_workflow.py"
+            shutil.copyfile(Path(__file__).resolve(strict=True), moved_test_path)
+            shutil.copyfile(
+                TRUSTED_CANDIDATE_SUPPORT_PATH,
+                moved_tests_root / "required_ci_candidate.py",
+            )
+            environment = os.environ.copy()
+            environment["GITHUB_WORKSPACE"] = str(workspace)
+            environment.pop(REQUIRED_CI_CANDIDATE_ROOT_ENV, None)
+            environment.pop(REQUIRED_CI_CANDIDATE_SHA_ENV, None)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(moved_test_path),
+                    TRUSTED_STRUCTURE_VALIDATOR_FLAG,
+                ],
+                cwd=moved_trusted_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("requires candidate root and SHA together", completed.stderr)
+
+    def test_structure_validation_binds_workflow_and_support_to_frozen_commit(
+        self,
+    ) -> None:
+        for target in ("workflow", "support"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary_directory:
+                _, candidate_root, _ = self.prepare_structure_cli_split(
+                    temporary_directory
+                )
+                workflow_path = (
+                    candidate_root / ".github/workflows/required-ci.yml"
+                )
+                support_path = (
+                    distribution_tests_root(candidate_root)
+                    / "required_ci_candidate.py"
+                )
+                selected_path = (
+                    workflow_path if target == "workflow" else support_path
+                )
+                trusted_source = selected_path.read_bytes()
+                selected_path.write_bytes(
+                    b"name: attacker-controlled\n"
+                    if target == "workflow"
+                    else b"raise SystemExit('attacker-controlled')\n"
+                )
+                for command in (
+                    [
+                        _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                        "-C",
+                        str(candidate_root),
+                        "add",
+                        "--all",
+                    ],
+                    [
+                        _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                        "-C",
+                        str(candidate_root),
+                        "-c",
+                        "user.name=Required CI Test",
+                        "-c",
+                        "user.email=required-ci@example.invalid",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "-m",
+                        f"malicious {target}",
+                    ],
+                ):
+                    completed = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                candidate_sha = _CANDIDATE_SUPPORT._run_candidate_git(
+                    candidate_root, "rev-parse", "--verify", "HEAD^{commit}"
+                ).decode("ascii").removesuffix("\n")
+                selected_path.write_bytes(trusted_source)
+
+                with self.assertRaisesRegex(
+                    AssertionError, "does not match the frozen commit"
+                ):
+                    validate_required_ci_repository(
+                        candidate_root, candidate_sha=candidate_sha
+                    )
+
+    def test_structure_validation_scans_callers_from_frozen_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root, _ = self.prepare_structure_cli_split(
+                temporary_directory
+            )
+            caller_path = candidate_root / ".github/workflows/caller.yml"
+            caller_path.write_text(
+                "jobs:\n"
+                "  required:\n"
+                "    uses: ./.github/workflows/required-ci.yml\n",
+                encoding="utf-8",
+            )
+            for command in (
+                [
+                    _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                    "-C",
+                    str(candidate_root),
+                    "add",
+                    "--all",
+                ],
+                [
+                    _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                    "-C",
+                    str(candidate_root),
+                    "-c",
+                    "user.name=Required CI Test",
+                    "-c",
+                    "user.email=required-ci@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "hidden caller",
+                ],
+            ):
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            candidate_sha = _CANDIDATE_SUPPORT._run_candidate_git(
+                candidate_root, "rev-parse", "--verify", "HEAD^{commit}"
+            ).decode("ascii").removesuffix("\n")
+            caller_path.unlink()
+
+            with self.assertRaisesRegex(
+                AssertionError, "another Required CI caller"
+            ):
+                validate_required_ci_repository(
+                    candidate_root, candidate_sha=candidate_sha
+                )
 
     def test_production_supervisor_still_requires_exact_strict_mode(self) -> None:
         captured_stderr = io.StringIO()
@@ -5272,6 +7472,287 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
             self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
 
+    def test_candidate_git_stdout_limit_is_enforced_while_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            marker = root / "finished"
+            fixture = root / "stdout.py"
+            fixture.write_text(
+                "import os\n"
+                "import pathlib\n"
+                "import sys\n"
+                "import time\n"
+                "marker = pathlib.Path(sys.argv[1])\n"
+                "for _ in range(64):\n"
+                "    os.write(1, b'x' * 1024)\n"
+                "    time.sleep(0.01)\n"
+                "marker.write_text('finished', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            command = [sys.executable, "-I", "-B", str(fixture), str(marker)]
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_git_argv",
+                return_value=command,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "exceeded its stdout limit"
+                ):
+                    _CANDIDATE_SUPPORT._run_candidate_git(
+                        root, "status", output_limit=4096
+                    )
+
+            self.assertFalse(marker.exists())
+
+    def test_candidate_git_stderr_limit_is_enforced_while_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            marker = root / "finished"
+            fixture = root / "stderr.py"
+            fixture.write_text(
+                "import os\n"
+                "import pathlib\n"
+                "import sys\n"
+                "import time\n"
+                "marker = pathlib.Path(sys.argv[1])\n"
+                "for _ in range(64):\n"
+                "    os.write(2, b'x' * 1024)\n"
+                "    time.sleep(0.01)\n"
+                "marker.write_text('finished', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            command = [sys.executable, "-I", "-B", str(fixture), str(marker)]
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_git_argv",
+                return_value=command,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "exceeded its stderr limit"
+                ):
+                    _CANDIDATE_SUPPORT._run_candidate_git(
+                        root, "status", output_limit=4096
+                    )
+
+            self.assertFalse(marker.exists())
+
+    def test_candidate_git_combined_output_limit_has_an_exact_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            fixture = root / "combined.py"
+            fixture.write_text(
+                "import os\n"
+                "import sys\n"
+                "os.write(1, b'o' * int(sys.argv[1]))\n"
+                "os.write(2, b'e' * int(sys.argv[2]))\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_git_argv",
+                return_value=[
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(fixture),
+                    "2048",
+                    "2048",
+                ],
+            ):
+                with self.assertRaisesRegex(AssertionError, "wrote stderr"):
+                    _CANDIDATE_SUPPORT._run_candidate_git(
+                        root, "status", output_limit=4096
+                    )
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_git_argv",
+                return_value=[
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(fixture),
+                    "2048",
+                    "2049",
+                ],
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "exceeded its combined output limit"
+                ):
+                    _CANDIDATE_SUPPORT._run_candidate_git(
+                        root, "status", output_limit=4096
+                    )
+
+    def test_candidate_git_timeout_reaps_its_complete_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            fixture = root / "process-tree.py"
+            lock_path = root / "child.lock"
+            pid_path = root / "child.pid"
+            ready_path = root / "child.ready"
+            fixture.write_text(
+                "import fcntl\n"
+                "import os\n"
+                "import pathlib\n"
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "lock_path, pid_path, ready_path = map(pathlib.Path, sys.argv[2:5])\n"
+                "if sys.argv[1] == 'child':\n"
+                "    lock = lock_path.open('a+b')\n"
+                "    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)\n"
+                "    pid_path.write_text(str(os.getpid()), encoding='ascii')\n"
+                "    ready_path.write_text('ready', encoding='ascii')\n"
+                "    time.sleep(30)\n"
+                "else:\n"
+                "    subprocess.Popen(\n"
+                "        [sys.executable, '-I', '-B', __file__, 'child',\n"
+                "         str(lock_path), str(pid_path), str(ready_path)],\n"
+                "        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+                "        stderr=subprocess.DEVNULL, close_fds=True)\n"
+                "    deadline = time.monotonic() + 5\n"
+                "    while not ready_path.exists():\n"
+                "        if time.monotonic() >= deadline:\n"
+                "            raise SystemExit(92)\n"
+                "        time.sleep(0.01)\n"
+                "    time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable,
+                "-I",
+                "-B",
+                str(fixture),
+                "parent",
+                str(lock_path),
+                str(pid_path),
+                str(ready_path),
+            ]
+            child_pid: int | None = None
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "candidate_git_argv",
+                    return_value=command,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "CANDIDATE_GIT_TIMEOUT_SECONDS",
+                    0.4,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "CANDIDATE_GIT_REAP_TIMEOUT_SECONDS",
+                    2,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "exceeded its fixed timeout"
+                    ):
+                        _CANDIDATE_SUPPORT._run_candidate_git(root, "status")
+
+                child_pid = int(pid_path.read_text(encoding="ascii"))
+                lock = lock_path.open("a+b")
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    lock.close()
+            finally:
+                if child_pid is None and pid_path.exists():
+                    child_pid = int(pid_path.read_text(encoding="ascii"))
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_candidate_git_success_reaps_a_lingering_group_before_returning(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            fixture = root / "lingering.py"
+            lock_path = root / "child.lock"
+            pid_path = root / "child.pid"
+            ready_path = root / "child.ready"
+            fixture.write_text(
+                "import fcntl\n"
+                "import os\n"
+                "import pathlib\n"
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "lock_path, pid_path, ready_path = map(pathlib.Path, sys.argv[2:5])\n"
+                "if sys.argv[1] == 'child':\n"
+                "    lock = lock_path.open('a+b')\n"
+                "    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)\n"
+                "    pid_path.write_text(str(os.getpid()), encoding='ascii')\n"
+                "    ready_path.write_text('ready', encoding='ascii')\n"
+                "    time.sleep(30)\n"
+                "else:\n"
+                "    subprocess.Popen(\n"
+                "        [sys.executable, '-I', '-B', __file__, 'child',\n"
+                "         str(lock_path), str(pid_path), str(ready_path)],\n"
+                "        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+                "        stderr=subprocess.DEVNULL, close_fds=True)\n"
+                "    deadline = time.monotonic() + 5\n"
+                "    while not ready_path.exists():\n"
+                "        if time.monotonic() >= deadline:\n"
+                "            raise SystemExit(92)\n"
+                "        time.sleep(0.01)\n",
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable,
+                "-I",
+                "-B",
+                str(fixture),
+                "parent",
+                str(lock_path),
+                str(pid_path),
+                str(ready_path),
+            ]
+            child_pid: int | None = None
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "candidate_git_argv",
+                    return_value=command,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "CANDIDATE_GIT_REAP_TIMEOUT_SECONDS",
+                    2,
+                ):
+                    output = _CANDIDATE_SUPPORT._run_candidate_git(root, "status")
+
+                child_pid = int(pid_path.read_text(encoding="ascii"))
+                self.assertEqual(output, b"")
+                lock = lock_path.open("a+b")
+                try:
+                    deadline = time.monotonic() + 1
+                    while True:
+                        try:
+                            fcntl.flock(
+                                lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                            )
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.01)
+                finally:
+                    lock.close()
+            finally:
+                if child_pid is None and pid_path.exists():
+                    child_pid = int(pid_path.read_text(encoding="ascii"))
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_candidate_git_safe_directory_ignores_global_pollution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory).resolve(strict=True)
@@ -5890,15 +8371,61 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             registry_root.mkdir(mode=0o700)
             metadata = registry_root.lstat()
             original_identity = (metadata.st_dev, metadata.st_ino)
-            registry_root.rmdir()
-            registry_root.mkdir(mode=0o700)
+            replacement_root = Path(temporary_directory) / "replacement"
+            replacement_root.mkdir(mode=0o700)
+            replacement_metadata = replacement_root.lstat()
+            self.assertNotEqual(
+                (replacement_metadata.st_dev, replacement_metadata.st_ino),
+                original_identity,
+            )
+            registry_descriptor = os.open(
+                registry_root,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+            )
+            try:
+                registry_root.rmdir()
+                replacement_root.rename(registry_root)
 
-            with self.assertRaisesRegex(AssertionError, "identity.*changed"):
-                _CANDIDATE_SUPPORT._wait_exact_registry_root_absent(
-                    registry_root,
-                    original_identity,
-                    timeout_seconds=0.05,
-                )
+                with self.assertRaisesRegex(AssertionError, "identity.*changed"):
+                    _CANDIDATE_SUPPORT._wait_exact_registry_root_absent(
+                        registry_root,
+                        original_identity,
+                        timeout_seconds=0.05,
+                        bound_descriptor=registry_descriptor,
+                    )
+            finally:
+                os.close(registry_descriptor)
+
+    def test_outer_fault_registry_disappearance_rejects_original_root_present(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry_root = Path(temporary_directory) / "registry"
+            registry_root.mkdir(mode=0o700)
+            metadata = registry_root.lstat()
+            original_identity = (metadata.st_dev, metadata.st_ino)
+            registry_descriptor = os.open(
+                registry_root,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+            )
+            try:
+                with self.assertRaisesRegex(
+                    AssertionError, "registry root was not removed"
+                ):
+                    _CANDIDATE_SUPPORT._wait_exact_registry_root_absent(
+                        registry_root,
+                        original_identity,
+                        timeout_seconds=0.05,
+                        bound_descriptor=registry_descriptor,
+                    )
+            finally:
+                os.close(registry_descriptor)
 
     def test_outer_fault_probe_reaches_real_target_active_boundary(self) -> None:
         ensure_source = inspect.getsource(
@@ -7788,7 +10315,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             clear=False,
         ):
             return supervise_trusted_required_ci_tests(
-                trusted_root, candidate_root
+                trusted_root,
+                candidate_root,
+                supervisor_deadline=(
+                    time.monotonic() + TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS
+                ),
             )
 
     def test_local_supervisor_harness_clears_inherited_strict_registry(
@@ -7805,8 +10336,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         observed_environment: dict[str, str] = {}
 
         def record_environment(
-            _trusted_root: Path, _candidate_root: Path
+            _trusted_root: Path,
+            _candidate_root: Path,
+            *,
+            supervisor_deadline: float,
         ) -> dict[str, str]:
+            self.assertGreater(supervisor_deadline, time.monotonic())
             observed_environment.update(os.environ)
             return {"status": "completed"}
 
@@ -8038,7 +10573,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     candidate_root, candidate_sha, require_clean=True
                 )
                 receipt = supervise_trusted_required_ci_tests(
-                    trusted_root, candidate_root
+                    trusted_root,
+                    candidate_root,
+                    supervisor_deadline=(
+                        time.monotonic()
+                        + TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS
+                    ),
                 )
                 after = _CANDIDATE_SUPPORT.candidate_checkout_binding(
                     candidate_root, candidate_sha, require_clean=True
@@ -8153,7 +10693,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.write_test_module(
                 candidate_root, "test_required.py", self.required_module()
             )
-            actual_run = subprocess.run
+            actual_run = _run_trusted_test_child
             captured_calls: list[tuple[list[str], dict[str, object]]] = []
 
             def recording_run(
@@ -8168,12 +10708,22 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 {
                     REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
                     REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                    TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV: "999.000000000",
                 },
                 clear=False,
             ):
-                with mock.patch.object(subprocess, "run", side_effect=recording_run):
+                with mock.patch.object(
+                    sys.modules[__name__],
+                    "_run_trusted_test_child",
+                    side_effect=recording_run,
+                ):
                     receipt = supervise_trusted_required_ci_tests(
-                        trusted_root, candidate_root
+                        trusted_root,
+                        candidate_root,
+                        supervisor_deadline=(
+                            time.monotonic()
+                            + TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS
+                        ),
                     )
 
         self.assertEqual(receipt["status"], "completed")
@@ -8200,7 +10750,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(
             options["pass_fds"], (), "local nonstrict harness must not pass a realm fd"
         )
-        child_environment = options["env"]
+        self.assertIsInstance(options["supervisor_deadline"], float)
+        child_environment = options["environment"]
         self.assertIsInstance(child_environment, dict)
         self.assertEqual(
             child_environment[REQUIRED_CI_CANDIDATE_ROOT_ENV], str(candidate_root)
@@ -8208,8 +10759,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(
             child_environment[REQUIRED_CI_CANDIDATE_SHA_ENV], candidate_sha
         )
+        self.assertEqual(child_environment["GITHUB_SHA"], candidate_sha)
         self.assertNotIn("PYTHONHOME", child_environment)
         self.assertNotIn("PYTHONPATH", child_environment)
+        self.assertNotIn(
+            TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV, child_environment
+        )
         for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
             self.assertNotIn(key, child_environment)
 
@@ -8595,6 +11150,382 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         candidate_root, candidate_sha, require_clean=True
                     )
 
+    def test_local_dirty_helper_executes_a_bound_worktree_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            runner_path = (
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            dirty_source = "print('dirty worktree helper')\n"
+            runner_path.write_text(dirty_source, encoding="utf-8")
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root)},
+                clear=False,
+            ):
+                os.environ.pop(REQUIRED_CI_CANDIDATE_SHA_ENV, None)
+                binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                    candidate_root, candidate_sha, require_clean=False
+                )
+                completed = _CANDIDATE_SUPPORT.run_candidate_python(
+                    runner_path
+                )
+
+            script_manifest = binding["candidate_script_sha256"]
+            self.assertIsInstance(script_manifest, dict)
+            if not isinstance(script_manifest, dict):
+                raise AssertionError("candidate script manifest is malformed")
+            runner_relative = (
+                TRUSTED_CONTENT_RELATIVE_ROOT
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            ).as_posix()
+            self.assertEqual(
+                script_manifest[runner_relative],
+                hashlib.sha256(dirty_source.encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, "dirty worktree helper\n")
+            self.assertNotEqual(Path(completed.args[2]), runner_path)
+            self.assertEqual(runner_path.read_text(encoding="utf-8"), dirty_source)
+
+    def test_local_capture_rejects_same_bytes_through_replaced_ancestor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            content_root = distribution_content_root(candidate_root)
+            scripts_root = content_root / "skills/waited-delivery/scripts"
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            detached_scripts = scripts_root.with_name("detached-scripts")
+            outside_scripts = candidate_root.parent / "outside-scripts"
+            shutil.copytree(scripts_root, outside_scripts)
+            runner_path = scripts_root / "waited_delivery_runner.py"
+            original_open = os.open
+            original_lstat = Path.lstat
+            runner_lstat_count = 0
+            swapped = False
+
+            def replace_scripts_before_second_leaf_lstat(
+                selected_path: Path,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal runner_lstat_count, swapped
+                if Path(selected_path) == runner_path:
+                    runner_lstat_count += 1
+                    if runner_lstat_count == 2 and not swapped:
+                        scripts_root.rename(detached_scripts)
+                        scripts_root.symlink_to(
+                            outside_scripts, target_is_directory=True
+                        )
+                        swapped = True
+                return original_lstat(selected_path, *args, **kwargs)
+
+            def replace_scripts_before_open(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal swapped
+                selected = Path(selected_path)
+                if not swapped and (
+                    selected == runner_path
+                    or (selected == Path("scripts") and "dir_fd" in kwargs)
+                ):
+                    scripts_root.rename(detached_scripts)
+                    scripts_root.symlink_to(
+                        outside_scripts, target_is_directory=True
+                    )
+                    swapped = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root)},
+                clear=False,
+            ), mock.patch.object(
+                Path,
+                "lstat",
+                new=replace_scripts_before_second_leaf_lstat,
+            ), mock.patch.object(
+                os,
+                "open",
+                side_effect=replace_scripts_before_open,
+            ):
+                os.environ.pop(REQUIRED_CI_CANDIDATE_SHA_ENV, None)
+                with self.assertRaisesRegex(
+                    AssertionError, "path binding|bound safely"
+                ):
+                    _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                        candidate_root,
+                        candidate_sha,
+                        require_clean=False,
+                    )
+
+            self.assertTrue(swapped, "the ancestor replacement fixture must execute")
+            self.assertTrue(scripts_root.is_symlink())
+            self.assertEqual(
+                (detached_scripts / runner_path.name).read_bytes(),
+                (outside_scripts / runner_path.name).read_bytes(),
+            )
+
+    def test_local_capture_rejects_whole_checkout_root_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            runner_relative = (
+                TRUSTED_CONTENT_RELATIVE_ROOT
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            runner_path = candidate_root / runner_relative
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            detached_root = candidate_root.with_name("detached-candidate")
+            replacement_root = candidate_root.with_name("replacement-candidate")
+            shutil.copytree(candidate_root, replacement_root, symlinks=True)
+            original_open = os.open
+            swapped = False
+
+            def replace_checkout_before_open(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal swapped
+                selected = Path(selected_path)
+                if not swapped and (
+                    selected == runner_path
+                    or (
+                        selected == Path(candidate_root.name)
+                        and "dir_fd" in kwargs
+                    )
+                ):
+                    candidate_root.rename(detached_root)
+                    replacement_root.rename(candidate_root)
+                    swapped = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root)},
+                clear=False,
+            ), mock.patch.object(
+                os, "open", side_effect=replace_checkout_before_open
+            ):
+                os.environ.pop(REQUIRED_CI_CANDIDATE_SHA_ENV, None)
+                with self.assertRaisesRegex(
+                    AssertionError, "checkout root path binding changed"
+                ):
+                    _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                        candidate_root,
+                        candidate_sha,
+                        require_clean=False,
+                    )
+
+            self.assertTrue(swapped, "the checkout replacement fixture must execute")
+            self.assertEqual(
+                (detached_root / runner_relative).read_bytes(),
+                (candidate_root / runner_relative).read_bytes(),
+            )
+
+    def test_local_capture_allows_benign_checkout_child_churn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            benign_child = candidate_root / "benign-child"
+            original_read = os.read
+            churned = False
+
+            def create_benign_child(
+                descriptor: int, length: int
+            ) -> bytes:
+                nonlocal churned
+                if not churned:
+                    benign_child.mkdir()
+                    churned = True
+                return original_read(descriptor, length)
+
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root)},
+                clear=False,
+            ), mock.patch.object(os, "read", side_effect=create_benign_child):
+                os.environ.pop(REQUIRED_CI_CANDIDATE_SHA_ENV, None)
+                binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                    candidate_root,
+                    candidate_sha,
+                    require_clean=False,
+                )
+
+            self.assertTrue(churned, "the benign churn fixture must execute")
+            self.assertTrue(benign_child.is_dir())
+            self.assertEqual(binding["candidate_sha"], candidate_sha)
+
+    def test_local_capture_never_blocks_on_fifo_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            content_root = distribution_content_root(candidate_root)
+            runner_path = (
+                content_root
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            detached_runner = runner_path.with_name("detached-runner.py")
+            original_open = os.open
+            guard_descriptor: int | None = None
+            leaf_open_flags: int | None = None
+            replaced = False
+            captured_error: BaseException | None = None
+
+            def replace_runner_with_fifo(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal guard_descriptor, leaf_open_flags, replaced
+                selected = Path(selected_path)
+                if not replaced and (
+                    selected == runner_path
+                    or (
+                        selected == Path(runner_path.name)
+                        and "dir_fd" in kwargs
+                    )
+                ):
+                    runner_path.rename(detached_runner)
+                    os.mkfifo(runner_path)
+                    guard_descriptor = original_open(
+                        runner_path, os.O_RDWR | os.O_NONBLOCK
+                    )
+                    leaf_open_flags = flags
+                    replaced = True
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            def capture_candidate_binding() -> None:
+                nonlocal captured_error
+                try:
+                    _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                        candidate_root,
+                        candidate_sha,
+                        require_clean=False,
+                    )
+                except BaseException as error:
+                    captured_error = error
+
+            try:
+                with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                    os.environ,
+                    {REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root)},
+                    clear=False,
+                ), mock.patch.object(
+                    os, "open", side_effect=replace_runner_with_fifo
+                ):
+                    os.environ.pop(REQUIRED_CI_CANDIDATE_SHA_ENV, None)
+                    worker = threading.Thread(target=capture_candidate_binding)
+                    worker.start()
+                    worker.join(timeout=0.25)
+                    completed_without_writer = not worker.is_alive()
+                    if worker.is_alive():
+                        guard_descriptor = original_open(
+                            runner_path, os.O_RDWR | os.O_NONBLOCK
+                        )
+                        worker.join(timeout=2)
+                    self.assertFalse(
+                        worker.is_alive(),
+                        "the FIFO fixture worker must be recoverable",
+                    )
+            finally:
+                if guard_descriptor is not None:
+                    os.close(guard_descriptor)
+
+            self.assertTrue(replaced, "the FIFO replacement fixture must execute")
+            self.assertTrue(
+                completed_without_writer,
+                "candidate capture must reject a FIFO without waiting for a writer",
+            )
+            self.assertIsInstance(captured_error, AssertionError)
+            self.assertIn("candidate file identity is unsafe", str(captured_error))
+            self.assertIsNotNone(leaf_open_flags)
+            assert leaf_open_flags is not None
+            self.assertTrue(leaf_open_flags & os.O_NONBLOCK)
+            self.assertTrue(leaf_open_flags & os.O_NOCTTY)
+            self.assertTrue(stat.S_ISFIFO(runner_path.lstat().st_mode))
+            self.assertTrue(detached_runner.is_file())
+
+    def test_local_snapshot_reuses_the_binding_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            runner_path = (
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            self.initialize_candidate_checkout(candidate_root)
+            runner_path.write_text("print('captured once')\n", encoding="utf-8")
+            original_capture = _CANDIDATE_SUPPORT._candidate_script_sources
+            capture_count = 0
+
+            def capture_sources(root: Path) -> dict[Path, bytes]:
+                nonlocal capture_count
+                capture_count += 1
+                return original_capture(root)
+
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root)},
+                clear=False,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_candidate_script_sources",
+                side_effect=capture_sources,
+            ):
+                os.environ.pop(REQUIRED_CI_CANDIDATE_SHA_ENV, None)
+                completed = _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, "captured once\n")
+            self.assertEqual(
+                capture_count,
+                2,
+                "binding and final revalidation may capture once each; the "
+                "snapshot must consume the initial held-FD capture",
+            )
+
+    def test_strict_execution_never_falls_back_to_worktree_sources(self) -> None:
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "strict_isolation_platform_preflight",
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_isolation_requested",
+            return_value=True,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_active_strict_session",
+            return_value={},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_repository_root",
+            return_value=Path("/candidate"),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "expected_candidate_sha",
+            return_value=("a" * 40, False),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+        ) as binding, mock.patch.object(subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(
+                AssertionError, "explicit frozen candidate SHA"
+            ):
+                _CANDIDATE_SUPPORT.run_candidate_python(Path("/candidate.py"))
+
+        binding.assert_not_called()
+        popen.assert_not_called()
+
     def test_execution_snapshot_reads_the_frozen_candidate_sha_not_head(
         self,
     ) -> None:
@@ -8672,7 +11603,31 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 probe_path = Path(candidate_paths["strict-capability-probe.py"])
                 self.assertEqual(probe_path.read_bytes(), probe_source)
 
+    def test_snapshot_permission_gate_rejects_nonstrict_root_evidence(
+        self,
+    ) -> None:
+        with _local_nonstrict_supervisor_environment(), mock.patch.object(
+            os, "geteuid", return_value=0
+        ):
+            self.assertFalse(_snapshot_permission_probe_is_meaningful())
+
+        with _local_nonstrict_supervisor_environment(), mock.patch.object(
+            os, "geteuid", return_value=501
+        ):
+            self.assertTrue(_snapshot_permission_probe_is_meaningful())
+
+        with mock.patch.dict(
+            os.environ,
+            {REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE},
+            clear=False,
+        ), mock.patch.object(os, "geteuid", return_value=0):
+            self.assertTrue(_snapshot_permission_probe_is_meaningful())
+
     def test_candidate_script_persistent_mutation_fails_closed(self) -> None:
+        if not _snapshot_permission_probe_is_meaningful():
+            self.skipTest(
+                "non-strict UID 0 cannot prove snapshot DAC write denial"
+            )
         with tempfile.TemporaryDirectory() as temporary_directory:
             _, candidate_root = self.prepare_roots(temporary_directory)
             runner_path = (
@@ -8707,6 +11662,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
 
     def test_candidate_script_restore_is_isolated_before_next_execution(self) -> None:
+        if not _snapshot_permission_probe_is_meaningful():
+            self.skipTest(
+                "non-strict UID 0 cannot prove snapshot DAC write denial"
+            )
         with tempfile.TemporaryDirectory() as temporary_directory:
             _, candidate_root = self.prepare_roots(temporary_directory)
             scripts_root = (
@@ -8741,6 +11700,82 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertIn("Permission denied", rejected.stderr)
             self.assertEqual(subsequent.returncode, 0, subsequent.stderr)
             self.assertEqual(subsequent.stdout, "original\n")
+
+    def test_strict_target_access_policy_blocks_snapshot_write_and_control_read(
+        self,
+    ) -> None:
+        mode = os.environ.get(REQUIRED_CI_ISOLATION_MODE_ENV)
+        if mode is None:
+            self.skipTest(
+                "strict target credential transition is exercised only by the "
+                "trusted Required CI supervisor"
+            )
+        self.assertEqual(mode, REQUIRED_CI_ISOLATION_MODE)
+        trusted_control_relative = (
+            TRUSTED_CONTENT_RELATIVE_ROOT
+            / "skills/waited-delivery/tests/required_ci_candidate.py"
+        ).as_posix()
+        with _CANDIDATE_SUPPORT.candidate_fixture_directory(
+            "required-ci-access-policy-"
+        ) as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            runner_path = (
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            runner_path.write_text(
+                "from pathlib import Path\n"
+                "import os\n"
+                "candidate_path = Path(__file__)\n"
+                "candidate_root = next(\n"
+                "    parent for parent in candidate_path.parents\n"
+                "    if parent.name == 'candidate-code'\n"
+                ")\n"
+                "trusted_control = (\n"
+                "    candidate_root.parent / 'trusted-control' / "
+                f"{trusted_control_relative!r}\n"
+                ")\n"
+                "try:\n"
+                "    candidate_path.write_bytes(b'candidate mutation\\n')\n"
+                "except PermissionError:\n"
+                "    write_status = 'write-denied'\n"
+                "else:\n"
+                "    write_status = 'write-allowed'\n"
+                "try:\n"
+                "    trusted_control.read_bytes()\n"
+                "except PermissionError:\n"
+                "    read_status = 'read-denied'\n"
+                "else:\n"
+                "    read_status = 'read-allowed'\n"
+                "print(\n"
+                "    f'{os.getuid()}:{os.geteuid()}:{os.getgid()}:{os.getegid()}:'\n"
+                "    f'{write_status}:{read_status}'\n"
+                ")\n"
+                "if (write_status, read_status) != "
+                "('write-denied', 'read-denied'):\n"
+                "    raise SystemExit(91)\n",
+                encoding="utf-8",
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                completed = _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+
+            realm = _CANDIDATE_SUPPORT._strict_realm()
+            target_uid = int(realm["uid"])
+            target_gid = int(realm["gid"])
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.stdout,
+                f"{target_uid}:{target_uid}:{target_gid}:{target_gid}:"
+                "write-denied:read-denied\n",
+            )
 
     def test_candidate_cannot_use_runner_environment_for_trusted_source_aba(
         self,
@@ -8870,6 +11905,33 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             )
                         self.assertFalse(marker.exists())
                         return
+                    registry_environment = (
+                        os.environ.get(
+                            _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV
+                        ),
+                        os.environ.get(
+                            _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV
+                        ),
+                    )
+                    if (
+                        registry_environment == (None, None)
+                        and _CANDIDATE_SUPPORT._STRICT_SESSION is None
+                    ):
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            "strict isolation session must be active",
+                        ):
+                            _CANDIDATE_SUPPORT.run_candidate_python(
+                                runner_path, writable_roots=(root,)
+                            )
+                        self.assertFalse(marker.exists())
+                        return
+                    if registry_environment != (None, None):
+                        self.assertNotIn(
+                            None,
+                            registry_environment,
+                            "strict inherited registry environment must be complete",
+                        )
                     completed = _CANDIDATE_SUPPORT.run_candidate_python(
                         runner_path, writable_roots=(root,)
                     )
@@ -8881,6 +11943,42 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         )
             finally:
                 self._terminate_marked_process(marker, lock_path)
+
+    def test_strict_candidate_probe_requires_an_active_registry_session(self) -> None:
+        previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+        previous_validated = _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED
+        _CANDIDATE_SUPPORT._STRICT_SESSION = None
+        _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = False
+        try:
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE},
+                clear=False,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "strict isolation session must be active",
+                ):
+                    _CANDIDATE_SUPPORT._ensure_strict_backend()
+        finally:
+            _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+            _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = previous_validated
+
+    def test_setsid_fixture_fails_closed_without_inherited_registry(
+        self,
+    ) -> None:
+        with _local_nonstrict_supervisor_environment(), mock.patch.object(
+            sys, "platform", "linux"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", False
+        ):
+            self.test_candidate_setsid_descendant_cannot_outlive_success_receipt()
 
     def test_candidate_stdout_cannot_form_the_trusted_parent_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -9022,6 +12120,11 @@ class RequiredCiCallerRegressionTests(unittest.TestCase):
                     "  required:\n"
                     "    uses: ./.github/workflows/required-ci.yml\n"
                 ),
+                ".github/workflows/dollar-caller.yml": (
+                    "jobs:\n"
+                    "  required:\n"
+                    "    uses: $/.github/workflows/required-ci.yml\n"
+                ),
                 ".github/workflows/remote-caller.yaml": (
                     "jobs:\n"
                     "  required:\n"
@@ -9038,6 +12141,8 @@ class RequiredCiCallerRegressionTests(unittest.TestCase):
                     "    uses: ./.github/workflows/required-ci.yml.disabled\n"
                     "  case-variant-path:\n"
                     "    uses: Joey-Tools/codex-waited-delivery/.github/workflows/Required-CI.yml@master\n"
+                    "  dollar-call-with-ref:\n"
+                    "    uses: $/.github/workflows/required-ci.yml@master\n"
                     "  ordinary-string:\n"
                     "    runs-on: ubuntu-latest\n"
                     "    steps:\n"
@@ -9062,6 +12167,11 @@ class RequiredCiCallerRegressionTests(unittest.TestCase):
                 for path, line_number, uses in callers
             ],
             [
+                (
+                    ".github/workflows/dollar-caller.yml",
+                    3,
+                    "$/.github/workflows/required-ci.yml",
+                ),
                 (
                     ".github/workflows/local-caller.yml",
                     3,
@@ -9147,6 +12257,79 @@ class RequiredCiCallerRegressionTests(unittest.TestCase):
 
 
 class RequiredCiWorkflowTests(unittest.TestCase):
+    def test_trusted_step_launcher_captures_deadline_before_its_only_exec(
+        self,
+    ) -> None:
+        compile(
+            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE,
+            "<trusted-test-supervisor-launcher>",
+            "exec",
+        )
+        self.assertNotIn("\n", TRUSTED_TEST_SUPERVISOR_COMMAND)
+        self.assertEqual(
+            TRUSTED_TEST_SUPERVISOR_STEP.count(
+                f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
+            ),
+            1,
+        )
+        self.assertEqual(
+            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE.count("time.monotonic()"),
+            1,
+        )
+        self.assertEqual(
+            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE.count("os.execve"), 1
+        )
+        self.assertLess(
+            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE.index("time.monotonic()"),
+            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE.index("os.execve"),
+        )
+        self.assertNotIn("time.time()", TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE)
+
+    def test_workflow_and_supervisor_budgets_form_exact_nested_envelopes(
+        self,
+    ) -> None:
+        job_timeout_seconds = int(EXPECTED_TEST_TIMEOUT_MINUTES) * 60
+
+        self.assertEqual(TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES, 15)
+        self.assertEqual(TRUSTED_TEST_STEP_TIMEOUT_MINUTES, 15)
+        self.assertEqual(TRUSTED_JOB_RUNNER_MARGIN_MINUTES, 5)
+        self.assertEqual(
+            TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES
+            + TRUSTED_TEST_STEP_TIMEOUT_MINUTES
+            + TRUSTED_JOB_RUNNER_MARGIN_MINUTES,
+            int(EXPECTED_TEST_TIMEOUT_MINUTES),
+        )
+        self.assertEqual(TRUSTED_TEST_SUITE_TIMEOUT_SECONDS, 8 * 60)
+        self.assertEqual(TRUSTED_TEST_CLEANUP_RESERVE_SECONDS, 2 * 60)
+        self.assertEqual(TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS, 10 * 60)
+        self.assertEqual(TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS, 5 * 60)
+        self.assertEqual(TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS, 1)
+        self.assertEqual(
+            TRUSTED_TEST_SUITE_TIMEOUT_SECONDS
+            + TRUSTED_TEST_CLEANUP_RESERVE_SECONDS,
+            TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS,
+        )
+        self.assertEqual(
+            TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS
+            + TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS,
+            TRUSTED_TEST_STEP_TIMEOUT_MINUTES * 60,
+        )
+        self.assertEqual(
+            TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES * 60
+            + TRUSTED_TEST_STEP_TIMEOUT_MINUTES * 60
+            + TRUSTED_JOB_RUNNER_MARGIN_MINUTES * 60,
+            job_timeout_seconds,
+        )
+
+    def test_module_postpones_runtime_annotation_evaluation(self) -> None:
+        source = Path(__file__).resolve(strict=True).read_text(encoding="utf-8")
+
+        self.assertTrue(
+            source.startswith("from __future__ import annotations\n"),
+            "workflow tests must import on Python 3.9 before builtin generic "
+            "annotations are evaluated",
+        )
+
     def test_trusted_checkout_requires_an_explicit_candidate_root(self) -> None:
         original = os.environ.pop(REQUIRED_CI_CANDIDATE_ROOT_ENV, None)
         try:
@@ -9160,19 +12343,24 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         self,
     ) -> None:
         original = os.environ.get(REQUIRED_CI_CANDIDATE_ROOT_ENV)
+        original_workspace = os.environ.get("GITHUB_WORKSPACE")
         try:
-            for invalid in (".candidate", "/example/candidate"):
-                with self.subTest(invalid=invalid):
-                    os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = invalid
-                    with self.assertRaises(AssertionError):
-                        required_ci_repository_root(Path("/example/.required-ci"))
-
             with tempfile.TemporaryDirectory() as temporary_directory:
-                candidate_root = Path(temporary_directory) / ".candidate"
+                workspace = Path(temporary_directory).resolve(strict=True)
+                os.environ["GITHUB_WORKSPACE"] = str(workspace)
+                trusted_root = workspace / ".required-ci"
+                candidate_root = workspace / ".candidate"
+                trusted_root.mkdir()
                 candidate_root.mkdir()
+                for invalid in (".candidate", str(workspace / "candidate")):
+                    with self.subTest(invalid=invalid):
+                        os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = invalid
+                        with self.assertRaises(AssertionError):
+                            required_ci_repository_root(trusted_root)
+
                 os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(candidate_root)
                 self.assertEqual(
-                    required_ci_repository_root(Path("/example/.required-ci")),
+                    required_ci_repository_root(trusted_root),
                     candidate_root.resolve(),
                 )
         finally:
@@ -9180,6 +12368,147 @@ class RequiredCiWorkflowTests(unittest.TestCase):
                 os.environ.pop(REQUIRED_CI_CANDIDATE_ROOT_ENV, None)
             else:
                 os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = original
+            if original_workspace is None:
+                os.environ.pop("GITHUB_WORKSPACE", None)
+            else:
+                os.environ["GITHUB_WORKSPACE"] = original_workspace
+
+    def test_trusted_checkout_rejects_a_decoy_candidate_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            workspace = root / "workspace"
+            trusted_root = workspace / ".required-ci"
+            candidate_root = workspace / ".candidate"
+            decoy_root = root / "decoy" / ".candidate"
+            trusted_root.mkdir(parents=True)
+            candidate_root.mkdir()
+            decoy_root.mkdir(parents=True)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GITHUB_WORKSPACE": str(workspace),
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(decoy_root),
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "mandated candidate checkout"
+                ):
+                    required_ci_repository_root(trusted_root)
+
+                os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(candidate_root)
+                self.assertEqual(
+                    required_ci_repository_root(trusted_root), candidate_root
+                )
+
+    def test_workspace_context_rejects_coordinated_trusted_and_candidate_decoys(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            workspace = root / "workspace"
+            trusted_root = workspace / ".required-ci"
+            candidate_root = workspace / ".candidate"
+            decoy_workspace = root / "decoy"
+            decoy_trusted_root = decoy_workspace / ".required-ci"
+            decoy_candidate_root = decoy_workspace / ".candidate"
+            for checkout in (
+                trusted_root,
+                candidate_root,
+                decoy_trusted_root,
+                decoy_candidate_root,
+            ):
+                checkout.mkdir(parents=True)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GITHUB_WORKSPACE": str(workspace),
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(decoy_candidate_root),
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "trusted checkout.*GitHub workspace"
+                ):
+                    required_ci_repository_root(decoy_trusted_root)
+
+                os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(candidate_root)
+                self.assertEqual(
+                    required_ci_repository_root(trusted_root), candidate_root
+                )
+
+    def test_formal_entry_binds_candidate_sha_to_github_sha(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory).resolve(strict=True)
+            trusted_root = workspace / ".required-ci"
+            candidate_root = workspace / ".candidate"
+            trusted_root.mkdir()
+            candidate_root.mkdir()
+            script = str(Path(__file__).resolve(strict=True))
+            formal_entries = {
+                "structure": [script, TRUSTED_STRUCTURE_VALIDATOR_FLAG],
+                "supervisor": [script, TRUSTED_TEST_SUPERVISOR_FLAG],
+                "child": [
+                    script,
+                    TRUSTED_TEST_CHILD_FLAG,
+                    str(trusted_root),
+                ],
+            }
+            caller_event_shas = {
+                "push": "a" * 40,
+                "pull-request-merge": "b" * 40,
+                "workflow-call-caller": "c" * 40,
+            }
+            self.assertEqual(
+                TRUSTED_VALIDATOR_ENV[REQUIRED_CI_CANDIDATE_SHA_ENV],
+                "${{ github.sha }}",
+            )
+            self.assertEqual(
+                CANDIDATE_CHECKOUT_INPUTS["ref"], "${{ github.sha }}"
+            )
+            for entry_name, argv in formal_entries.items():
+                for event_name, github_sha in caller_event_shas.items():
+                    with self.subTest(entry=entry_name, event=event_name), mock.patch.object(
+                        sys, "argv", argv
+                    ), mock.patch.dict(
+                        os.environ,
+                        {
+                            "GITHUB_WORKSPACE": str(workspace),
+                            "GITHUB_SHA": github_sha,
+                            REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                            REQUIRED_CI_CANDIDATE_SHA_ENV: github_sha,
+                        },
+                        clear=False,
+                    ):
+                        self.assertEqual(
+                            required_ci_repository_root(trusted_root),
+                            candidate_root,
+                        )
+                        os.environ[REQUIRED_CI_CANDIDATE_SHA_ENV] = "d" * 40
+                        with self.assertRaisesRegex(
+                            AssertionError, "candidate SHA must equal GITHUB_SHA"
+                        ):
+                            required_ci_repository_root(trusted_root)
+
+            with mock.patch.object(
+                sys,
+                "argv",
+                formal_entries["structure"],
+            ), mock.patch.dict(
+                os.environ,
+                {
+                    "GITHUB_WORKSPACE": str(workspace),
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: "a" * 40,
+                },
+                clear=False,
+            ):
+                os.environ.pop("GITHUB_SHA", None)
+                with self.assertRaisesRegex(
+                    AssertionError, "requires the GitHub candidate SHA binding"
+                ):
+                    required_ci_repository_root(trusted_root)
 
     def test_private_distribution_is_identified_without_repository_files(self) -> None:
         root = Path("/example/repository")

@@ -9,13 +9,15 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 35
     steps:
       - name: Reject unexpected repository
         if: ${{ github.repository != 'Joey-Tools/codex-waited-delivery' }}
+        timeout-minutes: 1
         run: exit 1
       - name: Check out candidate
         uses: actions/checkout@v4
+        timeout-minutes: 3
         with:
           repository: Joey-Tools/codex-waited-delivery
           ref: ${{ github.sha }}
@@ -23,6 +25,7 @@ jobs:
           persist-credentials: false
       - name: Check out trusted Required CI source
         uses: actions/checkout@v4
+        timeout-minutes: 3
         with:
           # GitHub.com job workflow identity pins this reusable leaf's own source.
           repository: ${{ job.workflow_repository }}
@@ -30,21 +33,25 @@ jobs:
           path: .required-ci
           persist-credentials: false
       - uses: actions/setup-python@v5
+        timeout-minutes: 3
         with:
           python-version: "3.x"
       - name: Compile candidate Python helpers
+        timeout-minutes: 2
         run: |
           python3 -I -X pycache_prefix="$RUNNER_TEMP/required-ci-pycache" -m py_compile "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/waited_delivery_bridge.py" "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/waited_delivery_hook_adapter.py" "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/waited_delivery_runner.py"
       - name: Validate Required CI structure
+        timeout-minutes: 3
         env:
           REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate
           REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}
         run: |
           python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py" --validate-required-ci-structure
       - name: Run trusted Required CI tests
+        timeout-minutes: 15
         env:
           REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate
           REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}
           REQUIRED_CI_ISOLATION_MODE: sudo-setpriv-v1
         run: |
-          python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py" --run-trusted-tests
+          python3 -I -B -S -c 'import os,sys,time; environment=os.environ.copy(); environment["REQUIRED_CI_SUPERVISOR_DEADLINE"]=f"{time.monotonic()+600:.9f}"; os.execve(sys.executable,[sys.executable,"-I","-B","-S",environment["GITHUB_WORKSPACE"]+"/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py","--run-trusted-tests"],environment)'

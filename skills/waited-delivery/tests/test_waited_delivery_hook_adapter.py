@@ -299,27 +299,180 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
             ]
         return completed, events
 
-    def test_terminal_stop_prompts_refuse_missing_child_identity(self) -> None:
-        for name in (
-            "_build_stop_continuation_prompt",
-            "_build_stop_fallback_prompt",
-            "_build_stop_last_resort_prompt",
-            "_build_stop_emergency_prompt",
-        ):
-            with self.subTest(name=name):
-                _, source = self._adapter_function(name)
-                self.assertIn("child_session_id", source)
-                self.assertIn("child_session_id.strip()", source)
-                if name == "_build_stop_continuation_prompt":
-                    self.assertIn("without a nonblank child_session_id", source)
-                else:
-                    self.assertIn("missing or blank", source)
-                self.assertIn("reconcile-active-run", source)
+    def _run_terminal_stop_prompt_probe(
+        self,
+        *,
+        label: str,
+        child_session_id: str | None,
+        faults: tuple[str, ...],
+    ) -> tuple[
+        subprocess.CompletedProcess[str],
+        list[dict[str, object]],
+        str,
+        str,
+    ]:
+        session_id = f"session-{label}"
+        attached_child_session_id = f"child-{label}"
+        home = self.root / f"{label}-home"
+        home.mkdir()
+        environment = os.environ.copy()
+        environment.pop("CODEX_THREAD_ID", None)
+        environment["HOME"] = str(home)
+        observed = self._run_adapter(
+            "user-prompt-submit-hook",
+            input_payload=self._session_payload(session_id=session_id),
+            env_overrides={"HOME": str(home)},
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        prepared = self._run_adapter(
+            "prepare-active-run",
+            "--repo",
+            str(self.repo),
+            "--goal",
+            "Exercise terminal child prompt identity guard",
+            "--external-helper",
+            str(self.fake_helper),
+            "--no-fallback-smoke",
+            "--session-id",
+            session_id,
+            env_overrides={"HOME": str(home)},
+        )
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        run_dir = json.loads(prepared.stdout)["run_dir"]
+        attached = self._run_adapter(
+            "attach-child-active-run",
+            "--repo",
+            str(self.repo),
+            "--run-dir",
+            run_dir,
+            "--child-session-id",
+            attached_child_session_id,
+            "--session-id",
+            session_id,
+            env_overrides={"HOME": str(home)},
+        )
+        self.assertEqual(attached.returncode, 0, attached.stderr)
 
-        _, terminal_source = self._adapter_function("_run_is_terminal")
-        self.assertIn("bool(child_session_id.strip())", terminal_source)
-        self.assertIn('phases.get("internal_review")', terminal_source)
-        self.assertIn("all(status in TERMINAL_PHASE_STATUSES", terminal_source)
+        state_path = pathlib.Path(run_dir) / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["overall_status"] = "passed"
+        orchestration = state["orchestration"]
+        self.assertIsInstance(orchestration, dict)
+        orchestration["child_status"] = "completed"
+        if child_session_id is None:
+            orchestration.pop("child_session_id", None)
+        else:
+            orchestration["child_session_id"] = child_session_id
+        phases = state["phases"]
+        self.assertIsInstance(phases, dict)
+        for phase in phases.values():
+            self.assertIsInstance(phase, dict)
+            phase["status"] = "passed"
+        state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        stop_payload = {
+            "session_id": session_id,
+            "transcript_path": f"/tmp/{label}-transcript.jsonl",
+            "cwd": str(self.repo),
+            "hook_event_name": "Stop",
+            "model": "gpt-5.5",
+            "permission_mode": "acceptEdits",
+            "stop_hook_active": False,
+            "last_assistant_message": "I am about to stop",
+        }
+        if faults:
+            completed = run_candidate_hook_fault_probe(
+                ADAPTER_PATH,
+                faults,
+                env=environment,
+                input_text=json.dumps(stop_payload),
+                writable_roots=(self.root,),
+            )
+        else:
+            completed = self._run_adapter(
+                "stop-hook",
+                input_payload=stop_payload,
+                env_overrides={"HOME": str(home)},
+            )
+        log_path = self._home_log_dir(home) / "waited-delivery-hooks.jsonl"
+        events = []
+        if log_path.is_file():
+            events = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+        return completed, events, run_dir, session_id
+
+    def test_terminal_stop_prompts_refuse_missing_child_identity(self) -> None:
+        builders = (
+            ("continuation", (), "without a nonblank child_session_id"),
+            (
+                "fallback",
+                ("continuation",),
+                "could not render the full continuation prompt",
+            ),
+            (
+                "last-resort",
+                ("continuation", "fallback"),
+                "State is inconsistent",
+            ),
+            (
+                "emergency",
+                ("continuation", "fallback", "last-resort"),
+                "State is inconsistent",
+            ),
+        )
+        identities = (("missing", None), ("blank", " \t "))
+        for identity_label, child_session_id in identities:
+            for builder_label, faults, prompt_marker in builders:
+                label = f"{identity_label}-{builder_label}"
+                with self.subTest(identity=identity_label, builder=builder_label):
+                    completed, events, run_dir, session_id = (
+                        self._run_terminal_stop_prompt_probe(
+                            label=label,
+                            child_session_id=child_session_id,
+                            faults=faults,
+                        )
+                    )
+                    self.assertEqual(completed.returncode, 2, completed.stderr)
+                    self.assertEqual(completed.stdout, "")
+                    self.assertIn(prompt_marker, completed.stderr)
+                    self.assertIn("child_session_id", completed.stderr)
+                    self.assertNotIn("reconcile-active-run", completed.stderr)
+                    self.assertEqual(
+                        [event["error_message"] for event in events],
+                        [
+                            f"required-ci injected {fault} failure"
+                            for fault in faults
+                        ],
+                    )
+                    index = json.loads(
+                        self._index_path().read_text(encoding="utf-8")
+                    )
+                    record = index["sessions"][session_id]
+                    self.assertEqual(record["status"], "active")
+                    self.assertEqual(record["run_dir"], run_dir)
+
+    def test_run_is_terminal_accepts_complete_state_with_attached_child(self) -> None:
+        completed, events, run_dir, session_id = (
+            self._run_terminal_stop_prompt_probe(
+                label="terminal-positive-control",
+                child_session_id="child-terminal-positive-control",
+                faults=(),
+            )
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "{}\n")
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(events, [])
+        index = json.loads(self._index_path().read_text(encoding="utf-8"))
+        record = index["sessions"][session_id]
+        self.assertEqual(record["status"], "completed")
+        self.assertIsNone(record["run_dir"])
+        self.assertTrue(pathlib.Path(run_dir, "state.json").is_file())
 
     def test_user_prompt_submit_hook_records_session_metadata(self) -> None:
         completed = self._run_adapter(
