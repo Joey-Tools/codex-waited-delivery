@@ -193,6 +193,39 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("compatibility/diagnostic dependency", readme)
         self.assertNotIn("review transport/runtime dependency", readme)
 
+    def test_documents_required_ci_activation_boundary(self) -> None:
+        require_canonical_documentation(self)
+        dependencies = " ".join(
+            DEPENDENCIES_PATH.read_text(encoding="utf-8").split()
+        )
+
+        self.assertIn("input-free reusable leaf", dependencies)
+        self.assertIn("intentionally exposes only `workflow_call`", dependencies)
+        self.assertIn("does not schedule itself", dependencies)
+        self.assertIn("does not create or claim a required check by itself", dependencies)
+        self.assertIn(
+            "Joey-Tools/codex-review-gate/.github/workflows/required-ci-router.yml",
+            dependencies,
+        )
+        self.assertIn("organization required-workflow/ruleset activation", dependencies)
+        self.assertIn("treat the leaf as published but not enforced", dependencies)
+        self.assertIn("does not claim that activation has occurred", dependencies)
+        self.assertIn(
+            "Direct triggers in the leaf and a duplicate caller in this repository "
+            "are forbidden",
+            dependencies,
+        )
+        self.assertIn("target caller event must supply the exact GitHub context", dependencies)
+        self.assertIn(
+            "`github.repository` must be exactly "
+            "`Joey-Tools/codex-waited-delivery`",
+            dependencies,
+        )
+        self.assertIn(
+            "`github.sha` must be the exact target commit under evaluation",
+            dependencies,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

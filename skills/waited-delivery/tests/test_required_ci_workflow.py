@@ -64,6 +64,7 @@ def _mapping_pair(fragment: str, line_number: int) -> tuple[str, str]:
     quote: str | None = None
     escaped = False
     flow_stack: list[str] = []
+    unseparated_colon = False
     for index, character in enumerate(fragment):
         if quote == '"':
             if escaped:
@@ -87,6 +88,9 @@ def _mapping_pair(fragment: str, line_number: int) -> tuple[str, str]:
             if not flow_stack or "[{"["]}".index(character)] != flow_stack.pop():
                 raise AssertionError(f"malformed flow shape on line {line_number}")
         elif character == ":" and not flow_stack:
+            if index + 1 < len(fragment) and fragment[index + 1] not in " \t":
+                unseparated_colon = True
+                continue
             key = fragment[:index].strip()
             if not _PLAIN_KEY.fullmatch(key):
                 raise AssertionError(
@@ -95,6 +99,11 @@ def _mapping_pair(fragment: str, line_number: int) -> tuple[str, str]:
             return key, fragment[index + 1 :].strip()
     if flow_stack:
         raise AssertionError(f"unclosed flow shape on line {line_number}")
+    if unseparated_colon:
+        raise AssertionError(
+            "block mapping separator must be followed by whitespace or line end "
+            f"on line {line_number}"
+        )
     raise AssertionError(f"expected a mapping entry on line {line_number}")
 
 
@@ -784,6 +793,27 @@ def validate_required_workflow(workflow: str) -> list[str]:
     return checkouts
 
 
+class MappingPairParsingTests(unittest.TestCase):
+    def test_block_mapping_separator_requires_whitespace_or_line_end(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "mapping separator"):
+            _mapping_pair("name:Required CI", 1)
+
+    def test_colons_after_the_mapping_separator_remain_scalar_content(self) -> None:
+        fixtures = {
+            "plain value": ("run: echo key:value", ("run", "echo key:value")),
+            "quoted value": ('name: "Required: CI"', ("name", '"Required: CI"')),
+            "trailing comment": (
+                _strip_yaml_comment("name: Required CI # expected name", 1),
+                ("name", "Required CI"),
+            ),
+            "line end": ("jobs:", ("jobs", "")),
+        }
+
+        for name, (fragment, expected) in fixtures.items():
+            with self.subTest(name=name):
+                self.assertEqual(_mapping_pair(fragment, 1), expected)
+
+
 class CheckoutStepParsingTests(unittest.TestCase):
     def test_unsafe_named_checkout_is_enumerated_for_contract_rejection(self) -> None:
         workflow = (
@@ -1284,19 +1314,26 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         checkout = validate_required_workflow(workflow)
         self.assertEqual(len(checkout), 1)
 
-    def test_invalid_plain_workflow_name_fails_closed(self) -> None:
+    def test_invalid_plain_workflow_names_fail_closed(self) -> None:
         if DISTRIBUTION_PROFILE == "private":
             self.skipTest(
                 "repository-only required CI contract is not packaged in the "
                 "private skill-only distribution"
             )
         workflow_path = REPO_ROOT / ".github/workflows/required-ci.yml"
-        workflow = workflow_path.read_text(encoding="utf-8").replace(
-            "name: Required CI\n", "name: Required CI: disabled\n", 1
-        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+        invalid_names = {
+            "nested mapping separator": "name: Required CI: disabled\n",
+            "missing separator whitespace": "name:Required CI\n",
+        }
 
-        with self.assertRaisesRegex(AssertionError, "workflow name must be exactly"):
-            validate_required_workflow(workflow)
+        for name, invalid_name in invalid_names.items():
+            with self.subTest(name=name):
+                invalid_workflow = workflow.replace(
+                    "name: Required CI\n", invalid_name, 1
+                )
+                with self.assertRaises(AssertionError):
+                    validate_required_workflow(invalid_workflow)
 
 
 if __name__ == "__main__":
