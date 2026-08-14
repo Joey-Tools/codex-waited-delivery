@@ -303,6 +303,30 @@ def _validate_permissions(
             )
 
 
+def _validate_workflow_envelope(workflow: str) -> None:
+    _, top_level = _top_level_blocks(workflow)
+    if list(top_level) != ["name", "on", "permissions", "jobs"]:
+        raise AssertionError(
+            "workflow top-level keys must be exactly name, on, permissions, "
+            "and jobs in order"
+        )
+    name_value, name_line, name_entries = top_level["name"]
+    if name_entries or not _plain_scalar(name_value, name_line):
+        raise AssertionError("workflow name must be a non-empty scalar")
+
+    trigger_value, trigger_line, trigger_entries = top_level["on"]
+    if trigger_value:
+        raise AssertionError(
+            f"workflow trigger must use a block mapping on line {trigger_line}"
+        )
+    triggers = _mapping_blocks(trigger_entries, "workflow trigger")
+    if len(triggers) != 1:
+        raise AssertionError("workflow must declare only the workflow_call trigger")
+    key, value, _, block = triggers[0]
+    if key != "workflow_call" or value or len(block) != 1:
+        raise AssertionError("workflow_call must be the only empty trigger")
+
+
 def _reject_yaml_indirection(content: str, line_number: int) -> None:
     unquoted = []
     quote: str | None = None
@@ -464,6 +488,182 @@ def _validate_repository_guard(
         )
 
 
+def _step_blocks(
+    steps_property: list[tuple[int, int, str]], job_id: str
+) -> tuple[int, list[list[tuple[int, int, str]]]]:
+    if len(steps_property) < 2:
+        raise AssertionError(f"job {job_id!r} steps block must not be empty")
+    entries = steps_property[1:]
+    step_indent = min(entry[1] for entry in entries)
+    starts = [
+        index for index, entry in enumerate(entries) if entry[1] == step_indent
+    ]
+    if not starts or starts[0] != 0:
+        raise AssertionError(f"malformed steps indentation in job {job_id!r}")
+    blocks: list[list[tuple[int, int, str]]] = []
+    for step_number, start in enumerate(starts):
+        end = starts[step_number + 1] if step_number + 1 < len(starts) else len(entries)
+        block = entries[start:end]
+        if not block[0][2].startswith("- "):
+            raise AssertionError(
+                f"steps must use a block sequence on line {block[0][0] + 1}"
+            )
+        blocks.append(block)
+    return step_indent, blocks
+
+
+def _require_step_properties(
+    entries: list[tuple[int, int, str]],
+    step_indent: int,
+    expected_keys: list[str],
+    description: str,
+) -> dict[str, tuple[str, int, list[tuple[int, int, str]]]]:
+    properties = _step_properties(entries, step_indent)
+    if list(properties) != expected_keys:
+        raise AssertionError(
+            f"{description} properties must be exactly {expected_keys!r} in order"
+        )
+    return properties
+
+
+def _require_scalar(
+    property_entry: tuple[str, int, list[tuple[int, int, str]]],
+    expected: str,
+    description: str,
+) -> None:
+    value, line_number, block = property_entry
+    if len(block) != 1 or _plain_scalar(value, line_number) != expected:
+        raise AssertionError(
+            f"{description} must equal {expected!r} on line {line_number}"
+        )
+
+
+def _require_exact_mapping(
+    property_entry: tuple[str, int, list[tuple[int, int, str]]],
+    expected: dict[str, str],
+    description: str,
+) -> None:
+    value, line_number, block = property_entry
+    if value:
+        raise AssertionError(
+            f"{description} must use a block mapping on line {line_number}"
+        )
+    entries = _mapping_blocks(block[1:], description)
+    actual: dict[str, str] = {}
+    for key, entry_value, entry_line, entry_block in entries:
+        if len(entry_block) != 1:
+            raise AssertionError(
+                f"{description} key {key!r} must be a scalar on line {entry_line}"
+            )
+        actual[key] = _plain_scalar(entry_value, entry_line)
+    if actual != expected:
+        raise AssertionError(f"{description} must equal the required mapping")
+
+
+def _require_run_block(
+    lines: list[str],
+    property_entry: tuple[str, int, list[tuple[int, int, str]]],
+    expected_command: str,
+    description: str,
+) -> None:
+    value, line_number, block = property_entry
+    if value != "|" or len(block) != 1:
+        raise AssertionError(
+            f"{description} must use a literal block scalar on line {line_number}"
+        )
+    header = lines[line_number - 1]
+    header_indent = len(header) - len(header.lstrip(" "))
+    body: list[str] = []
+    for raw_line in lines[line_number:]:
+        if raw_line:
+            indent = len(raw_line) - len(raw_line.lstrip(" "))
+            if indent <= header_indent:
+                break
+        body.append(raw_line)
+    expected_body = [" " * (header_indent + 2) + expected_command]
+    if body != expected_body:
+        raise AssertionError(
+            f"{description} must contain exactly the required command"
+        )
+
+
+def _validate_test_job(
+    lines: list[str], job_entries: list[tuple[int, int, str]]
+) -> None:
+    properties = _mapping_blocks(job_entries[1:], "job 'test' property")
+    if [key for key, _, _, _ in properties] != ["runs-on", "steps"]:
+        raise AssertionError(
+            "test job properties must be exactly runs-on and steps in order"
+        )
+    runs_key, runs_value, runs_line, runs_block = properties[0]
+    if runs_key != "runs-on" or len(runs_block) != 1:
+        raise AssertionError("test job runner must be a scalar")
+    if _plain_scalar(runs_value, runs_line) != "ubuntu-latest":
+        raise AssertionError("test job must run on ubuntu-latest")
+
+    steps_key, steps_value, steps_line, steps_property = properties[1]
+    if steps_key != "steps" or steps_value:
+        raise AssertionError(
+            f"test job steps must use a block sequence on line {steps_line}"
+        )
+    step_indent, steps = _step_blocks(steps_property, "test")
+    if len(steps) != 5:
+        raise AssertionError("test job must contain exactly the five required steps")
+
+    guard = _require_step_properties(
+        steps[0], step_indent, ["name", "if", "run"], "repository guard"
+    )
+    _require_scalar(guard["name"], "Reject unexpected repository", "guard name")
+    _require_scalar(
+        guard["if"],
+        f"${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}",
+        "guard condition",
+    )
+    _require_scalar(guard["run"], "exit 1", "guard command")
+
+    checkout = _require_step_properties(
+        steps[1], step_indent, ["uses", "with"], "checkout step"
+    )
+    _require_scalar(checkout["uses"], "actions/checkout@v4", "checkout action")
+    _require_exact_mapping(
+        checkout["with"],
+        _EXPECTED_CHECKOUT_INPUTS,
+        "checkout inputs",
+    )
+
+    setup = _require_step_properties(
+        steps[2], step_indent, ["uses", "with"], "Python setup step"
+    )
+    _require_scalar(setup["uses"], "actions/setup-python@v5", "Python setup action")
+    _require_exact_mapping(
+        setup["with"], {"python-version": "3.x"}, "Python setup inputs"
+    )
+
+    compile_step = _require_step_properties(
+        steps[3], step_indent, ["name", "run"], "compile step"
+    )
+    _require_scalar(
+        compile_step["name"], "Compile Python helpers", "compile step name"
+    )
+    _require_run_block(
+        lines,
+        compile_step["run"],
+        "python3 -m py_compile skills/waited-delivery/scripts/*.py",
+        "compile step command",
+    )
+
+    test_step = _require_step_properties(
+        steps[4], step_indent, ["name", "run"], "test step"
+    )
+    _require_scalar(test_step["name"], "Run tests", "test step name")
+    _require_run_block(
+        lines,
+        test_step["run"],
+        "python3 -m unittest discover -s skills/waited-delivery/tests",
+        "test step command",
+    )
+
+
 def checkout_steps(workflow: str, *, validate_contract: bool = False) -> list[str]:
     lines, structural = _structural_yaml_lines(workflow)
     jobs_entries = [
@@ -572,10 +772,12 @@ def checkout_steps(workflow: str, *, validate_contract: bool = False) -> list[st
 
 
 def validate_required_workflow(workflow: str) -> list[str]:
-    _, jobs = _workflow_job_blocks(workflow)
+    lines, jobs = _workflow_job_blocks(workflow)
     if [job_id for job_id, _ in jobs] != ["test"]:
         raise AssertionError("workflow must contain exactly the test job")
     _validate_permissions(workflow, jobs)
+    _validate_test_job(lines, jobs[0][1])
+    _validate_workflow_envelope(workflow)
     checkouts = checkout_steps(workflow, validate_contract=True)
     if not checkouts:
         raise AssertionError("workflow must contain a checkout step")
@@ -876,6 +1078,8 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
     def test_comments_and_ordinary_strings_do_not_create_structure(self) -> None:
         workflow = (
             'name: "permissions: write-all # ordinary text"\n'
+            "on:\n"
+            "  workflow_call:\n"
             "permissions:\n"
             "  contents: read\n"
             "# jobs:\n"
@@ -883,21 +1087,174 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
             "jobs:\n"
             "  # release: this remains a comment\n"
             "  test: # the only real job\n"
+            "    runs-on: ubuntu-latest\n"
             "    steps:\n"
-            "      - name: Ordinary text\n"
-            "        run: |\n"
-            "          echo 'release: # not a job'\n"
-            "          echo 'permissions: write-all'\n"
             f"{REPOSITORY_GUARD}\n"
             "      - uses: actions/checkout@v4\n"
             "        with:\n"
             f"          repository: {EXPECTED_REPOSITORY}\n"
             "          ref: ${{ github.sha }}\n"
             "          persist-credentials: false\n"
+            "      - uses: actions/setup-python@v5\n"
+            "        with:\n"
+            '          python-version: "3.x"\n'
+            "      - name: Compile Python helpers\n"
+            "        run: |\n"
+            "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
+            "      - name: Run tests\n"
+            "        run: |\n"
+            "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
         )
 
         self.assertEqual(top_level_job_ids(workflow), ["test"])
         self.assertEqual(len(validate_required_workflow(workflow)), 1)
+
+
+class RequiredJobExecutionRegressionTests(unittest.TestCase):
+    @staticmethod
+    def required_workflow(
+        *,
+        job_properties: str = "",
+        runner: str = "ubuntu-latest",
+        trailing_steps: str = "",
+    ) -> str:
+        return (
+            "name: Required CI\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "permissions:\n"
+            "  contents: read\n"
+            "jobs:\n"
+            "  test:\n"
+            f"{job_properties}"
+            f"    runs-on: {runner}\n"
+            "    steps:\n"
+            f"{REPOSITORY_GUARD}\n"
+            "      - uses: actions/checkout@v4\n"
+            "        with:\n"
+            f"          repository: {EXPECTED_REPOSITORY}\n"
+            "          ref: ${{ github.sha }}\n"
+            "          persist-credentials: false\n"
+            "      - uses: actions/setup-python@v5\n"
+            "        with:\n"
+            '          python-version: "3.x"\n'
+            f"{trailing_steps}"
+        )
+
+    def test_test_job_cannot_be_skipped_or_suppress_errors(self) -> None:
+        fixtures = {
+            "job condition": "    if: false\n",
+            "job error suppression": "    continue-on-error: true\n",
+        }
+
+        for name, job_properties in fixtures.items():
+            with self.subTest(name=name):
+                with self.assertRaises(AssertionError):
+                    validate_required_workflow(
+                        self.required_workflow(job_properties=job_properties)
+                    )
+
+    def test_runner_text_in_a_fake_node_does_not_satisfy_the_contract(self) -> None:
+        workflow = self.required_workflow(
+            job_properties=(
+                "    env:\n"
+                "      REQUIRED_RUNNER_TEXT: ubuntu-latest\n"
+            ),
+            runner="windows-latest",
+        )
+
+        with self.assertRaises(AssertionError):
+            validate_required_workflow(workflow)
+
+    def test_commands_must_be_bound_to_the_intended_run_steps(self) -> None:
+        fixtures = {
+            "name smuggling": (
+                "      - name: |\n"
+                "          Compile Python helpers\n"
+                "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
+                "        run: true\n"
+                "      - name: |\n"
+                "          Run tests\n"
+                "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
+                "        run: true\n"
+            ),
+            "swapped run steps": (
+                "      - name: Compile Python helpers\n"
+                "        run: |\n"
+                "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
+                "      - name: Run tests\n"
+                "        run: |\n"
+                "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
+            ),
+        }
+
+        for name, trailing_steps in fixtures.items():
+            with self.subTest(name=name):
+                with self.assertRaises(AssertionError):
+                    validate_required_workflow(
+                        self.required_workflow(trailing_steps=trailing_steps)
+                    )
+
+    def test_commands_cannot_run_in_suppressed_steps(self) -> None:
+        workflow = self.required_workflow(
+            trailing_steps=(
+                "      - name: Compile Python helpers\n"
+                "        if: false\n"
+                "        run: |\n"
+                "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
+                "      - name: Run tests\n"
+                "        continue-on-error: true\n"
+                "        run: |\n"
+                "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
+            )
+        )
+
+        with self.assertRaises(AssertionError):
+            validate_required_workflow(workflow)
+
+    def test_workflow_level_execution_overrides_fail_closed(self) -> None:
+        variants = {
+            "custom shell swallows failures": (
+                "defaults:\n"
+                "  run:\n"
+                "    shell: bash {0} || true\n"
+            ),
+            "path override selects another interpreter": (
+                "env:\n"
+                "  PATH: ./untrusted-bin:/usr/bin:/bin\n"
+            ),
+        }
+
+        for name, override in variants.items():
+            with self.subTest(name=name):
+                workflow = self.required_workflow(
+                    trailing_steps=(
+                        "      - name: Compile Python helpers\n"
+                        "        run: |\n"
+                        "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
+                        "      - name: Run tests\n"
+                        "        run: |\n"
+                        "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
+                    )
+                ).replace("permissions:\n", f"{override}permissions:\n", 1)
+
+                with self.assertRaises(AssertionError):
+                    validate_required_workflow(workflow)
+
+    def test_workflow_call_is_the_only_trigger(self) -> None:
+        workflow = self.required_workflow(
+            trailing_steps=(
+                "      - name: Compile Python helpers\n"
+                "        run: |\n"
+                "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
+                "      - name: Run tests\n"
+                "        run: |\n"
+                "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
+            )
+        ).replace("  workflow_call:\n", "  workflow_call:\n  push:\n", 1)
+
+        with self.assertRaises(AssertionError):
+            validate_required_workflow(workflow)
 
 
 class RequiredCiWorkflowTests(unittest.TestCase):
@@ -919,32 +1276,8 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         workflow_path = REPO_ROOT / ".github/workflows/required-ci.yml"
         workflow = workflow_path.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "on:\n  workflow_call:\n\npermissions:\n",
-            workflow,
-        )
-        self.assertIn("runs-on: ubuntu-latest", workflow)
         checkout = validate_required_workflow(workflow)
-        self.assertGreater(len(checkout), 0)
-        self.assertNotIn("repository: ${{ github.repository }}", workflow)
-        self.assertNotIn("inputs.repository", workflow)
-        self.assertNotIn("inputs.ref", workflow)
-        self.assertIn(
-            "python3 -m py_compile skills/waited-delivery/scripts/*.py",
-            workflow,
-        )
-        self.assertIn(
-            "python3 -m unittest discover -s skills/waited-delivery/tests",
-            workflow,
-        )
-        for forbidden in (
-            "pull_request:",
-            "pull_request_target:",
-            "push:",
-            "macos-latest",
-            "secrets.",
-        ):
-            self.assertNotIn(forbidden, workflow)
+        self.assertEqual(len(checkout), 1)
 
 
 if __name__ == "__main__":
