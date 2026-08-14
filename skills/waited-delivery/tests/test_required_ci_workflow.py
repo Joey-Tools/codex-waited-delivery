@@ -42,7 +42,6 @@ def top_level_job_ids(workflow: str) -> list[str]:
 
 
 _PLAIN_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
-_YAML_INDIRECTION = re.compile(r"(?:^|[\s,\[{])(?:&|\*)[A-Za-z0-9_-]+(?=$|[\s,\]}])")
 _BLOCK_SCALAR = re.compile(r"[|>](?:[1-9][+-]?|[+-][1-9]?)?\Z")
 
 
@@ -230,7 +229,15 @@ def _reject_yaml_indirection(content: str, line_number: int) -> None:
             unquoted.append(character)
         index += 1
     projected = "".join(unquoted)
-    if _YAML_INDIRECTION.search(projected) or re.search(
+    has_node_indirection = False
+    for index, character in enumerate(projected):
+        if character not in "&*":
+            continue
+        prefix = projected[:index].rstrip()
+        if not prefix or prefix[-1] in ":,[]{}?-":
+            has_node_indirection = True
+            break
+    if has_node_indirection or re.search(
         r"(?:^|[-\s,{])<<\s*:", projected
     ):
         raise AssertionError(
@@ -464,12 +471,36 @@ class CheckoutStepParsingTests(unittest.TestCase):
                 "      - name: Merged checkout\n"
                 "        <<: *checkout\n"
             ),
+            "punctuated anchor and alias": (
+                "jobs:\n"
+                "  test:\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n"
+                "      - name: &checkout.action actions/checkout@v4\n"
+                "        uses: *checkout.action\n"
+                "        with:\n"
+                "          repository: attacker/example\n"
+            ),
         }
 
         for name, workflow in fixtures.items():
             with self.subTest(name=name):
                 with self.assertRaisesRegex(AssertionError, "anchors, aliases"):
                     checkout_steps(workflow)
+
+    def test_plain_scalar_operators_are_not_yaml_indirection(self) -> None:
+        workflow = (
+            "jobs:\n"
+            "  test:\n"
+            "    steps:\n"
+            "      - name: Ordinary operators\n"
+            "        run: echo a*b && true\n"
+            "      - uses: actions/checkout@v4\n"
+        )
+
+        checkout = checkout_steps(workflow)
+
+        self.assertEqual(len(checkout), 1)
 
     def test_unclosed_or_flow_step_shapes_fail_closed(self) -> None:
         fixtures = {
