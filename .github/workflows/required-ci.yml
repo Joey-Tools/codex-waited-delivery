@@ -14,17 +14,31 @@ jobs:
       - name: Reject unexpected repository
         if: ${{ github.repository != 'Joey-Tools/codex-waited-delivery' }}
         run: exit 1
-      - uses: actions/checkout@v4
+      - name: Check out candidate
+        uses: actions/checkout@v4
         with:
           repository: Joey-Tools/codex-waited-delivery
           ref: ${{ github.sha }}
+          path: .candidate
+          persist-credentials: false
+      - name: Check out trusted Required CI source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .required-ci
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Compile Python helpers
+      - name: Compile candidate Python helpers
         run: |
-          python3 -m py_compile skills/waited-delivery/scripts/*.py
-      - name: Run tests
+          python3 -I -m py_compile "$GITHUB_WORKSPACE"/.candidate/skills/waited-delivery/scripts/*.py
+      - name: Validate Required CI structure
+        env:
+          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate
         run: |
-          python3 -m unittest discover -s skills/waited-delivery/tests
+          python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py"
+      - name: Run candidate tests
+        run: |
+          python3 -I -m unittest discover -s "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/tests"

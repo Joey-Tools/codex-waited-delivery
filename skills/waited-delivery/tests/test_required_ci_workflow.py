@@ -1,6 +1,9 @@
 from pathlib import Path
 import json
+import os
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -14,14 +17,112 @@ def distribution_contract_context(skill_root: Path) -> tuple[Path, str]:
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT, DISTRIBUTION_PROFILE = distribution_contract_context(SKILL_ROOT)
+TRUSTED_REPO_ROOT, DISTRIBUTION_PROFILE = distribution_contract_context(SKILL_ROOT)
 EXPECTED_REPOSITORY = "Joey-Tools/codex-waited-delivery"
 EXPECTED_TEST_TIMEOUT_MINUTES = "10"
+REQUIRED_CI_CANDIDATE_ROOT_ENV = "REQUIRED_CI_CANDIDATE_ROOT"
 REPOSITORY_GUARD = (
     "      - name: Reject unexpected repository\n"
     f"        if: ${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}\n"
     "        run: exit 1"
 )
+CANDIDATE_CHECKOUT_INPUTS = {
+    "repository": EXPECTED_REPOSITORY,
+    "ref": "${{ github.sha }}",
+    "path": ".candidate",
+    "persist-credentials": "false",
+}
+TRUSTED_CHECKOUT_INPUTS = {
+    "repository": "${{ job.workflow_repository }}",
+    "ref": "${{ job.workflow_sha }}",
+    "path": ".required-ci",
+    "persist-credentials": "false",
+}
+TRUSTED_VALIDATOR_ENV = {
+    REQUIRED_CI_CANDIDATE_ROOT_ENV: "${{ github.workspace }}/.candidate"
+}
+CANDIDATE_COMPILE_COMMAND = (
+    'python3 -I -m py_compile "$GITHUB_WORKSPACE"/'
+    ".candidate/skills/waited-delivery/scripts/*.py"
+)
+TRUSTED_VALIDATOR_COMMAND = (
+    'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
+    'test_required_ci_workflow.py"'
+)
+CANDIDATE_TEST_COMMAND = (
+    'python3 -I -m unittest discover -s "$GITHUB_WORKSPACE/'
+    '.candidate/skills/waited-delivery/tests"'
+)
+CANDIDATE_CHECKOUT_STEP = (
+    "      - name: Check out candidate\n"
+    "        uses: actions/checkout@v4\n"
+    "        with:\n"
+    f"          repository: {EXPECTED_REPOSITORY}\n"
+    "          ref: ${{ github.sha }}\n"
+    "          path: .candidate\n"
+    "          persist-credentials: false\n"
+)
+TRUSTED_CHECKOUT_STEP = (
+    "      - name: Check out trusted Required CI source\n"
+    "        uses: actions/checkout@v4\n"
+    "        with:\n"
+    "          repository: ${{ job.workflow_repository }}\n"
+    "          ref: ${{ job.workflow_sha }}\n"
+    "          path: .required-ci\n"
+    "          persist-credentials: false\n"
+)
+PYTHON_SETUP_STEP = (
+    "      - uses: actions/setup-python@v5\n"
+    "        with:\n"
+    '          python-version: "3.x"\n'
+)
+REQUIRED_EXECUTION_STEPS = (
+    "      - name: Compile candidate Python helpers\n"
+    "        run: |\n"
+    f"          {CANDIDATE_COMPILE_COMMAND}\n"
+    "      - name: Validate Required CI structure\n"
+    "        env:\n"
+    "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
+    "        run: |\n"
+    f"          {TRUSTED_VALIDATOR_COMMAND}\n"
+    "      - name: Run candidate tests\n"
+    "        run: |\n"
+    f"          {CANDIDATE_TEST_COMMAND}\n"
+)
+
+
+def required_ci_repository_root(trusted_repo_root: Path) -> Path:
+    candidate_root_value = os.environ.get(REQUIRED_CI_CANDIDATE_ROOT_ENV)
+    if candidate_root_value is None:
+        if trusted_repo_root.name == ".required-ci":
+            raise AssertionError(
+                f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} is required in the trusted "
+                "checkout"
+            )
+        return trusted_repo_root
+    candidate_root = Path(candidate_root_value)
+    if not candidate_root.is_absolute() or candidate_root.name != ".candidate":
+        raise AssertionError(
+            f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must be an absolute .candidate path"
+        )
+    if candidate_root.is_symlink():
+        raise AssertionError(
+            f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must not select a symlink"
+        )
+    try:
+        resolved = candidate_root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must select an existing directory"
+        ) from error
+    if not resolved.is_dir():
+        raise AssertionError(
+            f"{REQUIRED_CI_CANDIDATE_ROOT_ENV} must select a directory"
+        )
+    return resolved
+
+
+REPO_ROOT = required_ci_repository_root(TRUSTED_REPO_ROOT)
 
 
 def top_level_job_ids(workflow: str) -> list[str]:
@@ -503,15 +604,10 @@ def _step_properties(
     }
 
 
-_EXPECTED_CHECKOUT_INPUTS = {
-    "repository": EXPECTED_REPOSITORY,
-    "ref": "${{ github.sha }}",
-    "persist-credentials": "false",
-}
-
-
 def _validate_checkout_inputs(
-    entries: list[tuple[int, int, str]], step_indent: int
+    entries: list[tuple[int, int, str]],
+    step_indent: int,
+    expected: dict[str, str],
 ) -> None:
     properties = _step_properties(entries, step_indent)
     if "with" not in properties:
@@ -530,10 +626,9 @@ def _validate_checkout_inputs(
             )
         _plain_scalar(value, line_number)
         actual[key] = value
-    if actual != _EXPECTED_CHECKOUT_INPUTS:
+    if actual != expected or list(actual) != list(expected):
         raise AssertionError(
-            "checkout inputs must be exactly repository, ref, and "
-            "persist-credentials with the required values"
+            "checkout inputs must be exactly the required ordered mapping"
         )
 
 
@@ -628,7 +723,7 @@ def _require_exact_mapping(
                 f"{description} key {key!r} must be a scalar on line {entry_line}"
             )
         actual[key] = _plain_scalar(entry_value, entry_line)
-    if actual != expected:
+    if actual != expected or list(actual) != list(expected):
         raise AssertionError(f"{description} must equal the required mapping")
 
 
@@ -695,8 +790,8 @@ def _validate_test_job(
             f"test job steps must use a block sequence on line {steps_line}"
         )
     step_indent, steps = _step_blocks(steps_property, "test")
-    if len(steps) != 5:
-        raise AssertionError("test job must contain exactly the five required steps")
+    if len(steps) != 7:
+        raise AssertionError("test job must contain exactly the seven required steps")
 
     guard = _require_step_properties(
         steps[0], step_indent, ["name", "if", "run"], "repository guard"
@@ -709,18 +804,42 @@ def _validate_test_job(
     )
     _require_scalar(guard["run"], "exit 1", "guard command")
 
-    checkout = _require_step_properties(
-        steps[1], step_indent, ["uses", "with"], "checkout step"
+    candidate_checkout = _require_step_properties(
+        steps[1], step_indent, ["name", "uses", "with"], "candidate checkout step"
     )
-    _require_scalar(checkout["uses"], "actions/checkout@v4", "checkout action")
+    _require_scalar(
+        candidate_checkout["name"], "Check out candidate", "candidate checkout name"
+    )
+    _require_scalar(
+        candidate_checkout["uses"], "actions/checkout@v4", "candidate checkout action"
+    )
     _require_exact_mapping(
-        checkout["with"],
-        _EXPECTED_CHECKOUT_INPUTS,
-        "checkout inputs",
+        candidate_checkout["with"],
+        CANDIDATE_CHECKOUT_INPUTS,
+        "candidate checkout inputs",
+    )
+
+    trusted_checkout = _require_step_properties(
+        steps[2], step_indent, ["name", "uses", "with"], "trusted checkout step"
+    )
+    _require_scalar(
+        trusted_checkout["name"],
+        "Check out trusted Required CI source",
+        "trusted checkout name",
+    )
+    _require_scalar(
+        trusted_checkout["uses"],
+        "actions/checkout@v4",
+        "trusted checkout action",
+    )
+    _require_exact_mapping(
+        trusted_checkout["with"],
+        TRUSTED_CHECKOUT_INPUTS,
+        "trusted checkout inputs",
     )
 
     setup = _require_step_properties(
-        steps[2], step_indent, ["uses", "with"], "Python setup step"
+        steps[3], step_indent, ["uses", "with"], "Python setup step"
     )
     _require_scalar(setup["uses"], "actions/setup-python@v5", "Python setup action")
     _require_exact_mapping(
@@ -728,26 +847,46 @@ def _validate_test_job(
     )
 
     compile_step = _require_step_properties(
-        steps[3], step_indent, ["name", "run"], "compile step"
+        steps[4], step_indent, ["name", "run"], "compile step"
     )
     _require_scalar(
-        compile_step["name"], "Compile Python helpers", "compile step name"
+        compile_step["name"],
+        "Compile candidate Python helpers",
+        "compile step name",
     )
     _require_run_block(
         lines,
         compile_step["run"],
-        "python3 -m py_compile skills/waited-delivery/scripts/*.py",
+        CANDIDATE_COMPILE_COMMAND,
         "compile step command",
     )
 
-    test_step = _require_step_properties(
-        steps[4], step_indent, ["name", "run"], "test step"
+    validator_step = _require_step_properties(
+        steps[5], step_indent, ["name", "env", "run"], "validator step"
     )
-    _require_scalar(test_step["name"], "Run tests", "test step name")
+    _require_scalar(
+        validator_step["name"],
+        "Validate Required CI structure",
+        "validator step name",
+    )
+    _require_exact_mapping(
+        validator_step["env"], TRUSTED_VALIDATOR_ENV, "validator environment"
+    )
+    _require_run_block(
+        lines,
+        validator_step["run"],
+        TRUSTED_VALIDATOR_COMMAND,
+        "validator step command",
+    )
+
+    test_step = _require_step_properties(
+        steps[6], step_indent, ["name", "run"], "test step"
+    )
+    _require_scalar(test_step["name"], "Run candidate tests", "test step name")
     _require_run_block(
         lines,
         test_step["run"],
-        "python3 -m unittest discover -s skills/waited-delivery/tests",
+        CANDIDATE_TEST_COMMAND,
         "test step command",
     )
 
@@ -835,16 +974,28 @@ def checkout_steps(workflow: str, *, validate_contract: bool = False) -> list[st
             if not _checkout_from_step(step_entries, step_indent):
                 continue
             if validate_contract:
-                _validate_checkout_inputs(step_entries, step_indent)
-                if step_number == 0:
+                expected_checkouts = (
+                    CANDIDATE_CHECKOUT_INPUTS,
+                    TRUSTED_CHECKOUT_INPUTS,
+                )
+                checkout_number = len(checkouts)
+                if checkout_number >= len(expected_checkouts):
+                    raise AssertionError("workflow contains an unexpected checkout")
+                _validate_checkout_inputs(
+                    step_entries,
+                    step_indent,
+                    expected_checkouts[checkout_number],
+                )
+                if checkout_number == 0 and step_number == 0:
                     raise AssertionError(
                         "checkout step is missing its repository guard"
                     )
-                guard_start = step_starts[step_number - 1]
-                guard_end = step_start
-                _validate_repository_guard(
-                    steps_block[guard_start:guard_end], step_indent
-                )
+                if checkout_number == 0:
+                    guard_start = step_starts[step_number - 1]
+                    guard_end = step_start
+                    _validate_repository_guard(
+                        steps_block[guard_start:guard_end], step_indent
+                    )
             raw_start = step_entries[0][0]
             raw_end = (
                 steps_block[step_end][0]
@@ -867,8 +1018,27 @@ def validate_required_workflow(workflow: str) -> list[str]:
     _validate_test_job(lines, jobs[0][1])
     _validate_workflow_envelope(workflow)
     checkouts = checkout_steps(workflow, validate_contract=True)
-    if not checkouts:
-        raise AssertionError("workflow must contain a checkout step")
+    if len(checkouts) != 2:
+        raise AssertionError("workflow must contain exactly two checkout steps")
+    return checkouts
+
+
+def validate_required_ci_repository(repo_root: Path) -> list[str]:
+    workflow_path = repo_root / ".github/workflows/required-ci.yml"
+    if workflow_path.is_symlink() or not workflow_path.is_file():
+        raise AssertionError(
+            "candidate repository must contain an ordinary required-ci.yml"
+        )
+    try:
+        workflow = workflow_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise AssertionError("candidate required-ci.yml cannot be read") from error
+    checkouts = validate_required_workflow(workflow)
+    callers = required_ci_callers_in_repository(repo_root)
+    if callers:
+        raise AssertionError(
+            "candidate repository must not contain another Required CI caller"
+        )
     return checkouts
 
 
@@ -1200,20 +1370,10 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
             "    timeout-minutes: 10\n"
             "    steps:\n"
             f"{REPOSITORY_GUARD}\n"
-            "      - uses: actions/checkout@v4\n"
-            "        with:\n"
-            f"          repository: {EXPECTED_REPOSITORY}\n"
-            "          ref: ${{ github.sha }}\n"
-            "          persist-credentials: false\n"
-            "      - uses: actions/setup-python@v5\n"
-            "        with:\n"
-            '          python-version: "3.x"\n'
-            "      - name: Compile Python helpers\n"
-            "        run: |\n"
-            "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
-            "      - name: Run tests\n"
-            "        run: |\n"
-            "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
+            f"{CANDIDATE_CHECKOUT_STEP}"
+            f"{TRUSTED_CHECKOUT_STEP}"
+            f"{PYTHON_SETUP_STEP}"
+            f"{REQUIRED_EXECUTION_STEPS}"
         )
 
         self.assertEqual(top_level_job_ids(workflow), ["test"])
@@ -1222,7 +1382,7 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
             'name: "Required CI"\n',
             1,
         )
-        self.assertEqual(len(validate_required_workflow(required_name_workflow)), 1)
+        self.assertEqual(len(validate_required_workflow(required_name_workflow)), 2)
 
 
 class RequiredJobExecutionRegressionTests(unittest.TestCase):
@@ -1232,7 +1392,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
         job_properties: str = "",
         runner: str = "ubuntu-latest",
         timeout_minutes: str | None = EXPECTED_TEST_TIMEOUT_MINUTES,
-        trailing_steps: str = "",
+        trailing_steps: str = REQUIRED_EXECUTION_STEPS,
     ) -> str:
         timeout_line = (
             ""
@@ -1252,28 +1412,16 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             f"{timeout_line}"
             "    steps:\n"
             f"{REPOSITORY_GUARD}\n"
-            "      - uses: actions/checkout@v4\n"
-            "        with:\n"
-            f"          repository: {EXPECTED_REPOSITORY}\n"
-            "          ref: ${{ github.sha }}\n"
-            "          persist-credentials: false\n"
-            "      - uses: actions/setup-python@v5\n"
-            "        with:\n"
-            '          python-version: "3.x"\n'
+            f"{CANDIDATE_CHECKOUT_STEP}"
+            f"{TRUSTED_CHECKOUT_STEP}"
+            f"{PYTHON_SETUP_STEP}"
             f"{trailing_steps}"
         )
 
     def test_test_job_requires_the_exact_literal_timeout(self) -> None:
-        trailing_steps = (
-            "      - name: Compile Python helpers\n"
-            "        run: |\n"
-            "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
-            "      - name: Run tests\n"
-            "        run: |\n"
-            "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
-        )
+        trailing_steps = REQUIRED_EXECUTION_STEPS
         valid_workflow = self.required_workflow(trailing_steps=trailing_steps)
-        self.assertEqual(len(validate_required_workflow(valid_workflow)), 1)
+        self.assertEqual(len(validate_required_workflow(valid_workflow)), 2)
 
         invalid_timeouts = {
             "missing": None,
@@ -1309,6 +1457,165 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                         self.required_workflow(job_properties=job_properties)
                     )
 
+    def test_candidate_and_trusted_checkouts_are_exact_and_ordered(self) -> None:
+        workflow = self.required_workflow()
+        fixtures = {
+            "missing trusted checkout": workflow.replace(
+                TRUSTED_CHECKOUT_STEP, "", 1
+            ),
+            "trusted repository follows candidate context": workflow.replace(
+                "          repository: ${{ job.workflow_repository }}\n",
+                f"          repository: {EXPECTED_REPOSITORY}\n",
+                1,
+            ),
+            "trusted ref follows candidate context": workflow.replace(
+                "          ref: ${{ job.workflow_sha }}\n",
+                "          ref: ${{ github.sha }}\n",
+                1,
+            ),
+            "trusted checkout path is relaxed": workflow.replace(
+                "          path: .required-ci\n",
+                "          path: .trusted\n",
+                1,
+            ),
+            "candidate checkout path is missing": workflow.replace(
+                "          path: .candidate\n", "", 1
+            ),
+            "candidate credentials are persisted": workflow.replace(
+                "          persist-credentials: false\n",
+                "          persist-credentials: true\n",
+                1,
+            ),
+            "checkout order is reversed": workflow.replace(
+                CANDIDATE_CHECKOUT_STEP + TRUSTED_CHECKOUT_STEP,
+                TRUSTED_CHECKOUT_STEP + CANDIDATE_CHECKOUT_STEP,
+                1,
+            ),
+        }
+
+        for name, fixture in fixtures.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(fixture, workflow)
+                with self.assertRaises(AssertionError):
+                    validate_required_workflow(fixture)
+
+    def test_python_invocations_are_isolated_and_bound_to_exact_roots(self) -> None:
+        workflow = self.required_workflow()
+        candidate_validator_command = (
+            'python3 -I "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/'
+            'tests/test_required_ci_workflow.py"'
+        )
+        fixtures = {
+            "compile lacks isolated mode": workflow.replace(
+                CANDIDATE_COMPILE_COMMAND,
+                CANDIDATE_COMPILE_COMMAND.replace("python3 -I", "python3", 1),
+                1,
+            ),
+            "compile uses a relative candidate path": workflow.replace(
+                CANDIDATE_COMPILE_COMMAND,
+                "python3 -I -m py_compile skills/waited-delivery/scripts/*.py",
+                1,
+            ),
+            "validator lacks isolated mode": workflow.replace(
+                TRUSTED_VALIDATOR_COMMAND,
+                TRUSTED_VALIDATOR_COMMAND.replace("python3 -I", "python3", 1),
+                1,
+            ),
+            "validator runs candidate copy": workflow.replace(
+                TRUSTED_VALIDATOR_COMMAND, candidate_validator_command, 1
+            ),
+            "validator uses relative path": workflow.replace(
+                TRUSTED_VALIDATOR_COMMAND,
+                "python3 -I skills/waited-delivery/tests/test_required_ci_workflow.py",
+                1,
+            ),
+            "validator candidate root env is missing": workflow.replace(
+                "        env:\n"
+                "          REQUIRED_CI_CANDIDATE_ROOT: "
+                "${{ github.workspace }}/.candidate\n",
+                "",
+                1,
+            ),
+            "validator candidate root env is relaxed": workflow.replace(
+                "${{ github.workspace }}/.candidate",
+                "${{ github.workspace }}",
+                1,
+            ),
+            "validator environment has an extra key": workflow.replace(
+                "          REQUIRED_CI_CANDIDATE_ROOT: "
+                "${{ github.workspace }}/.candidate\n",
+                "          REQUIRED_CI_CANDIDATE_ROOT: "
+                "${{ github.workspace }}/.candidate\n"
+                "          PYTHONPATH: ${{ github.workspace }}/.candidate\n",
+                1,
+            ),
+            "functional discovery lacks isolated mode": workflow.replace(
+                CANDIDATE_TEST_COMMAND,
+                CANDIDATE_TEST_COMMAND.replace("python3 -I", "python3", 1),
+                1,
+            ),
+            "functional discovery uses a relative path": workflow.replace(
+                CANDIDATE_TEST_COMMAND,
+                "python3 -I -m unittest discover -s skills/waited-delivery/tests",
+                1,
+            ),
+            "functional discovery changes candidate cwd": workflow.replace(
+                CANDIDATE_TEST_COMMAND,
+                "cd \"$GITHUB_WORKSPACE/.candidate\" && "
+                "python3 -I -m unittest discover -s "
+                "skills/waited-delivery/tests",
+                1,
+            ),
+        }
+
+        for name, fixture in fixtures.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(fixture, workflow)
+                with self.assertRaises(AssertionError):
+                    validate_required_workflow(fixture)
+
+    def test_candidate_validator_deletion_or_replacement_cannot_bypass_trust(
+        self,
+    ) -> None:
+        secure_workflow = self.required_workflow()
+        candidate_validator_command = (
+            'python3 -I "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/'
+            'tests/test_required_ci_workflow.py"'
+        )
+        insecure_workflow = secure_workflow.replace(
+            TRUSTED_VALIDATOR_COMMAND, candidate_validator_command, 1
+        )
+        self.assertNotEqual(insecure_workflow, secure_workflow)
+
+        for state in ("deleted", "replaced"):
+            with self.subTest(state=state):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    candidate_root = Path(temporary_directory) / ".candidate"
+                    workflow_path = (
+                        candidate_root / ".github/workflows/required-ci.yml"
+                    )
+                    workflow_path.parent.mkdir(parents=True)
+                    workflow_path.write_text(secure_workflow, encoding="utf-8")
+                    candidate_validator = (
+                        candidate_root
+                        / "skills/waited-delivery/tests/"
+                        "test_required_ci_workflow.py"
+                    )
+                    if state == "replaced":
+                        candidate_validator.parent.mkdir(parents=True)
+                        candidate_validator.write_text(
+                            "raise SystemExit(0)\n", encoding="utf-8"
+                        )
+
+                    self.assertEqual(
+                        len(validate_required_ci_repository(candidate_root)), 2
+                    )
+                    workflow_path.write_text(
+                        insecure_workflow, encoding="utf-8"
+                    )
+                    with self.assertRaises(AssertionError):
+                        validate_required_ci_repository(candidate_root)
+
     def test_runner_text_in_a_fake_node_does_not_satisfy_the_contract(self) -> None:
         workflow = self.required_workflow(
             job_properties=(
@@ -1325,21 +1632,32 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
         fixtures = {
             "name smuggling": (
                 "      - name: |\n"
-                "          Compile Python helpers\n"
-                "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
+                "          Compile candidate Python helpers\n"
+                f"          {CANDIDATE_COMPILE_COMMAND}\n"
                 "        run: true\n"
                 "      - name: |\n"
-                "          Run tests\n"
-                "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
+                "          Validate Required CI structure\n"
+                f"          {TRUSTED_VALIDATOR_COMMAND}\n"
+                "        env:\n"
+                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
+                "        run: true\n"
+                "      - name: |\n"
+                "          Run candidate tests\n"
+                f"          {CANDIDATE_TEST_COMMAND}\n"
                 "        run: true\n"
             ),
             "swapped run steps": (
-                "      - name: Compile Python helpers\n"
+                "      - name: Compile candidate Python helpers\n"
                 "        run: |\n"
-                "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
-                "      - name: Run tests\n"
+                f"          {CANDIDATE_TEST_COMMAND}\n"
+                "      - name: Validate Required CI structure\n"
+                "        env:\n"
+                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
                 "        run: |\n"
-                "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
+                f"          {TRUSTED_VALIDATOR_COMMAND}\n"
+                "      - name: Run candidate tests\n"
+                "        run: |\n"
+                f"          {CANDIDATE_COMPILE_COMMAND}\n"
             ),
         }
 
@@ -1353,14 +1671,19 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
     def test_commands_cannot_run_in_suppressed_steps(self) -> None:
         workflow = self.required_workflow(
             trailing_steps=(
-                "      - name: Compile Python helpers\n"
+                "      - name: Compile candidate Python helpers\n"
                 "        if: false\n"
                 "        run: |\n"
-                "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
-                "      - name: Run tests\n"
+                f"          {CANDIDATE_COMPILE_COMMAND}\n"
+                "      - name: Validate Required CI structure\n"
+                "        env:\n"
+                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
+                "        run: |\n"
+                f"          {TRUSTED_VALIDATOR_COMMAND}\n"
+                "      - name: Run candidate tests\n"
                 "        continue-on-error: true\n"
                 "        run: |\n"
-                "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
+                f"          {CANDIDATE_TEST_COMMAND}\n"
             )
         )
 
@@ -1383,14 +1706,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
         for name, override in variants.items():
             with self.subTest(name=name):
                 workflow = self.required_workflow(
-                    trailing_steps=(
-                        "      - name: Compile Python helpers\n"
-                        "        run: |\n"
-                        "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
-                        "      - name: Run tests\n"
-                        "        run: |\n"
-                        "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
-                    )
+                    trailing_steps=REQUIRED_EXECUTION_STEPS
                 ).replace("permissions:\n", f"{override}permissions:\n", 1)
 
                 with self.assertRaises(AssertionError):
@@ -1398,18 +1714,63 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
 
     def test_workflow_call_is_the_only_trigger(self) -> None:
         workflow = self.required_workflow(
-            trailing_steps=(
-                "      - name: Compile Python helpers\n"
-                "        run: |\n"
-                "          python3 -m py_compile skills/waited-delivery/scripts/*.py\n"
-                "      - name: Run tests\n"
-                "        run: |\n"
-                "          python3 -m unittest discover -s skills/waited-delivery/tests\n"
-            )
+            trailing_steps=REQUIRED_EXECUTION_STEPS
         ).replace("  workflow_call:\n", "  workflow_call:\n  push:\n", 1)
 
         with self.assertRaises(AssertionError):
             validate_required_workflow(workflow)
+
+
+class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
+    def test_isolated_unittest_ignores_candidate_root_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            candidate_root = Path(temporary_directory) / ".candidate"
+            tests_root = candidate_root / "tests"
+            tests_root.mkdir(parents=True)
+            shadow_marker = candidate_root / "shadow-imported"
+            (candidate_root / "unittest.py").write_text(
+                'open("shadow-imported", "w", encoding="utf-8").write("used")\n',
+                encoding="utf-8",
+            )
+            (tests_root / "test_failure.py").write_text(
+                "import unittest\n\n"
+                "class IntentionalFailure(unittest.TestCase):\n"
+                "    def test_failure(self):\n"
+                '        self.fail("real discovery ran")\n',
+                encoding="utf-8",
+            )
+            common_arguments = [
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                str(tests_root),
+            ]
+
+            shadowed = subprocess.run(
+                [sys.executable, *common_arguments],
+                cwd=candidate_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(shadowed.returncode, 0)
+            self.assertTrue(shadow_marker.is_file())
+            shadow_marker.unlink()
+
+            isolated = subprocess.run(
+                [sys.executable, "-I", *common_arguments],
+                cwd=candidate_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            self.assertNotEqual(isolated.returncode, 0)
+            self.assertIn("real discovery ran", isolated.stderr)
+            self.assertFalse(shadow_marker.exists())
 
 
 class RequiredCiCallerRegressionTests(unittest.TestCase):
@@ -1499,6 +1860,40 @@ class RequiredCiCallerRegressionTests(unittest.TestCase):
 
 
 class RequiredCiWorkflowTests(unittest.TestCase):
+    def test_trusted_checkout_requires_an_explicit_candidate_root(self) -> None:
+        original = os.environ.pop(REQUIRED_CI_CANDIDATE_ROOT_ENV, None)
+        try:
+            with self.assertRaisesRegex(AssertionError, "required in the trusted"):
+                required_ci_repository_root(Path("/example/.required-ci"))
+        finally:
+            if original is not None:
+                os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = original
+
+    def test_candidate_root_must_be_an_absolute_real_candidate_directory(
+        self,
+    ) -> None:
+        original = os.environ.get(REQUIRED_CI_CANDIDATE_ROOT_ENV)
+        try:
+            for invalid in (".candidate", "/example/candidate"):
+                with self.subTest(invalid=invalid):
+                    os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = invalid
+                    with self.assertRaises(AssertionError):
+                        required_ci_repository_root(Path("/example/.required-ci"))
+
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                candidate_root = Path(temporary_directory) / ".candidate"
+                candidate_root.mkdir()
+                os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(candidate_root)
+                self.assertEqual(
+                    required_ci_repository_root(Path("/example/.required-ci")),
+                    candidate_root.resolve(),
+                )
+        finally:
+            if original is None:
+                os.environ.pop(REQUIRED_CI_CANDIDATE_ROOT_ENV, None)
+            else:
+                os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = original
+
     def test_private_distribution_is_identified_without_repository_files(self) -> None:
         root = Path("/example/repository")
         self.assertEqual(
@@ -1514,11 +1909,8 @@ class RequiredCiWorkflowTests(unittest.TestCase):
                 "repository-only required CI contract is not packaged in the "
                 "private skill-only distribution"
             )
-        workflow_path = REPO_ROOT / ".github/workflows/required-ci.yml"
-        workflow = workflow_path.read_text(encoding="utf-8")
-
-        checkout = validate_required_workflow(workflow)
-        self.assertEqual(len(checkout), 1)
+        checkouts = validate_required_ci_repository(REPO_ROOT)
+        self.assertEqual(len(checkouts), 2)
 
     def test_invalid_plain_workflow_names_fail_closed(self) -> None:
         if DISTRIBUTION_PROFILE == "private":
