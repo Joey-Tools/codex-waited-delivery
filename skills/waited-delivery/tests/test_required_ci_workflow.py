@@ -213,6 +213,10 @@ def _mapping_pair(fragment: str, line_number: int) -> tuple[str, str]:
 def _plain_scalar(value: str, line_number: int) -> str:
     if not value:
         raise AssertionError(f"missing scalar value on line {line_number}")
+    if value[0] == "!":
+        raise AssertionError(
+            f"explicit YAML tags are unsupported on line {line_number}"
+        )
     if value[0] == "'":
         if len(value) < 2 or value[-1] != "'":
             raise AssertionError(f"unclosed quoted scalar on line {line_number}")
@@ -1848,6 +1852,67 @@ class RequiredCiCallerRegressionTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_workflow_inventory_rejects_explicit_yaml_tags_on_job_uses(
+        self,
+    ) -> None:
+        tagged_values = {
+            "standard local tag": "!!str ./.github/workflows/required-ci.yml",
+            "custom remote tag": (
+                "!required-ci "
+                "'Joey-Tools/codex-waited-delivery/.github/workflows/"
+                "required-ci.yml@master'"
+            ),
+            "verbatim local tag": (
+                "!<tag:yaml.org,2002:str> "
+                '"./.github/workflows/required-ci.yml"'
+            ),
+            "tag and anchor combination": (
+                "!!str &required ./.github/workflows/required-ci.yml"
+            ),
+        }
+
+        for name, tagged_value in tagged_values.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    repo_root = Path(temporary_directory)
+                    self.write_workflow(
+                        repo_root,
+                        ".github/workflows/tagged-caller.yml",
+                        "jobs:\n"
+                        "  required:\n"
+                        f"    uses: {tagged_value}\n",
+                    )
+
+                    with self.assertRaisesRegex(
+                        AssertionError, "explicit YAML tags"
+                    ):
+                        required_ci_callers_in_repository(repo_root)
+
+    def test_yaml_tag_text_in_non_structural_content_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo_root = Path(temporary_directory)
+            self.write_workflow(
+                repo_root,
+                ".github/workflows/tag-text-near-misses.yml",
+                "# uses: !!str ./.github/workflows/required-ci.yml\n"
+                "jobs:\n"
+                "  quoted-tag-text:\n"
+                "    uses: '!!str ./.github/workflows/required-ci.yml'\n"
+                "  ordinary-action:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - run: |\n"
+                "          echo 'uses: !!str "
+                "./.github/workflows/required-ci.yml'\n"
+                "      - uses: example/action@v1\n"
+                "        with:\n"
+                "          uses: !!str ./.github/workflows/required-ci.yml\n",
+            )
+
+            callers = required_ci_callers_in_repository(repo_root)
+
+        self.assertEqual(callers, [])
 
     def test_repository_has_no_duplicate_required_ci_caller(self) -> None:
         if DISTRIBUTION_PROFILE == "private":
