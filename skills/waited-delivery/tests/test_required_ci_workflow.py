@@ -311,8 +311,8 @@ def _validate_workflow_envelope(workflow: str) -> None:
             "and jobs in order"
         )
     name_value, name_line, name_entries = top_level["name"]
-    if name_entries or not _plain_scalar(name_value, name_line):
-        raise AssertionError("workflow name must be a non-empty scalar")
+    if name_entries or _plain_scalar(name_value, name_line) != "Required CI":
+        raise AssertionError("workflow name must be exactly 'Required CI'")
 
     trigger_value, trigger_line, trigger_entries = top_level["on"]
     if trigger_value:
@@ -1107,7 +1107,12 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual(top_level_job_ids(workflow), ["test"])
-        self.assertEqual(len(validate_required_workflow(workflow)), 1)
+        required_name_workflow = workflow.replace(
+            'name: "permissions: write-all # ordinary text"\n',
+            'name: "Required CI"\n',
+            1,
+        )
+        self.assertEqual(len(validate_required_workflow(required_name_workflow)), 1)
 
 
 class RequiredJobExecutionRegressionTests(unittest.TestCase):
@@ -1278,6 +1283,20 @@ class RequiredCiWorkflowTests(unittest.TestCase):
 
         checkout = validate_required_workflow(workflow)
         self.assertEqual(len(checkout), 1)
+
+    def test_invalid_plain_workflow_name_fails_closed(self) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "repository-only required CI contract is not packaged in the "
+                "private skill-only distribution"
+            )
+        workflow_path = REPO_ROOT / ".github/workflows/required-ci.yml"
+        workflow = workflow_path.read_text(encoding="utf-8").replace(
+            "name: Required CI\n", "name: Required CI: disabled\n", 1
+        )
+
+        with self.assertRaisesRegex(AssertionError, "workflow name must be exactly"):
+            validate_required_workflow(workflow)
 
 
 if __name__ == "__main__":
