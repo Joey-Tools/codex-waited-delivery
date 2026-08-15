@@ -82,11 +82,12 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
     DISTRIBUTION_PROFILE,
 ) = distribution_contract_context(SKILL_ROOT)
 EXPECTED_REPOSITORY = "Joey-Tools/codex-waited-delivery"
-EXPECTED_TEST_TIMEOUT_MINUTES = "35"
+EXPECTED_TEST_TIMEOUT_MINUTES = "37"
 TRUSTED_REPOSITORY_GUARD_TIMEOUT_MINUTES = 1
 TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES = 3
 TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES = 3
 TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES = 3
+STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES = 2
 TRUSTED_COMPILE_TIMEOUT_MINUTES = 2
 TRUSTED_STRUCTURE_TIMEOUT_MINUTES = 3
 TRUSTED_TEST_STEP_TIMEOUT_MINUTES = 15
@@ -110,6 +111,7 @@ TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES = (
     + TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES
     + TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES
     + TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES
+    + STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES
     + TRUSTED_COMPILE_TIMEOUT_MINUTES
     + TRUSTED_STRUCTURE_TIMEOUT_MINUTES
 )
@@ -242,6 +244,47 @@ README_COMPILE_COMMAND = (
 README_DISCOVERY_COMMAND = (
     "python3 -I -m unittest discover -s skills/waited-delivery/tests"
 )
+STRICT_RUNTIME_HARDENING_COMMAND = (
+    'if [[ ! "$pythonLocation" =~ '
+    "^/opt/hostedtoolcache/Python/"
+    "[0-9]+\\.[0-9]+\\.[0-9]+/x64$ ]]; then\n"
+    '  echo "unexpected configured Python location: '
+    '$pythonLocation" >&2\n'
+    "  exit 1\n"
+    "fi\n"
+    'python_version_dir="${pythonLocation%/*}"\n'
+    'python_family_dir="${python_version_dir%/*}"\n'
+    "for path in \\\n"
+    "  /usr/share/zoneinfo \\\n"
+    '  "$pythonLocation" \\\n'
+    "  /usr/share \\\n"
+    "  /opt \\\n"
+    "  /opt/hostedtoolcache \\\n"
+    '  "$python_family_dir" \\\n'
+    '  "$python_version_dir"\n'
+    "do\n"
+    '  if [[ ! -d "$path" || -L "$path" ]]; then\n'
+    '    echo "unsafe strict runtime path: $path" >&2\n'
+    "    exit 1\n"
+    "  fi\n"
+    "done\n"
+    'sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"\n'
+    "sudo chmod a-w -- \\\n"
+    "  /usr/share \\\n"
+    "  /opt \\\n"
+    "  /opt/hostedtoolcache \\\n"
+    '  "$python_family_dir" \\\n'
+    '  "$python_version_dir"'
+)
+CI_STRICT_RUNTIME_HARDENING_STEP = (
+    "      - name: Harden strict live runtime roots\n"
+    f"        timeout-minutes: {STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES}\n"
+    "        run: |\n"
+    + "".join(
+        f"          {line}\n"
+        for line in STRICT_RUNTIME_HARDENING_COMMAND.splitlines()
+    )
+)
 CI_STRICT_RUNTIME_LIVE_JOB = (
     "  strict-live:\n"
     "    runs-on: ubuntu-24.04\n"
@@ -257,6 +300,7 @@ CI_STRICT_RUNTIME_LIVE_JOB = (
     "        timeout-minutes: 3\n"
     "        with:\n"
     '          python-version: "3.x"\n'
+    f"{CI_STRICT_RUNTIME_HARDENING_STEP}"
     "      - name: Run strict target credential live test\n"
     "        timeout-minutes: 15\n"
     "        env:\n"
@@ -296,6 +340,7 @@ PYTHON_SETUP_STEP = (
 TRUSTED_TEST_SUPERVISOR_STEP = (
     "      - name: Run trusted Required CI tests\n"
     f"        timeout-minutes: {TRUSTED_TEST_STEP_TIMEOUT_MINUTES}\n"
+    "        working-directory: ${{ github.workspace }}/.candidate\n"
     "        env:\n"
     "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
     "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n"
@@ -304,6 +349,7 @@ TRUSTED_TEST_SUPERVISOR_STEP = (
     f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
 )
 REQUIRED_EXECUTION_STEPS = (
+    f"{CI_STRICT_RUNTIME_HARDENING_STEP}"
     "      - name: Compile candidate Python helpers\n"
     f"        timeout-minutes: {TRUSTED_COMPILE_TIMEOUT_MINUTES}\n"
     "        run: |\n"
@@ -2066,7 +2112,10 @@ def _require_run_block(
             if indent <= header_indent:
                 break
         body.append(raw_line)
-    expected_body = [" " * (header_indent + 2) + expected_command]
+    expected_body = [
+        " " * (header_indent + 2) + line
+        for line in expected_command.splitlines()
+    ]
     if body != expected_body:
         raise AssertionError(
             f"{description} must contain exactly the required command"
@@ -2109,8 +2158,8 @@ def _validate_test_job(
             f"test job steps must use a block sequence on line {steps_line}"
         )
     step_indent, steps = _step_blocks(steps_property, "test")
-    if len(steps) != 7:
-        raise AssertionError("test job must contain exactly the seven required steps")
+    if len(steps) != 8:
+        raise AssertionError("test job must contain exactly the eight required steps")
 
     guard = _require_step_properties(
         steps[0],
@@ -2197,8 +2246,31 @@ def _validate_test_job(
         setup["with"], {"python-version": "3.x"}, "Python setup inputs"
     )
 
-    compile_step = _require_step_properties(
+    hardening_step = _require_step_properties(
         steps[4],
+        step_indent,
+        ["name", "timeout-minutes", "run"],
+        "strict runtime hardening step",
+    )
+    _require_scalar(
+        hardening_step["name"],
+        "Harden strict live runtime roots",
+        "strict runtime hardening step name",
+    )
+    _require_exact_timeout(
+        hardening_step["timeout-minutes"],
+        STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES,
+        "strict runtime hardening timeout",
+    )
+    _require_run_block(
+        lines,
+        hardening_step["run"],
+        STRICT_RUNTIME_HARDENING_COMMAND,
+        "strict runtime hardening command",
+    )
+
+    compile_step = _require_step_properties(
+        steps[5],
         step_indent,
         ["name", "timeout-minutes", "run"],
         "compile step",
@@ -2221,7 +2293,7 @@ def _validate_test_job(
     )
 
     validator_step = _require_step_properties(
-        steps[5],
+        steps[6],
         step_indent,
         ["name", "timeout-minutes", "env", "run"],
         "validator step",
@@ -2247,9 +2319,9 @@ def _validate_test_job(
     )
 
     test_step = _require_step_properties(
-        steps[6],
+        steps[7],
         step_indent,
-        ["name", "timeout-minutes", "env", "run"],
+        ["name", "timeout-minutes", "working-directory", "env", "run"],
         "test step",
     )
     _require_scalar(
@@ -2261,6 +2333,11 @@ def _validate_test_job(
         test_step["timeout-minutes"],
         TRUSTED_TEST_STEP_TIMEOUT_MINUTES,
         "test step timeout",
+    )
+    _require_scalar(
+        test_step["working-directory"],
+        "${{ github.workspace }}/.candidate",
+        "test supervisor working directory",
     )
     _require_exact_mapping(
         test_step["env"], TRUSTED_RUNTIME_ENV, "test supervisor environment"
@@ -3082,6 +3159,71 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, CI_STRICT_RUNTIME_LIVE_JOB)
 
+    def test_strict_runtime_live_hardens_only_bound_runtime_roots(self) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "repository-only CI workflow is not packaged in the private "
+                "skill-only distribution"
+            )
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        setup_marker = (
+            "      - name: Set up configured Python for strict live evidence\n"
+        )
+        run_marker = "      - name: Run strict target credential live test\n"
+        self.assertEqual(workflow.count(CI_STRICT_RUNTIME_HARDENING_STEP), 1)
+        self.assertLess(
+            workflow.index(setup_marker),
+            workflow.index(CI_STRICT_RUNTIME_HARDENING_STEP),
+        )
+        self.assertLess(
+            workflow.index(CI_STRICT_RUNTIME_HARDENING_STEP),
+            workflow.index(run_marker),
+        )
+        self.assertIn(
+            r"^/opt/hostedtoolcache/Python/"
+            r"[0-9]+\.[0-9]+\.[0-9]+/x64$",
+            CI_STRICT_RUNTIME_HARDENING_STEP,
+        )
+        for unsafe_location in (
+            "/opt/hostedtoolcache/Python/../..",
+            "/opt/hostedtoolcache/Python/3.14.7/..",
+            "/opt/hostedtoolcache/Python/.hidden/x64",
+        ):
+            with self.subTest(unsafe_location=unsafe_location):
+                self.assertIsNone(
+                    re.fullmatch(
+                        r"/opt/hostedtoolcache/Python/"
+                        r"[0-9]+\.[0-9]+\.[0-9]+/x64",
+                        unsafe_location,
+                    )
+                )
+        self.assertIn(
+            'sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"',
+            CI_STRICT_RUNTIME_HARDENING_STEP,
+        )
+        self.assertNotIn(
+            "sudo chmod -R a-w -- /usr/share ",
+            CI_STRICT_RUNTIME_HARDENING_STEP,
+        )
+        self.assertNotIn(
+            "sudo chmod -R a-w -- /opt ",
+            CI_STRICT_RUNTIME_HARDENING_STEP,
+        )
+        for path in (
+            "/usr/share/zoneinfo",
+            '"$pythonLocation"',
+            "/usr/share",
+            "/opt",
+            "/opt/hostedtoolcache",
+            '"$python_family_dir"',
+            '"$python_version_dir"',
+        ):
+            with self.subTest(path=path):
+                self.assertIn(path, CI_STRICT_RUNTIME_HARDENING_STEP)
+
     def test_checkout_inputs_cannot_be_smuggled_through_the_step_name(self) -> None:
         for style in ("|", ">-"):
             with self.subTest(style=style):
@@ -3299,7 +3441,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             "zero": "0",
             "noninteger word": "ten",
             "noninteger decimal": "10.5",
-            "quoted integer": '"35"',
+            "quoted integer": f'"{EXPECTED_TEST_TIMEOUT_MINUTES}"',
             "expression": "${{ vars.REQUIRED_CI_TIMEOUT_MINUTES }}",
             "over GitHub maximum": "361",
             "different positive integer": "36",
@@ -3338,8 +3480,14 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             (
                 "Python setup",
                 "      - uses: actions/setup-python@v5\n",
-                "      - name: Compile candidate Python helpers\n",
+                "      - name: Harden strict live runtime roots\n",
                 TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES,
+            ),
+            (
+                "strict runtime hardening",
+                "      - name: Harden strict live runtime roots\n",
+                "      - name: Compile candidate Python helpers\n",
+                STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES,
             ),
             (
                 "compile",
@@ -3521,11 +3669,17 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                 "test_required_ci_workflow.py --run-trusted-tests",
                 1,
             ),
-            "functional supervisor changes candidate cwd": workflow.replace(
-                TRUSTED_TEST_SUPERVISOR_COMMAND,
-                "cd \"$GITHUB_WORKSPACE/.candidate\" && "
-                "python3 -I ../.required-ci/skills/waited-delivery/tests/"
-                "test_required_ci_workflow.py --run-trusted-tests",
+            "functional supervisor candidate cwd is missing": workflow.replace(
+                "        working-directory: "
+                "${{ github.workspace }}/.candidate\n",
+                "",
+                1,
+            ),
+            "functional supervisor runs from trusted checkout": workflow.replace(
+                "        working-directory: "
+                "${{ github.workspace }}/.candidate\n",
+                "        working-directory: "
+                "${{ github.workspace }}/.required-ci\n",
                 1,
             ),
         }
@@ -12214,6 +12368,135 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             decoder_namespace["decode_mount_path"]("/alias/../child")
         self.assertEqual(rejected_path.exception.code, 155)
 
+    def test_strict_host_read_binding_requires_runner_writable_roots_hardened(
+        self,
+    ) -> None:
+        real_policy = _CANDIDATE_SUPPORT._assert_strict_target_runtime_policy
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            localtime_root = fixture_root / "usr/share/zoneinfo"
+            localtime_root.mkdir(parents=True)
+            localtime_path = localtime_root / "UTC"
+            localtime_path.write_bytes(b"UTC")
+            runtime_root = fixture_root / "opt/hostedtoolcache/Python/3.14.7/x64"
+            interpreter_path = runtime_root / "bin/python3.14"
+            stdlib_root = runtime_root / "lib/python3.14"
+            interpreter_path.parent.mkdir(parents=True)
+            stdlib_root.mkdir(parents=True)
+            interpreter_path.write_bytes(b"python")
+
+            fixture_paths = [
+                fixture_root,
+                *(path for path in fixture_root.rglob("*") if path.is_dir()),
+                localtime_path,
+                interpreter_path,
+            ]
+            fixture_identities = {
+                (path.lstat().st_dev, path.lstat().st_ino)
+                for path in fixture_paths
+            }
+
+            def enforce_fixture_policy(
+                metadata: os.stat_result, **kwargs: object
+            ) -> None:
+                if (metadata.st_dev, metadata.st_ino) in fixture_identities:
+                    real_policy(metadata, **kwargs)
+
+            for path in fixture_paths:
+                path.chmod(0o555)
+            try:
+                common_patches = (
+                    mock.patch.object(os, "O_PATH", 0, create=True),
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_assert_strict_target_runtime_policy",
+                        side_effect=enforce_fixture_policy,
+                    ),
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT, "_strict_runtime_acl_is_absent"
+                    ),
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_host_read_root_mount_binding",
+                        return_value=17,
+                    ),
+                )
+                with contextlib.ExitStack() as stack:
+                    for patcher in common_patches:
+                        stack.enter_context(patcher)
+
+                    (fixture_root / "usr/share").chmod(0o777)
+                    with self.assertRaisesRegex(
+                        AssertionError, "access policy is unsafe"
+                    ):
+                        _CANDIDATE_SUPPORT._capture_strict_host_read_root_binding(
+                            localtime_path,
+                            purpose="localtime",
+                            kind="file",
+                            target_uid=60000,
+                            target_gid=60000,
+                        )
+                    (fixture_root / "usr/share").chmod(0o555)
+                    localtime_path.chmod(0o777)
+                    with self.assertRaisesRegex(
+                        AssertionError, "access policy is unsafe"
+                    ):
+                        _CANDIDATE_SUPPORT._capture_strict_host_read_root_binding(
+                            localtime_path,
+                            purpose="localtime",
+                            kind="file",
+                            target_uid=60000,
+                            target_gid=60000,
+                        )
+                    localtime_path.chmod(0o555)
+
+                    (fixture_root / "opt").chmod(0o777)
+                    with self.assertRaisesRegex(
+                        AssertionError, "access policy is unsafe"
+                    ):
+                        _CANDIDATE_SUPPORT._capture_strict_host_read_root_binding(
+                            interpreter_path,
+                            purpose="configured-executable",
+                            kind="file",
+                            target_uid=60000,
+                            target_gid=60000,
+                        )
+                    (fixture_root / "opt").chmod(0o555)
+                    interpreter_path.chmod(0o777)
+                    with self.assertRaisesRegex(
+                        AssertionError, "access policy is unsafe"
+                    ):
+                        _CANDIDATE_SUPPORT._capture_strict_host_read_root_binding(
+                            interpreter_path,
+                            purpose="configured-executable",
+                            kind="file",
+                            target_uid=60000,
+                            target_gid=60000,
+                        )
+                    interpreter_path.chmod(0o555)
+
+                    for path, purpose, kind in (
+                        (localtime_path, "localtime", "file"),
+                        (interpreter_path, "configured-executable", "file"),
+                        (stdlib_root, "configured-stdlib", "directory"),
+                    ):
+                        with self.subTest(path=path):
+                            binding = (
+                                _CANDIDATE_SUPPORT._capture_strict_host_read_root_binding(
+                                    path,
+                                    purpose=purpose,
+                                    kind=kind,
+                                    target_uid=60000,
+                                    target_gid=60000,
+                                )
+                            )
+                            self.assertEqual(binding["path"], str(path))
+            finally:
+                for path in sorted(
+                    fixture_paths, key=lambda value: len(value.parts), reverse=True
+                ):
+                    path.chmod(0o755 if path.is_dir() else 0o644)
+
     def test_strict_host_read_roots_reject_wide_runtime_prefixes(self) -> None:
         for prefix in (Path("/opt"), Path("/usr")):
             with self.subTest(prefix=prefix), mock.patch.object(
@@ -17823,7 +18106,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
     ) -> None:
         job_timeout_seconds = int(EXPECTED_TEST_TIMEOUT_MINUTES) * 60
 
-        self.assertEqual(TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES, 15)
+        self.assertEqual(TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES, 17)
         self.assertEqual(TRUSTED_TEST_STEP_TIMEOUT_MINUTES, 15)
         self.assertEqual(TRUSTED_JOB_RUNNER_MARGIN_MINUTES, 5)
         self.assertEqual(

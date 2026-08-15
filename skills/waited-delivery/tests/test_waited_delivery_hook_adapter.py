@@ -10,7 +10,9 @@ import textwrap
 import unittest
 import zlib
 from collections.abc import Mapping
+from unittest import mock
 
+import required_ci_candidate as candidate_support
 from required_ci_candidate import (
     candidate_fixture_directory,
     candidate_script,
@@ -908,12 +910,62 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertIn("path.stem", source)
         self.assertIn('strftime("%Y%m%dT%H%M%SZ")', source)
 
-    def test_compress_hook_log_falls_back_to_jsonl_when_zstd_missing(self) -> None:
-        _, source = self._adapter_function("_compress_hook_log")
-        self.assertIn('shutil.which("zstd")', source)
-        self.assertIn("if zstd is None", source)
-        self.assertGreaterEqual(source.count('archive = archive.with_suffix("")'), 2)
-        self.assertGreaterEqual(source.count("path.replace(archive)"), 2)
+    def test_hook_diagnostics_rotate_to_jsonl_when_zstd_missing(self) -> None:
+        fake_home = self.root / "home-rotation-no-zstd"
+        no_zstd_path = self.root / "no-zstd-bin"
+        no_zstd_path.mkdir()
+        adapter_dir = self.repo / ".codex-tmp" / "waited-delivery-hook-adapter"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        env: Mapping[str, str | None] = {
+            "HOME": str(fake_home),
+            "PATH": str(no_zstd_path),
+            "WAITED_DELIVERY_HOOK_LOG_MAX_BYTES": "256",
+            "WAITED_DELIVERY_HOOK_LOG_UNCOMPRESSED_SLOTS": "3",
+        }
+        candidate_environment_keys = candidate_support._CANDIDATE_ENV_KEYS | {"PATH"}
+        with mock.patch.object(
+            candidate_support,
+            "_CANDIDATE_ENV_KEYS",
+            candidate_environment_keys,
+        ):
+            for _ in range(4):
+                (adapter_dir / "index.json").write_text(
+                    "{invalid json\n", encoding="utf-8"
+                )
+                completed = self._run_adapter(
+                    "stop-hook",
+                    input_payload={
+                        "session_id": "session-rotation-no-zstd",
+                        "transcript_path": "/tmp/transcript-rotation-no-zstd.jsonl",
+                        "cwd": str(self.repo),
+                        "hook_event_name": "Stop",
+                        "model": "gpt-5.5",
+                        "permission_mode": "acceptEdits",
+                        "stop_hook_active": False,
+                        "last_assistant_message": "rotate without zstd",
+                    },
+                    env_overrides=env,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        log_dir = self._home_log_dir(fake_home)
+        for name in (
+            "waited-delivery-hooks.jsonl",
+            "waited-delivery-hooks.1.jsonl",
+            "waited-delivery-hooks.2.jsonl",
+        ):
+            path = log_dir / name
+            self.assertTrue(path.is_file(), name)
+            self.assertTrue(path.read_text(encoding="utf-8").strip(), name)
+        archives = list(log_dir.glob("waited-delivery-hooks-*.jsonl"))
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(list(log_dir.glob("waited-delivery-hooks-*.jsonl.zst")), [])
+        entries = [
+            json.loads(line)
+            for line in archives[0].read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertTrue(entries)
+        self.assertEqual(entries[-1]["hook_command"], "stop-hook")
 
     def test_hook_diagnostics_rotate_and_compress_with_zstd(self) -> None:
         zstd = next(

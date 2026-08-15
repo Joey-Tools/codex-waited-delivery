@@ -9,7 +9,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 37
     steps:
       - name: Reject unexpected repository
         if: ${{ github.repository != 'Joey-Tools/codex-waited-delivery' }}
@@ -36,6 +36,36 @@ jobs:
         timeout-minutes: 3
         with:
           python-version: "3.x"
+      - name: Harden strict live runtime roots
+        timeout-minutes: 2
+        run: |
+          if [[ ! "$pythonLocation" =~ ^/opt/hostedtoolcache/Python/[0-9]+\.[0-9]+\.[0-9]+/x64$ ]]; then
+            echo "unexpected configured Python location: $pythonLocation" >&2
+            exit 1
+          fi
+          python_version_dir="${pythonLocation%/*}"
+          python_family_dir="${python_version_dir%/*}"
+          for path in \
+            /usr/share/zoneinfo \
+            "$pythonLocation" \
+            /usr/share \
+            /opt \
+            /opt/hostedtoolcache \
+            "$python_family_dir" \
+            "$python_version_dir"
+          do
+            if [[ ! -d "$path" || -L "$path" ]]; then
+              echo "unsafe strict runtime path: $path" >&2
+              exit 1
+            fi
+          done
+          sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"
+          sudo chmod a-w -- \
+            /usr/share \
+            /opt \
+            /opt/hostedtoolcache \
+            "$python_family_dir" \
+            "$python_version_dir"
       - name: Compile candidate Python helpers
         timeout-minutes: 2
         run: |
@@ -49,6 +79,7 @@ jobs:
           python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py" --validate-required-ci-structure
       - name: Run trusted Required CI tests
         timeout-minutes: 15
+        working-directory: ${{ github.workspace }}/.candidate
         env:
           REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate
           REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}

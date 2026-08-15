@@ -37,6 +37,36 @@ jobs:
         timeout-minutes: 3
         with:
           python-version: "3.x"
+      - name: Harden strict live runtime roots
+        timeout-minutes: 2
+        run: |
+          if [[ ! "$pythonLocation" =~ ^/opt/hostedtoolcache/Python/[0-9]+\.[0-9]+\.[0-9]+/x64$ ]]; then
+            echo "unexpected configured Python location: $pythonLocation" >&2
+            exit 1
+          fi
+          python_version_dir="${pythonLocation%/*}"
+          python_family_dir="${python_version_dir%/*}"
+          for path in \
+            /usr/share/zoneinfo \
+            "$pythonLocation" \
+            /usr/share \
+            /opt \
+            /opt/hostedtoolcache \
+            "$python_family_dir" \
+            "$python_version_dir"
+          do
+            if [[ ! -d "$path" || -L "$path" ]]; then
+              echo "unsafe strict runtime path: $path" >&2
+              exit 1
+            fi
+          done
+          sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"
+          sudo chmod a-w -- \
+            /usr/share \
+            /opt \
+            /opt/hostedtoolcache \
+            "$python_family_dir" \
+            "$python_version_dir"
       - name: Run strict target credential live test
         timeout-minutes: 15
         env:
