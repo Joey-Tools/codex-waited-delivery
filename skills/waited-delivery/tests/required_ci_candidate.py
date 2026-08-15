@@ -59,6 +59,7 @@ _CANDIDATE_WORKSPACE_TAR_RECORD_BYTES = 20 * 512
 _STRICT_WRITABLE_ROOT_LIMIT = 64
 _STRICT_HOST_READ_ROOT_LIMIT = 32
 _STRICT_MOUNTINFO_LIMIT_BYTES = 1024 * 1024
+_STRICT_NETWORK_INTERFACE_FD = 63
 _STRICT_PRIVATE_SURFACE_PATHS = (
     Path("/tmp"),
     Path("/var/tmp"),
@@ -2971,12 +2972,47 @@ os.execve(candidate_argv[0], candidate_argv, closed_environment)
 _MOUNT_NAMESPACE_BOOTSTRAP_SOURCE = r'''
 import ctypes
 import errno
+import fcntl
 import json
 import os
 import re
 import resource
 import stat
 import sys
+
+NETWORK_INTERFACE_FD = 63
+
+
+def reject_mount_network_probe(stage, error=None):
+    error_number = getattr(error, "errno", None)
+    suffix = (
+        f":errno={error_number}"
+        if type(error_number) is int and 0 <= error_number <= 4095
+        else ""
+    )
+    print(
+        f"strict mount network descriptor rejected: stage={stage}{suffix}",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(150)
+
+
+if len(sys.argv) < 7:
+    reject_mount_network_probe("arguments")
+try:
+    readiness_fd = int(sys.argv[1])
+except ValueError:
+    reject_mount_network_probe("readiness-number")
+if readiness_fd <= 2 or readiness_fd == NETWORK_INTERFACE_FD:
+    reject_mount_network_probe("readiness-number")
+try:
+    os.fstat(NETWORK_INTERFACE_FD)
+except OSError as error:
+    if error.errno != errno.EBADF:
+        reject_mount_network_probe("reserved-fd-check", error)
+else:
+    reject_mount_network_probe("reserved-fd-occupied")
 
 STRICT_LIMITS = {
     resource.RLIMIT_NPROC: 64,
@@ -2991,6 +3027,17 @@ for limit_name, value in STRICT_LIMITS.items():
     resource.setrlimit(limit_name, (value, value))
     if resource.getrlimit(limit_name) != (value, value):
         raise SystemExit(150)
+
+try:
+    os.dup2(readiness_fd, NETWORK_INTERFACE_FD, inheritable=False)
+except OSError as error:
+    reject_mount_network_probe("reserved-fd-claim", error)
+try:
+    reserved_inheritable = os.get_inheritable(NETWORK_INTERFACE_FD)
+except OSError as error:
+    reject_mount_network_probe("reserved-fd-flags", error)
+if reserved_inheritable:
+    reject_mount_network_probe("reserved-fd-flags")
 
 core_pattern_descriptor = None
 try:
@@ -3153,18 +3200,11 @@ NAMESPACE_READ_PATHS = (
     ("/proc/self/status", "file"),
     ("/proc/self/limits", "file"),
     ("/proc/self/mountinfo", "file"),
-    ("/proc/self/net/dev", "file"),
     ("/proc/sys/kernel/core_pattern", "file"),
     ("/proc/sys/kernel/cap_last_cap", "file"),
     *((path, "file") for path, _ in IPC_SYSCTLS),
 )
 
-if len(sys.argv) < 7:
-    raise SystemExit(150)
-try:
-    readiness_fd = int(sys.argv[1])
-except ValueError:
-    raise SystemExit(150)
 host_mount_namespace = sys.argv[2]
 host_ipc_namespace = sys.argv[3]
 host_network_namespace = sys.argv[4]
@@ -3765,6 +3805,82 @@ def descriptor_mount_id(descriptor):
     if len(values) != 1:
         raise SystemExit(155)
     return values[0]
+
+
+def seal_network_interface_descriptor(inventory, host_network_namespace):
+    try:
+        current_network_namespace = os.readlink("/proc/self/ns/net")
+    except OSError as error:
+        reject_mount_network_probe("namespace-read", error)
+    if (
+        re.fullmatch(r"net:\[[1-9][0-9]*\]", current_network_namespace) is None
+        or current_network_namespace == host_network_namespace
+    ):
+        reject_mount_network_probe("namespace-identity")
+
+    source_descriptor = None
+    try:
+        source_descriptor = os.open(
+            "/proc/self/net/dev",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        if source_descriptor == NETWORK_INTERFACE_FD:
+            reject_mount_network_probe("reserved-fd-reused")
+        metadata = os.fstat(source_descriptor)
+        status_flags = fcntl.fcntl(source_descriptor, fcntl.F_GETFL)
+        try:
+            mount_id = descriptor_mount_id(source_descriptor)
+        except SystemExit:
+            reject_mount_network_probe("proc-mount-id")
+        record = inventory.get(mount_id)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or status_flags & os.O_ACCMODE != os.O_RDONLY
+            or record is None
+            or record["mountpoint"] != "/proc"
+            or record["filesystem"] != "proc"
+            or record["source"] != "proc"
+            or "ro" not in record["options"]
+            or record["major_minor"]
+            != (os.major(metadata.st_dev), os.minor(metadata.st_dev))
+        ):
+            reject_mount_network_probe("proc-object")
+        os.dup2(source_descriptor, NETWORK_INTERFACE_FD, inheritable=True)
+        os.set_inheritable(NETWORK_INTERFACE_FD, True)
+    except OSError as error:
+        reject_mount_network_probe("proc-open", error)
+    finally:
+        if source_descriptor is not None and source_descriptor != NETWORK_INTERFACE_FD:
+            try:
+                os.close(source_descriptor)
+            except OSError as error:
+                reject_mount_network_probe("proc-source-close", error)
+
+    try:
+        sealed_metadata = os.fstat(NETWORK_INTERFACE_FD)
+        sealed_status_flags = fcntl.fcntl(
+            NETWORK_INTERFACE_FD, fcntl.F_GETFL
+        )
+        try:
+            sealed_mount_id = descriptor_mount_id(NETWORK_INTERFACE_FD)
+        except SystemExit:
+            reject_mount_network_probe("sealed-mount-id")
+        sealed_inheritable = os.get_inheritable(NETWORK_INTERFACE_FD)
+    except OSError as error:
+        reject_mount_network_probe("sealed-fd-check", error)
+    if (
+        sealed_mount_id != mount_id
+        or not stat.S_ISREG(sealed_metadata.st_mode)
+        or sealed_status_flags & os.O_ACCMODE != os.O_RDONLY
+        or not sealed_inheritable
+        or (
+            sealed_metadata.st_dev,
+            sealed_metadata.st_ino,
+            sealed_metadata.st_mode,
+        )
+        != (metadata.st_dev, metadata.st_ino, metadata.st_mode)
+    ):
+        reject_mount_network_probe("sealed-fd-identity")
 
 
 def validate_binding(document):
@@ -4534,6 +4650,9 @@ try:
         read_roots, read_descriptors, strict=True
     ):
         revalidate_held_read_root(document, descriptor)
+    seal_network_interface_descriptor(
+        final_inventory, host_network_namespace
+    )
     landlock_ruleset_fd = prepare_candidate_landlock(
         tuple(bound_descriptors), tuple(read_descriptors)
     )
@@ -4584,7 +4703,7 @@ if (
     or not stat.S_ISREG(standard_modes[2])
 ):
     raise SystemExit(162)
-if open_descriptors != {readiness_fd}:
+if open_descriptors != {readiness_fd, NETWORK_INTERFACE_FD}:
     raise SystemExit(162)
 install_candidate_seccomp_filter()
 try:
@@ -4596,10 +4715,30 @@ os.execve(continuation_argv[0], continuation_argv, os.environ.copy())
 '''.strip()
 _CANDIDATE_BOOTSTRAP_SOURCE = r'''
 import errno
+import fcntl
 import json
 import os
 import re
+import stat
 import sys
+
+NETWORK_INTERFACE_FD = 63
+
+
+def reject_network_probe(stage, error=None):
+    error_number = getattr(error, "errno", None)
+    suffix = (
+        f":errno={error_number}"
+        if type(error_number) is int and 0 <= error_number <= 4095
+        else ""
+    )
+    print(
+        f"strict candidate network probe rejected: stage={stage}{suffix}",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(127)
+
 
 uid = int(sys.argv[1])
 gid = int(sys.argv[2])
@@ -4607,41 +4746,81 @@ trusted_root = sys.argv[3]
 trusted_sentinel = sys.argv[4]
 host_parent_pid = int(sys.argv[5])
 host_network_namespace = sys.argv[6]
-runtime_binding_json = sys.argv[7]
-configured_bootstrap_source = sys.argv[8]
-candidate_argv = sys.argv[9:]
+try:
+    network_interface_fd_value = sys.argv[7]
+    network_interface_fd = int(network_interface_fd_value)
+except (IndexError, ValueError):
+    reject_network_probe("fd-number")
+if network_interface_fd_value != str(network_interface_fd):
+    reject_network_probe("fd-number")
+runtime_binding_json = sys.argv[8]
+configured_bootstrap_source = sys.argv[9]
+candidate_argv = sys.argv[10:]
 
 
-def read_network_interfaces(path):
-    descriptor = None
+def candidate_open_descriptors():
+    descriptors = set()
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError as error:
+        reject_network_probe("fd-inventory", error)
+    for name in names:
+        if not name.isdecimal() or int(name) <= 2:
+            continue
+        descriptor = int(name)
+        try:
+            os.fstat(descriptor)
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                continue
+            reject_network_probe("fd-inventory-stat", error)
+        descriptors.add(descriptor)
+    return descriptors
+
+
+def read_network_interfaces(descriptor):
+    if type(descriptor) is not int or descriptor != NETWORK_INTERFACE_FD:
+        reject_network_probe("fd-number")
+    try:
+        metadata = os.fstat(descriptor)
+        status_flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+        inheritable = os.get_inheritable(descriptor)
+    except OSError as error:
+        reject_network_probe("fd-stat", error)
+    if not stat.S_ISREG(metadata.st_mode):
+        reject_network_probe("fd-type")
+    if status_flags & os.O_ACCMODE != os.O_RDONLY or not inheritable:
+        reject_network_probe("fd-access")
+    if candidate_open_descriptors() != {NETWORK_INTERFACE_FD}:
+        reject_network_probe("fd-inventory-before")
     data = bytearray()
     try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-        )
         while True:
             chunk = os.read(descriptor, min(4096, 65537 - len(data)))
             if not chunk:
                 break
             data.extend(chunk)
             if len(data) > 65536:
-                raise SystemExit(127)
-    except OSError:
-        raise SystemExit(127)
+                reject_network_probe("proc-size")
+    except OSError as error:
+        reject_network_probe("fd-read", error)
     finally:
-        if descriptor is not None:
+        try:
             os.close(descriptor)
+        except OSError as error:
+            reject_network_probe("fd-close", error)
+    if candidate_open_descriptors():
+        reject_network_probe("fd-inventory-after")
     try:
         lines = bytes(data).decode("ascii").splitlines()
     except UnicodeDecodeError:
-        raise SystemExit(127)
+        reject_network_probe("proc-decode")
     if (
         len(lines) < 3
         or not lines[0].startswith("Inter-|")
         or not lines[1].lstrip().startswith("face |")
     ):
-        raise SystemExit(127)
+        reject_network_probe("proc-header")
     interfaces = set()
     for line in lines[2:]:
         name_field, separator, counters = line.partition(":")
@@ -4657,7 +4836,7 @@ def read_network_interfaces(path):
             or len(values) != 16
             or any(not value.isdecimal() for value in values)
         ):
-            raise SystemExit(127)
+            reject_network_probe("proc-row")
         interfaces.add(name)
     return interfaces
 
@@ -4697,24 +4876,25 @@ if not os.path.isfile("/proc/1/status"):
     raise SystemExit(126)
 try:
     current_network_namespace = os.readlink("/proc/self/ns/net")
-except OSError:
-    raise SystemExit(127)
-if (
-    re.fullmatch(r"net:\[[1-9][0-9]*\]", host_network_namespace) is None
-    or current_network_namespace == host_network_namespace
-    or re.fullmatch(r"net:\[[1-9][0-9]*\]", current_network_namespace) is None
-):
-    raise SystemExit(127)
+except OSError as error:
+    reject_network_probe("namespace-read", error)
+if re.fullmatch(r"net:\[[1-9][0-9]*\]", host_network_namespace) is None:
+    reject_network_probe("host-namespace-format")
+if current_network_namespace == host_network_namespace:
+    reject_network_probe("namespace-reused")
+if re.fullmatch(r"net:\[[1-9][0-9]*\]", current_network_namespace) is None:
+    reject_network_probe("current-namespace-format")
 # The inherited sysfs mount remains tagged to the host network namespace.
 # procfs generates this inventory from the current namespace instead.  A
 # kernel that auto-creates fallback tunnel devices is unsupported here and
 # fails closed rather than widening the candidate's network surface.
-network_interfaces = read_network_interfaces("/proc/self/net/dev")
+network_interfaces = read_network_interfaces(network_interface_fd)
 if network_interfaces != {"lo"}:
     print(
         "strict candidate network interface inventory rejected: "
         + json.dumps(sorted(network_interfaces), separators=(",", ":")),
         file=sys.stderr,
+        flush=True,
     )
     raise SystemExit(127)
 try:
@@ -5862,6 +6042,7 @@ def _root_controller_candidate_command(
         trusted_sentinel,
         str(host_parent_pid),
         host_network_namespace,
+        str(_STRICT_NETWORK_INTERFACE_FD),
         runtime_binding_json,
         _CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE,
         *candidate_argv,

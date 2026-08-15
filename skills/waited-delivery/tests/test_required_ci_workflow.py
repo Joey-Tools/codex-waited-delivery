@@ -12006,12 +12006,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(command[bootstrap_index + 4], "net:[103]")
         self.assertEqual(command[candidate_index + 5], "1234")
         self.assertEqual(command[candidate_index + 6], "net:[103]")
-        self.assertEqual(command[candidate_index + 7], "null")
+        self.assertEqual(command[candidate_index + 7], "63")
+        self.assertEqual(command[candidate_index + 8], "null")
         self.assertEqual(
-            command[candidate_index + 8],
+            command[candidate_index + 9],
             _CANDIDATE_SUPPORT._CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE,
         )
-        self.assertEqual(command[candidate_index + 9], "/usr/bin/python3")
+        self.assertEqual(command[candidate_index + 10], "/usr/bin/python3")
         self.assertEqual(command.count("net:[103]"), 2)
         self.assertIn(
             'host_network_namespace = _strict_host_namespace_identity("net")',
@@ -12034,12 +12035,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "current_network_namespace == host_network_namespace",
             candidate_source,
         )
-        self.assertIn(
+        self.assertNotIn(
             '("/proc/self/net/dev", "file")', bootstrap_source
         )
         self.assertIn(
-            'read_network_interfaces("/proc/self/net/dev")', candidate_source
+            "read_network_interfaces(network_interface_fd)", candidate_source
         )
+        self.assertNotIn('os.open(\n            path,', candidate_source)
         self.assertNotIn('os.listdir("/sys/class/net")', candidate_source)
         self.assertIn(
             "strict candidate network interface inventory rejected",
@@ -12080,12 +12082,20 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
         )
         network_identity_nodes = candidate_nodes[
-            network_identity_index : network_identity_index + 2
+            network_identity_index : network_identity_index + 4
         ]
-        self.assertEqual(len(network_identity_nodes), 2)
-        self.assertIsInstance(network_identity_nodes[1], ast.If)
+        self.assertEqual(len(network_identity_nodes), 4)
+        self.assertTrue(
+            all(isinstance(node, ast.If) for node in network_identity_nodes[1:])
+        )
+        reject_network_probe = next(
+            node
+            for node in candidate_nodes
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "reject_network_probe"
+        )
         network_identity_module = ast.Module(
-            body=network_identity_nodes,
+            body=[reject_network_probe, *network_identity_nodes],
             type_ignores=[],
         )
         ast.fix_missing_locations(network_identity_module)
@@ -12102,8 +12112,28 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "host_network_namespace": "net:[103]",
                 "os": valid_namespace_os,
                 "re": re,
+                "sys": sys,
             },
         )
+        unreadable_namespace_os = mock.Mock()
+        unreadable_namespace_os.readlink.side_effect = PermissionError(
+            errno.EACCES, "network namespace cannot be read"
+        )
+        diagnostic = io.StringIO()
+        with contextlib.redirect_stderr(diagnostic), self.assertRaises(
+            SystemExit
+        ) as rejected:
+            exec(
+                network_identity_code,
+                {
+                    "host_network_namespace": "net:[103]",
+                    "os": unreadable_namespace_os,
+                    "re": re,
+                    "sys": sys,
+                },
+            )
+        self.assertEqual(rejected.exception.code, 127)
+        self.assertIn("stage=namespace-read:errno=13", diagnostic.getvalue())
         for name, host_identity, current_identity in (
             ("missing", "", "net:[104]"),
             ("reordered argument", "null", "net:[104]"),
@@ -12113,67 +12143,33 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         ):
             rejected_namespace_os = mock.Mock()
             rejected_namespace_os.readlink.return_value = current_identity
+            diagnostic = io.StringIO()
             with self.subTest(name=name):
-                with self.assertRaises(SystemExit) as rejected:
+                with contextlib.redirect_stderr(diagnostic), self.assertRaises(
+                    SystemExit
+                ) as rejected:
                     exec(
                         network_identity_code,
                         {
                             "host_network_namespace": host_identity,
                             "os": rejected_namespace_os,
                             "re": re,
+                            "sys": sys,
                         },
                     )
                 self.assertEqual(rejected.exception.code, 127)
+                self.assertIn("stage=", diagnostic.getvalue())
 
-        parser_function = next(
+        enforcement_assignment = next(
             node
             for node in candidate_nodes
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "read_network_interfaces"
-        )
-        parser_module = ast.Module(body=[parser_function], type_ignores=[])
-        ast.fix_missing_locations(parser_module)
-        parser_namespace = {"os": os}
-        exec(
-            compile(parser_module, "<network-interface-parser>", "exec"),
-            parser_namespace,
-        )
-        header = (
-            "Inter-|   Receive |  Transmit\n"
-            " face |bytes packets errs drop fifo frame compressed multicast|"
-            "bytes packets errs drop fifo colls carrier compressed\n"
-        )
-        lo_row = "    lo: " + " ".join("0" for _ in range(16)) + "\n"
-        eth_row = "  eth0: " + " ".join("1" for _ in range(16)) + "\n"
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            fixture = Path(temporary_directory) / "dev"
-            fixture.write_text(header + lo_row, encoding="ascii")
-            self.assertEqual(
-                parser_namespace["read_network_interfaces"](str(fixture)),
-                {"lo"},
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "network_interfaces"
+                for target in node.targets
             )
-            fixture.write_text(header + lo_row + eth_row, encoding="ascii")
-            self.assertEqual(
-                parser_namespace["read_network_interfaces"](str(fixture)),
-                {"lo", "eth0"},
-            )
-            for malformed in (
-                header + "missing-colon\n",
-                header + lo_row + lo_row,
-                header + "   bad: " + " ".join(["0"] * 15 + ["x"]) + "\n",
-                "X" * 65537,
-            ):
-                fixture.write_text(malformed, encoding="ascii")
-                with self.subTest(malformed=malformed[:32]), self.assertRaises(
-                    SystemExit
-                ) as rejected:
-                    parser_namespace["read_network_interfaces"](str(fixture))
-                self.assertEqual(rejected.exception.code, 127)
-            fixture.write_bytes((header + lo_row).encode("ascii") + b"\xff")
-            with self.assertRaises(SystemExit) as rejected:
-                parser_namespace["read_network_interfaces"](str(fixture))
-            self.assertEqual(rejected.exception.code, 127)
-
+        )
         enforcement_if = next(
             node
             for node in candidate_nodes
@@ -12187,7 +12183,19 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             and isinstance(node.test.comparators[0], ast.Set)
             and ast.literal_eval(node.test.comparators[0]) == {"lo"}
         )
-        enforcement_module = ast.Module(body=[enforcement_if], type_ignores=[])
+        enforcement_assignment_index = candidate_nodes.index(
+            enforcement_assignment
+        )
+        enforcement_if_index = candidate_nodes.index(enforcement_if)
+        self.assertEqual(
+            enforcement_if_index, enforcement_assignment_index + 1
+        )
+        enforcement_module = ast.Module(
+            body=candidate_nodes[
+                enforcement_assignment_index : enforcement_if_index + 1
+            ],
+            type_ignores=[],
+        )
         ast.fix_missing_locations(enforcement_module)
         enforcement_code = compile(
             enforcement_module,
@@ -12196,7 +12204,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         )
         exec(
             enforcement_code,
-            {"json": json, "network_interfaces": {"lo"}, "sys": sys},
+            {
+                "json": json,
+                "network_interface_fd": 63,
+                "read_network_interfaces": lambda descriptor: {"lo"},
+                "sys": sys,
+            },
         )
         for rejected_interfaces in (set(), {"lo", "eth0"}):
             diagnostic = io.StringIO()
@@ -12208,7 +12221,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         enforcement_code,
                         {
                             "json": json,
-                            "network_interfaces": rejected_interfaces,
+                            "network_interface_fd": 63,
+                            "read_network_interfaces": (
+                                lambda descriptor, result=rejected_interfaces: result
+                            ),
                             "sys": sys,
                         },
                     )
@@ -12217,6 +12233,303 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     "strict candidate network interface inventory rejected",
                     diagnostic.getvalue(),
                 )
+
+    def test_strict_network_inventory_uses_a_sealed_preopened_descriptor(
+        self,
+    ) -> None:
+        with self.root_command_mount_contract():
+            command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                self.root_command_config(), 1234, 9
+            )
+
+        bootstrap_source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        candidate_source = _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE
+        candidate_index = command.index(candidate_source)
+
+        self.assertNotIn(
+            '("/proc/self/net/dev", "file")', bootstrap_source
+        )
+        self.assertIn("NETWORK_INTERFACE_FD = 63", bootstrap_source)
+        self.assertIn(
+            'os.open(\n            "/proc/self/net/dev",', bootstrap_source
+        )
+        self.assertIn(
+            "os.dup2(source_descriptor, NETWORK_INTERFACE_FD",
+            bootstrap_source,
+        )
+        self.assertIn(
+            "os.set_inheritable(NETWORK_INTERFACE_FD, True)",
+            bootstrap_source,
+        )
+        self.assertIn(
+            "{readiness_fd, NETWORK_INTERFACE_FD}", bootstrap_source
+        )
+        self.assertEqual(command[candidate_index + 7], "63")
+        self.assertIn("network_interface_fd_value = sys.argv[7]", candidate_source)
+        self.assertIn(
+            "network_interface_fd = int(network_interface_fd_value)",
+            candidate_source,
+        )
+        self.assertIn(
+            "network_interfaces = read_network_interfaces(network_interface_fd)",
+            candidate_source,
+        )
+        self.assertNotIn("/proc/self/net/dev", candidate_source)
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._STRICT_NETWORK_INTERFACE_FD, 63
+        )
+        self.assertEqual(bootstrap_source.count('"/proc/self/net/dev"'), 1)
+        self.assertLess(
+            bootstrap_source.index(
+                "resource.setrlimit(limit_name, (value, value))"
+            ),
+            bootstrap_source.index(
+                "os.dup2(readiness_fd, NETWORK_INTERFACE_FD"
+            ),
+        )
+        self.assertLess(
+            bootstrap_source.index(
+                "os.dup2(readiness_fd, NETWORK_INTERFACE_FD"
+            ),
+            bootstrap_source.index("core_pattern_descriptor = os.open("),
+        )
+        self.assertLess(
+            bootstrap_source.index('"/proc/self/net/dev"'),
+            bootstrap_source.index(
+                "landlock_ruleset_fd = prepare_candidate_landlock("
+            ),
+        )
+        self.assertLess(
+            bootstrap_source.index(
+                "landlock_ruleset_fd = prepare_candidate_landlock("
+            ),
+            bootstrap_source.index(
+                "activate_candidate_landlock(landlock_ruleset_fd)"
+            ),
+        )
+
+        candidate_nodes = ast.parse(candidate_source).body
+        helper_names = {
+            "reject_network_probe",
+            "candidate_open_descriptors",
+            "read_network_interfaces",
+        }
+        helper_nodes = [
+            node
+            for node in candidate_nodes
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        self.assertEqual({node.name for node in helper_nodes}, helper_names)
+        helper_module = ast.Module(body=helper_nodes, type_ignores=[])
+        ast.fix_missing_locations(helper_module)
+        helper_namespace = {
+            "errno": errno,
+            "fcntl": fcntl,
+            "NETWORK_INTERFACE_FD": 63,
+            "os": os,
+            "stat": stat,
+            "sys": sys,
+        }
+        exec(
+            compile(helper_module, "<sealed-network-interface-fd>", "exec"),
+            helper_namespace,
+        )
+        read_interfaces = helper_namespace["read_network_interfaces"]
+        header = (
+            "Inter-|   Receive |  Transmit\n"
+            " face |bytes packets errs drop fifo frame compressed multicast|"
+            "bytes packets errs drop fifo colls carrier compressed\n"
+        )
+        lo_row = "    lo: " + " ".join("0" for _ in range(16)) + "\n"
+        eth_row = "  eth0: " + " ".join("1" for _ in range(16)) + "\n"
+
+        saved_descriptor = None
+        saved_inheritable = None
+        descriptor_was_open = False
+        try:
+            saved_inheritable = os.get_inheritable(63)
+        except OSError as error:
+            if error.errno != errno.EBADF:
+                raise
+        else:
+            saved_descriptor = os.dup(63)
+            descriptor_was_open = True
+
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                fixture = Path(temporary_directory) / "dev"
+
+                def install_fixture(
+                    data: bytes, flags: int = os.O_RDONLY
+                ) -> None:
+                    fixture.write_bytes(data)
+                    source_descriptor = os.open(fixture, flags)
+                    if source_descriptor == 63:
+                        os.set_inheritable(source_descriptor, True)
+                    else:
+                        try:
+                            os.dup2(source_descriptor, 63, inheritable=True)
+                        finally:
+                            os.close(source_descriptor)
+
+                install_fixture((header + lo_row).encode("ascii"))
+                inventory = (["0", "1", "2", "63"], ["0", "1", "2"])
+                with mock.patch.object(
+                    os,
+                    "open",
+                    side_effect=PermissionError(
+                        errno.EACCES, "pathname reopen must not occur"
+                    ),
+                ) as forbidden_open, mock.patch.object(
+                    os, "listdir", side_effect=inventory
+                ):
+                    self.assertEqual(read_interfaces(63), {"lo"})
+                forbidden_open.assert_not_called()
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(63)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
+
+                install_fixture((header + lo_row + eth_row).encode("ascii"))
+                with mock.patch.object(
+                    os,
+                    "listdir",
+                    side_effect=(["0", "1", "2", "63"], ["0", "1", "2"]),
+                ):
+                    self.assertEqual(read_interfaces(63), {"lo", "eth0"})
+
+                for malformed, expected_stage in (
+                    ((header + "missing-colon\n").encode("ascii"), "proc-row"),
+                    ((header + lo_row + lo_row).encode("ascii"), "proc-row"),
+                    (
+                        (
+                            header
+                            + "   bad: "
+                            + " ".join(["0"] * 15 + ["x"])
+                            + "\n"
+                        ).encode("ascii"),
+                        "proc-row",
+                    ),
+                    (b"X" * 65537, "proc-size"),
+                    ((header + lo_row).encode("ascii") + b"\xff", "proc-decode"),
+                ):
+                    install_fixture(malformed)
+                    diagnostic = io.StringIO()
+                    listdir_values = (
+                        [["0", "1", "2", "63"]]
+                        if expected_stage == "proc-size"
+                        else [["0", "1", "2", "63"], ["0", "1", "2"]]
+                    )
+                    with self.subTest(stage=expected_stage), mock.patch.object(
+                        os, "listdir", side_effect=listdir_values
+                    ), contextlib.redirect_stderr(diagnostic), self.assertRaises(
+                        SystemExit
+                    ) as rejected:
+                        read_interfaces(63)
+                    self.assertEqual(rejected.exception.code, 127)
+                    self.assertIn(f"stage={expected_stage}", diagnostic.getvalue())
+
+                try:
+                    os.close(63)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
+                diagnostic = io.StringIO()
+                with contextlib.redirect_stderr(diagnostic), self.assertRaises(
+                    SystemExit
+                ) as rejected:
+                    read_interfaces(63)
+                self.assertEqual(rejected.exception.code, 127)
+                self.assertIn("stage=fd-stat:errno=9", diagnostic.getvalue())
+
+                diagnostic = io.StringIO()
+                with contextlib.redirect_stderr(diagnostic), self.assertRaises(
+                    SystemExit
+                ) as rejected:
+                    read_interfaces(62)
+                self.assertEqual(rejected.exception.code, 127)
+                self.assertIn("stage=fd-number", diagnostic.getvalue())
+
+                install_fixture((header + lo_row).encode("ascii"), os.O_RDWR)
+                diagnostic = io.StringIO()
+                with contextlib.redirect_stderr(diagnostic), self.assertRaises(
+                    SystemExit
+                ) as rejected:
+                    read_interfaces(63)
+                self.assertEqual(rejected.exception.code, 127)
+                self.assertIn("stage=fd-access", diagnostic.getvalue())
+
+                read_descriptor, write_descriptor = os.pipe()
+                try:
+                    if read_descriptor == 63:
+                        os.set_inheritable(read_descriptor, True)
+                    else:
+                        os.dup2(read_descriptor, 63, inheritable=True)
+                finally:
+                    if read_descriptor != 63:
+                        os.close(read_descriptor)
+                    os.close(write_descriptor)
+                diagnostic = io.StringIO()
+                with contextlib.redirect_stderr(diagnostic), self.assertRaises(
+                    SystemExit
+                ) as rejected:
+                    read_interfaces(63)
+                self.assertEqual(rejected.exception.code, 127)
+                self.assertIn("stage=fd-type", diagnostic.getvalue())
+
+                install_fixture((header + lo_row).encode("ascii"))
+                duplicate_descriptor = os.dup(63)
+                try:
+                    diagnostic = io.StringIO()
+                    with mock.patch.object(
+                        os,
+                        "listdir",
+                        return_value=["0", "1", "2", "63", str(duplicate_descriptor)],
+                    ), contextlib.redirect_stderr(
+                        diagnostic
+                    ), self.assertRaises(SystemExit) as rejected:
+                        read_interfaces(63)
+                    self.assertEqual(rejected.exception.code, 127)
+                    self.assertIn(
+                        "stage=fd-inventory-before", diagnostic.getvalue()
+                    )
+                finally:
+                    os.close(duplicate_descriptor)
+
+                install_fixture((header + lo_row).encode("ascii"))
+                diagnostic = io.StringIO()
+                with mock.patch.object(
+                    os,
+                    "listdir",
+                    side_effect=(
+                        ["0", "1", "2", "63"],
+                        ["0", "1", "2", "63"],
+                    ),
+                ), mock.patch.object(
+                    os, "close", return_value=None
+                ) as suppressed_close, contextlib.redirect_stderr(
+                    diagnostic
+                ), self.assertRaises(SystemExit) as rejected:
+                    read_interfaces(63)
+                self.assertEqual(rejected.exception.code, 127)
+                self.assertIn("stage=fd-inventory-after", diagnostic.getvalue())
+                suppressed_close.assert_called_once_with(63)
+                os.fstat(63)
+        finally:
+            try:
+                os.close(63)
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    raise
+            if descriptor_was_open:
+                self.assertIsNotNone(saved_descriptor)
+                try:
+                    os.dup2(
+                        int(saved_descriptor),
+                        63,
+                        inheritable=bool(saved_inheritable),
+                    )
+                finally:
+                    os.close(saved_descriptor)
 
     def test_strict_root_command_seals_host_mounts_before_setpriv(self) -> None:
         with self.root_command_mount_contract():
@@ -12487,7 +12800,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertIn(str(syscall_number), bootstrap_source)
         self.assertNotIn('os.listdir("/sys/class/net")', candidate_source)
         self.assertIn(
-            'read_network_interfaces("/proc/self/net/dev")', candidate_source
+            "read_network_interfaces(network_interface_fd)", candidate_source
         )
         self.assertNotIn("socket.if_nameindex", candidate_source)
         self.assertIn('status.get("Seccomp") != "2"', candidate_source)
