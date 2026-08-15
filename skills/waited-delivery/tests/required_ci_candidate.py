@@ -10,7 +10,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import pwd
 import re
 import resource
@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -48,6 +49,11 @@ CANDIDATE_GIT_OUTPUT_LIMIT_BYTES = 1024 * 1024
 CANDIDATE_GIT_REAP_TIMEOUT_SECONDS = 5
 _CANDIDATE_GIT_PIPE_READ_BYTES = 64 * 1024
 CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES = 4 * 1024 * 1024
+CANDIDATE_WORKSPACE_FILE_LIMIT = 256
+CANDIDATE_WORKSPACE_DIRECTORY_LIMIT = 256
+CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES = 3 * 1024 * 1024
+CANDIDATE_WORKSPACE_ARCHIVE_LIMIT_BYTES = 4 * 1024 * 1024
+_CANDIDATE_WORKSPACE_TAR_RECORD_BYTES = 20 * 512
 _STRICT_PROCESS_LIMIT = 64
 _STRICT_CPU_LIMIT_SECONDS = 20
 _STRICT_ADDRESS_SPACE_LIMIT_BYTES = 1024 * 1024 * 1024
@@ -335,8 +341,19 @@ def _candidate_git_process_group_has_live_members(process_group: int) -> bool:
         return False
     try:
         os.killpg(process_group, 0)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError as error:
+        if sys.platform == "darwin":
+            # The fixed trusted-Git argv/environment cannot transition a
+            # descendant into a different signal-permission domain. With the
+            # unreaped leader pinning this process-group generation, Darwin's
+            # EPERM (no signal-authorized non-zombie member) therefore proves
+            # that this trusted process group has no live member.
+            return False
+        raise AssertionError(
+            "candidate Git process inventory is unreadable"
+        ) from error
     return True
 
 
@@ -348,12 +365,12 @@ def _terminate_candidate_git_process_tree(
         os.killpg(process_group, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    except PermissionError:
-        # Darwin reports EPERM for a process group whose only remaining member
-        # is the already-exited session leader. The still-unreaped leader below
-        # pins the numeric process-group generation while live members are
-        # inventoried, so this is not permission to signal a replacement group.
-        pass
+    except PermissionError as error:
+        if sys.platform != "darwin":
+            cleanup_failures.append(f"signal: {error}")
+        # Darwin EPERM is not itself terminal. The still-unreaped leader below
+        # pins the PGID generation, and the fresh inventory applies the fixed
+        # trusted-Git all-live-descendants-signalable invariant before success.
     except OSError as error:
         cleanup_failures.append(f"signal: {error}")
     deadline = time.monotonic() + CANDIDATE_GIT_REAP_TIMEOUT_SECONDS
@@ -367,6 +384,27 @@ def _terminate_candidate_git_process_tree(
                 break
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
+            break
+        except PermissionError as error:
+            if sys.platform != "darwin":
+                cleanup_failures.append(f"live-member cleanup: {error}")
+                break
+            # A Darwin group can transition from a live child to only the
+            # unreaped leader between inventory and signal. Accept EPERM only
+            # after a fresh signal-authority inventory under the fixed trusted-
+            # Git invariant; the leader still pins this exact PGID generation.
+            try:
+                live_members_remain = (
+                    _candidate_git_process_group_has_live_members(process_group)
+                )
+            except BaseException as verification_error:
+                cleanup_failures.append(
+                    "live-member revalidation: " f"{verification_error}"
+                )
+                break
+            if not live_members_remain:
+                break
+            cleanup_failures.append(f"live-member cleanup: {error}")
             break
         except OSError as error:
             cleanup_failures.append(f"live-member cleanup: {error}")
@@ -907,12 +945,391 @@ def _candidate_script_manifest(
     return manifest, execution_sources
 
 
+def _candidate_workspace_blob_oid(data: bytes, object_format: str) -> str:
+    if object_format != "sha1":
+        raise AssertionError(
+            "candidate Git object format is outside the SHA-1 authority contract"
+        )
+    header = f"blob {len(data)}\0".encode("ascii")
+    return hashlib.new(object_format, header + data).hexdigest()
+
+
+def _candidate_workspace_path(raw_path: bytes) -> Path:
+    try:
+        text = raw_path.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise AssertionError("candidate workspace path is not UTF-8") from error
+    pure_path = PurePosixPath(text)
+    folded_parts = tuple(
+        unicodedata.normalize("NFC", part).casefold()
+        for part in pure_path.parts
+    )
+    if (
+        not text
+        or not pure_path.parts
+        or pure_path.is_absolute()
+        or pure_path.as_posix() != text
+        or any(part in ("", ".", "..") for part in pure_path.parts)
+        # The candidate workspace reproduces tracked content only. It never
+        # exposes Git administrative metadata, including filesystem aliases.
+        or ".git" in folded_parts
+    ):
+        raise AssertionError("candidate workspace path is unsafe")
+    return Path(*pure_path.parts)
+
+
+def _admit_candidate_workspace_directories(
+    trie: dict[str, object],
+    relative_path: Path,
+    directory_count: int,
+) -> int:
+    node = trie
+    for component in relative_path.parts[:-1]:
+        child = node.get(component)
+        if child is None:
+            if directory_count >= CANDIDATE_WORKSPACE_DIRECTORY_LIMIT:
+                raise AssertionError(
+                    "candidate workspace directory inventory exceeds its limit"
+                )
+            child = {}
+            node[component] = child
+            directory_count += 1
+        if not isinstance(child, dict):
+            raise AssertionError(
+                "candidate workspace directory inventory is malformed"
+            )
+        node = child
+    return directory_count
+
+
+def _candidate_workspace_directory_trie(
+    paths: Mapping[Path, object],
+) -> tuple[dict[str, object], int]:
+    trie: dict[str, object] = {}
+    directory_count = 0
+    for relative_path in paths:
+        if not isinstance(relative_path, Path):
+            raise AssertionError(
+                "candidate workspace directory inventory is malformed"
+            )
+        directory_count = _admit_candidate_workspace_directories(
+            trie, relative_path, directory_count
+        )
+    return trie, directory_count
+
+
+def _candidate_workspace_directory_is_expected(
+    trie: Mapping[str, object], relative_path: Path
+) -> bool:
+    if not relative_path.parts:
+        return False
+    node = trie
+    for component in relative_path.parts:
+        child = node.get(component)
+        if not isinstance(child, dict):
+            return False
+        node = child
+    return True
+
+
+def _candidate_workspace_tree_inventory(
+    tree_output: bytes, object_format: str
+) -> dict[Path, tuple[str, int, bool]]:
+    oid_size = {"sha1": 40}.get(object_format)
+    if oid_size is None:
+        raise AssertionError("candidate Git object format is unsupported")
+    if tree_output and not tree_output.endswith(b"\0"):
+        raise AssertionError("candidate workspace tree inventory is truncated")
+    records = tree_output.split(b"\0")[:-1] if tree_output else []
+    if not records or len(records) > CANDIDATE_WORKSPACE_FILE_LIMIT:
+        raise AssertionError("candidate workspace file inventory exceeds its limit")
+    inventory: dict[Path, tuple[str, int, bool]] = {}
+    directory_trie: dict[str, object] = {}
+    directory_count = 0
+    total_size = 0
+    for record in records:
+        try:
+            header, raw_path = record.split(b"\t", 1)
+            mode, object_type, raw_oid, raw_size = header.split()
+            oid = raw_oid.decode("ascii")
+            size_text = raw_size.decode("ascii")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise AssertionError(
+                "candidate workspace tree inventory is malformed"
+            ) from error
+        if (
+            mode not in (b"100644", b"100755")
+            or object_type != b"blob"
+            or re.fullmatch(rf"[0-9a-f]{{{oid_size}}}", oid) is None
+            or not size_text.isascii()
+            or not size_text.isdecimal()
+        ):
+            raise AssertionError("candidate workspace tree entry is unsupported")
+        size = int(size_text)
+        if str(size) != size_text or size > CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES:
+            raise AssertionError("candidate workspace file exceeds its size limit")
+        relative_path = _candidate_workspace_path(raw_path)
+        if relative_path in inventory:
+            raise AssertionError("candidate workspace tree path is duplicated")
+        directory_count = _admit_candidate_workspace_directories(
+            directory_trie, relative_path, directory_count
+        )
+        total_size += size
+        if total_size > CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES:
+            raise AssertionError("candidate workspace content exceeds its total limit")
+        inventory[relative_path] = (oid, size, mode == b"100755")
+    return inventory
+
+
+def _candidate_workspace_archive_sources(
+    archive_output: bytes,
+    *,
+    candidate_sha: str,
+    object_format: str,
+    tree_inventory: Mapping[Path, tuple[str, int, bool]],
+) -> dict[Path, tuple[bytes, bool]]:
+    directory_trie, expected_directory_count = (
+        _candidate_workspace_directory_trie(tree_inventory)
+    )
+    sources: dict[Path, tuple[bytes, bool]] = {}
+    observed_directories: set[Path] = set()
+    observed_names: set[Path] = set()
+    def field_bytes(field: bytes) -> bytes:
+        if b"\0" not in field:
+            return field
+        value, padding = field.split(b"\0", 1)
+        if any(padding):
+            raise AssertionError("candidate workspace archive header is malformed")
+        return value
+
+    def octal_field(field: bytes) -> int:
+        value = field.rstrip(b"\0 ")
+        if not value or re.fullmatch(rb"[0-7]+", value) is None:
+            raise AssertionError("candidate workspace archive header is malformed")
+        return int(value, 8)
+
+    def pax_comment() -> bytes:
+        body = f" comment={candidate_sha}\n".encode("ascii")
+        size = len(body) + 1
+        while True:
+            record = str(size).encode("ascii") + body
+            if len(record) == size:
+                return record
+            size = len(record)
+
+    if not archive_output or len(archive_output) % 512 != 0:
+        raise AssertionError("candidate workspace archive framing is malformed")
+    offset = 0
+    saw_global_header = False
+    saw_end = False
+    while offset < len(archive_output):
+        header = archive_output[offset : offset + 512]
+        if len(header) != 512:
+            raise AssertionError("candidate workspace archive is truncated")
+        if not any(header):
+            expected_archive_size = (
+                (
+                    offset
+                    + 1024
+                    + _CANDIDATE_WORKSPACE_TAR_RECORD_BYTES
+                    - 1
+                )
+                // _CANDIDATE_WORKSPACE_TAR_RECORD_BYTES
+                * _CANDIDATE_WORKSPACE_TAR_RECORD_BYTES
+            )
+            if (
+                len(archive_output) != expected_archive_size
+                or any(archive_output[offset:])
+            ):
+                raise AssertionError(
+                    "candidate workspace archive framing is malformed"
+                )
+            saw_end = True
+            break
+        if (
+            header[257:263] != b"ustar\0"
+            or header[263:265] != b"00"
+            or field_bytes(header[157:257])
+            or field_bytes(header[265:297]) != b"root"
+            or field_bytes(header[297:329]) != b"root"
+            or octal_field(header[108:116]) != 0
+            or octal_field(header[116:124]) != 0
+            or octal_field(header[329:337]) != 0
+            or octal_field(header[337:345]) != 0
+            or any(header[500:512])
+        ):
+            raise AssertionError("candidate workspace archive header is unsupported")
+        expected_checksum = octal_field(header[148:156])
+        actual_checksum = sum(header[:148]) + 8 * 0x20 + sum(header[156:])
+        if actual_checksum != expected_checksum:
+            raise AssertionError("candidate workspace archive checksum changed")
+        mode = octal_field(header[100:108])
+        size = octal_field(header[124:136])
+        octal_field(header[136:148])
+        type_flag = header[156:157]
+        name = field_bytes(header[:100])
+        prefix = field_bytes(header[345:500])
+        raw_name = (prefix + b"/" if prefix else b"") + name
+        data_offset = offset + 512
+        data_end = data_offset + size
+        padded_end = data_offset + ((size + 511) // 512) * 512
+        if data_end > len(archive_output) or padded_end > len(archive_output):
+            raise AssertionError("candidate workspace archive is truncated")
+        if any(archive_output[data_end:padded_end]):
+            raise AssertionError("candidate workspace archive padding is malformed")
+        data = archive_output[data_offset:data_end]
+        if type_flag == b"g":
+            if (
+                saw_global_header
+                or offset != 0
+                or raw_name != b"pax_global_header"
+                or mode != 0o666
+                or data != pax_comment()
+            ):
+                raise AssertionError(
+                    "candidate workspace archive provenance is malformed"
+                )
+            saw_global_header = True
+            offset = padded_end
+            continue
+        if not saw_global_header or type_flag not in (b"0", b"5"):
+            raise AssertionError(
+                "candidate workspace archive member type is unsupported"
+            )
+        if type_flag == b"5":
+            if not raw_name.endswith(b"/"):
+                raise AssertionError(
+                    "candidate workspace archive directory is malformed"
+                )
+            raw_name = raw_name[:-1]
+        elif raw_name.endswith(b"/"):
+            raise AssertionError("candidate workspace archive file is malformed")
+        relative_path = _candidate_workspace_path(raw_name)
+        if relative_path in observed_names:
+            raise AssertionError(
+                "candidate workspace archive member is duplicated or extended"
+            )
+        observed_names.add(relative_path)
+        if type_flag == b"5":
+            if (
+                size != 0
+                or mode != 0o755
+                or not _candidate_workspace_directory_is_expected(
+                    directory_trie, relative_path
+                )
+            ):
+                raise AssertionError(
+                    "candidate workspace archive directory is unexpected"
+                )
+            observed_directories.add(relative_path)
+        else:
+            expected = tree_inventory.get(relative_path)
+            if expected is None:
+                raise AssertionError(
+                    "candidate workspace archive file is not in the Git tree"
+                )
+            oid, expected_size, executable = expected
+            if size != expected_size or mode != (0o755 if executable else 0o644):
+                raise AssertionError(
+                    "candidate workspace archive file policy changed"
+                )
+            if _candidate_workspace_blob_oid(data, object_format) != oid:
+                raise AssertionError(
+                    "candidate workspace archive blob identity changed"
+                )
+            sources[relative_path] = (data, executable)
+        offset = padded_end
+    if not saw_global_header or not saw_end:
+        raise AssertionError("candidate workspace archive framing is malformed")
+    if set(sources) != set(tree_inventory):
+        raise AssertionError("candidate workspace archive file inventory is incomplete")
+    if len(observed_directories) != expected_directory_count:
+        raise AssertionError(
+            "candidate workspace archive directory inventory is incomplete"
+        )
+    return sources
+
+
+def _candidate_workspace_sources(
+    checkout_root: Path,
+    candidate_sha: str,
+    candidate_sources: Mapping[Path, bytes],
+) -> dict[Path, tuple[bytes, bool]]:
+    if set(candidate_sources) != set(CANDIDATE_SCRIPT_RELATIVE_PATHS) or not all(
+        isinstance(source, bytes) for source in candidate_sources.values()
+    ):
+        raise AssertionError(
+            "candidate workspace helper override inventory is not exact"
+        )
+    object_format_output = _run_candidate_git(
+        checkout_root,
+        "rev-parse",
+        "--show-object-format",
+        output_limit=32,
+    )
+    try:
+        object_format = object_format_output.decode("ascii").removesuffix("\n")
+    except UnicodeDecodeError as error:
+        raise AssertionError("candidate Git object format is malformed") from error
+    if object_format != "sha1" or len(candidate_sha) != 40:
+        raise AssertionError(
+            "candidate Git object format is outside the SHA-1 authority contract"
+        )
+    tree_output = _run_candidate_git(
+        checkout_root,
+        "ls-tree",
+        "-r",
+        "-z",
+        "-l",
+        "--full-tree",
+        candidate_sha,
+        output_limit=CANDIDATE_GIT_OUTPUT_LIMIT_BYTES,
+    )
+    tree_inventory = _candidate_workspace_tree_inventory(tree_output, object_format)
+    archive_output = _run_candidate_git(
+        checkout_root,
+        "-c",
+        "tar.umask=0022",
+        "archive",
+        "--format=tar",
+        candidate_sha,
+        output_limit=CANDIDATE_WORKSPACE_ARCHIVE_LIMIT_BYTES,
+    )
+    workspace_sources = _candidate_workspace_archive_sources(
+        archive_output,
+        candidate_sha=candidate_sha,
+        object_format=object_format,
+        tree_inventory=tree_inventory,
+    )
+    for content_relative_path, source in candidate_sources.items():
+        checkout_relative_path = _candidate_checkout_relative_path(
+            content_relative_path
+        )
+        existing = workspace_sources.get(checkout_relative_path)
+        if existing is None or not isinstance(source, bytes):
+            raise AssertionError(
+                "candidate workspace helper override is not in the Git tree"
+            )
+        workspace_sources[checkout_relative_path] = (source, existing[1])
+    if (
+        sum(len(source) for source, _ in workspace_sources.values())
+        > CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES
+    ):
+        raise AssertionError("candidate workspace content exceeds its total limit")
+    return _validated_candidate_workspace_sources(workspace_sources)
+
+
 def _candidate_checkout_binding_with_sources(
     root: Path,
     candidate_sha: str,
     *,
     require_clean: bool,
-) -> tuple[dict[str, object], dict[Path, bytes]]:
+    capture_workspace: bool = False,
+) -> tuple[
+    dict[str, object],
+    dict[Path, bytes],
+    dict[Path, tuple[bytes, bool]] | None,
+]:
     canonical_root = candidate_repository_root()
     if root.resolve(strict=True) != canonical_root:
         raise AssertionError("candidate checkout binding root is not canonical")
@@ -942,6 +1359,15 @@ def _candidate_checkout_binding_with_sources(
     script_manifest, captured_sources = _candidate_script_manifest(
         canonical_root, candidate_sha, require_clean=require_clean
     )
+    workspace_sources = (
+        _candidate_workspace_sources(
+            canonical_root,
+            candidate_sha,
+            captured_sources,
+        )
+        if capture_workspace
+        else None
+    )
     head_after = _run_candidate_git(
         canonical_root, "rev-parse", "--verify", "HEAD^{commit}"
     )
@@ -967,6 +1393,7 @@ def _candidate_checkout_binding_with_sources(
             "candidate_script_sha256": script_manifest,
         },
         captured_sources,
+        workspace_sources,
     )
 
 
@@ -976,7 +1403,7 @@ def candidate_checkout_binding(
     *,
     require_clean: bool,
 ) -> dict[str, object]:
-    binding, _ = _candidate_checkout_binding_with_sources(
+    binding, _, _ = _candidate_checkout_binding_with_sources(
         root,
         candidate_sha,
         require_clean=require_clean,
@@ -2785,6 +3212,7 @@ def _root_cleanup_main(
 
 _ROOT_TREE_MODE_PROFILES = {
     "candidate-code": (0o550, 0o440, 0o550, False),
+    "candidate-workspace": (0o770, 0o660, 0o770, False),
     "candidate-home": (0o700, 0o600, 0o700, False),
     "fixture-restore": (0o2770, 0o660, 0o770, True),
     "fixture-shared": (0o2770, 0o660, 0o770, False),
@@ -7484,6 +7912,257 @@ def _write_single_link_file(path: Path, source: bytes, mode: int) -> None:
         raise AssertionError("execution snapshot file identity is unsafe")
 
 
+def _validated_candidate_workspace_sources(
+    sources: Mapping[Path, tuple[bytes, bool]],
+) -> dict[Path, tuple[bytes, bool]]:
+    if not sources or len(sources) > CANDIDATE_WORKSPACE_FILE_LIMIT:
+        raise AssertionError("candidate workspace file inventory exceeds its limit")
+    validated: dict[Path, tuple[bytes, bool]] = {}
+    alias_bindings: dict[tuple[str, ...], tuple[str, Path]] = {}
+    total_size = 0
+    for relative_path, value in sources.items():
+        if (
+            not isinstance(relative_path, Path)
+            or not isinstance(value, tuple)
+            or len(value) != 2
+            or not isinstance(value[0], bytes)
+            or type(value[1]) is not bool
+        ):
+            raise AssertionError("candidate workspace source is malformed")
+        canonical_path = _candidate_workspace_path(
+            relative_path.as_posix().encode("utf-8")
+        )
+        if canonical_path != relative_path or canonical_path in validated:
+            raise AssertionError("candidate workspace source path is duplicated")
+        for parent in reversed(canonical_path.parents[:-1]):
+            alias = tuple(
+                unicodedata.normalize("NFC", part).casefold()
+                for part in parent.parts
+            )
+            existing = alias_bindings.setdefault(alias, ("directory", parent))
+            if existing != ("directory", parent):
+                raise AssertionError("candidate workspace path has a filesystem alias")
+        file_alias = tuple(
+            unicodedata.normalize("NFC", part).casefold()
+            for part in canonical_path.parts
+        )
+        existing = alias_bindings.setdefault(file_alias, ("file", canonical_path))
+        if existing != ("file", canonical_path):
+            raise AssertionError("candidate workspace path has a filesystem alias")
+        source, executable = value
+        if len(source) > CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES:
+            raise AssertionError("candidate workspace file exceeds its size limit")
+        total_size += len(source)
+        if total_size > CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES:
+            raise AssertionError("candidate workspace content exceeds its total limit")
+        validated[canonical_path] = (source, executable)
+    return validated
+
+
+def _materialize_candidate_workspace(
+    execution_root: Path,
+    sources: Mapping[Path, tuple[bytes, bool]],
+) -> Path:
+    validated = _validated_candidate_workspace_sources(sources)
+    directories = {
+        parent
+        for relative_path in validated
+        for parent in relative_path.parents
+        if parent != Path(".")
+    }
+    if len(directories) > CANDIDATE_WORKSPACE_DIRECTORY_LIMIT:
+        raise AssertionError(
+            "candidate workspace directory inventory exceeds its limit"
+        )
+    child_directories: dict[Path, set[str]] = {
+        directory: set() for directory in (*directories, Path("."))
+    }
+    child_files: dict[Path, dict[str, tuple[bytes, bool]]] = {
+        directory: {} for directory in (*directories, Path("."))
+    }
+    for directory in directories:
+        child_directories[directory.parent].add(directory.name)
+    for relative_path, source in validated.items():
+        child_files[relative_path.parent][relative_path.name] = source
+
+    def populate(directory_fd: int, relative_directory: Path) -> None:
+        expected_names = child_directories[relative_directory] | set(
+            child_files[relative_directory]
+        )
+        for name in sorted(child_directories[relative_directory]):
+            try:
+                os.mkdir(name, mode=0o755, dir_fd=directory_fd)
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise AssertionError(
+                    "candidate workspace directory cannot be created uniquely"
+                ) from error
+            try:
+                opened = os.fstat(child_fd)
+                if not stat.S_ISDIR(opened.st_mode):
+                    raise AssertionError(
+                        "candidate workspace directory identity is unsafe"
+                    )
+                os.fchmod(child_fd, 0o755)
+                populate(child_fd, relative_directory / name)
+                final_opened = os.fstat(child_fd)
+                linked = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(final_opened.st_mode)
+                    or not stat.S_ISDIR(linked.st_mode)
+                    or (final_opened.st_dev, final_opened.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                    or (linked.st_dev, linked.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                    or stat.S_IMODE(final_opened.st_mode) != 0o755
+                ):
+                    raise AssertionError(
+                        "candidate workspace directory identity changed"
+                    )
+            finally:
+                os.close(child_fd)
+        file_identities: dict[str, tuple[int, int, int, int]] = {}
+        for name, (source, executable) in sorted(
+            child_files[relative_directory].items()
+        ):
+            mode = 0o755 if executable else 0o644
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK
+                    | os.O_NOCTTY
+                    | os.O_CLOEXEC,
+                    mode,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise AssertionError(
+                    "candidate workspace file cannot be created uniquely"
+                ) from error
+            try:
+                offset = 0
+                while offset < len(source):
+                    written = os.write(descriptor, source[offset:])
+                    if written <= 0:
+                        raise AssertionError(
+                            "candidate workspace file cannot be written completely"
+                        )
+                    offset += written
+                os.fchmod(descriptor, mode)
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != 1
+                    or opened.st_size != len(source)
+                    or stat.S_IMODE(opened.st_mode) != mode
+                ):
+                    raise AssertionError(
+                        "candidate workspace file identity is unsafe"
+                    )
+                file_identities[name] = (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_size,
+                    mode,
+                )
+            finally:
+                os.close(descriptor)
+        try:
+            final_names = set(os.listdir(directory_fd))
+        except OSError as error:
+            raise AssertionError(
+                "candidate workspace directory cannot be enumerated"
+            ) from error
+        if final_names != expected_names:
+            raise AssertionError(
+                "candidate workspace filesystem name binding changed"
+            )
+        for name, identity in file_identities.items():
+            try:
+                linked = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except OSError as error:
+                raise AssertionError(
+                    "candidate workspace file cannot be revalidated"
+                ) from error
+            if (
+                not stat.S_ISREG(linked.st_mode)
+                or linked.st_nlink != 1
+                or (linked.st_dev, linked.st_ino, linked.st_size)
+                != identity[:3]
+                or stat.S_IMODE(linked.st_mode) != identity[3]
+            ):
+                raise AssertionError(
+                    "candidate workspace file identity changed"
+                )
+
+    try:
+        execution_fd = os.open(
+            execution_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as error:
+        raise AssertionError("candidate execution root cannot be bound") from error
+    workspace_fd: int | None = None
+    try:
+        try:
+            os.mkdir(".candidate", mode=0o700, dir_fd=execution_fd)
+            workspace_fd = os.open(
+                ".candidate",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=execution_fd,
+            )
+        except OSError as error:
+            raise AssertionError(
+                "candidate workspace root cannot be created uniquely"
+            ) from error
+        opened_root = os.fstat(workspace_fd)
+        if not stat.S_ISDIR(opened_root.st_mode):
+            raise AssertionError("candidate workspace root identity is unsafe")
+        populate(workspace_fd, Path("."))
+        os.fchmod(workspace_fd, 0o770)
+        try:
+            os.stat(".git", dir_fd=workspace_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise AssertionError(
+                "candidate workspace Git metadata lookup is unreadable"
+            ) from error
+        else:
+            raise AssertionError("candidate workspace exposes a Git metadata alias")
+        final_opened_root = os.fstat(workspace_fd)
+        linked_root = os.stat(
+            ".candidate", dir_fd=execution_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISDIR(final_opened_root.st_mode)
+            or not stat.S_ISDIR(linked_root.st_mode)
+            or (final_opened_root.st_dev, final_opened_root.st_ino)
+            != (opened_root.st_dev, opened_root.st_ino)
+            or (linked_root.st_dev, linked_root.st_ino)
+            != (opened_root.st_dev, opened_root.st_ino)
+            or stat.S_IMODE(final_opened_root.st_mode) != 0o770
+        ):
+            raise AssertionError("candidate workspace root identity changed")
+    finally:
+        if workspace_fd is not None:
+            os.close(workspace_fd)
+        os.close(execution_fd)
+    return execution_root / ".candidate"
+
+
 def _prepare_isolation_resource_ancestors(
     session: Mapping[str, object],
 ) -> None:
@@ -7594,12 +8273,69 @@ def _execution_snapshot(
     require_clean: bool = True,
     expected_script_manifest: Mapping[str, str] | None = None,
     candidate_sources: Mapping[Path, bytes] | None = None,
+    candidate_workspace_sources: Mapping[Path, tuple[bytes, bool]] | None = None,
+    materialize_workspace: bool = True,
     probe_source: bytes | None = None,
 ) -> Iterator[dict[str, object]]:
-    if candidate_sources is not None and probe_source is not None:
+    if (
+        probe_source is not None
+        and (candidate_sources is not None or candidate_workspace_sources is not None)
+    ):
         raise AssertionError(
             "candidate sources and a capability probe are mutually exclusive"
         )
+    workspace_required = probe_source is None and materialize_workspace
+    if not workspace_required and candidate_workspace_sources is not None:
+        raise AssertionError(
+            "candidate workspace sources were supplied without a workspace"
+        )
+    resolved_sources: dict[Path, bytes] | None = None
+    resolved_workspace_sources: dict[Path, tuple[bytes, bool]] | None = None
+    if probe_source is None:
+        if candidate_sources is None:
+            resolved_sources = _candidate_snapshot_script_bytes(
+                checkout_root,
+                candidate_sha,
+                require_clean=require_clean,
+            )
+        else:
+            resolved_sources = dict(candidate_sources)
+            if set(resolved_sources) != set(CANDIDATE_SCRIPT_RELATIVE_PATHS):
+                raise AssertionError("candidate captured source inventory is not exact")
+            if not all(
+                isinstance(source, bytes) for source in resolved_sources.values()
+            ):
+                raise AssertionError("candidate captured source bytes are malformed")
+        snapshot_manifest = {
+            _candidate_checkout_relative_path(relative_path).as_posix(): hashlib.sha256(
+                source
+            ).hexdigest()
+            for relative_path, source in resolved_sources.items()
+        }
+        if (
+            expected_script_manifest is not None
+            and snapshot_manifest != dict(expected_script_manifest)
+        ):
+            raise AssertionError(
+                "candidate implementation changed before snapshot capture"
+            )
+        if workspace_required:
+            if candidate_workspace_sources is None:
+                resolved_workspace_sources = (
+                    _validated_candidate_workspace_sources(
+                        _candidate_workspace_sources(
+                            checkout_root,
+                            candidate_sha,
+                            resolved_sources,
+                        )
+                    )
+                )
+            else:
+                resolved_workspace_sources = (
+                    _validated_candidate_workspace_sources(
+                        candidate_workspace_sources
+                    )
+                )
     strict = _strict_isolation_requested()
     temporary: tempfile.TemporaryDirectory[str] | None = None
     resource_entry_path: Path | None = None
@@ -7695,6 +8431,7 @@ def _execution_snapshot(
             execution_root = Path(temporary.name).resolve(strict=True)
         try:
             candidate_snapshot_root = execution_root / "candidate-code"
+            candidate_workspace_root: Path | None = None
             control_snapshot_root = execution_root / "trusted-control"
             runtime_root = execution_root / "runtime"
             candidate_content_root = (
@@ -7715,35 +8452,11 @@ def _execution_snapshot(
             _write_single_link_file(handshake_path, b"", 0o600)
             candidate_paths: dict[str, str] = {}
             if probe_source is None:
-                if candidate_sources is None:
-                    sources = _candidate_snapshot_script_bytes(
-                        checkout_root,
-                        candidate_sha,
-                        require_clean=require_clean,
-                    )
-                else:
-                    sources = dict(candidate_sources)
-                    if set(sources) != set(CANDIDATE_SCRIPT_RELATIVE_PATHS):
-                        raise AssertionError(
-                            "candidate captured source inventory is not exact"
-                        )
-                    if not all(isinstance(source, bytes) for source in sources.values()):
-                        raise AssertionError(
-                            "candidate captured source bytes are malformed"
-                        )
-                snapshot_manifest = {
-                    _candidate_checkout_relative_path(relative_path).as_posix():
-                    hashlib.sha256(source).hexdigest()
-                    for relative_path, source in sources.items()
-                }
-                if (
-                    expected_script_manifest is not None
-                    and snapshot_manifest != dict(expected_script_manifest)
+                if resolved_sources is None or (
+                    workspace_required and resolved_workspace_sources is None
                 ):
-                    raise AssertionError(
-                        "candidate implementation changed before snapshot capture"
-                    )
-                for relative_path, source in sources.items():
+                    raise AssertionError("candidate execution sources are unavailable")
+                for relative_path, source in resolved_sources.items():
                     path = candidate_content_root / relative_path
                     _write_single_link_file(path, source, 0o440)
                     candidate_paths[relative_path.name] = str(path)
@@ -7757,6 +8470,12 @@ def _execution_snapshot(
                 candidate_paths[functional_probe_path.name] = str(
                     functional_probe_path
                 )
+                if workspace_required:
+                    assert resolved_workspace_sources is not None
+                    candidate_workspace_root = _materialize_candidate_workspace(
+                        execution_root,
+                        resolved_workspace_sources,
+                    )
             else:
                 path = candidate_snapshot_root / "strict-capability-probe.py"
                 _write_single_link_file(path, probe_source, 0o440)
@@ -7778,6 +8497,19 @@ def _execution_snapshot(
                     gid,
                     "candidate-code",
                 )
+                if workspace_required:
+                    if candidate_workspace_root is None:
+                        raise AssertionError(
+                            "candidate workspace was not materialized"
+                        )
+                    _invoke_root_tree_operation(
+                        controller_path,
+                        "own",
+                        candidate_workspace_root,
+                        uid,
+                        gid,
+                        "candidate-workspace",
+                    )
                 _invoke_root_tree_operation(
                     controller_path,
                     "own",
@@ -7797,6 +8529,7 @@ def _execution_snapshot(
             yield {
                 "execution_root": execution_root,
                 "candidate_root": candidate_snapshot_root,
+                "workspace_root": candidate_workspace_root,
                 "control_root": control_snapshot_root,
                 "runtime_root": runtime_root,
                 "controller_path": controller_path,
@@ -9149,9 +9882,19 @@ def _run_candidate_process(
         raise AssertionError(
             "strict candidate isolation requires an explicit frozen candidate SHA"
         )
-    before, captured_sources = _candidate_checkout_binding_with_sources(
-        root, candidate_sha, require_clean=require_clean
+    need_workspace = cwd is None
+    before, captured_sources, captured_workspace_sources = (
+        _candidate_checkout_binding_with_sources(
+            root,
+            candidate_sha,
+            require_clean=require_clean,
+            capture_workspace=need_workspace,
+        )
     )
+    if need_workspace and captured_workspace_sources is None:
+        raise AssertionError("candidate workspace sources were not captured")
+    if not need_workspace and captured_workspace_sources is not None:
+        raise AssertionError("candidate workspace sources were unexpectedly captured")
     _validated_candidate_script(root, script)
     input_bytes = b"" if input_text is None else input_text.encode("utf-8")
     if len(input_bytes) > CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES:
@@ -9192,6 +9935,8 @@ def _run_candidate_process(
         require_clean=require_clean,
         expected_script_manifest=expected_script_manifest,
         candidate_sources=captured_sources,
+        candidate_workspace_sources=captured_workspace_sources,
+        materialize_workspace=need_workspace,
     ) as snapshot, _prepared_candidate_fixtures(
         Path(snapshot["controller_path"]),
         tuple(Path(path) for path in writable_roots),
@@ -9204,7 +9949,16 @@ def _run_candidate_process(
             )
             candidate_paths = snapshot["candidate_paths"]
             runtime_root = snapshot["runtime_root"]
-            if not isinstance(candidate_paths, dict) or not isinstance(runtime_root, Path):
+            workspace_root = snapshot["workspace_root"]
+            if (
+                not isinstance(candidate_paths, dict)
+                or not isinstance(runtime_root, Path)
+                or (
+                    need_workspace
+                    and not isinstance(workspace_root, Path)
+                )
+                or (not need_workspace and workspace_root is not None)
+            ):
                 raise AssertionError("candidate execution snapshot is malformed")
             snapshot_script = Path(candidate_paths[script.name])
             exact_command = [
@@ -9230,7 +9984,9 @@ def _run_candidate_process(
                 temporary_root=runtime_root,
                 safe_git_directories=safe_git_directories,
             )
-            child_cwd = runtime_root if cwd is None else Path(cwd)
+            child_cwd = workspace_root if need_workspace else Path(cwd)
+            if not isinstance(child_cwd, Path):
+                raise AssertionError("candidate child cwd is malformed")
             if strict:
                 receipt = _invoke_strict_controller(
                     snapshot,

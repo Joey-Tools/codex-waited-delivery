@@ -18,6 +18,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -4515,6 +4516,68 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertRegex(candidate_sha, r"\A[0-9a-f]{40}\Z")
         return candidate_sha
 
+    @staticmethod
+    def candidate_workspace_archive_fixture(
+        candidate_root: Path, candidate_sha: str
+    ) -> tuple[
+        str,
+        dict[Path, tuple[str, int, bool]],
+        bytes,
+    ]:
+        object_format = _CANDIDATE_SUPPORT._run_candidate_git(
+            candidate_root,
+            "rev-parse",
+            "--show-object-format",
+            output_limit=32,
+        ).decode("ascii").removesuffix("\n")
+        tree_output = _CANDIDATE_SUPPORT._run_candidate_git(
+            candidate_root,
+            "ls-tree",
+            "-r",
+            "-z",
+            "-l",
+            "--full-tree",
+            candidate_sha,
+            output_limit=_CANDIDATE_SUPPORT.CANDIDATE_GIT_OUTPUT_LIMIT_BYTES,
+        )
+        inventory = _CANDIDATE_SUPPORT._candidate_workspace_tree_inventory(
+            tree_output, object_format
+        )
+        archive_output = _CANDIDATE_SUPPORT._run_candidate_git(
+            candidate_root,
+            "-c",
+            "tar.umask=0022",
+            "archive",
+            "--format=tar",
+            candidate_sha,
+            output_limit=_CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_ARCHIVE_LIMIT_BYTES,
+        )
+        return object_format, inventory, archive_output
+
+    @staticmethod
+    def mutate_tar_header(
+        archive_output: bytes,
+        header_offset: int,
+        start: int,
+        stop: int,
+        replacement: bytes,
+    ) -> bytes:
+        if len(replacement) != stop - start:
+            raise AssertionError("tar fixture replacement has the wrong width")
+        mutated = bytearray(archive_output)
+        header = bytearray(mutated[header_offset : header_offset + 512])
+        if len(header) != 512:
+            raise AssertionError("tar fixture header is truncated")
+        header[start:stop] = replacement
+        header[148:156] = b" " * 8
+        checksum = sum(header)
+        encoded_checksum = f"{checksum:07o}\0".encode("ascii")
+        if len(encoded_checksum) != 8:
+            raise AssertionError("tar fixture checksum is out of range")
+        header[148:156] = encoded_checksum
+        mutated[header_offset : header_offset + 512] = header
+        return bytes(mutated)
+
     def test_private_local_binding_uses_git_checkout_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             checkout_root = Path(temporary_directory).resolve(strict=True)
@@ -7587,6 +7650,183 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     _CANDIDATE_SUPPORT._run_candidate_git(
                         root, "status", output_limit=4096
                     )
+
+    def test_candidate_git_cleanup_revalidates_darwin_eperm_after_a_live_race(
+        self,
+    ) -> None:
+        process_group = 43210
+        for live_after_eperm, expected_error in (
+            (False, None),
+            (True, "live-member cleanup"),
+        ):
+            with self.subTest(live_after_eperm=live_after_eperm):
+                process = mock.Mock(pid=process_group)
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT.sys, "platform", "darwin"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_wait_candidate_git_exit_without_reaping",
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_candidate_git_process_group_has_live_members",
+                    side_effect=(True, live_after_eperm),
+                ) as live_members, mock.patch.object(
+                    _CANDIDATE_SUPPORT.os,
+                    "killpg",
+                    side_effect=(
+                        None,
+                        PermissionError(errno.EPERM, "injected Darwin race"),
+                    ),
+                ) as kill_group:
+                    if expected_error is None:
+                        _CANDIDATE_SUPPORT._terminate_candidate_git_process_tree(
+                            process, process_group
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            AssertionError, expected_error
+                        ):
+                            _CANDIDATE_SUPPORT._terminate_candidate_git_process_tree(
+                                process, process_group
+                            )
+
+                self.assertEqual(live_members.call_count, 2)
+                self.assertEqual(
+                    kill_group.call_args_list,
+                    [
+                        mock.call(process_group, signal.SIGKILL),
+                        mock.call(process_group, signal.SIGKILL),
+                    ],
+                )
+                process.wait.assert_called_once()
+
+    def test_candidate_git_cleanup_reports_darwin_eperm_revalidation_failure(
+        self,
+    ) -> None:
+        process_group = 43211
+        process = mock.Mock(pid=process_group)
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.sys, "platform", "darwin"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_wait_candidate_git_exit_without_reaping",
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_candidate_git_process_group_has_live_members",
+            side_effect=(True, RuntimeError("injected inventory failure")),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "killpg",
+            side_effect=(
+                None,
+                PermissionError(errno.EPERM, "injected Darwin race"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                AssertionError,
+                "live-member revalidation: injected inventory failure",
+            ):
+                _CANDIDATE_SUPPORT._terminate_candidate_git_process_tree(
+                    process, process_group
+                )
+
+        process.wait.assert_called_once()
+
+    def test_candidate_git_initial_darwin_eperm_is_not_a_terminal_signal(
+        self,
+    ) -> None:
+        process_group = 43212
+        process = mock.Mock(pid=process_group)
+        events: list[str] = []
+        signal_attempts = 0
+        live_results = iter((True, False))
+
+        def signal_group(selected_group: int, selected_signal: int) -> None:
+            nonlocal signal_attempts
+            self.assertEqual(selected_group, process_group)
+            self.assertEqual(selected_signal, signal.SIGKILL)
+            signal_attempts += 1
+            events.append(f"signal-{signal_attempts}")
+            if signal_attempts == 1:
+                raise PermissionError(errno.EPERM, "injected initial denial")
+
+        def wait_for_leader(
+            selected_process: object, selected_deadline: float
+        ) -> None:
+            self.assertIs(selected_process, process)
+            self.assertGreater(selected_deadline, time.monotonic())
+            events.append("leader-exit")
+
+        def inventory(selected_group: int) -> bool:
+            self.assertEqual(selected_group, process_group)
+            result = next(live_results)
+            events.append(f"live-{str(result).lower()}")
+            return result
+
+        process.wait.side_effect = lambda **_kwargs: events.append("reap") or 0
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.sys, "platform", "darwin"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_wait_candidate_git_exit_without_reaping",
+            side_effect=wait_for_leader,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_candidate_git_process_group_has_live_members",
+            side_effect=inventory,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os, "killpg", side_effect=signal_group
+        ):
+            _CANDIDATE_SUPPORT._terminate_candidate_git_process_tree(
+                process, process_group
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "signal-1",
+                "leader-exit",
+                "live-true",
+                "signal-2",
+                "live-false",
+                "reap",
+            ],
+        )
+
+    def test_candidate_git_eperm_fallback_is_darwin_only(self) -> None:
+        process_group = 43213
+        denial = PermissionError(errno.EPERM, "injected non-Darwin denial")
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.sys, "platform", "freebsd13"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os, "killpg", side_effect=denial
+        ):
+            with self.assertRaisesRegex(
+                AssertionError, "process inventory is unreadable"
+            ):
+                _CANDIDATE_SUPPORT._candidate_git_process_group_has_live_members(
+                    process_group
+                )
+
+        process = mock.Mock(pid=process_group)
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.sys, "platform", "freebsd13"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_wait_candidate_git_exit_without_reaping",
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_candidate_git_process_group_has_live_members",
+        ) as live_members, mock.patch.object(
+            _CANDIDATE_SUPPORT.os, "killpg", side_effect=denial
+        ):
+            with self.assertRaisesRegex(AssertionError, "signal:.*denial"):
+                _CANDIDATE_SUPPORT._terminate_candidate_git_process_tree(
+                    process, process_group
+                )
+
+        live_members.assert_not_called()
+        process.wait.assert_called_once()
 
     def test_candidate_git_timeout_reaps_its_complete_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -11157,8 +11397,22 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 distribution_content_root(candidate_root)
                 / "skills/waited-delivery/scripts/waited_delivery_runner.py"
             )
+            readme_path = candidate_root / "README.md"
+            readme_path.write_text("frozen nonhelper\n", encoding="utf-8")
             candidate_sha = self.initialize_candidate_checkout(candidate_root)
-            dirty_source = "print('dirty worktree helper')\n"
+            readme_path.write_text("dirty nonhelper\n", encoding="utf-8")
+            runner_relative = (
+                TRUSTED_CONTENT_RELATIVE_ROOT
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            ).as_posix()
+            dirty_source = (
+                "from pathlib import Path\n"
+                f"workspace_copy = Path({runner_relative!r}).read_text(encoding='utf-8')\n"
+                "helper = ('dirty worktree helper' if 'dirty-worktree-sentinel' "
+                "in workspace_copy else 'frozen helper')\n"
+                "print(f'{helper}:{Path(\"README.md\").read_text(encoding=\"utf-8\").strip()}')\n"
+                "# dirty-worktree-sentinel\n"
+            )
             runner_path.write_text(dirty_source, encoding="utf-8")
             with _local_nonstrict_supervisor_environment(), mock.patch.dict(
                 os.environ,
@@ -11177,18 +11431,19 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertIsInstance(script_manifest, dict)
             if not isinstance(script_manifest, dict):
                 raise AssertionError("candidate script manifest is malformed")
-            runner_relative = (
-                TRUSTED_CONTENT_RELATIVE_ROOT
-                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
-            ).as_posix()
             self.assertEqual(
                 script_manifest[runner_relative],
                 hashlib.sha256(dirty_source.encode("utf-8")).hexdigest(),
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(completed.stdout, "dirty worktree helper\n")
+            self.assertEqual(
+                completed.stdout, "dirty worktree helper:frozen nonhelper\n"
+            )
             self.assertNotEqual(Path(completed.args[2]), runner_path)
             self.assertEqual(runner_path.read_text(encoding="utf-8"), dirty_source)
+            self.assertEqual(
+                readme_path.read_text(encoding="utf-8"), "dirty nonhelper\n"
+            )
 
     def test_local_capture_rejects_same_bytes_through_replaced_ancestor(
         self,
@@ -11537,8 +11792,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
             bridge_path = content_root / bridge_relative
             bridge_path.write_text("print('frozen-a')\n", encoding="utf-8")
+            readme_path = candidate_root / "README.md"
+            readme_path.write_text("frozen-readme\n", encoding="utf-8")
             frozen_sha = self.initialize_candidate_checkout(candidate_root)
             bridge_path.write_text("print('moving-b')\n", encoding="utf-8")
+            readme_path.write_text("moving-readme\n", encoding="utf-8")
             for command in (
                 [
                     _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
@@ -11582,9 +11840,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     candidate_paths["waited_delivery_bridge.py"]
                 )
                 snapshot_bytes = snapshot_bridge.read_bytes()
+                workspace_root = snapshot["workspace_root"]
+                self.assertIsInstance(workspace_root, Path)
+                assert isinstance(workspace_root, Path)
+                snapshot_readme = (workspace_root / "README.md").read_bytes()
 
             self.assertEqual(snapshot_bytes, b"print('frozen-a')\n")
+            self.assertEqual(snapshot_readme, b"frozen-readme\n")
             self.assertEqual(bridge_path.read_bytes(), b"print('moving-b')\n")
+            self.assertEqual(readme_path.read_bytes(), b"moving-readme\n")
 
     def test_capability_probe_snapshot_never_reads_candidate_git(self) -> None:
         probe_source = b"print('probe')\n"
@@ -11700,6 +11964,651 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertIn("Permission denied", rejected.stderr)
             self.assertEqual(subsequent.returncode, 0, subsequent.stderr)
             self.assertEqual(subsequent.stdout, "original\n")
+
+    def test_candidate_process_uses_an_isolated_candidate_workspace_cwd(self) -> None:
+        with _CANDIDATE_SUPPORT.candidate_fixture_directory(
+            "required-ci-candidate-cwd-"
+        ) as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            candidate_readme = candidate_root / "README.md"
+            candidate_readme.write_text("candidate-relative\n", encoding="utf-8")
+            runner_path = (
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            runner_path.write_text(
+                "from pathlib import Path\n"
+                "import os\n"
+                "if Path('.git').exists():\n"
+                "    raise SystemExit('candidate workspace exposed .git')\n"
+                "if {Path(os.environ[name]).name for name in "
+                "('HOME', 'TEMP', 'TMP', 'TMPDIR')} != {'runtime'}:\n"
+                "    raise SystemExit('candidate runtime roots were not isolated')\n"
+                "target = Path('README.md')\n"
+                "before = target.read_text(encoding='utf-8').strip()\n"
+                "target.write_text('workspace-mutated\\n', encoding='utf-8')\n"
+                "print(f'{Path.cwd().name}:{before}:'\n"
+                "      f'{target.read_text(encoding=\"utf-8\").strip()}')\n",
+                encoding="utf-8",
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                completed = _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.stdout,
+                ".candidate:candidate-relative:workspace-mutated\n",
+            )
+            self.assertEqual(
+                candidate_readme.read_text(encoding="utf-8"),
+                "candidate-relative\n",
+            )
+
+    def test_candidate_workspace_rejects_export_archive_transformations(
+        self,
+    ) -> None:
+        fixtures = (
+            (
+                "export-ignore",
+                "omitted.txt export-ignore\n",
+                "omitted.txt",
+                "must remain present\n",
+                "file inventory is incomplete",
+            ),
+            (
+                "export-subst",
+                "substituted.txt export-subst\n",
+                "substituted.txt",
+                "$Format:%H$\n",
+                "file policy changed|blob identity changed",
+            ),
+        )
+        for name, attributes, selected_name, selected_source, message in fixtures:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                _, candidate_root = self.prepare_roots(temporary)
+                (candidate_root / ".gitattributes").write_text(
+                    attributes, encoding="utf-8"
+                )
+                (candidate_root / selected_name).write_text(
+                    selected_source, encoding="utf-8"
+                )
+                candidate_sha = self.initialize_candidate_checkout(candidate_root)
+
+                with self.assertRaisesRegex(AssertionError, message):
+                    _CANDIDATE_SUPPORT._candidate_workspace_sources(
+                        candidate_root,
+                        candidate_sha,
+                        _CANDIDATE_SUPPORT._candidate_script_sources(
+                            candidate_root
+                        ),
+                    )
+
+    def test_candidate_workspace_archive_rejects_policy_and_framing_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            (candidate_root / "README.md").write_text(
+                "candidate archive\n", encoding="utf-8"
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            object_format, inventory, archive_output = (
+                self.candidate_workspace_archive_fixture(
+                    candidate_root, candidate_sha
+                )
+            )
+            with tarfile.open(
+                fileobj=io.BytesIO(archive_output), mode="r:"
+            ) as archive:
+                readme = archive.getmember("README.md")
+                skills_directory = archive.getmember("skills")
+
+            valid = _CANDIDATE_SUPPORT._candidate_workspace_archive_sources(
+                archive_output,
+                candidate_sha=candidate_sha,
+                object_format=object_format,
+                tree_inventory=inventory,
+            )
+            self.assertEqual(valid[Path("README.md")], (b"candidate archive\n", False))
+            original_candidate_git = _CANDIDATE_SUPPORT._run_candidate_git
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_run_candidate_git",
+                wraps=original_candidate_git,
+            ) as candidate_git:
+                _CANDIDATE_SUPPORT._candidate_workspace_sources(
+                    candidate_root,
+                    candidate_sha,
+                    _CANDIDATE_SUPPORT._candidate_script_sources(candidate_root),
+                )
+            archive_calls = [
+                call
+                for call in candidate_git.call_args_list
+                if "archive" in call.args
+            ]
+            self.assertEqual(len(archive_calls), 1)
+            self.assertEqual(
+                archive_calls[0].kwargs["output_limit"],
+                _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_ARCHIVE_LIMIT_BYTES,
+            )
+
+            mutated_data = bytearray(archive_output)
+            mutated_data[readme.offset_data] ^= 1
+            cases = (
+                (
+                    "blob",
+                    bytes(mutated_data),
+                    "blob identity changed",
+                ),
+                (
+                    "mode",
+                    self.mutate_tar_header(
+                        archive_output,
+                        readme.offset,
+                        100,
+                        108,
+                        b"0000777\0",
+                    ),
+                    "file policy changed",
+                ),
+                (
+                    "hardlink",
+                    self.mutate_tar_header(
+                        archive_output,
+                        readme.offset,
+                        156,
+                        157,
+                        b"1",
+                    ),
+                    "member type is unsupported",
+                ),
+                (
+                    "symlink",
+                    self.mutate_tar_header(
+                        archive_output,
+                        readme.offset,
+                        156,
+                        157,
+                        b"2",
+                    ),
+                    "member type is unsupported",
+                ),
+                (
+                    "special",
+                    self.mutate_tar_header(
+                        archive_output,
+                        readme.offset,
+                        156,
+                        157,
+                        b"6",
+                    ),
+                    "member type is unsupported",
+                ),
+                (
+                    "path",
+                    self.mutate_tar_header(
+                        archive_output,
+                        readme.offset,
+                        0,
+                        100,
+                        b"../README.md" + b"\0" * (100 - len("../README.md")),
+                    ),
+                    "path is unsafe",
+                ),
+                (
+                    "root-directory-alias",
+                    self.mutate_tar_header(
+                        archive_output,
+                        skills_directory.offset,
+                        0,
+                        100,
+                        b"./" + b"\0" * 98,
+                    ),
+                    "path is unsafe",
+                ),
+                (
+                    "empty-archive",
+                    b"\0" * _CANDIDATE_SUPPORT._CANDIDATE_WORKSPACE_TAR_RECORD_BYTES,
+                    "framing is malformed",
+                ),
+                (
+                    "concatenated",
+                    archive_output + archive_output,
+                    "framing is malformed",
+                ),
+                (
+                    "trailing-nonzero",
+                    archive_output + b"x" * 512,
+                    "framing is malformed",
+                ),
+                (
+                    "trailing-zero-record",
+                    archive_output
+                    + b"\0" * _CANDIDATE_SUPPORT._CANDIDATE_WORKSPACE_TAR_RECORD_BYTES,
+                    "framing is malformed",
+                ),
+            )
+            for name, candidate_archive, message in cases:
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    AssertionError, message
+                ):
+                    _CANDIDATE_SUPPORT._candidate_workspace_archive_sources(
+                        candidate_archive,
+                        candidate_sha=candidate_sha,
+                        object_format=object_format,
+                        tree_inventory=inventory,
+                    )
+
+    def test_candidate_workspace_rejects_caps_aliases_and_git_metadata(
+        self,
+    ) -> None:
+        object_format = "sha1"
+        blob_oid = _CANDIDATE_SUPPORT._candidate_workspace_blob_oid(
+            b"x", object_format
+        )
+        too_many = b"".join(
+            f"100644 blob {blob_oid} 1\tfile-{index:03d}\0".encode("ascii")
+            for index in range(
+                _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_FILE_LIMIT + 1
+            )
+        )
+        with self.assertRaisesRegex(AssertionError, "file inventory.*limit"):
+            _CANDIDATE_SUPPORT._candidate_workspace_tree_inventory(
+                too_many, object_format
+            )
+
+        oversized = (
+            "100644 blob "
+            + blob_oid
+            + " "
+            + str(
+                _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES
+                + 1
+            )
+            + "\tlarge.bin\0"
+        ).encode("ascii")
+        with self.assertRaisesRegex(AssertionError, "content exceeds.*total limit"):
+            _CANDIDATE_SUPPORT._candidate_workspace_tree_inventory(
+                oversized, object_format
+            )
+        oversized_file = (
+            "100644 blob "
+            + blob_oid
+            + " "
+            + str(_CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES + 1)
+            + "\ttoo-large.bin\0"
+        ).encode("ascii")
+        with self.assertRaisesRegex(AssertionError, "file exceeds.*size limit"):
+            _CANDIDATE_SUPPORT._candidate_workspace_tree_inventory(
+                oversized_file, object_format
+            )
+
+        aliases = (
+            {Path("README.md"): (b"a", False), Path("readme.md"): (b"b", False)},
+            {
+                Path("\N{LATIN SMALL LETTER E WITH ACUTE}.txt"): (b"a", False),
+                Path("e\N{COMBINING ACUTE ACCENT}.txt"): (b"b", False),
+            },
+        )
+        for sources in aliases:
+            with self.subTest(paths=tuple(sources)), self.assertRaisesRegex(
+                AssertionError, "filesystem alias"
+            ):
+                _CANDIDATE_SUPPORT._validated_candidate_workspace_sources(
+                    sources
+                )
+        for path in (b".git/config", b".GIT/config"):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                AssertionError, "path is unsafe"
+            ):
+                _CANDIDATE_SUPPORT._candidate_workspace_path(path)
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "_run_candidate_git"
+        ) as candidate_git, self.assertRaisesRegex(
+            AssertionError, "helper override inventory is not exact"
+        ):
+            _CANDIDATE_SUPPORT._candidate_workspace_sources(
+                Path("/unused"), "a" * 40, {}
+            )
+        candidate_git.assert_not_called()
+
+    def test_candidate_workspace_directory_budget_precedes_archive_expansion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            deep_file = candidate_root.joinpath(
+                "deep",
+                *(["d"] * _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_DIRECTORY_LIMIT),
+                "payload.txt",
+            )
+            deep_file.parent.mkdir(parents=True)
+            deep_file.write_text("payload\n", encoding="utf-8")
+            (candidate_root / ".gitattributes").write_text(
+                "/deep export-ignore\n", encoding="utf-8"
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            content_root = distribution_content_root(candidate_root)
+            candidate_sources = {
+                relative_path: (content_root / relative_path).read_bytes()
+                for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS
+            }
+            original_run_git = _CANDIDATE_SUPPORT._run_candidate_git
+            observed_arguments: list[tuple[str, ...]] = []
+
+            def record_git(
+                root: Path,
+                *arguments: str,
+                **kwargs: object,
+            ) -> bytes:
+                observed_arguments.append(arguments)
+                return original_run_git(root, *arguments, **kwargs)
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_run_candidate_git",
+                side_effect=record_git,
+            ), self.assertRaisesRegex(
+                AssertionError, "directory inventory.*limit"
+            ):
+                _CANDIDATE_SUPPORT._candidate_workspace_sources(
+                    candidate_root,
+                    candidate_sha,
+                    candidate_sources,
+                )
+
+            self.assertFalse(
+                any("archive" in arguments for arguments in observed_arguments),
+                observed_arguments,
+            )
+
+    def test_candidate_workspace_directory_budget_has_an_exact_boundary(
+        self,
+    ) -> None:
+        object_format = "sha1"
+        blob_oid = _CANDIDATE_SUPPORT._candidate_workspace_blob_oid(
+            b"x", object_format
+        )
+
+        def tree_record(depth: int) -> bytes:
+            path = "/".join(["d"] * depth + ["file.txt"])
+            return (
+                f"100644 blob {blob_oid} 1\t{path}\0".encode("ascii")
+            )
+
+        exact_inventory = _CANDIDATE_SUPPORT._candidate_workspace_tree_inventory(
+            tree_record(
+                _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_DIRECTORY_LIMIT
+            ),
+            object_format,
+        )
+        directory_trie, directory_count = (
+            _CANDIDATE_SUPPORT._candidate_workspace_directory_trie(
+                exact_inventory
+            )
+        )
+        self.assertEqual(
+            directory_count,
+            _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_DIRECTORY_LIMIT,
+        )
+        self.assertTrue(
+            _CANDIDATE_SUPPORT._candidate_workspace_directory_is_expected(
+                directory_trie,
+                Path(*(["d"] * directory_count)),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError, "directory inventory.*limit"
+        ):
+            _CANDIDATE_SUPPORT._candidate_workspace_tree_inventory(
+                tree_record(directory_count + 1), object_format
+            )
+
+        shallow_inventory = (
+            _CANDIDATE_SUPPORT._candidate_workspace_tree_inventory(
+                (
+                    f"100644 blob {blob_oid} 1\talpha/one.txt\0"
+                    f"100644 blob {blob_oid} 1\tbeta/two.txt\0"
+                ).encode("ascii"),
+                object_format,
+            )
+        )
+        _, shallow_count = _CANDIDATE_SUPPORT._candidate_workspace_directory_trie(
+            shallow_inventory
+        )
+        self.assertEqual(shallow_count, 2)
+
+    def test_candidate_workspace_alias_preflight_precedes_snapshot_writes(
+        self,
+    ) -> None:
+        candidate_sources = {
+            relative_path: b"pass\n"
+            for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS
+        }
+        aliased_workspace = {
+            Path("README.md"): (b"first", False),
+            Path("readme.md"): (b"second", False),
+        }
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_candidate_workspace_sources",
+            return_value=aliased_workspace,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_write_single_link_file"
+        ) as write_snapshot_file:
+            with self.assertRaisesRegex(AssertionError, "filesystem alias"):
+                with _CANDIDATE_SUPPORT._execution_snapshot(
+                    Path("/unused"),
+                    "a" * 40,
+                    candidate_sources=candidate_sources,
+                ):
+                    self.fail("aliased workspace unexpectedly materialized")
+
+        write_snapshot_file.assert_not_called()
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_run_candidate_git",
+            return_value=b"sha256\n",
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_write_single_link_file"
+        ) as write_snapshot_file:
+            with self.assertRaisesRegex(AssertionError, "SHA-1 authority"):
+                with _CANDIDATE_SUPPORT._execution_snapshot(
+                    Path("/unused"),
+                    "a" * 40,
+                    candidate_sources=candidate_sources,
+                ):
+                    self.fail("SHA-256 workspace unexpectedly materialized")
+
+        write_snapshot_file.assert_not_called()
+
+    def test_candidate_workspace_materialization_never_overwrites_a_host_alias(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            execution_root = Path(temporary_directory).resolve(strict=True)
+            sources = {
+                Path("first.txt"): (b"first", False),
+                Path("second.txt"): (b"second", False),
+            }
+            original_open = os.open
+            alias_rejected = False
+            file_flags: int | None = None
+
+            def reject_second_host_name(
+                selected_path: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal alias_rejected, file_flags
+                if selected_path == "second.txt" and "dir_fd" in kwargs:
+                    alias_rejected = True
+                    file_flags = flags
+                    raise FileExistsError("simulated host filesystem alias")
+                return original_open(selected_path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "open", side_effect=reject_second_host_name
+            ), self.assertRaisesRegex(
+                AssertionError, "cannot be created uniquely"
+            ):
+                _CANDIDATE_SUPPORT._materialize_candidate_workspace(
+                    execution_root, sources
+                )
+
+            self.assertTrue(alias_rejected, "the host alias fixture must execute")
+            self.assertIsNotNone(file_flags)
+            assert file_flags is not None
+            self.assertTrue(file_flags & os.O_EXCL)
+            self.assertTrue(file_flags & os.O_NOFOLLOW)
+            self.assertTrue(file_flags & os.O_NONBLOCK)
+            self.assertTrue(file_flags & os.O_NOCTTY)
+            workspace_root = execution_root / ".candidate"
+            self.assertEqual((workspace_root / "first.txt").read_bytes(), b"first")
+            self.assertFalse((workspace_root / "second.txt").exists())
+
+    def test_candidate_workspace_materialization_rejects_a_host_git_alias(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            execution_root = Path(temporary_directory).resolve(strict=True)
+            original_stat = os.stat
+            alias_reported = False
+
+            def report_host_git_alias(
+                selected_path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal alias_reported
+                if selected_path == ".git" and "dir_fd" in kwargs:
+                    alias_reported = True
+                    return os.stat_result(
+                        (stat.S_IFREG | 0o644, 1, 1, 1, 0, 0, 1, 0, 0, 0)
+                    )
+                return original_stat(selected_path, *args, **kwargs)
+
+            with mock.patch.object(
+                os, "stat", side_effect=report_host_git_alias
+            ), self.assertRaisesRegex(
+                AssertionError, "exposes a Git metadata alias"
+            ):
+                _CANDIDATE_SUPPORT._materialize_candidate_workspace(
+                    execution_root,
+                    {Path("content.txt"): (b"content", False)},
+                )
+
+            self.assertTrue(alias_reported, "the Git alias fixture must execute")
+
+    def test_candidate_workspace_is_execution_scoped_and_has_exact_policies(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._ROOT_TREE_MODE_PROFILES["candidate-workspace"],
+            (0o770, 0o660, 0o770, False),
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._ROOT_TREE_MODE_PROFILES["candidate-code"],
+            (0o550, 0o440, 0o550, False),
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._ROOT_TREE_MODE_PROFILES["trusted-control"],
+            (0o700, 0o400, 0o500, False),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with _CANDIDATE_SUPPORT._execution_snapshot(
+                candidate_root, candidate_sha
+            ) as snapshot:
+                execution_root = snapshot["execution_root"]
+                workspace_root = snapshot["workspace_root"]
+                self.assertIsInstance(execution_root, Path)
+                self.assertIsInstance(workspace_root, Path)
+                assert isinstance(execution_root, Path)
+                assert isinstance(workspace_root, Path)
+                self.assertEqual(workspace_root.parent, execution_root)
+                self.assertFalse((workspace_root / ".git").exists())
+                self.assertTrue(workspace_root.is_dir())
+            self.assertFalse(execution_root.exists())
+
+    def test_explicit_candidate_cwd_is_not_replaced_by_the_workspace(self) -> None:
+        with _CANDIDATE_SUPPORT.candidate_fixture_directory(
+            "required-ci-candidate-explicit-"
+        ) as temporary_directory, _CANDIDATE_SUPPORT.candidate_fixture_directory(
+            "required-ci-explicit-cwd-"
+        ) as explicit_directory:
+            _, candidate_root = self.prepare_roots(temporary_directory)
+            explicit_root = Path(explicit_directory).resolve(strict=True)
+            (explicit_root / "marker.txt").write_text(
+                "explicit\n", encoding="utf-8"
+            )
+            overflow_root = candidate_root / "workspace-overflow"
+            overflow_root.mkdir()
+            for index in range(
+                _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_FILE_LIMIT + 1
+            ):
+                (overflow_root / f"file-{index:03d}").write_text(
+                    "overflow\n", encoding="utf-8"
+                )
+            execution_marker = explicit_root / "executed"
+            runner_path = (
+                distribution_content_root(candidate_root)
+                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+            )
+            runner_path.write_text(
+                "from pathlib import Path\n"
+                "print(\n"
+                "    f'{Path.cwd().name}:'\n"
+                "    f'{Path(\"marker.txt\").read_text(encoding=\"utf-8\").strip()}'\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            with runner_path.open("a", encoding="utf-8") as runner:
+                runner.write(
+                    "Path(" + repr(str(execution_marker)) + ").write_text("
+                    "'ran', encoding='utf-8')\n"
+                )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError, "file inventory.*limit"
+                ):
+                    _CANDIDATE_SUPPORT.run_candidate_python(
+                        runner_path,
+                        writable_roots=(explicit_root,),
+                    )
+                self.assertFalse(execution_marker.exists())
+                completed = _CANDIDATE_SUPPORT.run_candidate_python(
+                    runner_path,
+                    cwd=explicit_root,
+                    writable_roots=(explicit_root,),
+                )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.stdout,
+                f"{explicit_root.name}:explicit\n",
+            )
+            self.assertEqual(execution_marker.read_text(encoding="utf-8"), "ran")
 
     def test_strict_target_access_policy_blocks_snapshot_write_and_control_read(
         self,
