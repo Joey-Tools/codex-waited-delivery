@@ -60,6 +60,19 @@ jobs:
               exit 1
             fi
           done
+          acl_tool=/usr/bin/setfacl
+          if [[ ! -f "$acl_tool" || -L "$acl_tool" || ! -x "$acl_tool" ]]; then
+            echo "trusted setfacl is unavailable" >&2
+            exit 1
+          fi
+          unset POSIXLY_CORRECT
+          sudo "$acl_tool" --recursive --physical --remove-all --remove-default -- /usr/share/zoneinfo "$pythonLocation"
+          sudo "$acl_tool" --remove-all --remove-default -- \
+            /usr/share \
+            /opt \
+            /opt/hostedtoolcache \
+            "$python_family_dir" \
+            "$python_version_dir"
           sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"
           sudo chmod a-w -- \
             /usr/share \

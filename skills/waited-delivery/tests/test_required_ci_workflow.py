@@ -269,6 +269,20 @@ STRICT_RUNTIME_HARDENING_COMMAND = (
     "    exit 1\n"
     "  fi\n"
     "done\n"
+    "acl_tool=/usr/bin/setfacl\n"
+    'if [[ ! -f "$acl_tool" || -L "$acl_tool" || ! -x "$acl_tool" ]]; then\n'
+    '  echo "trusted setfacl is unavailable" >&2\n'
+    "  exit 1\n"
+    "fi\n"
+    "unset POSIXLY_CORRECT\n"
+    'sudo "$acl_tool" --recursive --physical --remove-all --remove-default -- '
+    '/usr/share/zoneinfo "$pythonLocation"\n'
+    'sudo "$acl_tool" --remove-all --remove-default -- \\\n'
+    "  /usr/share \\\n"
+    "  /opt \\\n"
+    "  /opt/hostedtoolcache \\\n"
+    '  "$python_family_dir" \\\n'
+    '  "$python_version_dir"\n'
     'sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"\n'
     "sudo chmod a-w -- \\\n"
     "  /usr/share \\\n"
@@ -3211,6 +3225,9 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"
         )
+        required_workflow = (
+            REPO_ROOT / ".github/workflows/required-ci.yml"
+        ).read_text(encoding="utf-8")
 
         setup_marker = (
             "      - name: Set up configured Python for strict live evidence\n"
@@ -3224,6 +3241,19 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
         self.assertLess(
             workflow.index(CI_STRICT_RUNTIME_HARDENING_STEP),
             workflow.index(run_marker),
+        )
+        self.assertEqual(
+            required_workflow.count(CI_STRICT_RUNTIME_HARDENING_STEP), 1
+        )
+        self.assertLess(
+            required_workflow.index(PYTHON_SETUP_STEP),
+            required_workflow.index(CI_STRICT_RUNTIME_HARDENING_STEP),
+        )
+        self.assertLess(
+            required_workflow.index(CI_STRICT_RUNTIME_HARDENING_STEP),
+            required_workflow.index(
+                "      - name: Compile candidate Python helpers\n"
+            ),
         )
         self.assertIn(
             r"^/opt/hostedtoolcache/Python/"
@@ -3243,6 +3273,41 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
                         unsafe_location,
                     )
                 )
+        self.assertIn(
+            'acl_tool=/usr/bin/setfacl',
+            CI_STRICT_RUNTIME_HARDENING_STEP,
+        )
+        self.assertIn("unset POSIXLY_CORRECT", CI_STRICT_RUNTIME_HARDENING_STEP)
+        self.assertIn(
+            'if [[ ! -f "$acl_tool" || -L "$acl_tool" || '
+            '! -x "$acl_tool" ]]; then',
+            CI_STRICT_RUNTIME_HARDENING_STEP,
+        )
+        recursive_acl_command = (
+            'sudo "$acl_tool" --recursive --physical --remove-all '
+            "--remove-default -- "
+            '/usr/share/zoneinfo "$pythonLocation"'
+        )
+        ancestor_acl_command = (
+            'sudo "$acl_tool" --remove-all --remove-default -- \\\n'
+            "  /usr/share \\\n"
+            "  /opt \\\n"
+            "  /opt/hostedtoolcache \\\n"
+            '  "$python_family_dir" \\\n'
+            '  "$python_version_dir"'
+        )
+        self.assertIn(recursive_acl_command, STRICT_RUNTIME_HARDENING_COMMAND)
+        self.assertIn(ancestor_acl_command, STRICT_RUNTIME_HARDENING_COMMAND)
+        self.assertLess(
+            STRICT_RUNTIME_HARDENING_COMMAND.index(recursive_acl_command),
+            STRICT_RUNTIME_HARDENING_COMMAND.index(
+                'sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"'
+            ),
+        )
+        self.assertLess(
+            STRICT_RUNTIME_HARDENING_COMMAND.index(ancestor_acl_command),
+            STRICT_RUNTIME_HARDENING_COMMAND.index("sudo chmod a-w --"),
+        )
         self.assertIn(
             'sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"',
             CI_STRICT_RUNTIME_HARDENING_STEP,
@@ -3498,6 +3563,55 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                             trailing_steps=trailing_steps,
                         )
                     )
+
+    def test_runtime_hardening_acl_commands_are_exact_and_fail_closed(
+        self,
+    ) -> None:
+        workflow = self.required_workflow()
+        mutations = {
+            "ambient setfacl": workflow.replace(
+                "acl_tool=/usr/bin/setfacl", "acl_tool=setfacl", 1
+            ),
+            "missing recursive access ACL removal": workflow.replace(
+                "--recursive --physical --remove-all --remove-default",
+                "--recursive --physical --remove-default",
+                1,
+            ),
+            "missing recursive default ACL removal": workflow.replace(
+                "--recursive --physical --remove-all --remove-default",
+                "--recursive --physical --remove-all",
+                1,
+            ),
+            "missing ancestor access ACL removal": workflow.replace(
+                'sudo "$acl_tool" --remove-all --remove-default',
+                'sudo "$acl_tool" --remove-default',
+                1,
+            ),
+            "missing ancestor default ACL removal": workflow.replace(
+                'sudo "$acl_tool" --remove-all --remove-default',
+                'sudo "$acl_tool" --remove-all',
+                1,
+            ),
+            "missing trusted tool preflight": workflow.replace(
+                '          if [[ ! -f "$acl_tool" || -L "$acl_tool" || '
+                '! -x "$acl_tool" ]]; then\n'
+                '            echo "trusted setfacl is unavailable" >&2\n'
+                "            exit 1\n"
+                "          fi\n",
+                "",
+                1,
+            ),
+            "POSIX mode is not cleared": workflow.replace(
+                "unset POSIXLY_CORRECT\n", "", 1
+            ),
+        }
+        for name, mutated in mutations.items():
+            with self.subTest(name=name):
+                self.assertNotEqual(mutated, workflow)
+                with self.assertRaisesRegex(
+                    AssertionError, "strict runtime hardening command"
+                ):
+                    validate_required_workflow(mutated)
 
     def test_every_required_step_has_an_exact_literal_timeout(self) -> None:
         workflow = self.required_workflow()
@@ -12508,12 +12622,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             interpreter_path.parent.mkdir(parents=True)
             stdlib_root.mkdir(parents=True)
             interpreter_path.write_bytes(b"python")
+            unbound_path = fixture_root / "usr/share/unbound"
+            unbound_path.write_bytes(b"unbound")
 
             fixture_paths = [
                 fixture_root,
                 *(path for path in fixture_root.rglob("*") if path.is_dir()),
                 localtime_path,
                 interpreter_path,
+                unbound_path,
             ]
             fixture_identities = {
                 (path.lstat().st_dev, path.lstat().st_ino)
@@ -12526,6 +12643,19 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 if (metadata.st_dev, metadata.st_ino) in fixture_identities:
                     real_policy(metadata, **kwargs)
 
+            acl_entries: dict[Path, set[str]] = {}
+
+            def enforce_fixture_acl(path: Path, description: str) -> None:
+                if acl_entries.get(path):
+                    raise AssertionError(
+                        f"{description} has an unexpected POSIX ACL"
+                    )
+
+            def normalize_acl(root: Path, *, recursive: bool) -> None:
+                for path, entries in acl_entries.items():
+                    if path == root or (recursive and path.is_relative_to(root)):
+                        entries.clear()
+
             for path in fixture_paths:
                 path.chmod(0o555)
             try:
@@ -12537,7 +12667,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         side_effect=enforce_fixture_policy,
                     ),
                     mock.patch.object(
-                        _CANDIDATE_SUPPORT, "_strict_runtime_acl_is_absent"
+                        _CANDIDATE_SUPPORT,
+                        "_strict_runtime_acl_is_absent",
+                        side_effect=enforce_fixture_acl,
                     ),
                     mock.patch.object(
                         _CANDIDATE_SUPPORT,
@@ -12598,6 +12730,54 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             target_gid=60000,
                         )
                     interpreter_path.chmod(0o555)
+
+                    acl_entries.update(
+                        {
+                            fixture_root / "usr/share": {"access", "default"},
+                            localtime_root: {"access", "default"},
+                            localtime_path: {"access"},
+                            fixture_root / "opt": {"access", "default"},
+                            runtime_root: {"access", "default"},
+                            interpreter_path: {"access"},
+                            stdlib_root: {"access", "default"},
+                            unbound_path: {"access"},
+                        }
+                    )
+                    for path, purpose, kind in (
+                        (localtime_path, "localtime", "file"),
+                        (interpreter_path, "configured-executable", "file"),
+                        (stdlib_root, "configured-stdlib", "directory"),
+                    ):
+                        with self.subTest(path=path, acl_state="present"):
+                            with self.assertRaisesRegex(
+                                AssertionError, "unexpected POSIX ACL"
+                            ):
+                                _CANDIDATE_SUPPORT._capture_strict_host_read_root_binding(
+                                    path,
+                                    purpose=purpose,
+                                    kind=kind,
+                                    target_uid=60000,
+                                    target_gid=60000,
+                                )
+
+                    normalize_acl(localtime_root, recursive=True)
+                    normalize_acl(runtime_root, recursive=True)
+                    for ancestor in (
+                        fixture_root / "usr/share",
+                        fixture_root / "opt",
+                        fixture_root / "opt/hostedtoolcache",
+                        fixture_root / "opt/hostedtoolcache/Python",
+                        fixture_root / "opt/hostedtoolcache/Python/3.14.7",
+                    ):
+                        normalize_acl(ancestor, recursive=False)
+                    self.assertEqual(acl_entries[unbound_path], {"access"})
+                    self.assertFalse(
+                        any(
+                            entries
+                            for path, entries in acl_entries.items()
+                            if path != unbound_path
+                        )
+                    )
 
                     for path, purpose, kind in (
                         (localtime_path, "localtime", "file"),
