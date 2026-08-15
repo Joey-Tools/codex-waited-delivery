@@ -23,6 +23,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import unicodedata
 import unittest
 import uuid
 from collections.abc import Iterator, Mapping
@@ -820,11 +821,53 @@ def _trusted_test_suite_receipt(
     }
 
 
+def _neutralize_failure_workflow_commands(value: str) -> str:
+    lines: list[str] = []
+    for line in value.split("\n"):
+        prefix_length = 0
+        while prefix_length < len(line) and line[prefix_length].isspace():
+            prefix_length += 1
+        if line[prefix_length:].startswith("::"):
+            line = line[:prefix_length] + "\\" + line[prefix_length:]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _canonical_failure_text(value: str) -> str:
+    escaped: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if character == "\n":
+            escaped.append(character)
+        elif unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
+            if codepoint <= 0xFF:
+                escaped.append(f"\\x{codepoint:02x}")
+            elif codepoint <= 0xFFFF:
+                escaped.append(f"\\u{codepoint:04x}")
+            else:
+                escaped.append(f"\\U{codepoint:08x}")
+        else:
+            escaped.append(character)
+    return _neutralize_failure_workflow_commands("".join(escaped))
+
+
 def _bounded_failure_text(value: str, limit: int = 2000) -> str:
-    normalized = value.replace("\x00", "\\0")
+    normalized = _canonical_failure_text(value)
     if len(normalized) <= limit:
         return normalized
-    return normalized[:limit] + "...[truncated]"
+    marker = "...[middle truncated]..."
+    if limit <= 0:
+        return ""
+    if limit <= len(marker) + 1:
+        return marker[:limit]
+    # Existing logical-line prefixes are already neutralized.  Reserve one
+    # byte so the post-join pass can also neutralize any prefix exposed at a
+    # truncation boundary without exceeding the caller's total limit.
+    retained = limit - len(marker) - 1
+    head_length = retained // 2
+    tail_length = retained - head_length
+    bounded = normalized[:head_length] + marker + normalized[-tail_length:]
+    return _neutralize_failure_workflow_commands(bounded)
 
 
 def _validated_trusted_child_receipt(
@@ -4728,6 +4771,57 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
 
 
 class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
+    def test_bounded_failure_text_preserves_head_and_terminal_cause(self) -> None:
+        value = (
+            "::warning title=forged::head\n"
+            "Traceback (most recent call last):\n"
+            + "H" * 2500
+            + "MIDDLE-DETAIL-MUST-BE-DROPPED"
+            + "T" * 2500
+            + "\n   ::stop-commands::forged-token\r"
+            + "\x00\x1b[31m\u2028\u2029\u202e\u200d\ud800\U000e0001"
+            + "AssertionError: terminal-cause\x7f"
+        )
+
+        bounded = _bounded_failure_text(value)
+
+        self.assertLessEqual(len(bounded), 2000)
+        self.assertTrue(bounded.startswith("\\::warning title=forged::head"))
+        self.assertIn("...[middle truncated]...", bounded)
+        self.assertNotIn("MIDDLE-DETAIL-MUST-BE-DROPPED", bounded)
+        self.assertTrue(
+            bounded.endswith(
+                "\\x1b[31m\\u2028\\u2029\\u202e\\u200d\\ud800"
+                "\\U000e0001"
+                "AssertionError: terminal-cause\\x7f"
+            )
+        )
+        self.assertTrue(
+            all(
+                not line.lstrip().startswith("::")
+                for line in bounded.split("\n")
+            )
+        )
+        self.assertFalse(
+            any(
+                character in bounded
+                for character in (
+                    "\x00",
+                    "\r",
+                    "\x1b",
+                    "\x7f",
+                    "\u2028",
+                    "\u2029",
+                    "\u202e",
+                    "\u200d",
+                    "\ud800",
+                    "\U000e0001",
+                )
+            )
+        )
+        self.assertIn("   \\::stop-commands::forged-token\\x0d", bounded)
+        self.assertEqual(_bounded_failure_text(bounded), bounded)
+
     def test_isolated_unittest_ignores_candidate_root_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             candidate_root = Path(temporary_directory) / ".candidate"
@@ -5137,6 +5231,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         binding = {"candidate_sha": candidate_sha}
         registry: dict[str, object] = {}
         realm = {"uid": 60000, "gid": 60000}
+        terminal_failure = (
+            "MIDDLE-DETAIL-" * 400
+            + "\n  ::add-mask::forged-secret\r"
+            + "\x1b[31m\u2028\u2029\u202e\u200d\ud800\U000e0001"
+            + "terminal-cause\x7f"
+        )
         stdout = io.StringIO()
         stderr = io.StringIO()
         with mock.patch.object(
@@ -5160,7 +5260,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         ) as cleanup, mock.patch.object(
             type(self),
             CI_STRICT_RUNTIME_LIVE_TEST_METHOD,
-            side_effect=AssertionError("injected live failure"),
+            side_effect=AssertionError(terminal_failure),
         ), mock.patch.object(
             _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
         ), mock.patch.object(
@@ -5171,6 +5271,30 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         cleanup.assert_called_once_with(registry)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("did not complete exactly once", stderr.getvalue())
+        self.assertIn("...[middle truncated]...", stderr.getvalue())
+        self.assertIn("terminal-cause", stderr.getvalue())
+        self.assertTrue(
+            all(
+                not line.lstrip().startswith("::")
+                for line in stderr.getvalue().split("\n")
+            )
+        )
+        self.assertFalse(
+            any(
+                character in stderr.getvalue()
+                for character in (
+                    "\r",
+                    "\x1b",
+                    "\x7f",
+                    "\u2028",
+                    "\u2029",
+                    "\u202e",
+                    "\u200d",
+                    "\ud800",
+                    "\U000e0001",
+                )
+            )
+        )
 
     def test_strict_live_entry_rejects_a_test_that_never_reaches_the_backend(
         self,
@@ -12533,6 +12657,56 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 _CANDIDATE_SUPPORT._strict_host_read_root_bindings(
                     {"binding": "synthetic"}, 60000, 60000
                 )
+
+    def test_strict_host_read_root_capture_reports_purpose_and_preserves_cause(
+        self,
+    ) -> None:
+        terminal_cause = AssertionError("terminal-cause")
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "uname",
+            return_value=mock.Mock(machine="x86_64"),
+        ), mock.patch.object(
+            Path,
+            "resolve",
+            new=lambda self, strict=False: self,
+        ), mock.patch.object(
+            Path,
+            "stat",
+            return_value=mock.Mock(st_mode=stat.S_IFDIR | 0o555),
+        ), mock.patch.object(
+            Path,
+            "lstat",
+            side_effect=FileNotFoundError,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_canonical_existing_directory",
+            side_effect=lambda path, _description: path,
+        ), mock.patch.dict(
+            _CANDIDATE_SUPPORT._STRICT_PRIMITIVES,
+            {
+                "python": Path("/usr/bin/python3.12"),
+                "setpriv": Path("/usr/bin/setpriv"),
+                "env": Path("/usr/bin/env"),
+            },
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_revalidate_trusted_git_binding",
+            return_value=Path("/usr/bin/git"),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_capture_strict_host_read_root_binding",
+            side_effect=terminal_cause,
+        ), self.assertRaisesRegex(
+            AssertionError,
+            "strict host read root system-arch-library directory rejected: "
+            "terminal-cause",
+        ) as raised:
+            _CANDIDATE_SUPPORT._strict_host_read_root_bindings(
+                None, 60000, 60000
+            )
+
+        self.assertIs(raised.exception.__cause__, terminal_cause)
 
     def test_strict_host_read_roots_reject_ld_preload(self) -> None:
         with mock.patch.object(

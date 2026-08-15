@@ -2522,15 +2522,19 @@ def _strict_host_read_root_bindings(
         if path in observed_paths:
             continue
         observed_paths.add(path)
-        bindings.append(
-            _capture_strict_host_read_root_binding(
+        try:
+            binding = _capture_strict_host_read_root_binding(
                 path,
                 purpose=purpose,
                 kind=kind,
                 target_uid=target_uid,
                 target_gid=target_gid,
             )
-        )
+        except AssertionError as error:
+            raise AssertionError(
+                f"strict host read root {purpose} {kind} rejected: {error}"
+            ) from error
+        bindings.append(binding)
     if not 1 <= len(bindings) <= _STRICT_HOST_READ_ROOT_LIMIT:
         raise AssertionError("strict host read root inventory exceeds its fixed limit")
     return bindings
