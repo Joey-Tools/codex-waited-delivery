@@ -129,6 +129,11 @@ TRUSTED_TEST_RECEIPT_SENTINEL = "REQUIRED_CI_TRUSTED_TESTS_COMPLETED:"
 TRUSTED_STRUCTURE_VALIDATOR_FLAG = "--validate-required-ci-structure"
 TRUSTED_TEST_SUPERVISOR_FLAG = "--run-trusted-tests"
 TRUSTED_TEST_CHILD_FLAG = "--run-trusted-test-suite"
+CI_STRICT_RUNTIME_LIVE_FLAG = "--run-strict-runtime-live-test"
+CI_STRICT_RUNTIME_LIVE_TEST_METHOD = (
+    "test_strict_target_access_policy_blocks_snapshot_write_and_control_read"
+)
+CI_STRICT_RUNTIME_LIVE_SENTINEL = "REQUIRED_CI_STRICT_RUNTIME_LIVE_COMPLETED:"
 TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV = "REQUIRED_CI_SUPERVISOR_DEADLINE"
 LOCAL_SUPERVISOR_ISOLATION_ENV = (
     REQUIRED_CI_ISOLATION_MODE_ENV,
@@ -137,6 +142,12 @@ LOCAL_SUPERVISOR_ISOLATION_ENV = (
     "REQUIRED_CI_INTERNAL_ISOLATION_LOCK_FD",
     "REQUIRED_CI_INTERNAL_ISOLATION_REGISTRY",
     "REQUIRED_CI_INTERNAL_ISOLATION_REGISTRY_TOKEN",
+)
+CI_STRICT_RUNTIME_LIVE_FORBIDDEN_ENV = (
+    REQUIRED_CI_CANDIDATE_ROOT_ENV,
+    TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV,
+    *LOCAL_SUPERVISOR_ISOLATION_ENV[1:],
+    "REQUIRED_CI_INTERNAL_ISOLATION_WATCHDOG_TOKEN",
 )
 
 
@@ -228,6 +239,30 @@ README_COMPILE_COMMAND = (
 )
 README_DISCOVERY_COMMAND = (
     "python3 -I -m unittest discover -s skills/waited-delivery/tests"
+)
+CI_STRICT_RUNTIME_LIVE_JOB = (
+    "  strict-live:\n"
+    "    runs-on: ubuntu-24.04\n"
+    "    timeout-minutes: 25\n"
+    "    steps:\n"
+    "      - name: Check out strict live candidate\n"
+    "        uses: actions/checkout@v4\n"
+    "        timeout-minutes: 3\n"
+    "        with:\n"
+    "          persist-credentials: false\n"
+    "      - name: Set up configured Python for strict live evidence\n"
+    "        uses: actions/setup-python@v5\n"
+    "        timeout-minutes: 3\n"
+    "        with:\n"
+    '          python-version: "3.x"\n'
+    "      - name: Run strict target credential live test\n"
+    "        timeout-minutes: 15\n"
+    "        env:\n"
+    "          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}\n"
+    "          REQUIRED_CI_ISOLATION_MODE: sudo-setpriv-v1\n"
+    "        run: |\n"
+    "          python3 -I -B -S skills/waited-delivery/tests/"
+    "test_required_ci_workflow.py --run-strict-runtime-live-test\n"
 )
 CANDIDATE_CHECKOUT_STEP = (
     "      - name: Check out candidate\n"
@@ -1109,6 +1144,210 @@ def _require_strict_workflow_mode() -> None:
         raise AssertionError(
             "trusted Required CI functional mode requires exact strict isolation"
         )
+
+
+def _strict_runtime_live_candidate_binding(
+) -> tuple[Path, str, dict[str, object]]:
+    _require_strict_workflow_mode()
+    if DISTRIBUTION_PROFILE != "canonical":
+        raise AssertionError(
+            "strict runtime live evidence requires the canonical repository layout"
+        )
+    if (
+        os.environ.get("GITHUB_ACTIONS") != "true"
+        or os.environ.get("RUNNER_OS") != "Linux"
+        or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+    ):
+        raise AssertionError(
+            "strict runtime live evidence requires a GitHub-hosted Linux runner"
+        )
+    inherited = [
+        name for name in CI_STRICT_RUNTIME_LIVE_FORBIDDEN_ENV if name in os.environ
+    ]
+    if inherited:
+        raise AssertionError(
+            "strict runtime live evidence requires a fresh owner environment"
+        )
+    if (
+        _CANDIDATE_SUPPORT._STRICT_SESSION is not None
+        or _CANDIDATE_SUPPORT._STRICT_REALM is not None
+        or _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED is not False
+    ):
+        raise AssertionError(
+            "strict runtime live evidence requires fresh isolation state"
+        )
+    workspace_value = os.environ.get("GITHUB_WORKSPACE")
+    if workspace_value is None:
+        raise AssertionError(
+            "strict runtime live evidence requires the GitHub workspace binding"
+        )
+    workspace = Path(workspace_value)
+    try:
+        canonical_workspace = workspace.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            "strict runtime live GitHub workspace is unreadable"
+        ) from error
+    if (
+        not workspace.is_absolute()
+        or workspace.is_symlink()
+        or canonical_workspace != workspace
+        or canonical_workspace != REPO_ROOT
+        or TRUSTED_REPO_ROOT != REPO_ROOT
+    ):
+        raise AssertionError(
+            "strict runtime live evidence requires the canonical checkout root"
+        )
+    candidate_sha_value = os.environ.get(REQUIRED_CI_CANDIDATE_SHA_ENV)
+    github_sha_value = os.environ.get("GITHUB_SHA")
+    if candidate_sha_value is None or github_sha_value is None:
+        raise AssertionError(
+            "strict runtime live evidence requires the GitHub candidate SHA binding"
+        )
+    candidate_sha = _CANDIDATE_SUPPORT._parse_candidate_sha(
+        candidate_sha_value, REQUIRED_CI_CANDIDATE_SHA_ENV
+    )
+    github_sha = _CANDIDATE_SUPPORT._parse_candidate_sha(
+        github_sha_value, "GITHUB_SHA"
+    )
+    if candidate_sha != github_sha:
+        raise AssertionError(
+            "strict runtime live candidate SHA must equal GITHUB_SHA"
+        )
+    expected_sha, require_clean = _CANDIDATE_SUPPORT.expected_candidate_sha(
+        REPO_ROOT
+    )
+    if expected_sha != candidate_sha or require_clean is not True:
+        raise AssertionError(
+            "strict runtime live candidate authority is not frozen"
+        )
+    binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+        REPO_ROOT,
+        candidate_sha,
+        require_clean=True,
+    )
+    return REPO_ROOT, candidate_sha, binding
+
+
+def _strict_runtime_live_owner_realm(
+    registry: Mapping[str, object],
+) -> dict[str, object]:
+    if (
+        not isinstance(registry, dict)
+        or registry.get("inherited") is not False
+        or registry.get("watchdog_authorized") is not False
+        or registry.get("closed") is not False
+        or not isinstance(registry.get("root"), Path)
+        or not isinstance(registry.get("watchdog_process"), subprocess.Popen)
+        or type(registry.get("watchdog_pidfd")) is not int
+        or _CANDIDATE_SUPPORT._active_strict_session() is not registry
+    ):
+        raise AssertionError(
+            "strict runtime live isolation registry is not an exact owner session"
+        )
+    realm = _CANDIDATE_SUPPORT._strict_realm()
+    lock = realm.get("lock") if isinstance(realm, dict) else None
+    try:
+        lock_descriptor = lock.fileno()
+    except (AttributeError, OSError, ValueError) as error:
+        raise AssertionError(
+            "strict runtime live owner identity lock is unavailable"
+        ) from error
+    if (
+        type(lock_descriptor) is not int
+        or lock_descriptor < 0
+        or realm.get("inherited_lock_fd") is not None
+        or type(realm.get("uid")) is not int
+        or realm.get("uid") != realm.get("gid")
+        or realm.get("uid") != registry.get("target_uid")
+    ):
+        raise AssertionError(
+            "strict runtime live owner identity realm is malformed"
+        )
+    return realm
+
+
+def _strict_runtime_live_main() -> int:
+    runner_output = io.StringIO()
+    try:
+        candidate_root, candidate_sha, candidate_binding = (
+            _strict_runtime_live_candidate_binding()
+        )
+        backend_validated = False
+        realm: dict[str, object] | None = None
+        result: unittest.TestResult | None = None
+        registry = _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+        try:
+            realm = _strict_runtime_live_owner_realm(registry)
+            suite = unittest.TestSuite(
+                [
+                    TrustedCandidateTestSupervisorRegressionTests(
+                        CI_STRICT_RUNTIME_LIVE_TEST_METHOD
+                    )
+                ]
+            )
+            result = unittest.TextTestRunner(
+                stream=runner_output,
+                verbosity=2,
+            ).run(suite)
+            backend_validated = (
+                _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED is True
+            )
+        finally:
+            _close_and_verify_trusted_isolation(registry)
+        final_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
+            candidate_root,
+            candidate_sha,
+            require_clean=True,
+        )
+        if final_binding != candidate_binding:
+            raise AssertionError(
+                "strict runtime live candidate binding changed during execution"
+            )
+        if _CANDIDATE_SUPPORT._STRICT_SESSION is not None:
+            raise AssertionError(
+                "strict runtime live owner registry remained active after cleanup"
+            )
+        if result is None or realm is None:
+            raise AssertionError("strict runtime live test did not run")
+        if (
+            result.testsRun != 1
+            or result.failures
+            or result.errors
+            or result.skipped
+            or result.expectedFailures
+            or result.unexpectedSuccesses
+            or not result.wasSuccessful()
+            or not backend_validated
+        ):
+            raise AssertionError(
+                "strict runtime live test did not complete exactly once without "
+                "failures or skips: "
+                + _bounded_failure_text(runner_output.getvalue())
+            )
+        receipt = {
+            "schema_version": 1,
+            "status": "completed",
+            "candidate_sha": candidate_sha,
+            "configured_python": str(Path(sys.executable).resolve(strict=True)),
+            "configured_version": list(sys.version_info[:3]),
+            "target_gid": int(realm["gid"]),
+            "target_uid": int(realm["uid"]),
+            "test": (
+                "TrustedCandidateTestSupervisorRegressionTests."
+                + CI_STRICT_RUNTIME_LIVE_TEST_METHOD
+            ),
+            "tests_run": 1,
+        }
+    except BaseException as error:
+        message = _bounded_failure_text(f"{type(error).__name__}: {error}")
+        print(f"strict runtime live evidence failed: {message}", file=sys.stderr)
+        return 1
+    print(
+        CI_STRICT_RUNTIME_LIVE_SENTINEL
+        + json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    )
+    return 0
 
 
 def _trusted_test_child_main(trusted_repo_root_value: str) -> int:
@@ -2802,6 +3041,45 @@ class CheckoutStepParsingTests(unittest.TestCase):
 
 
 class WorkflowHardeningRegressionTests(unittest.TestCase):
+    def test_ordinary_ci_has_exact_strict_runtime_live_job(self) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "repository-only CI workflow is not packaged in the private "
+                "skill-only distribution"
+            )
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertTrue(
+            workflow.startswith(
+                "name: CI\n\non:\n  pull_request:\n  push:\n"
+                "    branches:\n      - master\n\n"
+                "permissions:\n  contents: read\n"
+            )
+        )
+        self.assertNotIn("pull_request_target", workflow)
+        self.assertEqual(workflow.count("permissions:"), 1)
+        self.assertEqual(workflow.count("permissions:\n  contents: read\n"), 1)
+        self.assertEqual(top_level_job_ids(workflow), ["test", "strict-live"])
+        self.assertEqual(workflow.count(CI_STRICT_RUNTIME_LIVE_JOB), 1)
+        self.assertTrue(workflow.endswith(CI_STRICT_RUNTIME_LIVE_JOB))
+        self.assertEqual(
+            CI_STRICT_RUNTIME_LIVE_JOB.count(
+                "          persist-credentials: false\n"
+            ),
+            1,
+        )
+        for forbidden in (
+            "secrets:",
+            "actions/cache",
+            "actions/upload-artifact",
+            "actions/download-artifact",
+            "continue-on-error:",
+            "        if:",
+        ):
+            self.assertNotIn(forbidden, CI_STRICT_RUNTIME_LIVE_JOB)
+
     def test_checkout_inputs_cannot_be_smuggled_through_the_step_name(self) -> None:
         for style in ("|", ">-"):
             with self.subTest(style=style):
@@ -4379,6 +4657,383 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "    def test_two(self):\n"
             "        pass\n"
         )
+
+    def test_strict_live_binding_requires_exact_fresh_github_checkout(
+        self,
+    ) -> None:
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo_root = Path(temporary_directory).resolve(strict=True)
+            environment = {
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_SHA": candidate_sha,
+                "GITHUB_WORKSPACE": str(repo_root),
+                REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE,
+                "RUNNER_ENVIRONMENT": "github-hosted",
+                "RUNNER_OS": "Linux",
+            }
+            with mock.patch.dict(
+                os.environ, environment, clear=True
+            ), mock.patch.object(
+                sys.modules[__name__], "DISTRIBUTION_PROFILE", "canonical"
+            ), mock.patch.object(
+                sys.modules[__name__], "REPO_ROOT", repo_root
+            ), mock.patch.object(
+                sys.modules[__name__], "TRUSTED_REPO_ROOT", repo_root
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_STRICT_REALM", None
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", False
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "expected_candidate_sha",
+                return_value=(candidate_sha, True),
+            ) as expected_sha, mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_checkout_binding",
+                return_value=binding,
+            ) as checkout_binding:
+                self.assertEqual(
+                    _strict_runtime_live_candidate_binding(),
+                    (repo_root, candidate_sha, binding),
+                )
+
+                os.environ[
+                    "REQUIRED_CI_INTERNAL_ISOLATION_WATCHDOG_TOKEN"
+                ] = "b" * 32
+                with self.assertRaisesRegex(
+                    AssertionError, "fresh owner environment"
+                ):
+                    _strict_runtime_live_candidate_binding()
+
+        expected_sha.assert_called_once_with(repo_root)
+        checkout_binding.assert_called_once_with(
+            repo_root, candidate_sha, require_clean=True
+        )
+
+    def test_strict_live_entry_runs_exact_fixture_and_closes_before_receipt(
+        self,
+    ) -> None:
+        candidate_root = Path("/candidate")
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        process = mock.Mock(spec=subprocess.Popen)
+        lock = mock.Mock()
+        lock.fileno.return_value = 19
+        realm = {"uid": 60000, "gid": 60000, "lock": lock}
+        registry = {
+            "closed": False,
+            "inherited": False,
+            "root": Path("/registry"),
+            "target_uid": 60000,
+            "watchdog_authorized": False,
+            "watchdog_pidfd": 23,
+            "watchdog_process": process,
+        }
+        events: list[str] = []
+
+        def acquire_registry() -> dict[str, object]:
+            events.append("registry")
+            _CANDIDATE_SUPPORT._STRICT_SESSION = registry
+            return registry
+
+        def run_exact_fixture() -> None:
+            events.append("test")
+            _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = True
+
+        def cleanup(selected: Mapping[str, object]) -> None:
+            self.assertIs(selected, registry)
+            events.append("cleanup")
+            _CANDIDATE_SUPPORT._STRICT_SESSION = None
+
+        def final_binding(*_args: object, **_kwargs: object) -> dict[str, object]:
+            events.append("rebind")
+            return binding
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_candidate_binding",
+            side_effect=lambda: (
+                events.append("binding")
+                or (candidate_root, candidate_sha, binding)
+            ),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "trusted_isolation_chain_registry",
+            side_effect=acquire_registry,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_active_strict_session",
+            side_effect=lambda: events.append("active") or registry,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_realm",
+            side_effect=lambda: events.append("realm") or realm,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+            side_effect=final_binding,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_close_and_verify_trusted_isolation",
+            side_effect=cleanup,
+        ), mock.patch.object(
+            type(self),
+            CI_STRICT_RUNTIME_LIVE_TEST_METHOD,
+            side_effect=run_exact_fixture,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", False
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(_strict_runtime_live_main(), 0)
+
+        self.assertEqual(
+            events,
+            ["binding", "registry", "active", "realm", "test", "cleanup", "rebind"],
+        )
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(stdout.getvalue().startswith(CI_STRICT_RUNTIME_LIVE_SENTINEL))
+        receipt = json.loads(
+            stdout.getvalue().removeprefix(
+                CI_STRICT_RUNTIME_LIVE_SENTINEL
+            )
+        )
+        self.assertEqual(
+            receipt,
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "candidate_sha": candidate_sha,
+                "configured_python": str(
+                    Path(sys.executable).resolve(strict=True)
+                ),
+                "configured_version": list(sys.version_info[:3]),
+                "target_gid": 60000,
+                "target_uid": 60000,
+                "test": (
+                    "TrustedCandidateTestSupervisorRegressionTests."
+                    + CI_STRICT_RUNTIME_LIVE_TEST_METHOD
+                ),
+                "tests_run": 1,
+            },
+        )
+        live_source = inspect.getsource(_strict_runtime_live_main)
+        after_acquire = live_source.split(
+            "registry = _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()",
+            1,
+        )[1]
+        self.assertTrue(after_acquire.lstrip().startswith("try:"))
+
+    def test_strict_live_entry_rejects_skip_after_cleanup(self) -> None:
+        candidate_root = Path("/candidate")
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        process = mock.Mock(spec=subprocess.Popen)
+        lock = mock.Mock()
+        lock.fileno.return_value = 19
+        realm = {"uid": 60000, "gid": 60000, "lock": lock}
+        registry = {
+            "closed": False,
+            "inherited": False,
+            "root": Path("/registry"),
+            "target_uid": 60000,
+            "watchdog_authorized": False,
+            "watchdog_pidfd": 23,
+            "watchdog_process": process,
+        }
+        cleanup_calls: list[Mapping[str, object]] = []
+
+        def skip_fixture() -> None:
+            _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = True
+            raise unittest.SkipTest("injected live skip")
+
+        def cleanup(selected: Mapping[str, object]) -> None:
+            cleanup_calls.append(selected)
+            _CANDIDATE_SUPPORT._STRICT_SESSION = None
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_candidate_binding",
+            return_value=(candidate_root, candidate_sha, binding),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "trusted_isolation_chain_registry",
+            side_effect=lambda: setattr(
+                _CANDIDATE_SUPPORT, "_STRICT_SESSION", registry
+            )
+            or registry,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_active_strict_session",
+            return_value=registry,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_strict_realm", return_value=realm
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+            return_value=binding,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_close_and_verify_trusted_isolation",
+            side_effect=cleanup,
+        ), mock.patch.object(
+            type(self),
+            CI_STRICT_RUNTIME_LIVE_TEST_METHOD,
+            side_effect=skip_fixture,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", False
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(_strict_runtime_live_main(), 1)
+
+        self.assertEqual(cleanup_calls, [registry])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("did not complete exactly once", stderr.getvalue())
+
+    def test_strict_live_entry_rejects_failure_after_cleanup(self) -> None:
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        registry: dict[str, object] = {}
+        realm = {"uid": 60000, "gid": 60000}
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_candidate_binding",
+            return_value=(Path("/candidate"), candidate_sha, binding),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "trusted_isolation_chain_registry",
+            return_value=registry,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_owner_realm",
+            return_value=realm,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+            return_value=binding,
+        ), mock.patch.object(
+            sys.modules[__name__], "_close_and_verify_trusted_isolation"
+        ) as cleanup, mock.patch.object(
+            type(self),
+            CI_STRICT_RUNTIME_LIVE_TEST_METHOD,
+            side_effect=AssertionError("injected live failure"),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", True
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(_strict_runtime_live_main(), 1)
+
+        cleanup.assert_called_once_with(registry)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("did not complete exactly once", stderr.getvalue())
+
+    def test_strict_live_entry_rejects_a_test_that_never_reaches_the_backend(
+        self,
+    ) -> None:
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        registry: dict[str, object] = {}
+        realm = {"uid": 60000, "gid": 60000}
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_candidate_binding",
+            return_value=(Path("/candidate"), candidate_sha, binding),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "trusted_isolation_chain_registry",
+            return_value=registry,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_owner_realm",
+            return_value=realm,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+            return_value=binding,
+        ), mock.patch.object(
+            sys.modules[__name__], "_close_and_verify_trusted_isolation"
+        ) as cleanup, mock.patch.object(
+            type(self), CI_STRICT_RUNTIME_LIVE_TEST_METHOD, return_value=None
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", False
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(_strict_runtime_live_main(), 1)
+
+        cleanup.assert_called_once_with(registry)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("did not complete exactly once", stderr.getvalue())
+
+    def test_strict_live_entry_rejects_final_binding_or_session_drift(
+        self,
+    ) -> None:
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        cases = {
+            "binding changed": (
+                {"candidate_sha": "b" * 40},
+                None,
+                "binding changed",
+            ),
+            "session remained": (
+                binding,
+                {"closed": False},
+                "registry remained active",
+            ),
+        }
+        for name, (final_binding, final_session, expected_error) in cases.items():
+            with self.subTest(name=name):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    sys.modules[__name__],
+                    "_strict_runtime_live_candidate_binding",
+                    return_value=(Path("/candidate"), candidate_sha, binding),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "trusted_isolation_chain_registry",
+                    return_value={},
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "_strict_runtime_live_owner_realm",
+                    return_value={"uid": 60000, "gid": 60000},
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "candidate_checkout_binding",
+                    return_value=final_binding,
+                ), mock.patch.object(
+                    sys.modules[__name__], "_close_and_verify_trusted_isolation"
+                ), mock.patch.object(
+                    type(self),
+                    CI_STRICT_RUNTIME_LIVE_TEST_METHOD,
+                    return_value=None,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_STRICT_SESSION", final_session
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", True
+                ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                    stderr
+                ):
+                    self.assertEqual(_strict_runtime_live_main(), 1)
+
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(expected_error, stderr.getvalue())
 
     def prepare_roots(self, temporary_directory: str) -> tuple[Path, Path]:
         root = Path(temporary_directory).resolve(strict=True)
@@ -14454,4 +15109,6 @@ if __name__ == "__main__":
         raise SystemExit(_trusted_test_supervisor_main())
     if len(sys.argv) == 3 and sys.argv[1] == TRUSTED_TEST_CHILD_FLAG:
         raise SystemExit(_trusted_test_child_main(sys.argv[2]))
+    if sys.argv[1:] == [CI_STRICT_RUNTIME_LIVE_FLAG]:
+        raise SystemExit(_strict_runtime_live_main())
     unittest.main()

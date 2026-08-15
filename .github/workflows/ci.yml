@@ -23,3 +23,24 @@ jobs:
       - name: Run tests
         run: |
           python3 -I -m unittest discover -s skills/waited-delivery/tests
+  strict-live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out strict live candidate
+        uses: actions/checkout@v4
+        timeout-minutes: 3
+        with:
+          persist-credentials: false
+      - name: Set up configured Python for strict live evidence
+        uses: actions/setup-python@v5
+        timeout-minutes: 3
+        with:
+          python-version: "3.x"
+      - name: Run strict target credential live test
+        timeout-minutes: 15
+        env:
+          REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}
+          REQUIRED_CI_ISOLATION_MODE: sudo-setpriv-v1
+        run: |
+          python3 -I -B -S skills/waited-delivery/tests/test_required_ci_workflow.py --run-strict-runtime-live-test
