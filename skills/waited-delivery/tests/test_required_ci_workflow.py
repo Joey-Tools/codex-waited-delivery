@@ -220,9 +220,11 @@ TRUSTED_TEST_SUPERVISOR_COMMAND = (
     "'"
 )
 README_COMPILE_COMMAND = (
-    "python3 -I -X pycache_prefix=/tmp/codex-waited-delivery-pycache "
-    "-m py_compile "
-    'skills/waited-delivery/scripts/*.py'
+    "python3 -I -B -c 'import sys; from pathlib import Path; "
+    'paths=sorted(Path("skills/waited-delivery/scripts").glob("*.py")); '
+    'sys.exit("no candidate Python helpers found") if not paths else None; '
+    '[compile(path.read_bytes(), str(path), "exec") for path in paths]'
+    "'"
 )
 README_DISCOVERY_COMMAND = (
     "python3 -I -m unittest discover -s skills/waited-delivery/tests"
@@ -10759,6 +10761,146 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             [README_COMPILE_COMMAND, README_DISCOVERY_COMMAND],
         )
 
+    def test_readme_compile_checks_syntax_without_temp_or_bytecode(self) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "canonical repository documentation is not shipped in private distribution"
+            )
+        compile_command, _discovery_command = self.readme_test_commands(REPO_ROOT)
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            candidate_root = fixture_root / "candidate"
+            scripts_root = (
+                candidate_root / "skills/waited-delivery/scripts"
+            )
+            controlled_tmp = fixture_root / "controlled tmp"
+            fake_bin = fixture_root / "bin"
+            scripts_root.mkdir(parents=True)
+            controlled_tmp.mkdir()
+            fake_bin.mkdir()
+            mktemp_marker = fixture_root / "mktemp-called"
+            fake_mktemp = fake_bin / "mktemp"
+            fake_mktemp.write_text(
+                f"#!{sys.executable}\n"
+                "from pathlib import Path\n"
+                f"Path({str(mktemp_marker)!r}).write_text('called', encoding='utf-8')\n"
+                "raise SystemExit(97)\n",
+                encoding="utf-8",
+            )
+            fake_mktemp.chmod(0o700)
+            python_argv_marker = fixture_root / "python-argv.json"
+            fake_python = fake_bin / "python3"
+            fake_python.write_text(
+                f"#!{sys.executable}\n"
+                "import json\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "arguments = sys.argv[1:]\n"
+                f"Path({str(python_argv_marker)!r}).write_text(\n"
+                "    json.dumps(arguments), encoding='utf-8'\n"
+                ")\n"
+                "unsafe = (\n"
+                "    arguments[:3] != ['-I', '-B', '-c']\n"
+                "    or len(arguments) != 4\n"
+                "    or 'py_compile' in arguments[3]\n"
+                "    or 'pycache_prefix' in arguments[3]\n"
+                "    or 'mktemp' in arguments[3]\n"
+                ")\n"
+                "raise SystemExit(98 if unsafe else 0)\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o700)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}{os.pathsep}{environment.get('PATH', '')}",
+                    "TMPDIR": str(controlled_tmp),
+                }
+            )
+            environment.pop("BASH_ENV", None)
+
+            def run_compile() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [str(bash), "-c", compile_command],
+                    cwd=candidate_root,
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+            def assert_no_compile_artifacts() -> None:
+                self.assertFalse(mktemp_marker.exists())
+                self.assertEqual(list(controlled_tmp.iterdir()), [])
+                self.assertEqual(list(candidate_root.rglob("__pycache__")), [])
+                self.assertEqual(list(candidate_root.rglob("*.pyc")), [])
+
+            valid_path = scripts_root / "valid.py"
+            valid_path.write_bytes(
+                b'# coding: latin-1\nraise RuntimeError("executed")\n'
+                b'value = "caf\xe9"\n'
+            )
+            legacy_command = (
+                "python3 -I -X "
+                "pycache_prefix=/tmp/codex-waited-delivery-pycache "
+                "-m py_compile skills/waited-delivery/scripts/*.py"
+            )
+            legacy_completed = subprocess.run(
+                [str(bash), "-c", legacy_command],
+                cwd=candidate_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(legacy_completed.returncode, 98)
+            legacy_arguments = json.loads(
+                python_argv_marker.read_text(encoding="utf-8")
+            )
+            self.assertIn(
+                "pycache_prefix=/tmp/codex-waited-delivery-pycache",
+                legacy_arguments,
+            )
+            self.assertIn("py_compile", legacy_arguments)
+            assert_no_compile_artifacts()
+            python_argv_marker.unlink()
+
+            completed = run_compile()
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            python_arguments = json.loads(
+                python_argv_marker.read_text(encoding="utf-8")
+            )
+            self.assertEqual(python_arguments[:3], ["-I", "-B", "-c"])
+            self.assertEqual(len(python_arguments), 4)
+            self.assertNotIn("py_compile", python_arguments[3])
+            self.assertNotIn("pycache_prefix", python_arguments[3])
+            self.assertNotIn("mktemp", python_arguments[3])
+            assert_no_compile_artifacts()
+
+            fake_python.unlink()
+            completed = run_compile()
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            assert_no_compile_artifacts()
+
+            invalid_path = scripts_root / "invalid.py"
+            invalid_path.write_bytes(b"def invalid(:\n    pass\n")
+            completed = run_compile()
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("SyntaxError", completed.stderr)
+            assert_no_compile_artifacts()
+
+            valid_path.unlink()
+            invalid_path.unlink()
+            completed = run_compile()
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("no candidate Python helpers found", completed.stderr)
+            assert_no_compile_artifacts()
+
     def test_readme_compile_preserves_candidate_binding_and_supervisor(self) -> None:
         if DISTRIBUTION_PROFILE == "private":
             self.skipTest(
@@ -10776,24 +10918,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 commands,
                 [README_COMPILE_COMMAND, README_DISCOVERY_COMMAND],
             )
-            external_tmp = Path(temporary_directory).resolve(strict=True) / "external-tmp"
-            external_tmp.mkdir()
-            pycache_prefix = external_tmp / "required-ci-readme-pycache"
-            self.assertNotIn(candidate_root, pycache_prefix.parents)
-            compile_argv = [
-                sys.executable,
-                "-I",
-                "-X",
-                f"pycache_prefix={pycache_prefix}",
-                "-m",
-                "py_compile",
-                *[
-                    str(candidate_root / relative_path)
-                    for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS
-                ],
-            ]
+            bash = shutil.which("bash")
+            self.assertIsNotNone(bash)
             completed = subprocess.run(
-                compile_argv,
+                [str(bash), "-c", commands[0]],
                 cwd=candidate_root,
                 check=False,
                 capture_output=True,

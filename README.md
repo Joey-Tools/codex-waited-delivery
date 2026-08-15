@@ -8,6 +8,6 @@ compatibility/diagnostic dependency used by external lane-readiness smoke.
 ## Test
 
 ```bash
-python3 -I -X pycache_prefix=/tmp/codex-waited-delivery-pycache -m py_compile skills/waited-delivery/scripts/*.py
+python3 -I -B -c 'import sys; from pathlib import Path; paths=sorted(Path("skills/waited-delivery/scripts").glob("*.py")); sys.exit("no candidate Python helpers found") if not paths else None; [compile(path.read_bytes(), str(path), "exec") for path in paths]'
 python3 -I -m unittest discover -s skills/waited-delivery/tests
 ```
