@@ -10529,22 +10529,783 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             _CANDIDATE_SUPPORT._ROOT_PYTHON_ARGUMENTS,
             ("-I", "-B", "-S"),
         )
-        command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
-            {
-                "uid": 60000,
-                "gid": 60000,
-                "environment": {},
-                "candidate_argv": ["/usr/bin/python3", "-I", "/candidate.py"],
-                "trusted_root": "/trusted",
-                "trusted_sentinel": "/trusted/sentinel",
-            },
-            1234,
-        )
+        configured = {
+            "target_uid": 60000,
+            "target_gid": 60000,
+            "selector": "/opt/hostedtoolcache/Python/3.x/bin/python",
+            "resolved": "/opt/hostedtoolcache/Python/3.x/bin/python3.14",
+        }
+        candidate_argv = [configured["resolved"], "-I", "/candidate.py"]
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_revalidate_configured_candidate_interpreter",
+            return_value=configured,
+        ):
+            command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                {
+                    "uid": 60000,
+                    "gid": 60000,
+                    "environment": {},
+                    "candidate_argv": candidate_argv,
+                    "candidate_interpreter": configured,
+                    "trusted_root": "/trusted",
+                    "trusted_sentinel": "/trusted/sentinel",
+                },
+                1234,
+            )
         bootstrap_index = command.index("-c")
         self.assertEqual(
             command[bootstrap_index - 4 : bootstrap_index],
             ["/usr/bin/python3", "-I", "-B", "-S"],
         )
+        configured_bootstrap_index = command.index(
+            _CANDIDATE_SUPPORT._CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE
+        )
+        self.assertEqual(
+            command[configured_bootstrap_index + 1 :], candidate_argv
+        )
+        self.assertIn(
+            'runtime_binding["resolved"]',
+            _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE,
+        )
+        self.assertIn(
+            "os.execve(candidate_argv[0]",
+            _CANDIDATE_SUPPORT._CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE,
+        )
+        compile(
+            _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE,
+            "<system-isolation-bootstrap>",
+            "exec",
+        )
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_revalidate_configured_candidate_interpreter",
+            return_value=configured,
+        ), self.assertRaisesRegex(
+            AssertionError, "configured interpreter identity changed"
+        ):
+            _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                {
+                    "uid": 60000,
+                    "gid": 60000,
+                    "environment": {},
+                    "candidate_argv": ["/other/python", "-I"],
+                    "candidate_interpreter": configured,
+                    "trusted_root": "/trusted",
+                    "trusted_sentinel": "/trusted/sentinel",
+                },
+                1234,
+            )
+        compile(
+            _CANDIDATE_SUPPORT._CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE,
+            "<configured-runtime-bootstrap>",
+            "exec",
+        )
+        system_config = {
+            "uid": 60000,
+            "gid": 60000,
+            "environment": {},
+            "candidate_argv": ["/usr/bin/python3", "-I", "/probe.py"],
+            "candidate_interpreter": None,
+            "trusted_root": "/trusted",
+            "trusted_sentinel": "/trusted/sentinel",
+        }
+        system_command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+            system_config, 1234
+        )
+        self.assertIn("/usr/bin/python3", system_command)
+        with self.assertRaisesRegex(
+            AssertionError, "system interpreter identity changed"
+        ):
+            _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                {**system_config, "candidate_argv": ["/tmp/python", "-I"]},
+                1234,
+            )
+
+    def test_strict_controller_rejects_unbound_runtime_before_privilege(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "_strict_realm"
+        ) as strict_realm, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+        ) as root_tree, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_run_registered_sudo"
+        ) as registered_sudo, self.assertRaisesRegex(
+            AssertionError, "identity changed before privilege"
+        ):
+            _CANDIDATE_SUPPORT._invoke_strict_controller(
+                {},
+                ["/tmp/python", "-I", "/probe.py"],
+                {},
+                Path("/tmp"),
+                b"",
+                timeout_seconds=1,
+            )
+        strict_realm.assert_not_called()
+        root_tree.assert_not_called()
+        registered_sudo.assert_not_called()
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "_strict_realm"
+        ) as strict_realm, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+        ) as root_tree, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_run_registered_sudo"
+        ) as registered_sudo, self.assertRaisesRegex(
+            AssertionError, "identity changed before privilege"
+        ):
+            _CANDIDATE_SUPPORT._invoke_strict_controller(
+                {},
+                ["/other/python", "-I", "/probe.py"],
+                {},
+                Path("/tmp"),
+                b"",
+                timeout_seconds=1,
+                candidate_interpreter_binding={
+                    "resolved": "/configured/python"
+                },
+            )
+        strict_realm.assert_not_called()
+        root_tree.assert_not_called()
+        registered_sudo.assert_not_called()
+
+    def test_strict_controller_revalidates_runtime_before_privilege(
+        self,
+    ) -> None:
+        binding = {
+            "resolved": "/configured/python",
+            "target_uid": 60000,
+            "target_gid": 60000,
+        }
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_realm",
+            return_value={"uid": 60000, "gid": 60000},
+        ) as strict_realm, mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_revalidate_configured_candidate_interpreter",
+            side_effect=AssertionError(
+                "configured candidate interpreter binding changed"
+            ),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+        ) as root_tree, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_run_registered_sudo"
+        ) as registered_sudo, mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess, "Popen"
+        ) as popen, self.assertRaisesRegex(
+            AssertionError, "binding changed"
+        ):
+            _CANDIDATE_SUPPORT._invoke_strict_controller(
+                {},
+                ["/configured/python", "-I", "/probe.py"],
+                {},
+                Path("/tmp"),
+                b"",
+                timeout_seconds=1,
+                candidate_interpreter_binding=binding,
+            )
+        strict_realm.assert_not_called()
+        root_tree.assert_not_called()
+        registered_sudo.assert_not_called()
+        popen.assert_not_called()
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_revalidate_configured_candidate_interpreter",
+            return_value=binding,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_realm",
+            return_value={"uid": 60001, "gid": 60001},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+        ) as root_tree, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_run_registered_sudo"
+        ) as registered_sudo, mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess, "Popen"
+        ) as popen, self.assertRaisesRegex(
+            AssertionError, "target identity changed"
+        ):
+            _CANDIDATE_SUPPORT._invoke_strict_controller(
+                {},
+                ["/configured/python", "-I", "/probe.py"],
+                {},
+                Path("/tmp"),
+                b"",
+                timeout_seconds=1,
+                candidate_interpreter_binding=binding,
+            )
+        root_tree.assert_not_called()
+        registered_sudo.assert_not_called()
+        popen.assert_not_called()
+
+    def test_configured_interpreter_binding_accepts_setup_python_symlinks_and_rejects_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            runtime_root = root / "toolcache"
+            bin_root = runtime_root / "bin"
+            lib_root = runtime_root / "lib"
+            bin_root.mkdir(parents=True)
+            lib_root.mkdir()
+            real_interpreter = bin_root / "python3.14"
+            intermediate_interpreter = bin_root / "python3"
+            selector = bin_root / "python"
+            stdlib_real = lib_root / "os-real.py"
+            stdlib_selector = lib_root / "os.py"
+            real_interpreter.write_bytes(b"configured-python\n")
+            real_interpreter.chmod(0o755)
+            intermediate_interpreter.symlink_to(real_interpreter.name)
+            selector.symlink_to(intermediate_interpreter.name)
+            stdlib_real.write_bytes(b"stdlib\n")
+            stdlib_real.chmod(0o644)
+            stdlib_selector.symlink_to(stdlib_real.name)
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_capture_strict_runtime_lexical_path",
+                wraps=_CANDIDATE_SUPPORT._capture_strict_runtime_lexical_path,
+            ) as lexical_capture, mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_assert_strict_target_runtime_policy",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_runtime_acl_is_absent",
+            ):
+                binding = (
+                    _CANDIDATE_SUPPORT._capture_strict_candidate_interpreter_binding(
+                        str(selector),
+                        str(stdlib_selector),
+                        target_uid=60000,
+                        target_gid=60000,
+                        version=(3, 14, 7),
+                        implementation="cpython",
+                    )
+                )
+
+                self.assertEqual(binding["selector"], str(selector))
+                self.assertEqual(binding["resolved"], str(real_interpreter))
+                self.assertEqual(
+                    [
+                        selected.kwargs["executable"]
+                        for selected in lexical_capture.call_args_list
+                    ],
+                    [True, False, True, False],
+                )
+                selector_components = binding["selector_components"]
+                self.assertIsInstance(selector_components, list)
+                assert isinstance(selector_components, list)
+                self.assertEqual(
+                    [
+                        item["link_target"]
+                        for item in selector_components
+                        if item["kind"] == "symlink"
+                    ],
+                    [intermediate_interpreter.name],
+                )
+
+                interpreter_identity = (
+                    real_interpreter.stat().st_dev,
+                    real_interpreter.stat().st_ino,
+                )
+                stdlib_identity = (
+                    stdlib_real.stat().st_dev,
+                    stdlib_real.stat().st_ino,
+                )
+                detached_runtime = root / "detached-toolcache"
+                runtime_root.rename(detached_runtime)
+                runtime_root.mkdir()
+                (detached_runtime / "bin").rename(runtime_root / "bin")
+                (detached_runtime / "lib").rename(runtime_root / "lib")
+                self.assertEqual(
+                    (
+                        real_interpreter.stat().st_dev,
+                        real_interpreter.stat().st_ino,
+                    ),
+                    interpreter_identity,
+                )
+                self.assertEqual(
+                    (stdlib_real.stat().st_dev, stdlib_real.stat().st_ino),
+                    stdlib_identity,
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "binding changed"
+                ):
+                    _CANDIDATE_SUPPORT._revalidate_configured_candidate_interpreter(
+                        binding
+                    )
+
+    def test_configured_interpreter_binding_classifies_unreadable_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            runtime_root = root / "toolcache"
+            runtime_root.mkdir()
+            interpreter = runtime_root / "python"
+            stdlib = runtime_root / "os.py"
+            interpreter.write_bytes(b"configured-python\n")
+            interpreter.chmod(0o755)
+            stdlib.write_bytes(b"stdlib\n")
+            original_open = os.open
+
+            def deny_interpreter_open(
+                selected: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                if selected == interpreter.name and "dir_fd" in kwargs:
+                    raise PermissionError(errno.EACCES, "denied", str(selected))
+                return original_open(selected, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_assert_strict_target_runtime_policy",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_runtime_acl_is_absent",
+            ), mock.patch.object(
+                os, "open", side_effect=deny_interpreter_open
+            ), self.assertRaisesRegex(AssertionError, "interpreter is unreadable"):
+                _CANDIDATE_SUPPORT._capture_strict_candidate_interpreter_binding(
+                    str(interpreter),
+                    str(stdlib),
+                    target_uid=60000,
+                    target_gid=60000,
+                    version=(3, 14, 7),
+                    implementation="cpython",
+                )
+
+    def test_configured_interpreter_binding_accepts_execute_only_leaf(
+        self,
+    ) -> None:
+        if not hasattr(os, "O_PATH"):
+            self.skipTest("Linux O_PATH is required for this regression")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            interpreter = root / "python"
+            interpreter.write_bytes(b"configured-python\n")
+            interpreter.chmod(0o111)
+            original_open = os.open
+            leaf_flags: list[int] = []
+
+            def record_open(
+                selected: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                if selected == interpreter.name and "dir_fd" in kwargs:
+                    leaf_flags.append(flags)
+                return original_open(selected, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_assert_strict_target_runtime_policy",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_runtime_acl_is_absent",
+            ), mock.patch.object(os, "open", side_effect=record_open):
+                documents = (
+                    _CANDIDATE_SUPPORT._capture_strict_runtime_canonical_path(
+                        interpreter,
+                        target_uid=60000,
+                        target_gid=60000,
+                        description="configured candidate interpreter",
+                        executable=True,
+                    )
+                )
+
+            self.assertEqual(documents[-1]["kind"], "file")
+            self.assertTrue(leaf_flags)
+            self.assertTrue(all(flags & os.O_PATH for flags in leaf_flags))
+
+    def test_configured_interpreter_target_access_policy_is_exact(self) -> None:
+        def metadata(mode: int) -> os.stat_result:
+            return os.stat_result(
+                (mode, 11, 12, 1, 1000, 1000, 4096, 0, 0, 0)
+            )
+
+        _CANDIDATE_SUPPORT._assert_strict_target_runtime_policy(
+            metadata(stat.S_IFDIR | 0o755),
+            target_uid=60000,
+            target_gid=60000,
+            description="configured candidate interpreter",
+            directory=True,
+            executable=False,
+        )
+        _CANDIDATE_SUPPORT._assert_strict_target_runtime_policy(
+            metadata(stat.S_IFREG | 0o755),
+            target_uid=60000,
+            target_gid=60000,
+            description="configured candidate interpreter",
+            directory=False,
+            executable=True,
+        )
+        _CANDIDATE_SUPPORT._assert_strict_target_runtime_policy(
+            metadata(stat.S_IFREG | 0o111),
+            target_uid=60000,
+            target_gid=60000,
+            description="configured candidate interpreter",
+            directory=False,
+            executable=True,
+        )
+        _CANDIDATE_SUPPORT._assert_strict_target_runtime_policy(
+            metadata(stat.S_IFREG | 0o644),
+            target_uid=60000,
+            target_gid=60000,
+            description="configured candidate standard library",
+            directory=False,
+            executable=False,
+        )
+        hardlinked = list(metadata(stat.S_IFREG | 0o755))
+        hardlinked[3] = 2
+        _CANDIDATE_SUPPORT._assert_strict_target_runtime_policy(
+            os.stat_result(hardlinked),
+            target_uid=60000,
+            target_gid=60000,
+            description="configured candidate interpreter",
+            directory=False,
+            executable=True,
+        )
+        for mode, directory, executable in (
+            (stat.S_IFDIR | 0o757, True, False),
+            (stat.S_IFREG | 0o744, False, True),
+            (stat.S_IFREG | 0o646, False, False),
+        ):
+            with self.subTest(mode=oct(mode)), self.assertRaisesRegex(
+                AssertionError, "access policy is unsafe"
+            ):
+                _CANDIDATE_SUPPORT._assert_strict_target_runtime_policy(
+                    metadata(mode),
+                    target_uid=60000,
+                    target_gid=60000,
+                    description="configured candidate runtime",
+                    directory=directory,
+                    executable=executable,
+                )
+        for mode, directory, executable in (
+            (stat.S_IFDIR | 0o555, True, False),
+            (stat.S_IFREG | 0o555, False, True),
+            (stat.S_IFREG | 0o444, False, False),
+        ):
+            target_owned = list(metadata(mode))
+            target_owned[4] = 60000
+            with self.subTest(
+                target_owned=oct(mode)
+            ), self.assertRaisesRegex(
+                AssertionError, "access policy is unsafe"
+            ):
+                _CANDIDATE_SUPPORT._assert_strict_target_runtime_policy(
+                    os.stat_result(target_owned),
+                    target_uid=60000,
+                    target_gid=60000,
+                    description="configured candidate runtime",
+                    directory=directory,
+                    executable=executable,
+                )
+
+    def test_configured_interpreter_policy_is_bound_after_active_session_before_privilege(
+        self,
+    ) -> None:
+        events: list[str] = []
+
+        def active_session() -> dict[str, object]:
+            events.append("active-session")
+            return {}
+
+        def realm() -> dict[str, object]:
+            events.append("realm")
+            return {"uid": 60000, "gid": 60000}
+
+        def reject_binding(_uid: int, _gid: int) -> dict[str, object]:
+            events.append("interpreter-binding")
+            raise AssertionError(
+                "configured candidate interpreter access policy is unsafe"
+            )
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_isolation_requested",
+            return_value=True,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_active_strict_session",
+            side_effect=active_session,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_strict_realm", side_effect=realm
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_bind_configured_candidate_interpreter",
+            side_effect=reject_binding,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "candidate_repository_root"
+        ) as candidate_root, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_ensure_strict_backend"
+        ) as ensure_backend, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_run_registered_sudo"
+        ) as registered_sudo, mock.patch.object(
+            subprocess, "Popen"
+        ) as popen, mock.patch.dict(
+            os.environ,
+            {REQUIRED_CI_CANDIDATE_SHA_ENV: "a" * 40},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(AssertionError, "access policy is unsafe"):
+                _CANDIDATE_SUPPORT._run_candidate_process(
+                    Path("/candidate.py"),
+                    [sys.executable, "-I", "/candidate.py"],
+                )
+
+        self.assertEqual(
+            events, ["active-session", "realm", "interpreter-binding"]
+        )
+        candidate_root.assert_not_called()
+        ensure_backend.assert_not_called()
+        registered_sudo.assert_not_called()
+        popen.assert_not_called()
+
+    def test_configured_runtime_bootstrap_rejects_version_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            candidate = root / "candidate.py"
+            candidate.write_text(
+                "import os\n"
+                "import sys\n"
+                "if os.environ.get('REQUIRED_CI_CLOSED') != '1':\n"
+                "    raise SystemExit(90)\n"
+                "if 'REQUIRED_CI_LAUNCHER_CANARY' in os.environ:\n"
+                "    raise SystemExit(91)\n"
+                "print('.'.join(map(str, sys.version_info[:3])))\n",
+                encoding="utf-8",
+            )
+            binding = {
+                "schema_version": 1,
+                "selector": sys.executable,
+                "resolved": str(Path(sys.executable).resolve(strict=True)),
+                "stdlib_resolved": str(Path(os.__file__).resolve(strict=True)),
+                "version": list(sys.version_info[:3]),
+                "implementation": sys.implementation.name,
+            }
+            arguments = [
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                _CANDIDATE_SUPPORT._CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE,
+                binding["resolved"],
+                binding["stdlib_resolved"],
+                binding["implementation"],
+                *[str(value) for value in binding["version"]],
+                "1",
+                "REQUIRED_CI_CLOSED=1",
+                binding["resolved"],
+                "-I",
+                str(candidate),
+            ]
+            completed = subprocess.run(
+                arguments,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "REQUIRED_CI_LAUNCHER_CANARY": "1"},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.stdout,
+                ".".join(map(str, sys.version_info[:3])) + "\n",
+            )
+
+            arguments[9:12] = ["0", "0", "0"]
+            rejected = subprocess.run(
+                arguments,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "REQUIRED_CI_LAUNCHER_CANARY": "1"},
+            )
+            self.assertEqual(rejected.returncode, 118)
+
+            arguments[9:12] = [str(value) for value in binding["version"]]
+            arguments[7] = "/missing/os.py"
+            rejected = subprocess.run(
+                arguments,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "REQUIRED_CI_LAUNCHER_CANARY": "1"},
+            )
+            self.assertEqual(rejected.returncode, 118)
+
+    def test_strict_candidate_uses_the_configured_interpreter_runtime(self) -> None:
+        real_interpreter = sys.executable
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            candidate_root = root / ".candidate"
+            candidate_root.mkdir()
+            script = candidate_root / "candidate.py"
+            snapshot_script = root / "snapshot-candidate.py"
+            configured_interpreter = root / "configured-python3"
+            configured_selector = root / "configured-python"
+            workspace_root = root / "candidate-workspace"
+            runtime_root = root / "runtime"
+            workspace_root.mkdir()
+            runtime_root.mkdir()
+            source = (
+                "import os\n"
+                "if os.environ.get('REQUIRED_CI_CONFIGURED_RUNTIME') != '1':\n"
+                "    raise SystemExit(91)\n"
+                "print('configured-runtime')\n"
+            )
+            script.write_text(source, encoding="utf-8")
+            snapshot_script.write_text(source, encoding="utf-8")
+            configured_interpreter.write_text(
+                "#!/bin/sh\n"
+                "export REQUIRED_CI_CONFIGURED_RUNTIME=1\n"
+                f"exec {real_interpreter!r} \"$@\"\n",
+                encoding="utf-8",
+            )
+            configured_interpreter.chmod(0o755)
+            configured_selector.symlink_to(configured_interpreter.name)
+            before = {
+                "candidate_root": str(candidate_root),
+                "candidate_sha": "a" * 40,
+                "candidate_script_sha256": {},
+            }
+            snapshot = {
+                "candidate_paths": {
+                    script.name: snapshot_script,
+                    "required_ci_candidate.py": snapshot_script,
+                },
+                "workspace_root": workspace_root,
+                "runtime_root": runtime_root,
+                "controller_path": root / "controller.py",
+            }
+
+            @contextlib.contextmanager
+            def execution_snapshot(*_args: object, **_kwargs: object):
+                yield snapshot
+
+            @contextlib.contextmanager
+            def prepared_fixtures(*_args: object, **_kwargs: object):
+                yield ()
+
+            def invoke_controller(
+                _snapshot: Mapping[str, object],
+                candidate_argv: list[str],
+                environment: Mapping[str, str],
+                cwd: Path,
+                input_bytes: bytes,
+                **_kwargs: object,
+            ) -> dict[str, object]:
+                completed = subprocess.run(
+                    candidate_argv,
+                    cwd=cwd,
+                    env=dict(environment),
+                    input=input_bytes,
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
+                return {
+                    "status": "completed",
+                    "cleanup_status": "complete",
+                    "timed_out": False,
+                    "process_leak_observed": False,
+                    "returncode": completed.returncode,
+                    "stdout_base64": __import__("base64").b64encode(
+                        completed.stdout
+                    ).decode("ascii"),
+                    "stderr_base64": __import__("base64").b64encode(
+                        completed.stderr
+                    ).decode("ascii"),
+                }
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT.sys,
+                "executable",
+                str(configured_selector),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "strict_isolation_platform_preflight",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_isolation_requested",
+                return_value=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_active_strict_session",
+                return_value={},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_bind_configured_candidate_interpreter",
+                return_value={
+                    "selector": str(configured_selector),
+                    "resolved": str(configured_interpreter),
+                },
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_repository_root",
+                return_value=candidate_root,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "expected_candidate_sha",
+                return_value=("a" * 40, True),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_candidate_checkout_binding_with_sources",
+                return_value=(before, {}, {}),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_validated_candidate_script",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_ensure_strict_backend",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_execution_snapshot",
+                side_effect=execution_snapshot,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_prepared_candidate_fixtures",
+                side_effect=prepared_fixtures,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_fixture_git_repositories",
+                return_value=(),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_invoke_strict_controller",
+                side_effect=invoke_controller,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_checkout_binding",
+                return_value=before,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_candidate_uid_inventory",
+                return_value=set(),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_realm",
+                return_value={"uid": 60000, "gid": 60000},
+            ), mock.patch.dict(
+                os.environ,
+                {REQUIRED_CI_CANDIDATE_SHA_ENV: "a" * 40},
+                clear=False,
+            ):
+                completed = _CANDIDATE_SUPPORT.run_candidate_python(script)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, "configured-runtime\n")
+            self.assertEqual(completed.args[0], str(configured_interpreter))
 
     def supervise(self, trusted_root: Path, candidate_root: Path) -> dict[str, object]:
         candidate_sha = self.initialize_candidate_checkout(candidate_root)
@@ -12763,6 +13524,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             runner_path.write_text(
                 "from pathlib import Path\n"
                 "import os\n"
+                "import sys\n"
                 "candidate_path = Path(__file__)\n"
                 "candidate_root = next(\n"
                 "    parent for parent in candidate_path.parents\n"
@@ -12784,12 +13546,35 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "    read_status = 'read-denied'\n"
                 "else:\n"
                 "    read_status = 'read-allowed'\n"
+                "stdlib_path = Path(os.__file__)\n"
+                "stdlib_status = ('stdlib-readable' if stdlib_path.read_bytes() "
+                "else 'stdlib-empty')\n"
+                "try:\n"
+                "    with stdlib_path.open('ab'):\n"
+                "        pass\n"
+                "except PermissionError:\n"
+                "    stdlib_write_status = 'stdlib-write-denied'\n"
+                "else:\n"
+                "    stdlib_write_status = 'stdlib-write-allowed'\n"
+                "try:\n"
+                "    with Path(sys.executable).open('ab'):\n"
+                "        pass\n"
+                "except PermissionError:\n"
+                "    interpreter_write_status = 'interpreter-write-denied'\n"
+                "else:\n"
+                "    interpreter_write_status = 'interpreter-write-allowed'\n"
+                "runtime = sys.executable\n"
+                "version = '.'.join(map(str, sys.version_info[:3]))\n"
                 "print(\n"
                 "    f'{os.getuid()}:{os.geteuid()}:{os.getgid()}:{os.getegid()}:'\n"
-                "    f'{write_status}:{read_status}'\n"
+                "    f'{write_status}:{read_status}:{stdlib_status}:'\n"
+                "    f'{stdlib_write_status}:{interpreter_write_status}:'\n"
+                "    f'{runtime}:{version}'\n"
                 ")\n"
-                "if (write_status, read_status) != "
-                "('write-denied', 'read-denied'):\n"
+                "if (write_status, read_status, stdlib_status, "
+                "stdlib_write_status, interpreter_write_status) != "
+                "('write-denied', 'read-denied', 'stdlib-readable', "
+                "'stdlib-write-denied', 'interpreter-write-denied'):\n"
                 "    raise SystemExit(91)\n",
                 encoding="utf-8",
             )
@@ -12811,7 +13596,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertEqual(
                 completed.stdout,
                 f"{target_uid}:{target_uid}:{target_gid}:{target_gid}:"
-                "write-denied:read-denied\n",
+                "write-denied:read-denied:stdlib-readable:"
+                "stdlib-write-denied:interpreter-write-denied:"
+                f"{Path(sys.executable).resolve(strict=True)}:"
+                f"{'.'.join(map(str, sys.version_info[:3]))}\n",
             )
 
     def test_candidate_cannot_use_runner_environment_for_trusted_source_aba(

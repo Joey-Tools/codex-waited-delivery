@@ -1510,6 +1510,445 @@ def _validate_strict_primitive(path: Path, description: str) -> None:
         )
 
 
+def _strict_target_mode_allows(
+    metadata: os.stat_result, target_uid: int, target_gid: int, mask: int
+) -> bool:
+    shift = (
+        6
+        if metadata.st_uid == target_uid
+        else 3
+        if metadata.st_gid == target_gid
+        else 0
+    )
+    return ((metadata.st_mode >> shift) & mask) == mask
+
+
+def _strict_runtime_acl_is_absent(path: Path, description: str) -> None:
+    if not hasattr(os, "listxattr"):
+        if sys.platform == "linux":
+            raise AssertionError(f"{description} ACL state cannot be read")
+        return
+    _acl_is_absent(path, description)
+
+
+def _strict_runtime_identity_document(
+    path: Path, metadata: os.stat_result, kind: str, link_target: str | None = None
+) -> dict[str, object]:
+    # Bind path/object identity and target access policy only. Content bytes,
+    # timestamps, and link count are outside this target-UID threat boundary.
+    document: dict[str, object] = {
+        "path": str(path),
+        "kind": kind,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "link_target": link_target,
+    }
+    if kind != "symlink":
+        document.update(
+            uid=metadata.st_uid,
+            gid=metadata.st_gid,
+            permissions=stat.S_IMODE(metadata.st_mode),
+        )
+    return document
+
+
+def _strict_runtime_kind(metadata: os.stat_result) -> str | None:
+    if stat.S_ISDIR(metadata.st_mode):
+        return "directory"
+    if stat.S_ISREG(metadata.st_mode):
+        return "file"
+    if stat.S_ISLNK(metadata.st_mode):
+        return "symlink"
+    return None
+
+
+def _assert_strict_target_runtime_policy(
+    metadata: os.stat_result,
+    *,
+    target_uid: int,
+    target_gid: int,
+    description: str,
+    directory: bool,
+    executable: bool,
+) -> None:
+    expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_kind(metadata.st_mode):
+        raise AssertionError(f"{description} object identity is unsafe")
+    required = os.X_OK if directory or executable else os.R_OK
+    if (
+        metadata.st_uid == target_uid
+        or not _strict_target_mode_allows(
+            metadata, target_uid, target_gid, required
+        )
+        or _strict_target_mode_allows(
+            metadata, target_uid, target_gid, os.W_OK
+        )
+        or (not directory and metadata.st_mode & (stat.S_ISUID | stat.S_ISGID))
+    ):
+        raise AssertionError(f"{description} access policy is unsafe")
+
+
+def _capture_strict_runtime_lexical_path(
+    path: Path,
+    *,
+    target_uid: int,
+    target_gid: int,
+    description: str,
+    executable: bool,
+) -> list[dict[str, object]]:
+    current = Path(path.anchor)
+    documents: list[dict[str, object]] = []
+    for index, component in enumerate(path.parts[1:]):
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError as error:
+            raise AssertionError(f"{description} is missing") from error
+        except OSError as error:
+            raise AssertionError(f"{description} is unreadable") from error
+        kind = _strict_runtime_kind(metadata)
+        is_leaf = index == len(path.parts[1:]) - 1
+        if kind not in (("file", "symlink") if is_leaf else ("directory", "symlink")):
+            raise AssertionError(f"{description} path binding changed")
+        link_target = None
+        if kind == "symlink":
+            try:
+                link_target = os.readlink(current)
+            except OSError as error:
+                raise AssertionError(f"{description} is unreadable") from error
+        else:
+            _assert_strict_target_runtime_policy(
+                metadata,
+                target_uid=target_uid,
+                target_gid=target_gid,
+                description=description,
+                directory=kind == "directory",
+                executable=executable if is_leaf else False,
+            )
+            _strict_runtime_acl_is_absent(current, description)
+        documents.append(
+            _strict_runtime_identity_document(
+                current, metadata, kind, link_target
+            )
+        )
+    return documents
+
+
+def _capture_strict_runtime_canonical_path(
+    path: Path,
+    *,
+    target_uid: int,
+    target_gid: int,
+    description: str,
+    executable: bool,
+) -> list[dict[str, object]]:
+    if not path.is_absolute() or path.anchor != os.path.sep:
+        raise AssertionError(f"{description} must be an absolute POSIX path")
+    try:
+        if path.resolve(strict=True) != path:
+            raise AssertionError(f"{description} path binding changed")
+    except FileNotFoundError as error:
+        raise AssertionError(f"{description} is missing") from error
+    except OSError as error:
+        raise AssertionError(f"{description} is unreadable") from error
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    readable_file_flags = (
+        os.O_RDONLY
+        | os.O_NONBLOCK
+        | os.O_NOCTTY
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC
+    )
+    executable_file_flags = (
+        getattr(
+            os,
+            "O_PATH",
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY,
+        )
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC
+    )
+    documents: list[dict[str, object]] = []
+    with ExitStack() as descriptors:
+        anchor_descriptor = os.open(path.anchor, directory_flags)
+        descriptors.callback(os.close, anchor_descriptor)
+        parent_descriptor = anchor_descriptor
+        anchor_metadata = os.fstat(anchor_descriptor)
+        _assert_strict_target_runtime_policy(
+            anchor_metadata,
+            target_uid=target_uid,
+            target_gid=target_gid,
+            description=description,
+            directory=True,
+            executable=False,
+        )
+        _strict_runtime_acl_is_absent(Path(path.anchor), description)
+        anchor_document = _strict_runtime_identity_document(
+            Path(path.anchor), anchor_metadata, "directory"
+        )
+        documents.append(anchor_document)
+        bindings: list[tuple[int, str, int, dict[str, object]]] = []
+        current = Path(path.anchor)
+        for index, component in enumerate(path.parts[1:]):
+            current /= component
+            is_leaf = index == len(path.parts[1:]) - 1
+            flags = (
+                executable_file_flags if executable else readable_file_flags
+            ) if is_leaf else directory_flags
+            try:
+                selected = os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                descriptor = os.open(
+                    component, flags, dir_fd=parent_descriptor
+                )
+            except FileNotFoundError as error:
+                raise AssertionError(
+                    f"{description} disappeared during binding"
+                ) from error
+            except OSError as error:
+                if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise AssertionError(
+                        f"{description} path binding changed"
+                    ) from error
+                raise AssertionError(f"{description} is unreadable") from error
+            descriptors.callback(os.close, descriptor)
+            opened = os.fstat(descriptor)
+            expected_kind = "file" if is_leaf else "directory"
+            if (
+                _strict_runtime_kind(selected) != expected_kind
+                or _strict_runtime_kind(opened) != expected_kind
+                or (selected.st_dev, selected.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise AssertionError(f"{description} object identity changed")
+            _assert_strict_target_runtime_policy(
+                opened,
+                target_uid=target_uid,
+                target_gid=target_gid,
+                description=description,
+                directory=not is_leaf,
+                executable=executable if is_leaf else False,
+            )
+            _strict_runtime_acl_is_absent(current, description)
+            document = _strict_runtime_identity_document(
+                current, opened, expected_kind
+            )
+            documents.append(document)
+            bindings.append(
+                (parent_descriptor, component, descriptor, document)
+            )
+            parent_descriptor = descriptor
+        for parent_fd, component, descriptor, expected in bindings:
+            try:
+                opened = os.fstat(descriptor)
+                selected = os.stat(
+                    component, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except FileNotFoundError as error:
+                raise AssertionError(
+                    f"{description} disappeared during revalidation"
+                ) from error
+            except OSError as error:
+                raise AssertionError(
+                    f"{description} is unreadable during revalidation"
+                ) from error
+            kind = str(expected["kind"])
+            selected_document = _strict_runtime_identity_document(
+                Path(str(expected["path"])), selected, kind
+            )
+            opened_document = _strict_runtime_identity_document(
+                Path(str(expected["path"])), opened, kind
+            )
+            if (
+                _strict_runtime_kind(selected) != kind
+                or _strict_runtime_kind(opened) != kind
+                or selected_document != expected
+                or opened_document != expected
+            ):
+                raise AssertionError(
+                    f"{description} object identity or access policy changed"
+                )
+        if _strict_runtime_identity_document(
+            Path(path.anchor), os.fstat(anchor_descriptor), "directory"
+        ) != documents[0]:
+            raise AssertionError(
+                f"{description} object identity or access policy changed"
+            )
+    return documents
+
+
+def _capture_strict_candidate_interpreter_binding(
+    selector_value: str,
+    stdlib_value: str,
+    *,
+    target_uid: int,
+    target_gid: int,
+    version: Sequence[int],
+    implementation: str,
+) -> dict[str, object]:
+    if (
+        type(target_uid) is not int
+        or type(target_gid) is not int
+        or not 50000 <= target_uid <= 64999
+        or target_uid != target_gid
+    ):
+        raise AssertionError(
+            "configured candidate interpreter target identity is malformed"
+        )
+    if (
+        type(selector_value) is not str
+        or type(stdlib_value) is not str
+        or not selector_value
+        or not stdlib_value
+    ):
+        raise AssertionError("configured candidate interpreter selector is malformed")
+    selector = Path(selector_value)
+    stdlib_selector = Path(stdlib_value)
+    if (
+        not selector.is_absolute()
+        or selector.anchor != os.path.sep
+        or not stdlib_selector.is_absolute()
+        or stdlib_selector.anchor != os.path.sep
+    ):
+        raise AssertionError(
+            "configured candidate interpreter selectors must be absolute POSIX paths"
+        )
+    exact_version = list(version)
+    if (
+        len(exact_version) != 3
+        or any(type(item) is not int or item < 0 for item in exact_version)
+        or type(implementation) is not str
+        or not implementation
+    ):
+        raise AssertionError("configured candidate interpreter version is malformed")
+    lexical_before = _capture_strict_runtime_lexical_path(
+        selector,
+        target_uid=target_uid,
+        target_gid=target_gid,
+        description="configured candidate interpreter",
+        executable=True,
+    )
+    stdlib_lexical_before = _capture_strict_runtime_lexical_path(
+        stdlib_selector,
+        target_uid=target_uid,
+        target_gid=target_gid,
+        description="configured candidate startup-library sentinel",
+        executable=False,
+    )
+    try:
+        resolved = selector.resolve(strict=True)
+        stdlib_resolved = stdlib_selector.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise AssertionError("configured candidate runtime is missing") from error
+    except OSError as error:
+        raise AssertionError("configured candidate runtime is unreadable") from error
+    interpreter_chain = _capture_strict_runtime_canonical_path(
+        resolved,
+        target_uid=target_uid,
+        target_gid=target_gid,
+        description="configured candidate interpreter",
+        executable=True,
+    )
+    stdlib_chain = _capture_strict_runtime_canonical_path(
+        stdlib_resolved,
+        target_uid=target_uid,
+        target_gid=target_gid,
+        description="configured candidate startup-library sentinel",
+        executable=False,
+    )
+    lexical_after = _capture_strict_runtime_lexical_path(
+        selector,
+        target_uid=target_uid,
+        target_gid=target_gid,
+        description="configured candidate interpreter",
+        executable=True,
+    )
+    stdlib_lexical_after = _capture_strict_runtime_lexical_path(
+        stdlib_selector,
+        target_uid=target_uid,
+        target_gid=target_gid,
+        description="configured candidate startup-library sentinel",
+        executable=False,
+    )
+    if lexical_after != lexical_before or stdlib_lexical_after != stdlib_lexical_before:
+        raise AssertionError("configured candidate runtime path binding changed")
+    return {
+        "schema_version": 1,
+        "target_uid": target_uid,
+        "target_gid": target_gid,
+        "selector": str(selector),
+        "resolved": str(resolved),
+        "stdlib_selector": str(stdlib_selector),
+        "stdlib_resolved": str(stdlib_resolved),
+        "version": exact_version,
+        "implementation": implementation,
+        "selector_components": lexical_before,
+        "stdlib_selector_components": stdlib_lexical_before,
+        "interpreter_components": interpreter_chain,
+        "stdlib_components": stdlib_chain,
+    }
+
+
+def _bind_configured_candidate_interpreter(
+    target_uid: int, target_gid: int
+) -> dict[str, object]:
+    # Bind one startup-library sentinel and its canonical ancestors. The
+    # target-credential bootstrap below proves the configured runtime's other
+    # required imports are readable without an unbounded standard-library scan.
+    stdlib_value = getattr(os, "__file__", None)
+    if type(stdlib_value) is not str:
+        raise AssertionError(
+            "configured candidate startup-library sentinel is unavailable"
+        )
+    return _capture_strict_candidate_interpreter_binding(
+        sys.executable,
+        stdlib_value,
+        target_uid=target_uid,
+        target_gid=target_gid,
+        version=sys.version_info[:3],
+        implementation=sys.implementation.name,
+    )
+
+
+def _revalidate_configured_candidate_interpreter(
+    binding: object,
+) -> dict[str, object]:
+    required = {
+        "schema_version",
+        "target_uid",
+        "target_gid",
+        "selector",
+        "resolved",
+        "stdlib_selector",
+        "stdlib_resolved",
+        "version",
+        "implementation",
+        "selector_components",
+        "stdlib_selector_components",
+        "interpreter_components",
+        "stdlib_components",
+    }
+    if type(binding) is not dict or set(binding) != required:
+        raise AssertionError("configured candidate interpreter binding is malformed")
+    if binding.get("schema_version") != 1:
+        raise AssertionError("configured candidate interpreter binding schema is invalid")
+    version = binding.get("version")
+    recaptured = _capture_strict_candidate_interpreter_binding(
+        binding.get("selector"),
+        binding.get("stdlib_selector"),
+        target_uid=binding.get("target_uid"),
+        target_gid=binding.get("target_gid"),
+        version=version if isinstance(version, list) else (),
+        implementation=binding.get("implementation"),
+    )
+    if recaptured != binding:
+        raise AssertionError("configured candidate interpreter binding changed")
+    return recaptured
+
+
 def _minimal_supervisor_environment() -> dict[str, str]:
     return {
         "HOME": "/root",
@@ -1784,7 +2223,55 @@ _ROOT_TARGET_ACTIVE_PREFIX = "REQUIRED_CI_ROOT_TARGET_ACTIVE:"
 _TARGET_ACTIVE_MARKER_PREFIX = "REQUIRED_CI_TARGET_ACTIVE:"
 _ROOT_CLEANUP_RECEIPT_PREFIX = "REQUIRED_CI_ROOT_CLEANUP:"
 _ROOT_TREE_RECEIPT_PREFIX = "REQUIRED_CI_ROOT_TREE:"
+_CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE = r'''
+import os
+import sys
+
+if len(sys.argv) < 9:
+    raise SystemExit(118)
+resolved = sys.argv[1]
+stdlib_resolved = sys.argv[2]
+implementation = sys.argv[3]
+version_values = sys.argv[4:7]
+environment_count_value = sys.argv[7]
+try:
+    version = tuple(int(value) for value in version_values)
+    environment_count = int(environment_count_value)
+except ValueError:
+    raise SystemExit(118)
+if (
+    any(str(value) != encoded for value, encoded in zip(version, version_values))
+    or str(environment_count) != environment_count_value
+    or environment_count < 0
+    or len(sys.argv) < 9 + environment_count
+):
+    raise SystemExit(118)
+environment_arguments = sys.argv[8 : 8 + environment_count]
+candidate_argv = sys.argv[8 + environment_count :]
+closed_environment = {}
+for item in environment_arguments:
+    key, separator, value = item.partition("=")
+    if not separator or not key or "\x00" in key or "\x00" in value:
+        raise SystemExit(118)
+    if key in closed_environment:
+        raise SystemExit(118)
+    closed_environment[key] = value
+if (
+    version != tuple(sys.version_info[:3])
+    or implementation != sys.implementation.name
+    or os.path.realpath(sys.executable) != resolved
+    or type(getattr(os, "__file__", None)) is not str
+    or os.path.realpath(os.__file__) != stdlib_resolved
+    or (sys.platform == "linux" and os.path.realpath("/proc/self/exe") != resolved)
+    or not candidate_argv
+    or candidate_argv[0] != resolved
+):
+    raise SystemExit(118)
+os.execve(candidate_argv[0], candidate_argv, closed_environment)
+'''.strip()
 _CANDIDATE_BOOTSTRAP_SOURCE = r'''
+import errno
+import json
 import os
 import resource
 import socket
@@ -1795,7 +2282,9 @@ gid = int(sys.argv[2])
 trusted_root = sys.argv[3]
 trusted_sentinel = sys.argv[4]
 host_parent_pid = int(sys.argv[5])
-candidate_argv = sys.argv[6:]
+runtime_binding_json = sys.argv[6]
+configured_bootstrap_source = sys.argv[7]
+candidate_argv = sys.argv[8:]
 
 status = {}
 with open("/proc/self/status", encoding="ascii") as status_file:
@@ -1853,7 +2342,150 @@ expected_limits = {
 for limit_name, expected in expected_limits.items():
     if resource.getrlimit(limit_name) != (expected, expected):
         raise SystemExit(130)
-os.execve(candidate_argv[0], candidate_argv, os.environ.copy())
+runtime_binding = json.loads(runtime_binding_json)
+if runtime_binding is None:
+    os.execve(candidate_argv[0], candidate_argv, os.environ.copy())
+required_binding_keys = {
+    "schema_version",
+    "target_uid",
+    "target_gid",
+    "selector",
+    "resolved",
+    "stdlib_selector",
+    "stdlib_resolved",
+    "version",
+    "implementation",
+    "selector_components",
+    "stdlib_selector_components",
+    "interpreter_components",
+    "stdlib_components",
+}
+if (
+    type(runtime_binding) is not dict
+    or set(runtime_binding) != required_binding_keys
+    or runtime_binding.get("schema_version") != 1
+    or runtime_binding.get("target_uid") != uid
+    or runtime_binding.get("target_gid") != gid
+    or not candidate_argv
+    or candidate_argv[0] != runtime_binding.get("resolved")
+    or os.path.realpath(candidate_argv[0]) != runtime_binding.get("resolved")
+    or os.path.realpath(runtime_binding.get("stdlib_selector", ""))
+    != runtime_binding.get("stdlib_resolved")
+):
+    raise SystemExit(131)
+
+def observed_document(expected):
+    path = expected.get("path")
+    if type(path) is not str or not os.path.isabs(path):
+        raise SystemExit(132)
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        raise SystemExit(133)
+    except OSError:
+        raise SystemExit(134)
+    mode = metadata.st_mode
+    if os.path.islink(path):
+        selected_kind = "symlink"
+        link_target = os.readlink(path)
+    elif os.path.isdir(path):
+        selected_kind = "directory"
+        link_target = None
+    elif os.path.isfile(path):
+        selected_kind = "file"
+        link_target = None
+    else:
+        raise SystemExit(135)
+    document = {
+        "path": path,
+        "kind": selected_kind,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "link_target": link_target,
+    }
+    if selected_kind != "symlink":
+        document.update(
+            uid=metadata.st_uid,
+            gid=metadata.st_gid,
+            permissions=mode & 0o7777,
+        )
+    return document
+
+component_groups = (
+    runtime_binding["selector_components"],
+    runtime_binding["stdlib_selector_components"],
+    runtime_binding["interpreter_components"],
+    runtime_binding["stdlib_components"],
+)
+if any(type(group) is not list or not group for group in component_groups):
+    raise SystemExit(136)
+for group in component_groups:
+    for expected in group:
+        if type(expected) is not dict or observed_document(expected) != expected:
+            raise SystemExit(137)
+
+directory_paths = {
+    expected["path"]
+    for group in component_groups
+    for expected in group
+    if expected.get("kind") == "directory"
+}
+for selected in sorted(directory_paths):
+    if not os.access(selected, os.X_OK) or os.access(selected, os.W_OK):
+        raise SystemExit(138)
+for selected, required_access in (
+    (runtime_binding["selector"], os.X_OK),
+    (runtime_binding["resolved"], os.X_OK),
+    (runtime_binding["stdlib_selector"], os.R_OK),
+    (runtime_binding["stdlib_resolved"], os.R_OK),
+):
+    if not os.access(selected, required_access) or os.access(selected, os.W_OK):
+        raise SystemExit(139)
+selected = runtime_binding["stdlib_resolved"]
+try:
+    descriptor = os.open(
+        selected,
+        os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    os.read(descriptor, 1)
+except OSError:
+    raise SystemExit(140)
+finally:
+    try:
+        os.close(descriptor)
+    except (OSError, UnboundLocalError):
+        pass
+for selected in (
+    runtime_binding["resolved"],
+    runtime_binding["stdlib_resolved"],
+):
+    try:
+        writable = os.open(selected, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EROFS):
+            raise SystemExit(141)
+    else:
+        os.close(writable)
+        raise SystemExit(142)
+configured_argv = [
+    runtime_binding["resolved"],
+    "-I",
+    "-B",
+    "-S",
+    "-c",
+    configured_bootstrap_source,
+    runtime_binding["resolved"],
+    runtime_binding["stdlib_resolved"],
+    runtime_binding["implementation"],
+    *[str(value) for value in runtime_binding["version"]],
+    str(len(os.environ)),
+    *[
+        f"{key}={value}"
+        for key, value in sorted(os.environ.items())
+    ],
+    *candidate_argv,
+]
+os.execve(configured_argv[0], configured_argv, os.environ.copy())
 '''.strip()
 
 _ROOT_WRAPPER_SOURCE = r'''
@@ -2682,6 +3314,7 @@ def _root_controller_candidate_command(
     gid = config.get("gid")
     environment = config.get("environment")
     candidate_argv = config.get("candidate_argv")
+    runtime_binding = config.get("candidate_interpreter")
     if (
         type(uid) is not int
         or type(gid) is not int
@@ -2696,6 +3329,28 @@ def _root_controller_candidate_command(
     trusted_sentinel = config.get("trusted_sentinel")
     if type(trusted_root) is not str or type(trusted_sentinel) is not str:
         raise AssertionError("strict root controller trusted boundary is malformed")
+    if runtime_binding is not None:
+        runtime_binding = _revalidate_configured_candidate_interpreter(
+            runtime_binding
+        )
+        if (
+            runtime_binding["target_uid"] != uid
+            or runtime_binding["target_gid"] != gid
+        ):
+            raise AssertionError(
+                "strict root controller configured interpreter target identity changed"
+            )
+        if candidate_argv[0] != runtime_binding["resolved"]:
+            raise AssertionError(
+                "strict root controller configured interpreter identity changed"
+            )
+    elif candidate_argv[0] != str(_STRICT_PRIMITIVES["python"]):
+        raise AssertionError(
+            "strict root controller system interpreter identity changed"
+        )
+    runtime_binding_json = json.dumps(
+        runtime_binding, sort_keys=True, separators=(",", ":")
+    )
     environment_arguments = [
         f"{key}={value}" for key, value in sorted(environment.items())
     ]
@@ -2705,6 +3360,8 @@ def _root_controller_candidate_command(
         trusted_root,
         trusted_sentinel,
         str(host_parent_pid),
+        runtime_binding_json,
+        _CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE,
         *candidate_argv,
     ]
     return [
@@ -8651,8 +9308,52 @@ def _invoke_strict_controller(
     trusted_outer_fault_probe: tuple[Path, str, str, int] | None = None,
     trusted_completion_sentinel: Path | None = None,
     registered_session_id: str | None = None,
+    candidate_interpreter_binding: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    exact_candidate_argv = list(candidate_argv)
+    if (
+        not exact_candidate_argv
+        or type(exact_candidate_argv[0]) is not str
+        or not exact_candidate_argv[0]
+        or any(
+            type(item) is not str or "\x00" in item
+            for item in exact_candidate_argv
+        )
+    ):
+        raise AssertionError("strict candidate command is malformed")
+    if candidate_interpreter_binding is None:
+        expected_interpreter = str(_STRICT_PRIMITIVES["python"])
+    else:
+        expected_interpreter = candidate_interpreter_binding.get("resolved")
+        if type(expected_interpreter) is not str or not expected_interpreter:
+            raise AssertionError(
+                "strict candidate configured interpreter binding is malformed"
+            )
+    if exact_candidate_argv[0] != expected_interpreter:
+        raise AssertionError(
+            "strict candidate interpreter identity changed before privilege"
+        )
+    exact_interpreter_binding = (
+        None
+        if candidate_interpreter_binding is None
+        else _revalidate_configured_candidate_interpreter(
+            dict(candidate_interpreter_binding)
+        )
+    )
     realm = _strict_realm()
+    if exact_interpreter_binding is not None and (
+        exact_interpreter_binding["target_uid"] != realm.get("uid")
+        or exact_interpreter_binding["target_gid"] != realm.get("gid")
+    ):
+        raise AssertionError(
+            "strict candidate configured interpreter target identity changed"
+        )
+    if exact_interpreter_binding is not None and (
+        exact_candidate_argv[0] != exact_interpreter_binding["resolved"]
+    ):
+        raise AssertionError(
+            "strict candidate interpreter identity changed during revalidation"
+        )
     if trusted_outer_fault_probe is not None and (
         type(trusted_outer_fault_probe) is not tuple
         or len(trusted_outer_fault_probe) != 4
@@ -8739,7 +9440,8 @@ def _invoke_strict_controller(
         "handshake_path": str(handshake_path),
         "trusted_root": str(_TRUSTED_CHECKOUT_ROOT),
         "trusted_sentinel": str(_TRUSTED_SUPPORT_PATH),
-        "candidate_argv": list(candidate_argv),
+        "candidate_argv": exact_candidate_argv,
+        "candidate_interpreter": exact_interpreter_binding,
         "environment": dict(environment),
         "cwd": str(cwd),
         "timeout_seconds": timeout_seconds,
@@ -9873,10 +10575,21 @@ def _run_candidate_process(
     writable_roots: Sequence[Path] = (),
 ) -> subprocess.CompletedProcess[str]:
     strict_isolation_platform_preflight()
-    root = candidate_repository_root()
     strict = _strict_isolation_requested()
+    configured_interpreter_binding: dict[str, object] | None = None
     if strict:
         _active_strict_session()
+        strict_candidate_sha = os.environ.get(CANDIDATE_SHA_ENV)
+        if strict_candidate_sha is None:
+            raise AssertionError(
+                "strict candidate isolation requires an explicit frozen candidate SHA"
+            )
+        _parse_candidate_sha(strict_candidate_sha, CANDIDATE_SHA_ENV)
+        realm = _strict_realm()
+        configured_interpreter_binding = _bind_configured_candidate_interpreter(
+            int(realm["uid"]), int(realm["gid"])
+        )
+    root = candidate_repository_root()
     candidate_sha, require_clean = expected_candidate_sha(root)
     if strict and not require_clean:
         raise AssertionError(
@@ -9976,7 +10689,17 @@ def _run_candidate_process(
                     raise AssertionError(
                         "strict candidate command must start with the trusted interpreter selector"
                     )
-                exact_command[0] = str(_STRICT_PRIMITIVES["python"])
+                if (
+                    configured_interpreter_binding is None
+                    or exact_command[0]
+                    != configured_interpreter_binding.get("selector")
+                ):
+                    raise AssertionError(
+                        "strict candidate configured interpreter binding changed"
+                    )
+                exact_command[0] = str(
+                    configured_interpreter_binding["resolved"]
+                )
             child_home = runtime_root if requested_home is None else requested_home
             child_environment = _closed_candidate_environment(
                 supplied_environment,
@@ -9995,6 +10718,9 @@ def _run_candidate_process(
                     child_cwd,
                     input_bytes,
                     timeout_seconds=CANDIDATE_PROCESS_TIMEOUT_SECONDS,
+                    candidate_interpreter_binding=(
+                        configured_interpreter_binding
+                    ),
                 )
                 if receipt.get("status") != "completed":
                     raise AssertionError(

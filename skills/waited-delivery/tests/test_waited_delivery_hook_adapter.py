@@ -279,8 +279,14 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         ).resolve(strict=True)
         isolated_probe = pathlib.Path(completed.args[3])
         isolated_adapter = pathlib.Path(completed.args[5])
+        expected_interpreter = (
+            str(pathlib.Path(sys.executable).resolve(strict=True))
+            if os.environ.get("REQUIRED_CI_ISOLATION_MODE")
+            == "sudo-setpriv-v1"
+            else sys.executable
+        )
         self.assertEqual(
-            completed.args[:3], [sys.executable, "-I", "-B"]
+            completed.args[:3], [expected_interpreter, "-I", "-B"]
         )
         self.assertEqual(completed.args[4], "--hook-fault-probe")
         self.assertEqual(completed.args[6], ",".join(faults))
