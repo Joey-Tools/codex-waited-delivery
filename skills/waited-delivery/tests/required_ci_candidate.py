@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import binascii
 import ctypes
 import errno
 import fcntl
@@ -145,6 +146,55 @@ _DISTRIBUTION_LAYOUTS = (
     ),
     (Path("skills/waited-delivery"), Path(), "canonical"),
 )
+
+
+def _neutralize_failure_workflow_commands(value: str) -> str:
+    lines: list[str] = []
+    for line in value.split("\n"):
+        prefix_length = 0
+        while prefix_length < len(line) and line[prefix_length].isspace():
+            prefix_length += 1
+        if line[prefix_length:].startswith("::"):
+            line = line[:prefix_length] + "\\" + line[prefix_length:]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _canonical_failure_text(value: str) -> str:
+    escaped: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if character == "\n":
+            escaped.append(character)
+        elif unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
+            if codepoint <= 0xFF:
+                escaped.append(f"\\x{codepoint:02x}")
+            elif codepoint <= 0xFFFF:
+                escaped.append(f"\\u{codepoint:04x}")
+            else:
+                escaped.append(f"\\U{codepoint:08x}")
+        else:
+            escaped.append(character)
+    return _neutralize_failure_workflow_commands("".join(escaped))
+
+
+def _bounded_failure_text(value: str, limit: int = 2000) -> str:
+    normalized = _canonical_failure_text(value)
+    if len(normalized) <= limit:
+        return normalized
+    marker = "...[middle truncated]..."
+    if limit <= 0:
+        return ""
+    if limit <= len(marker) + 1:
+        return marker[:limit]
+    # Existing logical-line prefixes are already neutralized.  Reserve one
+    # byte so the post-join pass can also neutralize any prefix exposed at a
+    # truncation boundary without exceeding the caller's total limit.
+    retained = limit - len(marker) - 1
+    head_length = retained // 2
+    tail_length = retained - head_length
+    bounded = normalized[:head_length] + marker + normalized[-tail_length:]
+    return _neutralize_failure_workflow_commands(bounded)
 
 
 def _trusted_distribution_context() -> tuple[Path, Path, Path, str]:
@@ -12408,6 +12458,79 @@ if first == 0:
     os._exit(0)
 time.sleep(30)
 """
+
+
+def _decode_strict_probe_output_text(
+    receipt: Mapping[str, object], field: str
+) -> str:
+    encoded = receipt.get(field)
+    encoded_limit = ((CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES + 2) // 3) * 4
+    if type(encoded) is not str or len(encoded) > encoded_limit:
+        raise AssertionError(f"strict candidate {field} receipt is malformed")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise AssertionError(
+            f"strict candidate {field} receipt is malformed"
+        ) from error
+    if len(decoded) > CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES:
+        raise AssertionError(f"strict candidate {field} receipt is malformed")
+    return decoded.decode("utf-8", errors="backslashreplace")
+
+
+def _strict_probe_output_text(
+    receipt: Mapping[str, object], field: str
+) -> str:
+    try:
+        return _decode_strict_probe_output_text(receipt, field)
+    except AssertionError:
+        return f"<malformed {field}>"
+
+
+def _strict_normal_probe_failure_details(
+    receipt: Mapping[str, object],
+) -> str:
+    string_fields = ("status", "cleanup_status")
+    boolean_fields = ("timed_out", "process_leak_observed")
+    summary: dict[str, object] = {
+        field: (
+            receipt.get(field)
+            if type(receipt.get(field)) is str
+            and len(str(receipt.get(field))) <= 64
+            else "<malformed>"
+        )
+        for field in string_fields
+    }
+    summary.update(
+        {
+            field: (
+                receipt.get(field)
+                if type(receipt.get(field)) is bool
+                else "<malformed>"
+            )
+            for field in boolean_fields
+        }
+    )
+    returncode = receipt.get("returncode")
+    summary["returncode"] = (
+        returncode
+        if type(returncode) is int or returncode is None
+        else "<malformed>"
+    )
+    summary_text = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+    details = (
+        "receipt="
+        + summary_text
+        + "\nstdout:\n"
+        + _strict_probe_output_text(receipt, "stdout_base64")
+        + "\nstderr:\n"
+        + _strict_probe_output_text(receipt, "stderr_base64")
+        + "\nreceipt-final="
+        + summary_text
+    )
+    return _bounded_failure_text(details)
+
+
 _TARGET_ACTIVE_PROBE_SOURCE = b"""\
 import json
 import os
@@ -13251,11 +13374,40 @@ def _ensure_strict_backend() -> None:
             raise AssertionError("strict candidate live capability cleanup is incomplete")
         if receipt.get("timed_out") is not expect_timeout:
             raise AssertionError("strict candidate live capability timeout result is wrong")
+        try:
+            _decode_strict_probe_output_text(receipt, "stdout_base64")
+            _decode_strict_probe_output_text(receipt, "stderr_base64")
+        except AssertionError as error:
+            if not expect_timeout:
+                raise AssertionError(
+                    "strict candidate normal namespace probe failed: "
+                    + _strict_normal_probe_failure_details(receipt)
+                ) from error
+            raise AssertionError(
+                "strict candidate kill namespace probe output receipt is malformed"
+            ) from error
+        returncode = receipt.get("returncode")
+        process_leak_observed = receipt.get("process_leak_observed")
+        if type(returncode) is not int or type(process_leak_observed) is not bool:
+            if expect_timeout:
+                raise AssertionError(
+                    "strict candidate kill namespace probe receipt is malformed"
+                )
+            raise AssertionError(
+                "strict candidate normal namespace probe failed: "
+                + _strict_normal_probe_failure_details(receipt)
+            )
+        if expect_timeout and returncode != -signal.SIGKILL:
+            raise AssertionError(
+                "strict candidate kill namespace probe receipt is malformed"
+            )
         if not expect_timeout and (
-            receipt.get("returncode") != 0
-            or receipt.get("process_leak_observed") is not False
+            returncode != 0 or process_leak_observed is not False
         ):
-            raise AssertionError("strict candidate normal namespace probe failed")
+            raise AssertionError(
+                "strict candidate normal namespace probe failed: "
+                + _strict_normal_probe_failure_details(receipt)
+            )
         if _candidate_uid_inventory(int(_strict_realm()["uid"])):
             raise AssertionError("strict candidate live probe left a process")
     for fault_point in (
@@ -13591,8 +13743,18 @@ def _run_candidate_process(
                     )
                 if receipt.get("cleanup_status") != "complete":
                     raise AssertionError("strict candidate process cleanup is incomplete")
-                timed_out = receipt.get("timed_out") is True
-                lingering_group = receipt.get("process_leak_observed") is True
+                timed_out_value = receipt.get("timed_out")
+                if type(timed_out_value) is not bool:
+                    raise AssertionError(
+                        "strict candidate timed-out receipt is malformed"
+                    )
+                process_leak_observed = receipt.get("process_leak_observed")
+                if type(process_leak_observed) is not bool:
+                    raise AssertionError(
+                        "strict candidate process-leak receipt is malformed"
+                    )
+                timed_out = timed_out_value
+                lingering_group = process_leak_observed
                 returncode_value = receipt.get("returncode")
                 if type(returncode_value) is not int:
                     raise AssertionError("strict candidate return code is malformed")

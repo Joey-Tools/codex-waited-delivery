@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import contextlib
 import ctypes
 import errno
@@ -23,7 +24,6 @@ import tarfile
 import tempfile
 import threading
 import time
-import unicodedata
 import unittest
 import uuid
 from collections.abc import Iterator, Mapping
@@ -835,53 +835,7 @@ def _trusted_test_suite_receipt(
     }
 
 
-def _neutralize_failure_workflow_commands(value: str) -> str:
-    lines: list[str] = []
-    for line in value.split("\n"):
-        prefix_length = 0
-        while prefix_length < len(line) and line[prefix_length].isspace():
-            prefix_length += 1
-        if line[prefix_length:].startswith("::"):
-            line = line[:prefix_length] + "\\" + line[prefix_length:]
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def _canonical_failure_text(value: str) -> str:
-    escaped: list[str] = []
-    for character in value:
-        codepoint = ord(character)
-        if character == "\n":
-            escaped.append(character)
-        elif unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
-            if codepoint <= 0xFF:
-                escaped.append(f"\\x{codepoint:02x}")
-            elif codepoint <= 0xFFFF:
-                escaped.append(f"\\u{codepoint:04x}")
-            else:
-                escaped.append(f"\\U{codepoint:08x}")
-        else:
-            escaped.append(character)
-    return _neutralize_failure_workflow_commands("".join(escaped))
-
-
-def _bounded_failure_text(value: str, limit: int = 2000) -> str:
-    normalized = _canonical_failure_text(value)
-    if len(normalized) <= limit:
-        return normalized
-    marker = "...[middle truncated]..."
-    if limit <= 0:
-        return ""
-    if limit <= len(marker) + 1:
-        return marker[:limit]
-    # Existing logical-line prefixes are already neutralized.  Reserve one
-    # byte so the post-join pass can also neutralize any prefix exposed at a
-    # truncation boundary without exceeding the caller's total limit.
-    retained = limit - len(marker) - 1
-    head_length = retained // 2
-    tail_length = retained - head_length
-    bounded = normalized[:head_length] + marker + normalized[-tail_length:]
-    return _neutralize_failure_workflow_commands(bounded)
+_bounded_failure_text = _CANDIDATE_SUPPORT._bounded_failure_text
 
 
 def _validated_trusted_child_receipt(
@@ -4886,6 +4840,10 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
 
 class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
     def test_bounded_failure_text_preserves_head_and_terminal_cause(self) -> None:
+        self.assertIs(
+            _bounded_failure_text,
+            _CANDIDATE_SUPPORT._bounded_failure_text,
+        )
         value = (
             "::warning title=forged::head\n"
             "Traceback (most recent call last):\n"
@@ -5346,10 +5304,27 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         registry: dict[str, object] = {}
         realm = {"uid": 60000, "gid": 60000}
         terminal_failure = (
-            "MIDDLE-DETAIL-" * 400
-            + "\n  ::add-mask::forged-secret\r"
-            + "\x1b[31m\u2028\u2029\u202e\u200d\ud800\U000e0001"
-            + "terminal-cause\x7f"
+            "strict candidate normal namespace probe failed: "
+            + _CANDIDATE_SUPPORT._strict_normal_probe_failure_details(
+                {
+                    "status": "completed",
+                    "cleanup_status": "complete",
+                    "timed_out": False,
+                    "returncode": 127,
+                    "process_leak_observed": False,
+                    "stdout_base64": base64.b64encode(
+                        b"::warning title=forged::probe-output\n"
+                    ).decode("ascii"),
+                    "stderr_base64": base64.b64encode(
+                        (
+                            ("MIDDLE-DETAIL-" * 400)
+                            + "\n  ::add-mask::forged-secret\r"
+                            + "\x1b[31m\u2028\u2029\u202e\u200d"
+                            + "terminal-cause\x7f"
+                        ).encode("utf-8")
+                    ).decode("ascii"),
+                }
+            )
         )
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -5386,6 +5361,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("did not complete exactly once", stderr.getvalue())
         self.assertIn("...[middle truncated]...", stderr.getvalue())
+        self.assertIn('"returncode":127', stderr.getvalue())
+        self.assertIn('"process_leak_observed":false', stderr.getvalue())
         self.assertIn("terminal-cause", stderr.getvalue())
         self.assertTrue(
             all(
@@ -7149,6 +7126,206 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             backend_source.index("_active_strict_session"),
             backend_source.index("_run_registered_sudo"),
         )
+
+    def test_normal_namespace_probe_failure_reports_sanitized_receipt(
+        self,
+    ) -> None:
+        candidate_stderr = (
+            "probe-start\n"
+            + ("H" * 2500)
+            + "MIDDLE-DETAIL-MUST-BE-DROPPED"
+            + ("T" * 2500)
+            + "\n  ::stop-commands::forged-token\r"
+            + "\x00\x1b[31m"
+        ).encode("utf-8") + b"\xffAssertionError: terminal-cause\x7f"
+        receipt = {
+            "schema_version": 1,
+            "status": "completed",
+            "nonce": "a" * 32,
+            "returncode": 127,
+            "timed_out": False,
+            "process_leak_observed": False,
+            "cleanup_status": "complete",
+            "stdout_base64": base64.b64encode(
+                b"::warning title=forged::probe-output\n"
+            ).decode("ascii"),
+            "stderr_base64": base64.b64encode(candidate_stderr).decode("ascii"),
+        }
+        observed_cleanup_receipt = {
+            **receipt,
+            "returncode": 0,
+            "process_leak_observed": True,
+        }
+        malformed_output_receipt = {
+            **receipt,
+            "returncode": 0,
+            "process_leak_observed": False,
+            "stderr_base64": "%%%not-base64%%%",
+        }
+        boolean_returncode_receipt = {
+            **receipt,
+            "returncode": False,
+        }
+        floating_returncode_receipt = {
+            **receipt,
+            "returncode": 0.0,
+        }
+        kill_receipt = {
+            **receipt,
+            "returncode": -signal.SIGKILL,
+            "timed_out": True,
+            "stdout_base64": base64.b64encode(b"").decode("ascii"),
+            "stderr_base64": base64.b64encode(b"").decode("ascii"),
+        }
+        valid_normal_receipt = {
+            **receipt,
+            "returncode": 0,
+            "stdout_base64": base64.b64encode(b"").decode("ascii"),
+            "stderr_base64": base64.b64encode(b"").decode("ascii"),
+        }
+        selected_receipts = [receipt, kill_receipt]
+
+        def invoke_controller_side_effect(*_args, **kwargs):
+            if kwargs.get("trusted_fault_point") is not None:
+                raise AssertionError("expected synthetic fault probe rejection")
+            if kwargs.get("timeout_seconds") == 0.5:
+                return selected_receipts[1]
+            return selected_receipts[0]
+
+        snapshot = {
+            "candidate_paths": {"probe.py": Path("/snapshot/probe.py")},
+            "runtime_root": Path("/snapshot/runtime"),
+        }
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_active_strict_session", return_value={}
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_realm",
+            return_value={"uid": 60000, "gid": 60000},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_run_registered_sudo"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_protect_strict_checkout_boundaries"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_repository_root",
+            return_value=Path("/candidate"),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "expected_candidate_sha",
+            return_value=("b" * 40, True),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_execution_snapshot",
+            return_value=contextlib.nullcontext(snapshot),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_closed_candidate_environment",
+            return_value={},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_invoke_strict_controller",
+            side_effect=invoke_controller_side_effect,
+        ) as invoke_controller, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_candidate_uid_inventory", return_value=[]
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_probe_independent_outer_owner_fault"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", False
+        ):
+            messages: list[str] = []
+            for name, normal_receipt, selected_kill_receipt in (
+                ("returncode", receipt, kill_receipt),
+                ("observed-cleanup", observed_cleanup_receipt, kill_receipt),
+                ("malformed-output", malformed_output_receipt, kill_receipt),
+                ("boolean-returncode", boolean_returncode_receipt, kill_receipt),
+                ("floating-returncode", floating_returncode_receipt, kill_receipt),
+                (
+                    "kill-boolean-returncode",
+                    valid_normal_receipt,
+                    {**kill_receipt, "returncode": False},
+                ),
+                (
+                    "kill-floating-returncode",
+                    valid_normal_receipt,
+                    {**kill_receipt, "returncode": 0.0},
+                ),
+                (
+                    "kill-wrong-integer-returncode",
+                    valid_normal_receipt,
+                    {**kill_receipt, "returncode": 0},
+                ),
+                (
+                    "kill-nonboolean-leak",
+                    valid_normal_receipt,
+                    {**kill_receipt, "process_leak_observed": 0},
+                ),
+            ):
+                selected_receipts[:] = [normal_receipt, selected_kill_receipt]
+                _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = False
+                messages.append("")
+                with self.subTest(name=name):
+                    with self.assertRaises(AssertionError) as raised:
+                        _CANDIDATE_SUPPORT._ensure_strict_backend()
+                    messages[-1] = str(raised.exception)
+                    self.assertIs(
+                        _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED,
+                        False,
+                    )
+
+        self.assertEqual(invoke_controller.call_count, 13)
+        (
+            message,
+            observed_message,
+            malformed_message,
+            boolean_message,
+            floating_message,
+            kill_boolean_message,
+            kill_floating_message,
+            kill_wrong_integer_message,
+            kill_leak_message,
+        ) = messages
+        prefix = "strict candidate normal namespace probe failed: "
+        self.assertLessEqual(len(message), len(prefix) + 2000)
+        self.assertIn('"returncode":127', message)
+        self.assertIn('"process_leak_observed":false', message)
+        self.assertIn("\\::warning title=forged::probe-output", message)
+        self.assertIn("probe-start", message)
+        self.assertIn("...[middle truncated]...", message)
+        self.assertNotIn("MIDDLE-DETAIL-MUST-BE-DROPPED", message)
+        self.assertIn("\\xff", message)
+        self.assertIn("AssertionError: terminal-cause\\x7f", message)
+        self.assertTrue(
+            all(
+                not line.lstrip().startswith("::")
+                for line in message.split("\n")
+            )
+        )
+        self.assertFalse(
+            any(
+                character in message
+                for character in ("\x00", "\r", "\x1b", "\x7f")
+            )
+        )
+        self.assertIn('"returncode":0', observed_message)
+        self.assertIn('"process_leak_observed":true', observed_message)
+        self.assertIn('"returncode":0', malformed_message)
+        self.assertIn('"process_leak_observed":false', malformed_message)
+        self.assertIn("<malformed stderr_base64>", malformed_message)
+        self.assertIn('"returncode":"<malformed>"', boolean_message)
+        self.assertIn('"returncode":"<malformed>"', floating_message)
+        for kill_message in (
+            kill_boolean_message,
+            kill_floating_message,
+            kill_wrong_integer_message,
+            kill_leak_message,
+        ):
+            self.assertEqual(
+                kill_message,
+                "strict candidate kill namespace probe receipt is malformed",
+            )
 
     def test_supervisor_entry_consumes_the_launcher_absolute_deadline(
         self,
@@ -13780,6 +13957,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             def prepared_fixtures(*_args: object, **_kwargs: object):
                 yield ()
 
+            receipt_overrides: dict[str, object] = {}
+
             def invoke_controller(
                 _snapshot: Mapping[str, object],
                 candidate_argv: list[str],
@@ -13797,7 +13976,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     capture_output=True,
                     timeout=10,
                 )
-                return {
+                receipt: dict[str, object] = {
                     "status": "completed",
                     "cleanup_status": "complete",
                     "timed_out": False,
@@ -13810,6 +13989,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         completed.stderr
                     ).decode("ascii"),
                 }
+                receipt.update(receipt_overrides)
+                return receipt
 
             with mock.patch.object(
                 _CANDIDATE_SUPPORT.sys,
@@ -13885,6 +14066,23 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 clear=False,
             ):
                 completed = _CANDIDATE_SUPPORT.run_candidate_python(script)
+                receipt_overrides["timed_out"] = 0
+                with self.subTest(field="timed_out"):
+                    self.assertRaisesRegex(
+                        AssertionError,
+                        "timed-out receipt is malformed",
+                        _CANDIDATE_SUPPORT.run_candidate_python,
+                        script,
+                    )
+                receipt_overrides.clear()
+                receipt_overrides["process_leak_observed"] = 0.0
+                with self.subTest(field="process_leak_observed"):
+                    self.assertRaisesRegex(
+                        AssertionError,
+                        "process-leak receipt is malformed",
+                        _CANDIDATE_SUPPORT.run_candidate_python,
+                        script,
+                    )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(completed.stdout, "configured-runtime\n")
