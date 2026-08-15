@@ -4958,6 +4958,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "trusted_sentinel": "/trusted/sentinel",
             "host_mount_namespace": "mnt:[101]",
             "host_ipc_namespace": "ipc:[102]",
+            "host_network_namespace": "net:[103]",
             "writable_roots": [
                 {
                     "path": "/execution",
@@ -5018,6 +5019,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             side_effect=lambda namespace: {
                 "mnt": "mnt:[101]",
                 "ipc": "ipc:[102]",
+                "net": "net:[103]",
             }[namespace],
         ):
             yield
@@ -11984,6 +11986,238 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertLess(command.index("--ipc"), command.index("/usr/bin/setpriv"))
         self.assertNotIn("/usr/bin/prlimit", command)
 
+    def test_strict_root_command_binds_network_namespace_and_uses_proc_inventory(
+        self,
+    ) -> None:
+        with self.root_command_mount_contract():
+            command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                self.root_command_config(), 1234, 9
+            )
+
+        bootstrap_source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        candidate_source = _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE
+        invoke_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._invoke_strict_controller
+        )
+        bootstrap_index = command.index(bootstrap_source)
+        candidate_index = command.index(candidate_source)
+        self.assertIn("--net", command)
+        self.assertLess(command.index("--net"), command.index("/usr/bin/setpriv"))
+        self.assertEqual(command[bootstrap_index + 4], "net:[103]")
+        self.assertEqual(command[candidate_index + 5], "1234")
+        self.assertEqual(command[candidate_index + 6], "net:[103]")
+        self.assertEqual(command[candidate_index + 7], "null")
+        self.assertEqual(
+            command[candidate_index + 8],
+            _CANDIDATE_SUPPORT._CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE,
+        )
+        self.assertEqual(command[candidate_index + 9], "/usr/bin/python3")
+        self.assertEqual(command.count("net:[103]"), 2)
+        self.assertIn(
+            'host_network_namespace = _strict_host_namespace_identity("net")',
+            invoke_source,
+        )
+        self.assertIn(
+            '"host_network_namespace": host_network_namespace', invoke_source
+        )
+        self.assertIn("host_network_namespace", bootstrap_source)
+        self.assertIn(
+            'os.readlink("/proc/self/ns/net") == host_network_namespace',
+            bootstrap_source,
+        )
+        self.assertIn("host_network_namespace", candidate_source)
+        self.assertIn(
+            'current_network_namespace = os.readlink("/proc/self/ns/net")',
+            candidate_source,
+        )
+        self.assertIn(
+            "current_network_namespace == host_network_namespace",
+            candidate_source,
+        )
+        self.assertIn(
+            '("/proc/self/net/dev", "file")', bootstrap_source
+        )
+        self.assertIn(
+            'read_network_interfaces("/proc/self/net/dev")', candidate_source
+        )
+        self.assertNotIn('os.listdir("/sys/class/net")', candidate_source)
+        self.assertIn(
+            "strict candidate network interface inventory rejected",
+            candidate_source,
+        )
+        self.assertIn("fallback tunnel devices is unsupported", candidate_source)
+        with self.root_command_mount_contract(), self.assertRaisesRegex(
+            AssertionError, "trusted boundary is malformed"
+        ):
+            _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                self.root_command_config(host_network_namespace=None),
+                1234,
+                9,
+            )
+        with self.root_command_mount_contract(), self.assertRaisesRegex(
+            AssertionError, "host namespace identity changed"
+        ):
+            _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                self.root_command_config(host_network_namespace="net:[999]"),
+                1234,
+                9,
+            )
+
+        parsed_candidate = ast.parse(candidate_source)
+        candidate_nodes = parsed_candidate.body
+        network_identity_index = next(
+            index
+            for index, node in enumerate(candidate_nodes)
+            if isinstance(node, ast.Try)
+            and any(
+                isinstance(statement, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "current_network_namespace"
+                    for target in statement.targets
+                )
+                for statement in node.body
+            )
+        )
+        network_identity_nodes = candidate_nodes[
+            network_identity_index : network_identity_index + 2
+        ]
+        self.assertEqual(len(network_identity_nodes), 2)
+        self.assertIsInstance(network_identity_nodes[1], ast.If)
+        network_identity_module = ast.Module(
+            body=network_identity_nodes,
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(network_identity_module)
+        network_identity_code = compile(
+            network_identity_module,
+            "<network-namespace-identity>",
+            "exec",
+        )
+        valid_namespace_os = mock.Mock()
+        valid_namespace_os.readlink.return_value = "net:[104]"
+        exec(
+            network_identity_code,
+            {
+                "host_network_namespace": "net:[103]",
+                "os": valid_namespace_os,
+                "re": re,
+            },
+        )
+        for name, host_identity, current_identity in (
+            ("missing", "", "net:[104]"),
+            ("reordered argument", "null", "net:[104]"),
+            ("malformed host", "net:[]", "net:[104]"),
+            ("host namespace reused", "net:[103]", "net:[103]"),
+            ("malformed current", "net:[103]", "mnt:[104]"),
+        ):
+            rejected_namespace_os = mock.Mock()
+            rejected_namespace_os.readlink.return_value = current_identity
+            with self.subTest(name=name):
+                with self.assertRaises(SystemExit) as rejected:
+                    exec(
+                        network_identity_code,
+                        {
+                            "host_network_namespace": host_identity,
+                            "os": rejected_namespace_os,
+                            "re": re,
+                        },
+                    )
+                self.assertEqual(rejected.exception.code, 127)
+
+        parser_function = next(
+            node
+            for node in candidate_nodes
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "read_network_interfaces"
+        )
+        parser_module = ast.Module(body=[parser_function], type_ignores=[])
+        ast.fix_missing_locations(parser_module)
+        parser_namespace = {"os": os}
+        exec(
+            compile(parser_module, "<network-interface-parser>", "exec"),
+            parser_namespace,
+        )
+        header = (
+            "Inter-|   Receive |  Transmit\n"
+            " face |bytes packets errs drop fifo frame compressed multicast|"
+            "bytes packets errs drop fifo colls carrier compressed\n"
+        )
+        lo_row = "    lo: " + " ".join("0" for _ in range(16)) + "\n"
+        eth_row = "  eth0: " + " ".join("1" for _ in range(16)) + "\n"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture = Path(temporary_directory) / "dev"
+            fixture.write_text(header + lo_row, encoding="ascii")
+            self.assertEqual(
+                parser_namespace["read_network_interfaces"](str(fixture)),
+                {"lo"},
+            )
+            fixture.write_text(header + lo_row + eth_row, encoding="ascii")
+            self.assertEqual(
+                parser_namespace["read_network_interfaces"](str(fixture)),
+                {"lo", "eth0"},
+            )
+            for malformed in (
+                header + "missing-colon\n",
+                header + lo_row + lo_row,
+                header + "   bad: " + " ".join(["0"] * 15 + ["x"]) + "\n",
+                "X" * 65537,
+            ):
+                fixture.write_text(malformed, encoding="ascii")
+                with self.subTest(malformed=malformed[:32]), self.assertRaises(
+                    SystemExit
+                ) as rejected:
+                    parser_namespace["read_network_interfaces"](str(fixture))
+                self.assertEqual(rejected.exception.code, 127)
+            fixture.write_bytes((header + lo_row).encode("ascii") + b"\xff")
+            with self.assertRaises(SystemExit) as rejected:
+                parser_namespace["read_network_interfaces"](str(fixture))
+            self.assertEqual(rejected.exception.code, 127)
+
+        enforcement_if = next(
+            node
+            for node in candidate_nodes
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "network_interfaces"
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.NotEq)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Set)
+            and ast.literal_eval(node.test.comparators[0]) == {"lo"}
+        )
+        enforcement_module = ast.Module(body=[enforcement_if], type_ignores=[])
+        ast.fix_missing_locations(enforcement_module)
+        enforcement_code = compile(
+            enforcement_module,
+            "<network-interface-enforcement>",
+            "exec",
+        )
+        exec(
+            enforcement_code,
+            {"json": json, "network_interfaces": {"lo"}, "sys": sys},
+        )
+        for rejected_interfaces in (set(), {"lo", "eth0"}):
+            diagnostic = io.StringIO()
+            with self.subTest(rejected_interfaces=rejected_interfaces):
+                with contextlib.redirect_stderr(diagnostic), self.assertRaises(
+                    SystemExit
+                ) as rejected:
+                    exec(
+                        enforcement_code,
+                        {
+                            "json": json,
+                            "network_interfaces": rejected_interfaces,
+                            "sys": sys,
+                        },
+                    )
+                self.assertEqual(rejected.exception.code, 127)
+                self.assertIn(
+                    "strict candidate network interface inventory rejected",
+                    diagnostic.getvalue(),
+                )
+
     def test_strict_root_command_seals_host_mounts_before_setpriv(self) -> None:
         with self.root_command_mount_contract():
             command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
@@ -12071,12 +12305,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             'source_mount_record["mountpoint"] == path', bootstrap_source
         )
         bootstrap_index = command.index(bootstrap_source)
-        namespace_bindings = json.loads(command[bootstrap_index + 4])
+        namespace_bindings = json.loads(command[bootstrap_index + 5])
         self.assertEqual(
             namespace_bindings,
             [{"device": 1, "inode": 2, "path": "/execution"}],
         )
-        namespace_read_bindings = json.loads(command[bootstrap_index + 5])
+        namespace_read_bindings = json.loads(command[bootstrap_index + 6])
         expected_read_binding = dict(self.root_command_config()["read_roots"][0])
         expected_read_binding.pop("host_mount_id")
         self.assertEqual(namespace_read_bindings, [expected_read_binding])
@@ -12251,7 +12485,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             425,
         ):
             self.assertIn(str(syscall_number), bootstrap_source)
-        self.assertIn('os.listdir("/sys/class/net")', candidate_source)
+        self.assertNotIn('os.listdir("/sys/class/net")', candidate_source)
+        self.assertIn(
+            'read_network_interfaces("/proc/self/net/dev")', candidate_source
+        )
         self.assertNotIn("socket.if_nameindex", candidate_source)
         self.assertIn('status.get("Seccomp") != "2"', candidate_source)
         self.assertIn("Seccomp_filters", candidate_source)

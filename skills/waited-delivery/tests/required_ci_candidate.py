@@ -2973,6 +2973,7 @@ import ctypes
 import errno
 import json
 import os
+import re
 import resource
 import stat
 import sys
@@ -3152,6 +3153,7 @@ NAMESPACE_READ_PATHS = (
     ("/proc/self/status", "file"),
     ("/proc/self/limits", "file"),
     ("/proc/self/mountinfo", "file"),
+    ("/proc/self/net/dev", "file"),
     ("/proc/sys/kernel/core_pattern", "file"),
     ("/proc/sys/kernel/cap_last_cap", "file"),
     *((path, "file") for path, _ in IPC_SYSCTLS),
@@ -3165,19 +3167,21 @@ except ValueError:
     raise SystemExit(150)
 host_mount_namespace = sys.argv[2]
 host_ipc_namespace = sys.argv[3]
+host_network_namespace = sys.argv[4]
 try:
-    writable_roots = json.loads(sys.argv[4])
+    writable_roots = json.loads(sys.argv[5])
 except json.JSONDecodeError:
     raise SystemExit(150)
 try:
-    read_roots = json.loads(sys.argv[5])
+    read_roots = json.loads(sys.argv[6])
 except json.JSONDecodeError:
     raise SystemExit(150)
-continuation_argv = sys.argv[6:]
+continuation_argv = sys.argv[7:]
 if (
     readiness_fd <= 2
     or not host_mount_namespace.startswith("mnt:[")
     or not host_ipc_namespace.startswith("ipc:[")
+    or re.fullmatch(r"net:\[[1-9][0-9]*\]", host_network_namespace) is None
     or type(writable_roots) is not list
     or not 1 <= len(writable_roots) <= WRITABLE_ROOT_LIMIT
     or type(read_roots) is not list
@@ -3188,6 +3192,7 @@ if (
 if (
     os.readlink("/proc/self/ns/mnt") == host_mount_namespace
     or os.readlink("/proc/self/ns/ipc") == host_ipc_namespace
+    or os.readlink("/proc/self/ns/net") == host_network_namespace
 ):
     raise SystemExit(151)
 
@@ -4593,6 +4598,7 @@ _CANDIDATE_BOOTSTRAP_SOURCE = r'''
 import errno
 import json
 import os
+import re
 import sys
 
 uid = int(sys.argv[1])
@@ -4600,9 +4606,60 @@ gid = int(sys.argv[2])
 trusted_root = sys.argv[3]
 trusted_sentinel = sys.argv[4]
 host_parent_pid = int(sys.argv[5])
-runtime_binding_json = sys.argv[6]
-configured_bootstrap_source = sys.argv[7]
-candidate_argv = sys.argv[8:]
+host_network_namespace = sys.argv[6]
+runtime_binding_json = sys.argv[7]
+configured_bootstrap_source = sys.argv[8]
+candidate_argv = sys.argv[9:]
+
+
+def read_network_interfaces(path):
+    descriptor = None
+    data = bytearray()
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        while True:
+            chunk = os.read(descriptor, min(4096, 65537 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > 65536:
+                raise SystemExit(127)
+    except OSError:
+        raise SystemExit(127)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
+        lines = bytes(data).decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        raise SystemExit(127)
+    if (
+        len(lines) < 3
+        or not lines[0].startswith("Inter-|")
+        or not lines[1].lstrip().startswith("face |")
+    ):
+        raise SystemExit(127)
+    interfaces = set()
+    for line in lines[2:]:
+        name_field, separator, counters = line.partition(":")
+        name = name_field.strip()
+        values = counters.split()
+        if (
+            separator != ":"
+            or not name
+            or len(name) > 15
+            or any(character.isspace() or character in "/:" for character in name)
+            or any(ord(character) < 0x21 or ord(character) > 0x7E for character in name)
+            or name in interfaces
+            or len(values) != 16
+            or any(not value.isdecimal() for value in values)
+        ):
+            raise SystemExit(127)
+        interfaces.add(name)
+    return interfaces
 
 status = {}
 with open("/proc/self/status", encoding="ascii") as status_file:
@@ -4638,7 +4695,27 @@ for capability in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
         raise SystemExit(125)
 if not os.path.isfile("/proc/1/status"):
     raise SystemExit(126)
-if set(os.listdir("/sys/class/net")) != {"lo"}:
+try:
+    current_network_namespace = os.readlink("/proc/self/ns/net")
+except OSError:
+    raise SystemExit(127)
+if (
+    re.fullmatch(r"net:\[[1-9][0-9]*\]", host_network_namespace) is None
+    or current_network_namespace == host_network_namespace
+    or re.fullmatch(r"net:\[[1-9][0-9]*\]", current_network_namespace) is None
+):
+    raise SystemExit(127)
+# The inherited sysfs mount remains tagged to the host network namespace.
+# procfs generates this inventory from the current namespace instead.  A
+# kernel that auto-creates fallback tunnel devices is unsupported here and
+# fails closed rather than widening the candidate's network surface.
+network_interfaces = read_network_interfaces("/proc/self/net/dev")
+if network_interfaces != {"lo"}:
+    print(
+        "strict candidate network interface inventory rejected: "
+        + json.dumps(sorted(network_interfaces), separators=(",", ":")),
+        file=sys.stderr,
+    )
     raise SystemExit(127)
 try:
     os.kill(host_parent_pid, 0)
@@ -5679,6 +5756,7 @@ def _root_controller_candidate_command(
     trusted_sentinel = config.get("trusted_sentinel")
     host_mount_namespace = config.get("host_mount_namespace")
     host_ipc_namespace = config.get("host_ipc_namespace")
+    host_network_namespace = config.get("host_network_namespace")
     if (
         type(trusted_root) is not str
         or type(trusted_sentinel) is not str
@@ -5688,6 +5766,8 @@ def _root_controller_candidate_command(
         or re.fullmatch(r"mnt:\[[1-9][0-9]*\]", host_mount_namespace) is None
         or type(host_ipc_namespace) is not str
         or re.fullmatch(r"ipc:\[[1-9][0-9]*\]", host_ipc_namespace) is None
+        or type(host_network_namespace) is not str
+        or re.fullmatch(r"net:\[[1-9][0-9]*\]", host_network_namespace) is None
     ):
         raise AssertionError("strict root controller trusted boundary is malformed")
     writable_root_bindings = _revalidate_strict_writable_root_bindings(
@@ -5720,6 +5800,7 @@ def _root_controller_candidate_command(
     if (
         _strict_host_namespace_identity("mnt") != host_mount_namespace
         or _strict_host_namespace_identity("ipc") != host_ipc_namespace
+        or _strict_host_namespace_identity("net") != host_network_namespace
     ):
         raise AssertionError(
             "strict root controller host namespace identity changed"
@@ -5780,6 +5861,7 @@ def _root_controller_candidate_command(
         trusted_root,
         trusted_sentinel,
         str(host_parent_pid),
+        host_network_namespace,
         runtime_binding_json,
         _CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE,
         *candidate_argv,
@@ -5802,6 +5884,7 @@ def _root_controller_candidate_command(
         str(mount_readiness_fd),
         host_mount_namespace,
         host_ipc_namespace,
+        host_network_namespace,
         writable_root_json,
         read_root_json,
         str(_STRICT_PRIMITIVES["setpriv"]),
@@ -7828,7 +7911,7 @@ def _revalidate_strict_writable_root_bindings(
 
 
 def _strict_host_namespace_identity(namespace: str) -> str:
-    if namespace not in ("mnt", "ipc"):
+    if namespace not in ("mnt", "ipc", "net"):
         raise AssertionError("strict host namespace selector is malformed")
     try:
         identity = os.readlink(f"/proc/self/ns/{namespace}")
@@ -12317,6 +12400,7 @@ def _invoke_strict_controller(
             raise AssertionError("strict read and writable roots overlap")
     host_mount_namespace = _strict_host_namespace_identity("mnt")
     host_ipc_namespace = _strict_host_namespace_identity("ipc")
+    host_network_namespace = _strict_host_namespace_identity("net")
     inner_fault_point = (
         trusted_fault_point
         if trusted_fault_point
@@ -12343,6 +12427,7 @@ def _invoke_strict_controller(
         "read_roots": read_root_bindings,
         "host_mount_namespace": host_mount_namespace,
         "host_ipc_namespace": host_ipc_namespace,
+        "host_network_namespace": host_network_namespace,
         "environment": dict(environment),
         "cwd": str(cwd),
         "timeout_seconds": timeout_seconds,
