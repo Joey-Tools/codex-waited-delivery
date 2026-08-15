@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -23,6 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from collections.abc import Iterator, Mapping
 from unittest import mock
 
@@ -4625,6 +4627,82 @@ class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
 
 class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     @staticmethod
+    def root_command_config(**updates: object) -> dict[str, object]:
+        config: dict[str, object] = {
+            "uid": 60000,
+            "gid": 60000,
+            "environment": {},
+            "candidate_argv": ["/usr/bin/python3", "-I", "/probe.py"],
+            "candidate_interpreter": None,
+            "trusted_root": "/trusted",
+            "trusted_sentinel": "/trusted/sentinel",
+            "host_mount_namespace": "mnt:[101]",
+            "host_ipc_namespace": "ipc:[102]",
+            "writable_roots": [
+                {
+                    "path": "/execution",
+                    "device": 1,
+                    "inode": 2,
+                    "host_mount_id": 3,
+                }
+            ],
+            "read_roots": [
+                {
+                    "schema_version": 1,
+                    "purpose": "system-library",
+                    "kind": "directory",
+                    "path": "/runtime",
+                    "target_uid": 60000,
+                    "target_gid": 60000,
+                    "components": [
+                        {
+                            "path": "/",
+                            "kind": "directory",
+                            "device": 10,
+                            "inode": 11,
+                            "uid": 0,
+                            "gid": 0,
+                            "permissions": 0o755,
+                        },
+                        {
+                            "path": "/runtime",
+                            "kind": "directory",
+                            "device": 12,
+                            "inode": 13,
+                            "uid": 0,
+                            "gid": 0,
+                            "permissions": 0o755,
+                        },
+                    ],
+                    "host_mount_id": 4,
+                }
+            ],
+        }
+        config.update(updates)
+        return config
+
+    @staticmethod
+    @contextlib.contextmanager
+    def root_command_mount_contract() -> Iterator[None]:
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_revalidate_strict_writable_root_bindings",
+            side_effect=lambda value: value,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_revalidate_strict_host_read_root_bindings",
+            side_effect=lambda value: value,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_host_namespace_identity",
+            side_effect=lambda namespace: {
+                "mnt": "mnt:[101]",
+                "ipc": "ipc:[102]",
+            }[namespace],
+        ):
+            yield
+
+    @staticmethod
     def close_retained_acquisition_descriptors() -> None:
         session = _CANDIDATE_SUPPORT._STRICT_SESSION
         if not isinstance(session, dict):
@@ -5345,6 +5423,68 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
 
         self.assertNotIn("*", environment.values())
+
+    def test_candidate_environment_resolves_the_bound_git_without_a_platform_shim(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            environment = _CANDIDATE_SUPPORT._closed_candidate_environment(
+                {}, home=root, temporary_root=root
+            )
+
+        selected = shutil.which("git", path=environment["PATH"])
+        self.assertIsNotNone(selected)
+        self.assertEqual(
+            Path(str(selected)).resolve(strict=True),
+            Path(_CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE),
+        )
+
+    def test_candidate_git_binding_rejects_object_and_access_policy_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            tool_root = root / "tool"
+            bin_root = tool_root / "bin"
+            bin_root.mkdir(parents=True)
+            executable = bin_root / "git"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+            binding = _CANDIDATE_SUPPORT._capture_trusted_git_binding(
+                executable
+            )
+            self.assertEqual(
+                _CANDIDATE_SUPPORT._revalidate_trusted_git_binding(binding),
+                executable,
+            )
+
+            executable.chmod(0o644)
+            with self.assertRaisesRegex(AssertionError, "not executable"):
+                _CANDIDATE_SUPPORT._revalidate_trusted_git_binding(binding)
+            executable.chmod(0o755)
+
+            replaced = bin_root / "git.replaced"
+            executable.rename(replaced)
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+            with self.assertRaisesRegex(AssertionError, "object identity changed"):
+                _CANDIDATE_SUPPORT._revalidate_trusted_git_binding(binding)
+            executable.unlink()
+            replaced.rename(executable)
+
+            old_tool_root = root / "tool.old"
+            tool_root.rename(old_tool_root)
+            shutil.copytree(old_tool_root, tool_root)
+            with self.assertRaisesRegex(AssertionError, "object identity changed"):
+                _CANDIDATE_SUPPORT._revalidate_trusted_git_binding(binding)
+
+            with self.assertRaisesRegex(AssertionError, "not absolute"):
+                _CANDIDATE_SUPPORT._capture_trusted_git_binding(
+                    Path("relative/git")
+                )
+            with self.assertRaisesRegex(AssertionError, "unsafe object type"):
+                _CANDIDATE_SUPPORT._capture_trusted_git_binding(tool_root)
 
     def test_strict_non_linux_preflight_runs_before_git_or_candidate_popen(
         self,
@@ -11191,22 +11331,18 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "resolved": "/opt/hostedtoolcache/Python/3.x/bin/python3.14",
         }
         candidate_argv = [configured["resolved"], "-I", "/candidate.py"]
-        with mock.patch.object(
+        with self.root_command_mount_contract(), mock.patch.object(
             _CANDIDATE_SUPPORT,
             "_revalidate_configured_candidate_interpreter",
             return_value=configured,
         ):
             command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
-                {
-                    "uid": 60000,
-                    "gid": 60000,
-                    "environment": {},
-                    "candidate_argv": candidate_argv,
-                    "candidate_interpreter": configured,
-                    "trusted_root": "/trusted",
-                    "trusted_sentinel": "/trusted/sentinel",
-                },
+                self.root_command_config(
+                    candidate_argv=candidate_argv,
+                    candidate_interpreter=configured,
+                ),
                 1234,
+                9,
             )
         bootstrap_index = command.index("-c")
         self.assertEqual(
@@ -11232,7 +11368,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "<system-isolation-bootstrap>",
             "exec",
         )
-        with mock.patch.object(
+        with self.root_command_mount_contract(), mock.patch.object(
             _CANDIDATE_SUPPORT,
             "_revalidate_configured_candidate_interpreter",
             return_value=configured,
@@ -11240,42 +11376,1134 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             AssertionError, "configured interpreter identity changed"
         ):
             _CANDIDATE_SUPPORT._root_controller_candidate_command(
-                {
-                    "uid": 60000,
-                    "gid": 60000,
-                    "environment": {},
-                    "candidate_argv": ["/other/python", "-I"],
-                    "candidate_interpreter": configured,
-                    "trusted_root": "/trusted",
-                    "trusted_sentinel": "/trusted/sentinel",
-                },
+                self.root_command_config(
+                    candidate_argv=["/other/python", "-I"],
+                    candidate_interpreter=configured,
+                ),
                 1234,
+                9,
             )
         compile(
             _CANDIDATE_SUPPORT._CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE,
             "<configured-runtime-bootstrap>",
             "exec",
         )
-        system_config = {
-            "uid": 60000,
-            "gid": 60000,
-            "environment": {},
-            "candidate_argv": ["/usr/bin/python3", "-I", "/probe.py"],
-            "candidate_interpreter": None,
-            "trusted_root": "/trusted",
-            "trusted_sentinel": "/trusted/sentinel",
-        }
-        system_command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
-            system_config, 1234
-        )
+        system_config = self.root_command_config()
+        with self.root_command_mount_contract():
+            system_command = (
+                _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                    system_config, 1234, 9
+                )
+            )
         self.assertIn("/usr/bin/python3", system_command)
-        with self.assertRaisesRegex(
+        with self.root_command_mount_contract(), self.assertRaisesRegex(
             AssertionError, "system interpreter identity changed"
         ):
             _CANDIDATE_SUPPORT._root_controller_candidate_command(
                 {**system_config, "candidate_argv": ["/tmp/python", "-I"]},
                 1234,
+                9,
             )
+
+    def test_strict_root_command_isolates_ipc_before_candidate_launch(self) -> None:
+        with self.root_command_mount_contract():
+            command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                self.root_command_config(), 1234, 9
+            )
+
+        self.assertIn("--ipc", command)
+        self.assertLess(command.index("--ipc"), command.index("/usr/bin/setpriv"))
+        self.assertNotIn("/usr/bin/prlimit", command)
+
+    def test_strict_root_command_seals_host_mounts_before_setpriv(self) -> None:
+        with self.root_command_mount_contract():
+            command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                self.root_command_config(), 1234, 9
+            )
+        unshare_index = command.index("/usr/bin/unshare")
+        setpriv_index = command.index("/usr/bin/setpriv")
+        root_python_index = command.index(
+            "/usr/bin/python3", unshare_index + 1
+        )
+        bootstrap_source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+
+        self.assertLess(root_python_index, setpriv_index)
+        self.assertNotIn("/usr/bin/prlimit", command)
+        self.assertEqual(
+            command[root_python_index + 1 : root_python_index + 5],
+            ["-I", "-B", "-S", "-c"],
+        )
+        self.assertIn(
+            "mount_setattr",
+            _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
+        )
+        self.assertIn("MOUNT_ATTR_NODEV = 4", bootstrap_source)
+        self.assertIn("resource.RLIMIT_CORE: 1", bootstrap_source)
+        self.assertIn(
+            "resource.setrlimit(limit_name, (value, value))",
+            bootstrap_source,
+        )
+        self.assertIn('"/proc/sys/kernel/core_pattern"', bootstrap_source)
+        self.assertIn('core_pattern.startswith("|")', bootstrap_source)
+        self.assertLess(
+            bootstrap_source.index(
+                "resource.setrlimit(limit_name, (value, value))"
+            ),
+            bootstrap_source.rindex("install_candidate_seccomp_filter()"),
+        )
+        self.assertIn(
+            'set_mount_attributes("/", recursive=True, readonly=True, nodev=True)',
+            bootstrap_source,
+        )
+        self.assertIn(
+            'set_mount_attributes(\n        "",\n        recursive=False,\n        descriptor=safe_device_descriptor,\n        nodev=False,\n    )',
+            bootstrap_source,
+        )
+        self.assertIn(
+            "install_candidate_seccomp_filter",
+            _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
+        )
+        self.assertIn(
+            "activate_candidate_landlock",
+            _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
+        )
+        self.assertLess(
+            bootstrap_source.index(
+                "landlock_ruleset_fd = prepare_candidate_landlock("
+            ),
+            bootstrap_source.index(
+                "for descriptor in (*bound_descriptors, *source_descriptors)"
+            ),
+        )
+        self.assertLess(
+            bootstrap_source.index(
+                "for descriptor in (*bound_descriptors, *source_descriptors)"
+            ),
+            bootstrap_source.index(
+                "activate_candidate_landlock(landlock_ruleset_fd)"
+            ),
+        )
+        self.assertLess(
+            bootstrap_source.index(
+                "activate_candidate_landlock(landlock_ruleset_fd)"
+            ),
+            bootstrap_source.rindex("install_candidate_seccomp_filter()"),
+        )
+        self.assertLess(
+            bootstrap_source.rindex("install_candidate_seccomp_filter()"),
+            bootstrap_source.index('os.write(readiness_fd, b"G")'),
+        )
+        self.assertNotIn("host_mount_id", bootstrap_source)
+        self.assertIn(
+            "source_mount_record = initial_inventory.get(source_mount_id)",
+            bootstrap_source,
+        )
+        self.assertIn(
+            'source_mount_record["mountpoint"] == path', bootstrap_source
+        )
+        bootstrap_index = command.index(bootstrap_source)
+        namespace_bindings = json.loads(command[bootstrap_index + 4])
+        self.assertEqual(
+            namespace_bindings,
+            [{"device": 1, "inode": 2, "path": "/execution"}],
+        )
+        namespace_read_bindings = json.loads(command[bootstrap_index + 5])
+        expected_read_binding = dict(self.root_command_config()["read_roots"][0])
+        expected_read_binding.pop("host_mount_id")
+        self.assertEqual(namespace_read_bindings, [expected_read_binding])
+        parsed_bootstrap = ast.parse(bootstrap_source)
+        validate_binding = next(
+            node
+            for node in parsed_bootstrap.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "validate_binding"
+        )
+        validate_module = ast.Module(
+            body=[validate_binding], type_ignores=[]
+        )
+        ast.fix_missing_locations(validate_module)
+        validate_namespace = {"os": os, "stat": stat}
+        exec(
+            compile(
+                validate_module,
+                "<mount-namespace-binding-validator>",
+                "exec",
+            ),
+            validate_namespace,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            selected_root = Path(temporary_directory).resolve(strict=True)
+            metadata = selected_root.lstat()
+            namespace_binding = {
+                "path": str(selected_root),
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+            }
+            self.assertEqual(
+                validate_namespace["validate_binding"](namespace_binding),
+                str(selected_root),
+            )
+            with self.assertRaises(SystemExit) as rejected:
+                validate_namespace["validate_binding"](
+                    {**namespace_binding, "host_mount_id": 17}
+                )
+            self.assertEqual(rejected.exception.code, 156)
+        compile(
+            _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
+            "<mount-namespace-bootstrap>",
+            "exec",
+        )
+
+    def test_strict_mount_policy_blocks_persistent_host_channels(self) -> None:
+        bootstrap_source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        candidate_source = _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE
+        host_read_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._strict_host_read_root_bindings
+        )
+
+        self.assertIn("LANDLOCK_MINIMUM_ABI = 4", bootstrap_source)
+        self.assertIn("LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2", bootstrap_source)
+        self.assertIn("LANDLOCK_ACCESS_FS_WRITE_FILE", bootstrap_source)
+        self.assertIn("LANDLOCK_ACCESS_FS_MAKE_FIFO", bootstrap_source)
+        self.assertIn("LANDLOCK_ACCESS_FS_TRUNCATE", bootstrap_source)
+        self.assertNotIn("LANDLOCK_ACCESS_FS_IOCTL_DEV", bootstrap_source)
+        self.assertNotIn("LANDLOCK_ACCESS_FS_READ_DIR", bootstrap_source)
+        self.assertNotIn("os.listdir(trusted_root)", candidate_source)
+        self.assertIn(
+            '"trusted-test-file": "file"', bootstrap_source
+        )
+        self.assertIn(
+            '"system-arch-library": "directory"', bootstrap_source
+        )
+        self.assertIn(
+            'READ_ROOT_PURPOSES.get(document.get("purpose"))',
+            bootstrap_source,
+        )
+        self.assertIn(
+            "handled_access_fs=LANDLOCK_WRITE_ACCESS | LANDLOCK_ACCESS_FS_READ_FILE",
+            bootstrap_source,
+        )
+        self.assertIn(
+            "(descriptor, LANDLOCK_ACCESS_FS_READ_FILE)", bootstrap_source
+        )
+        self.assertIn("for descriptor in read_descriptors", bootstrap_source)
+        self.assertIn(
+            '("/proc/sys/kernel/cap_last_cap", "file")', bootstrap_source
+        )
+        self.assertNotIn(
+            '("/proc/self/fdinfo", "directory")', bootstrap_source
+        )
+        self.assertNotIn('("/proc", "directory")', bootstrap_source)
+        self.assertIn('Path("/usr/lib") / multiarch', host_read_source)
+        self.assertNotIn(
+            'Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',
+            host_read_source,
+        )
+        self.assertIn('Path("/etc/ld.so.preload").lstat()', host_read_source)
+        self.assertIn(
+            'system_stdlib / "lib-dynload"', host_read_source
+        )
+        self.assertIn(
+            'trusted_git.parent != Path("/usr/bin")', host_read_source
+        )
+        self.assertIn('"/dev/null"', bootstrap_source)
+        self.assertIn("os.major(null_metadata.st_rdev) != 1", bootstrap_source)
+        self.assertIn("os.minor(null_metadata.st_rdev) != 3", bootstrap_source)
+        self.assertIn("ctypes.sizeof(LandlockPathBeneathAttr) != 12", bootstrap_source)
+        self.assertIn("0x7E020080", bootstrap_source)
+        self.assertIn("errno.ENOSYS", bootstrap_source)
+        self.assertIn("16, 41, 42", bootstrap_source)
+        self.assertIn("29, 37, 97", bootstrap_source)
+        self.assertIn("321,", bootstrap_source)
+        self.assertIn("280,", bootstrap_source)
+        self.assertIn("160,", bootstrap_source)
+        self.assertIn("164,", bootstrap_source)
+        self.assertIn("302,", bootstrap_source)
+        self.assertIn("261,", bootstrap_source)
+        self.assertIn("prlimit_syscall,", bootstrap_source)
+        self.assertIn(
+            "SockFilter(BPF_JMP_JEQ_K, 0, 5, prlimit_syscall)",
+            bootstrap_source,
+        )
+        self.assertIn(
+            "SockFilter(BPF_LD_W_ABS, 0, 0, 32)", bootstrap_source
+        )
+        self.assertIn(
+            "SockFilter(BPF_LD_W_ABS, 0, 0, 36)", bootstrap_source
+        )
+        install_function = next(
+            node
+            for node in ast.parse(bootstrap_source).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "install_candidate_seccomp_filter"
+        )
+        architecture_assignment = next(
+            node
+            for node in install_function.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "architecture"
+                for target in node.targets
+            )
+        )
+        architecture_call = architecture_assignment.value
+        self.assertIsInstance(architecture_call, ast.Call)
+        architecture_get = architecture_call.func
+        self.assertIsInstance(architecture_get, ast.Attribute)
+        architecture_mapping = architecture_get.value
+        self.assertIsInstance(architecture_mapping, ast.Dict)
+        architectures = {
+            ast.literal_eval(key): ast.literal_eval(value)
+            for key, value in zip(
+                architecture_mapping.keys,
+                architecture_mapping.values,
+                strict=True,
+            )
+        }
+        self.assertEqual(architectures["x86_64"][3], 302)
+        self.assertNotIn(302, architectures["x86_64"][4])
+        self.assertEqual(architectures["aarch64"][3], 261)
+        self.assertNotIn(261, architectures["aarch64"][4])
+        self.assertNotIn("FS_IOC_", bootstrap_source)
+        self.assertIn("72,", bootstrap_source)
+        self.assertIn("25,", bootstrap_source)
+        self.assertIn("SockFilter(BPF_LD_W_ABS, 0, 0, 24)", bootstrap_source)
+        self.assertIn("SockFilter(BPF_JMP_JEQ_K, 0, 1, 1036)", bootstrap_source)
+        for syscall_number in (
+            41,
+            53,
+            86,
+            248,
+            265,
+            272,
+            307,
+            308,
+            425,
+        ):
+            self.assertIn(str(syscall_number), bootstrap_source)
+        self.assertIn('os.listdir("/sys/class/net")', candidate_source)
+        self.assertNotIn("socket.if_nameindex", candidate_source)
+        self.assertIn('status.get("Seccomp") != "2"', candidate_source)
+        self.assertIn("Seccomp_filters", candidate_source)
+        self.assertIn('"/proc/self/limits"', candidate_source)
+        self.assertNotIn("resource.getrlimit", candidate_source)
+        live_source = inspect.getsource(
+            type(self).test_strict_target_access_policy_blocks_snapshot_write_and_control_read
+        )
+        self.assertIn("fifo_path, os.O_RDWR | os.O_NONBLOCK", live_source)
+        self.assertIn('fifo_prefill = b"host-fifo-byte"', live_source)
+        self.assertIn("fifo_read_errno = operation_errno", live_source)
+        self.assertIn("readable_roots=(rw_hint_path,)", live_source)
+        self.assertNotIn('f"/proc/self/fdinfo/', live_source)
+        self.assertIn(
+            'record["mountpoint"] == "/dev/shm"', live_source
+        )
+        self.assertIn("len(dev_shm_mounts) != 1", live_source)
+        self.assertIn(
+            'record["mountpoint"] == "/dev/null"', live_source
+        )
+        self.assertIn("len(devnull_mounts) != 1", live_source)
+        self.assertIn(
+            '"/tmp/required-ci-alias-probe-target"', live_source
+        )
+        self.assertIn(
+            'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")',
+            live_source,
+        )
+
+    def test_strict_host_ipc_helper_acquisition_failure_reaps_direct_child(
+        self,
+    ) -> None:
+        live_source = inspect.cleandoc(
+            inspect.getsource(
+                type(self).test_strict_target_access_policy_blocks_snapshot_write_and_control_read
+            )
+        )
+        parsed = ast.parse(live_source)
+        start_helper = next(
+            node
+            for node in ast.walk(parsed)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "start_host_ipc_helper"
+        )
+        start_helper.returns = None
+        for argument in (
+            *start_helper.args.posonlyargs,
+            *start_helper.args.args,
+            *start_helper.args.kwonlyargs,
+        ):
+            argument.annotation = None
+        helper_module = ast.Module(body=[start_helper], type_ignores=[])
+        ast.fix_missing_locations(helper_module)
+        helper_namespace = {
+            "Path": Path,
+            "_CANDIDATE_SUPPORT": _CANDIDATE_SUPPORT,
+            "helper_source": "import time\ntime.sleep(30)\n",
+            "subprocess": subprocess,
+            "sys": sys,
+        }
+        exec(
+            compile(helper_module, "<strict-host-ipc-helper-start>", "exec"),
+            helper_namespace,
+        )
+        start = helper_namespace["start_host_ipc_helper"]
+        real_popen = subprocess.Popen
+        launched: list[subprocess.Popen[bytes]] = []
+
+        def launch(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            launched.append(process)
+            return process
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            socket_path = root / "host.sock"
+            fifo_path = root / "host.fifo"
+            go_path = root / "go"
+            ready_path = root / "ready"
+            with mock.patch.object(
+                subprocess, "Popen", side_effect=launch
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                side_effect=RuntimeError("identity probe failed"),
+            ), self.assertRaisesRegex(RuntimeError, "identity probe failed"):
+                start(
+                    socket_path,
+                    fifo_path,
+                    go_path,
+                    ready_path,
+                    mode="normal",
+                )
+
+            self.assertEqual(len(launched), 1)
+            self.assertIsNotNone(launched[0].poll())
+            self.assertFalse(socket_path.exists())
+            self.assertFalse(fifo_path.exists())
+            self.assertFalse(ready_path.exists())
+
+    def test_writable_root_mount_boundaries_fail_before_privilege(self) -> None:
+        root = Path("/tmp/execution")
+        device = os.makedev(8, 1)
+        metadata = mock.Mock(st_dev=device, st_ino=2)
+
+        def mount_inventory(*mountpoints: Path) -> dict[int, dict[str, object]]:
+            inventory: dict[int, dict[str, object]] = {
+                7: {
+                    "parent_id": 1,
+                    "major_minor": (8, 1),
+                    "root": "/",
+                    "mountpoint": Path("/"),
+                }
+            }
+            for mount_id, mountpoint in enumerate(mountpoints, start=8):
+                inventory[mount_id] = {
+                    "parent_id": 7,
+                    "major_minor": (0, mount_id),
+                    "root": "/",
+                    "mountpoint": mountpoint,
+                }
+            return inventory
+
+        common_patches = (
+            mock.patch.object(os, "O_PATH", 0x200000, create=True),
+            mock.patch.object(os, "open", return_value=11),
+            mock.patch.object(os, "fstat", return_value=metadata),
+            mock.patch.object(os, "close"),
+            mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_descriptor_mount_id",
+                return_value=7,
+            ),
+            mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_execution_root_binding",
+                return_value={
+                    "path": str(root),
+                    "device": device,
+                    "inode": 2,
+                },
+            ),
+        )
+        with contextlib.ExitStack() as stack:
+            for patcher in common_patches:
+                stack.enter_context(patcher)
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_mount_inventory",
+                return_value=mount_inventory(root),
+            ), self.assertRaisesRegex(
+                AssertionError, "contains a host mount boundary"
+            ):
+                _CANDIDATE_SUPPORT._strict_writable_root_mount_binding(root)
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_mount_inventory",
+                return_value=mount_inventory(root / "nested"),
+            ), self.assertRaisesRegex(
+                AssertionError, "contains a host mount boundary"
+            ):
+                _CANDIDATE_SUPPORT._strict_writable_root_mount_binding(root)
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_mount_inventory",
+                return_value=mount_inventory(),
+            ):
+                self.assertEqual(
+                    _CANDIDATE_SUPPORT._strict_writable_root_mount_binding(root),
+                    7,
+                )
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_mount_inventory",
+                return_value=mount_inventory(root / "nested"),
+            ), self.assertRaisesRegex(
+                AssertionError, "host read root contains a mount boundary"
+            ):
+                _CANDIDATE_SUPPORT._strict_host_read_root_mount_binding(root)
+
+        host_binding = {
+            "path": str(root),
+            "device": 1,
+            "inode": 2,
+            "host_mount_id": 7,
+        }
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_execution_root_binding",
+            return_value={"path": str(root), "device": 1, "inode": 2},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_writable_root_mount_binding",
+            return_value=8,
+        ), self.assertRaisesRegex(AssertionError, "binding changed"):
+            _CANDIDATE_SUPPORT._revalidate_strict_writable_root_bindings(
+                [host_binding]
+            )
+
+    def test_strict_directory_mount_aliases_fail_closed_at_both_layers(
+        self,
+    ) -> None:
+        selected_root = Path("/allowed")
+        device = os.makedev(8, 1)
+        topology = {
+            7: {
+                "parent_id": 1,
+                "major_minor": (8, 1),
+                "root": "/",
+                "mountpoint": Path("/"),
+            },
+            8: {
+                "parent_id": 7,
+                "major_minor": (8, 1),
+                # Filesystems may override mountinfo show_path; this opaque
+                # value must not be treated as a source-coordinate proof.
+                "root": "/opaque",
+                "mountpoint": Path("/alias"),
+            },
+            9: {
+                "parent_id": 8,
+                "major_minor": (0, 42),
+                "root": "/",
+                "mountpoint": Path("/alias/sub"),
+            },
+        }
+        with mock.patch.object(
+            os, "O_PATH", 0x200000, create=True
+        ), mock.patch.object(
+            os, "open", return_value=11
+        ), mock.patch.object(
+            os, "fstat", return_value=mock.Mock(st_dev=device, st_ino=2)
+        ), mock.patch.object(
+            os, "close"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_descriptor_mount_id",
+            return_value=7,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_mount_inventory",
+            return_value=topology,
+        ), self.assertRaisesRegex(
+            AssertionError, "host read root has a mount alias"
+        ):
+            _CANDIDATE_SUPPORT._strict_host_read_root_mount_binding(
+                selected_root
+            )
+
+        bootstrap_source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        parsed_bootstrap = ast.parse(bootstrap_source)
+        topology_functions = {
+            node.name: node
+            for node in parsed_bootstrap.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name
+            in {
+                "path_at_or_below",
+                "validate_directory_mount_topology",
+            }
+        }
+        self.assertEqual(
+            set(topology_functions),
+            {
+                "path_at_or_below",
+                "validate_directory_mount_topology",
+            },
+        )
+        topology_module = ast.Module(
+            body=[
+                topology_functions[name]
+                for name in (
+                    "path_at_or_below",
+                    "validate_directory_mount_topology",
+                )
+            ],
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(topology_module)
+        topology_namespace = {"os": os}
+        exec(
+            compile(
+                topology_module,
+                "<mount-alias-validator>",
+                "exec",
+            ),
+            topology_namespace,
+        )
+        namespace_topology = {
+            mount_id: {
+                **record,
+                "root": record["root"],
+                "mountpoint": str(record["mountpoint"]),
+                "options": frozenset({"ro"}),
+                "optional": (),
+                "filesystem": "ext4",
+                "source": "/dev/root",
+                "super_options": frozenset({"ro"}),
+            }
+            for mount_id, record in topology.items()
+        }
+        with self.assertRaises(SystemExit) as rejected:
+            topology_namespace["validate_directory_mount_topology"](
+                str(selected_root), 7, device, namespace_topology, 172
+            )
+        self.assertEqual(rejected.exception.code, 172)
+
+        initial_singleton_topology = {
+            7: {
+                **namespace_topology[7],
+                "parent_id": 7,
+            }
+        }
+        for same_rootfs_path in ("/usr/lib/python3.12", "/tmp/execution"):
+            topology_namespace["validate_directory_mount_topology"](
+                same_rootfs_path,
+                7,
+                device,
+                initial_singleton_topology,
+                172,
+            )
+
+        read_validation = bootstrap_source.index(
+            "read_descriptors.append(validate_read_root(document, initial_inventory))"
+        )
+        overlap_guard = bootstrap_source.index(
+            "for writable_path in binding_paths\n        ) or any("
+        )
+        first_private_mount = bootstrap_source.index(
+            'mount_call(\n            "required-ci-private"'
+        )
+        first_writable_bind = bootstrap_source.index(
+            'mount_call(\n            f"/proc/self/fd/{source_descriptor}"'
+        )
+        self.assertLess(overlap_guard, read_validation)
+        self.assertLess(read_validation, first_private_mount)
+        self.assertLess(read_validation, first_writable_bind)
+        self.assertIn(
+            "os.path.commonpath((path, writable_path)) == path",
+            bootstrap_source,
+        )
+        self.assertIn(
+            "os.path.commonpath((path, writable_path)) == writable_path",
+            bootstrap_source,
+        )
+        self.assertNotIn(
+            "validate_read_root(document, final_inventory)", bootstrap_source
+        )
+        final_revalidation = bootstrap_source.index(
+            "revalidate_held_read_root(document, descriptor)"
+        )
+        landlock_prepare = bootstrap_source.index(
+            "landlock_ruleset_fd = prepare_candidate_landlock("
+        )
+        self.assertLess(first_writable_bind, final_revalidation)
+        self.assertLess(final_revalidation, landlock_prepare)
+        self.assertIn(
+            "current_descriptor = validate_read_root(document, None)",
+            bootstrap_source,
+        )
+        self.assertIn(
+            "set(final_inventory) != expected_mount_ids", bootstrap_source
+        )
+        self.assertIn("| {safe_device_mount_id}", bootstrap_source)
+        self.assertIn("def prove_directory_alias_rejection", bootstrap_source)
+        self.assertIn("libc.umount2(os.fsencode(target), 0)", bootstrap_source)
+        self.assertLess(
+            bootstrap_source.index(
+                "current_inventory = prove_directory_alias_rejection("
+            ),
+            bootstrap_source.index('os.write(readiness_fd, b"G")'),
+        )
+        for protected_surface in (
+            '"/tmp"',
+            '"/var/tmp"',
+            '"/run"',
+            '"/dev/shm"',
+            '"/dev"',
+            '"/dev/mqueue"',
+            '"/dev/null"',
+        ):
+            self.assertIn(protected_surface, bootstrap_source)
+
+    def test_strict_mount_topology_binds_device_graph_and_raw_paths(self) -> None:
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._decode_strict_mountinfo_path("/"), Path("/")
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._decode_strict_mountinfo_path(
+                r"/alias\134040"
+            ),
+            Path(r"/alias\040"),
+        )
+        for value in (
+            "relative",
+            "/alias//child",
+            "/alias/./child",
+            "/alias/../child",
+            r"/alias\000child",
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                AssertionError, "mount topology is malformed"
+            ):
+                _CANDIDATE_SUPPORT._decode_strict_mountinfo_path(value)
+
+        valid_mountinfo = (
+            b"7 7 8:1 opaque-show-path / ro - ext4 /dev/root ro\n"
+        )
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.os, "open", return_value=11
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "read",
+            side_effect=(valid_mountinfo, b""),
+        ), mock.patch.object(_CANDIDATE_SUPPORT.os, "close"):
+            inventory = _CANDIDATE_SUPPORT._strict_mount_inventory()
+        self.assertEqual(
+            inventory,
+            {
+                7: {
+                    "parent_id": 7,
+                    "major_minor": (8, 1),
+                    "root": "opaque-show-path",
+                    "mountpoint": Path("/"),
+                }
+            },
+        )
+        malformed_graph = (
+            b"7 1 8:1 / / ro - ext4 /dev/root ro\n"
+            b"8 2 8:1 /other /other ro - ext4 /dev/root ro\n"
+        )
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.os, "open", return_value=11
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "read",
+            side_effect=(malformed_graph, b""),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os, "close"
+        ), self.assertRaisesRegex(
+            AssertionError, "mount topology is malformed"
+        ):
+            _CANDIDATE_SUPPORT._strict_mount_inventory()
+
+        selected_root = Path("/allowed")
+        device = os.makedev(8, 1)
+        _CANDIDATE_SUPPORT._strict_validate_directory_mount_topology(
+            selected_root,
+            7,
+            device,
+            inventory,
+            "host read root",
+        )
+        with self.assertRaisesRegex(
+            AssertionError, "mount identity changed"
+        ):
+            _CANDIDATE_SUPPORT._strict_validate_directory_mount_topology(
+                selected_root,
+                7,
+                os.makedev(8, 2),
+                inventory,
+                "host read root",
+            )
+
+        self_parent_topology = {
+            7: {
+                "parent_id": 7,
+                "major_minor": (8, 1),
+                "root": "/",
+                "mountpoint": Path("/"),
+            },
+            8: {
+                "parent_id": 7,
+                "major_minor": (9, 1),
+                "root": "/",
+                "mountpoint": Path("/selected"),
+            },
+            9: {
+                "parent_id": 7,
+                "major_minor": (10, 1),
+                "root": "/",
+                "mountpoint": Path("/unrelated"),
+            },
+        }
+        _CANDIDATE_SUPPORT._strict_validate_directory_mount_topology(
+            Path("/selected/child"),
+            8,
+            os.makedev(9, 1),
+            self_parent_topology,
+            "host read root",
+        )
+
+        parsed_bootstrap = ast.parse(
+            _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        )
+        self.assertIn(
+            '"root": fields[3]',
+            _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
+        )
+        self.assertNotIn(
+            '"root": decode_mount_path(fields[3])',
+            _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
+        )
+        decoder_functions = {
+            node.name: node
+            for node in parsed_bootstrap.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"decode_mount_field", "decode_mount_path"}
+        }
+        decoder_module = ast.Module(
+            body=[
+                decoder_functions["decode_mount_field"],
+                decoder_functions["decode_mount_path"],
+            ],
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(decoder_module)
+        decoder_namespace = {"os": os}
+        exec(
+            compile(decoder_module, "<mount-path-decoder>", "exec"),
+            decoder_namespace,
+        )
+        self.assertEqual(
+            decoder_namespace["decode_mount_path"](r"/alias\134040"),
+            r"/alias\040",
+        )
+        with self.assertRaises(SystemExit) as rejected_path:
+            decoder_namespace["decode_mount_path"]("/alias/../child")
+        self.assertEqual(rejected_path.exception.code, 155)
+
+    def test_strict_host_read_roots_reject_wide_runtime_prefixes(self) -> None:
+        for prefix in (Path("/opt"), Path("/usr")):
+            with self.subTest(prefix=prefix), mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "uname",
+                return_value=mock.Mock(machine="x86_64"),
+            ), mock.patch.object(
+                Path,
+                "resolve",
+                new=lambda self, strict=False: self,
+            ), mock.patch.object(
+                Path,
+                "stat",
+                return_value=mock.Mock(st_mode=stat.S_IFDIR | 0o755),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_canonical_existing_directory",
+                side_effect=lambda path, _description: path,
+            ), mock.patch.dict(
+                _CANDIDATE_SUPPORT._STRICT_PRIMITIVES,
+                {"python": Path("/usr/bin/python3.12")},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_revalidate_configured_candidate_interpreter",
+                return_value={
+                    "target_uid": 60000,
+                    "target_gid": 60000,
+                    "resolved": str(prefix / "bin/python3.14"),
+                    "stdlib_resolved": str(prefix / "lib/python3.14/os.py"),
+                },
+            ), self.assertRaisesRegex(
+                AssertionError, "runtime prefix is not narrowly bound"
+            ):
+                _CANDIDATE_SUPPORT._strict_host_read_root_bindings(
+                    {"binding": "synthetic"}, 60000, 60000
+                )
+
+    def test_strict_host_read_roots_reject_ld_preload(self) -> None:
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "uname",
+            return_value=mock.Mock(machine="x86_64"),
+        ), mock.patch.object(
+            Path,
+            "resolve",
+            new=lambda self, strict=False: self,
+        ), mock.patch.object(
+            Path,
+            "stat",
+            return_value=mock.Mock(st_mode=stat.S_IFDIR | 0o755),
+        ), mock.patch.object(
+            Path,
+            "lstat",
+            return_value=mock.Mock(st_mode=stat.S_IFREG | 0o644),
+        ), self.assertRaisesRegex(
+            AssertionError, "ld.so.preload is unsupported"
+        ):
+            _CANDIDATE_SUPPORT._strict_host_read_root_bindings(
+                None, 60000, 60000
+            )
+
+    def test_strict_host_read_file_binding_tracks_only_identity_and_access_policy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            selected = root / "trusted-read.txt"
+            selected.write_text("trusted\n", encoding="utf-8")
+            selected.chmod(0o444)
+            original_open = os.open
+
+            with mock.patch.object(os, "O_PATH", 0, create=True), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_assert_strict_target_runtime_policy",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_runtime_acl_is_absent",
+            ):
+                binding = (
+                    _CANDIDATE_SUPPORT._capture_strict_host_read_root_binding(
+                        selected,
+                        purpose="trusted-test-file",
+                        kind="file",
+                        target_uid=60000,
+                        target_gid=60000,
+                    )
+                )
+                with self.assertRaisesRegex(AssertionError, "is malformed"):
+                    _CANDIDATE_SUPPORT._revalidate_strict_host_read_root_bindings(
+                        [{**binding, "purpose": "system-arch-library"}]
+                    )
+                os.utime(selected, None)
+                self.assertEqual(
+                    _CANDIDATE_SUPPORT._revalidate_strict_host_read_root_bindings(
+                        [binding]
+                    ),
+                    [binding],
+                )
+
+                selected.chmod(0o440)
+                with self.assertRaisesRegex(AssertionError, "binding changed"):
+                    _CANDIDATE_SUPPORT._revalidate_strict_host_read_root_bindings(
+                        [binding]
+                    )
+                selected.chmod(0o444)
+
+                detached = root / "detached.txt"
+                selected.rename(detached)
+                selected.write_text("trusted\n", encoding="utf-8")
+                selected.chmod(0o444)
+                with self.assertRaisesRegex(AssertionError, "binding changed"):
+                    _CANDIDATE_SUPPORT._revalidate_strict_host_read_root_bindings(
+                        [binding]
+                    )
+
+                def deny_leaf_open(
+                    value: object,
+                    flags: int,
+                    *args: object,
+                    **kwargs: object,
+                ) -> int:
+                    if value == selected.name and "dir_fd" in kwargs:
+                        raise PermissionError(errno.EACCES, "denied", str(value))
+                    return original_open(value, flags, *args, **kwargs)
+
+                with mock.patch.object(
+                    os, "open", side_effect=deny_leaf_open
+                ), self.assertRaisesRegex(AssertionError, "is unreadable"):
+                    _CANDIDATE_SUPPORT._capture_strict_host_read_root_binding(
+                        selected,
+                        purpose="trusted-test-file",
+                        kind="file",
+                        target_uid=60000,
+                        target_gid=60000,
+                    )
+        controller_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_controller_main
+        )
+        self.assertLess(
+            controller_source.index("_root_wrapper_command("),
+            controller_source.index("subprocess.Popen("),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            snapshot_root = Path(temporary_directory).resolve(strict=True)
+            snapshot = {
+                "config_path": snapshot_root / "config.json",
+                "controller_path": snapshot_root / "controller.py",
+                "handshake_path": snapshot_root / "handshake.json",
+                "execution_root": snapshot_root,
+            }
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_realm",
+                return_value={"uid": 60000, "gid": 60000},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_writable_root_bindings",
+                side_effect=AssertionError(
+                    "strict writable root contains a host mount boundary"
+                ),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+            ) as root_tree, mock.patch.object(
+                _CANDIDATE_SUPPORT, "_run_registered_sudo"
+            ) as registered_sudo, mock.patch.object(
+                _CANDIDATE_SUPPORT.subprocess, "Popen"
+            ) as popen, self.assertRaisesRegex(
+                AssertionError, "contains a host mount boundary"
+            ):
+                _CANDIDATE_SUPPORT._invoke_strict_controller(
+                    snapshot,
+                    ["/usr/bin/python3", "-I", "/probe.py"],
+                    {},
+                    snapshot_root,
+                    b"",
+                    timeout_seconds=1,
+                )
+        root_tree.assert_not_called()
+        registered_sudo.assert_not_called()
+        popen.assert_not_called()
+
+    def test_mount_namespace_readiness_gate_is_exact(self) -> None:
+        readiness_read, readiness_write = os.pipe()
+        terminal_read, terminal_write = os.pipe()
+        try:
+            os.write(readiness_write, b"G")
+            _CANDIDATE_SUPPORT._wait_mount_namespace_ready(
+                readiness_read, terminal_read, timeout_seconds=0.1
+            )
+        finally:
+            for descriptor in (
+                readiness_read,
+                readiness_write,
+                terminal_read,
+                terminal_write,
+            ):
+                os.close(descriptor)
+
+        controller_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._root_controller_main
+        )
+        self.assertIn(
+            "pass_fds=(barrier_read_fd, mount_readiness_write_fd)",
+            controller_source,
+        )
+        self.assertLess(
+            controller_source.index("_release_wrapper_barrier"),
+            controller_source.index("_wait_mount_namespace_ready"),
+        )
+        self.assertLess(
+            controller_source.index("_wait_mount_namespace_ready"),
+            controller_source.index("process.communicate"),
+        )
+        bootstrap_source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        self.assertLess(
+            bootstrap_source.index("mount_setattr = libc.mount_setattr"),
+            bootstrap_source.index("os.write(readiness_fd, b\"G\")"),
+        )
+        self.assertLess(
+            bootstrap_source.index("install_candidate_seccomp_filter()"),
+            bootstrap_source.index("os.write(readiness_fd, b\"G\")"),
+        )
+
+        readiness_read, readiness_write = os.pipe()
+        terminal_read, terminal_write = os.pipe()
+        try:
+            os.close(readiness_write)
+            readiness_write = -1
+            with self.assertRaisesRegex(
+                AssertionError, "did not become ready"
+            ):
+                _CANDIDATE_SUPPORT._wait_mount_namespace_ready(
+                    readiness_read, terminal_read, timeout_seconds=0.1
+                )
+        finally:
+            for descriptor in (
+                readiness_read,
+                terminal_read,
+                terminal_write,
+            ):
+                os.close(descriptor)
+
+        readiness_read, readiness_write = os.pipe()
+        terminal_read, terminal_write = os.pipe()
+        try:
+            os.close(terminal_write)
+            terminal_write = -1
+            with self.assertRaisesRegex(
+                AssertionError, "exited before readiness"
+            ):
+                _CANDIDATE_SUPPORT._wait_mount_namespace_ready(
+                    readiness_read, terminal_read, timeout_seconds=0.1
+                )
+        finally:
+            for descriptor in (
+                readiness_read,
+                readiness_write,
+                terminal_read,
+            ):
+                os.close(descriptor)
+
+    def test_private_surface_ancestors_cannot_be_writable_roots(self) -> None:
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_execution_root_binding",
+            side_effect=lambda path: {
+                "path": str(path),
+                "device": 1,
+                "inode": hash(str(path)),
+            },
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_writable_root_mount_binding",
+            return_value=17,
+        ):
+            for exposed in (Path("/tmp"), Path("/var")):
+                with self.subTest(exposed=exposed), self.assertRaisesRegex(
+                    AssertionError, "private host surface"
+                ):
+                    _CANDIDATE_SUPPORT._strict_writable_root_bindings(
+                        Path("/execution"), (exposed,)
+                    )
+            bindings = _CANDIDATE_SUPPORT._strict_writable_root_bindings(
+                Path("/tmp/execution"), (Path("/var/tmp/fixture"),)
+            )
+        self.assertEqual(
+            [document["path"] for document in bindings],
+            ["/tmp/execution", "/var/tmp/fixture"],
+        )
 
     def test_strict_controller_rejects_unbound_runtime_before_privilege(
         self,
@@ -11391,6 +12619,69 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 timeout_seconds=1,
                 candidate_interpreter_binding=binding,
             )
+        root_tree.assert_not_called()
+        registered_sudo.assert_not_called()
+        popen.assert_not_called()
+
+    def test_strict_controller_binds_host_read_roots_before_privilege(
+        self,
+    ) -> None:
+        snapshot = {
+            "config_path": Path("/tmp/config.json"),
+            "controller_path": Path("/tmp/controller.py"),
+            "handshake_path": Path("/tmp/handshake.json"),
+            "execution_root": Path("/tmp/execution"),
+        }
+        readable = Path("/tmp/read-sentinel")
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_realm",
+            return_value={"uid": 60000, "gid": 60000},
+        ) as strict_realm, mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_writable_root_bindings",
+            return_value=[
+                {
+                    "path": "/tmp/execution",
+                    "device": 1,
+                    "inode": 2,
+                    "host_mount_id": 3,
+                }
+            ],
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_host_read_root_bindings",
+            side_effect=AssertionError("strict read prefix is unsafe"),
+        ) as bind_reads, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+        ) as root_tree, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_run_registered_sudo"
+        ) as registered_sudo, mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess, "Popen"
+        ) as popen, self.assertRaisesRegex(
+            AssertionError, "read prefix is unsafe"
+        ):
+            _CANDIDATE_SUPPORT._invoke_strict_controller(
+                snapshot,
+                [
+                    str(_CANDIDATE_SUPPORT._STRICT_PRIMITIVES["python"]),
+                    "-I",
+                    "-S",
+                    "/probe.py",
+                ],
+                {},
+                Path("/tmp/execution"),
+                b"",
+                timeout_seconds=1,
+                readable_roots=(readable,),
+            )
+        strict_realm.assert_called_once_with()
+        bind_reads.assert_called_once_with(
+            None,
+            60000,
+            60000,
+            readable_roots=(readable,),
+        )
         root_tree.assert_not_called()
         registered_sudo.assert_not_called()
         popen.assert_not_called()
@@ -14164,98 +15455,1860 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "trusted Required CI supervisor"
             )
         self.assertEqual(mode, REQUIRED_CI_ISOLATION_MODE)
+        if sys.platform != "linux":
+            self.skipTest("strict live mount and IPC isolation requires Linux")
+        _CANDIDATE_SUPPORT._ensure_strict_backend()
+
+        host_mount_namespace = os.readlink("/proc/self/ns/mnt")
+        host_ipc_namespace = os.readlink("/proc/self/ns/ipc")
+        realm = _CANDIDATE_SUPPORT._strict_realm()
+        target_uid = int(realm["uid"])
+        target_gid = int(realm["gid"])
+
+        runner_temp_value = os.environ.get("RUNNER_TEMP")
+        if runner_temp_value is None or not Path(runner_temp_value).is_absolute():
+            raise AssertionError(
+                "strict live RUNNER_TEMP must be an absolute trusted directory"
+            )
+        runner_temp = Path(runner_temp_value).resolve(strict=True)
+        private_surfaces = tuple(
+            Path(value) for value in ("/tmp", "/var/tmp", "/run", "/dev/shm")
+        )
+        if any(
+            runner_temp == surface or surface in runner_temp.parents
+            for surface in private_surfaces
+        ):
+            raise AssertionError(
+                "strict live RUNNER_TEMP must be outside private mount surfaces"
+            )
+        for ancestor in (runner_temp, *runner_temp.parents):
+            metadata = ancestor.stat()
+            if not stat.S_ISDIR(metadata.st_mode) or not metadata.st_mode & 0o001:
+                raise AssertionError(
+                    "strict live RUNNER_TEMP is not traversable by the target UID"
+                )
+            _CANDIDATE_SUPPORT._acl_is_absent(
+                ancestor, "strict live RUNNER_TEMP ancestor"
+            )
+            if ancestor == Path("/"):
+                break
+
+        surface_roots: list[Path] = []
+        surface_identities: dict[Path, tuple[int, int]] = {}
+        surface_markers: dict[Path, Path] = {}
+
+        def remove_empty_bound_root(
+            root: Path, identity: tuple[int, int]
+        ) -> None:
+            metadata = root.lstat()
+            if (metadata.st_dev, metadata.st_ino) != identity:
+                raise AssertionError(f"host setup root identity changed: {root}")
+            root.rmdir()
+
+        setup_cleanup = contextlib.ExitStack()
+        try:
+            ipc_root = Path(
+                tempfile.mkdtemp(prefix="required-ci-host-ipc-", dir=runner_temp)
+            ).resolve(strict=True)
+            ipc_root_metadata = ipc_root.lstat()
+            ipc_root_identity = (
+                ipc_root_metadata.st_dev,
+                ipc_root_metadata.st_ino,
+            )
+            setup_cleanup.callback(
+                remove_empty_bound_root, ipc_root, ipc_root_identity
+            )
+            ipc_root.chmod(0o711)
+            _CANDIDATE_SUPPORT._acl_is_absent(
+                ipc_root, "strict live host IPC scaffold"
+            )
+            socket_path = ipc_root / "post-seal.sock"
+            fifo_path = ipc_root / "post-seal.fifo"
+            if len(os.fsencode(socket_path)) >= 104:
+                raise AssertionError(
+                    "strict live RUNNER_TEMP produces an unsafe AF_UNIX path length"
+                )
+
+            for surface in (
+                Path("/tmp"),
+                Path("/var/tmp"),
+                Path("/dev/shm"),
+                Path("/run/lock"),
+            ):
+                root = Path(
+                    tempfile.mkdtemp(prefix="required-ci-private-", dir=surface)
+                ).resolve(strict=True)
+                metadata = root.lstat()
+                if not stat.S_ISDIR(metadata.st_mode) or metadata.st_nlink < 1:
+                    raise AssertionError(
+                        "strict live host scaffold identity is unsafe"
+                    )
+                surface_roots.append(root)
+                surface_identities[root] = (metadata.st_dev, metadata.st_ino)
+                setup_cleanup.callback(
+                    remove_empty_bound_root,
+                    root,
+                    surface_identities[root],
+                )
+                root.chmod(0o777)
+                surface_markers[root] = root / (
+                    "posix-shm-private-marker"
+                    if surface == Path("/dev/shm")
+                    else "candidate-private-marker"
+                )
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.shmget.argtypes = (ctypes.c_int, ctypes.c_size_t, ctypes.c_int)
+            libc.shmget.restype = ctypes.c_int
+            libc.shmctl.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+            libc.shmctl.restype = ctypes.c_int
+            libc.mq_unlink.argtypes = (ctypes.c_char_p,)
+            libc.mq_unlink.restype = ctypes.c_int
+
+            def remove_setup_sysv(shmid: int) -> None:
+                ctypes.set_errno(0)
+                if libc.shmctl(shmid, 0, None) != 0:
+                    raise OSError(ctypes.get_errno(), "shmctl setup cleanup failed")
+
+            sysv_key = 0
+            host_shmid = -1
+            for _ in range(64):
+                sysv_key = (uuid.uuid4().int & 0x3FFFFFFF) or 1
+                ctypes.set_errno(0)
+                host_shmid = libc.shmget(
+                    sysv_key,
+                    4096,
+                    0o1000 | 0o2000 | 0o666,
+                )
+                if host_shmid >= 0:
+                    setup_cleanup.callback(remove_setup_sysv, host_shmid)
+                    break
+                if ctypes.get_errno() != errno.EEXIST:
+                    raise OSError(ctypes.get_errno(), "shmget sentinel failed")
+            if host_shmid < 0:
+                raise AssertionError(
+                    "strict live SysV sentinel key inventory exhausted"
+                )
+
+            mqueue_name = f"/required-ci-{uuid.uuid4().hex}"
+            host_mqueue_path = Path("/dev/mqueue") / mqueue_name[1:]
+            if host_mqueue_path.exists():
+                raise AssertionError(
+                    "strict live POSIX mqueue name unexpectedly exists"
+                )
+        except BaseException:
+            setup_cleanup.close()
+            raise
+        else:
+            setup_cleanup.pop_all()
+
         trusted_control_relative = (
             TRUSTED_CONTENT_RELATIVE_ROOT
             / "skills/waited-delivery/tests/required_ci_candidate.py"
         ).as_posix()
-        with _CANDIDATE_SUPPORT.candidate_fixture_directory(
-            "required-ci-access-policy-"
-        ) as temporary_directory:
-            _, candidate_root = self.prepare_roots(temporary_directory)
-            runner_path = (
-                distribution_content_root(candidate_root)
-                / "skills/waited-delivery/scripts/waited_delivery_runner.py"
-            )
-            runner_path.write_text(
-                "from pathlib import Path\n"
-                "import os\n"
-                "import sys\n"
-                "candidate_path = Path(__file__)\n"
-                "candidate_root = next(\n"
-                "    parent for parent in candidate_path.parents\n"
-                "    if parent.name == 'candidate-code'\n"
-                ")\n"
-                "trusted_control = (\n"
-                "    candidate_root.parent / 'trusted-control' / "
-                f"{trusted_control_relative!r}\n"
-                ")\n"
-                "try:\n"
-                "    candidate_path.write_bytes(b'candidate mutation\\n')\n"
-                "except PermissionError:\n"
-                "    write_status = 'write-denied'\n"
-                "else:\n"
-                "    write_status = 'write-allowed'\n"
-                "try:\n"
-                "    trusted_control.read_bytes()\n"
-                "except PermissionError:\n"
-                "    read_status = 'read-denied'\n"
-                "else:\n"
-                "    read_status = 'read-allowed'\n"
-                "stdlib_path = Path(os.__file__)\n"
-                "stdlib_status = ('stdlib-readable' if stdlib_path.read_bytes() "
-                "else 'stdlib-empty')\n"
-                "try:\n"
-                "    with stdlib_path.open('ab'):\n"
-                "        pass\n"
-                "except PermissionError:\n"
-                "    stdlib_write_status = 'stdlib-write-denied'\n"
-                "else:\n"
-                "    stdlib_write_status = 'stdlib-write-allowed'\n"
-                "try:\n"
-                "    with Path(sys.executable).open('ab'):\n"
-                "        pass\n"
-                "except PermissionError:\n"
-                "    interpreter_write_status = 'interpreter-write-denied'\n"
-                "else:\n"
-                "    interpreter_write_status = 'interpreter-write-allowed'\n"
-                "runtime = sys.executable\n"
-                "version = '.'.join(map(str, sys.version_info[:3]))\n"
-                "print(\n"
-                "    f'{os.getuid()}:{os.geteuid()}:{os.getgid()}:{os.getegid()}:'\n"
-                "    f'{write_status}:{read_status}:{stdlib_status}:'\n"
-                "    f'{stdlib_write_status}:{interpreter_write_status}:'\n"
-                "    f'{runtime}:{version}'\n"
-                ")\n"
-                "if (write_status, read_status, stdlib_status, "
-                "stdlib_write_status, interpreter_write_status) != "
-                "('write-denied', 'read-denied', 'stdlib-readable', "
-                "'stdlib-write-denied', 'interpreter-write-denied'):\n"
-                "    raise SystemExit(91)\n",
-                encoding="utf-8",
-            )
-            candidate_sha = self.initialize_candidate_checkout(candidate_root)
-            with mock.patch.dict(
-                os.environ,
-                {
-                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
-                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
-                },
-                clear=False,
-            ):
-                completed = _CANDIDATE_SUPPORT.run_candidate_python(runner_path)
+        go_marker: Path | None = None
+        ready_marker: Path | None = None
+        explicit_marker: Path | None = None
+        listener_created: list[bool] = []
+        listener_received: list[bytes] = []
+        listener_fifo_remaining: bytes | None = None
+        listener_errors: list[BaseException] = []
+        listener_nodes: dict[Path, tuple[int, int, int]] = {}
+        listener_process: subprocess.Popen[bytes] | None = None
+        listener_identity: tuple[int, ...] | None = None
+        rw_hint_path = ipc_root / "rw-hint-sentinel"
+        rw_hint_identity: tuple[int, int] | None = None
+        rw_hint_descriptor: int | None = None
+        rw_hint_baseline: bytes | None = None
+        completed: subprocess.CompletedProcess[str] | None = None
+        helper_source = inspect.cleandoc(
+            r'''
+            import json
+            import os
+            from pathlib import Path
+            import select
+            import signal
+            import socket
+            import sys
+            import time
 
-            realm = _CANDIDATE_SUPPORT._strict_realm()
-            target_uid = int(realm["uid"])
-            target_gid = int(realm["gid"])
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(
-                completed.stdout,
-                f"{target_uid}:{target_uid}:{target_gid}:{target_gid}:"
-                "write-denied:read-denied:stdlib-readable:"
-                "stdlib-write-denied:interpreter-write-denied:"
-                f"{Path(sys.executable).resolve(strict=True)}:"
-                f"{'.'.join(map(str, sys.version_info[:3]))}\n",
+            if len(sys.argv) != 6 or sys.argv[1] not in ("normal", "hang"):
+                raise SystemExit(70)
+            mode = sys.argv[1]
+            socket_path = Path(sys.argv[2])
+            fifo_path = Path(sys.argv[3])
+            go_marker = Path(sys.argv[4])
+            ready_marker = Path(sys.argv[5])
+            if mode == "hang":
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+            deadline = time.monotonic() + 15.0
+            while not go_marker.exists():
+                readable, _, _ = select.select([0], [], [], 0.05)
+                if readable:
+                    os.read(0, 16)
+                    raise SystemExit(71)
+                if time.monotonic() >= deadline:
+                    raise SystemExit(72)
+            if go_marker.read_text(encoding="utf-8") != "go\n":
+                raise SystemExit(73)
+
+            received = []
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(str(socket_path))
+                socket_path.chmod(0o666)
+                os.mkfifo(fifo_path, 0o666)
+                fifo_path.chmod(0o666)
+                fifo_descriptor = os.open(
+                    fifo_path, os.O_RDWR | os.O_NONBLOCK
+                )
+                try:
+                    fifo_prefill = b"host-fifo-byte"
+                    if os.write(fifo_descriptor, fifo_prefill) != len(fifo_prefill):
+                        raise SystemExit(74)
+                    server.listen(1)
+                    server.settimeout(0.05)
+                    nodes = {}
+                    for path in (socket_path, fifo_path):
+                        metadata = path.lstat()
+                        nodes[str(path)] = [
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mode,
+                            metadata.st_uid,
+                        ]
+                    print(
+                        json.dumps(
+                            {
+                                "go_observed": True,
+                                "nodes": nodes,
+                                "pid": os.getpid(),
+                                "status": "ready",
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    ready_marker.write_text("ready\n", encoding="utf-8")
+                    while True:
+                        readable, _, _ = select.select([0], [], [], 0.05)
+                        if readable:
+                            command = os.read(0, 16)
+                            if mode == "normal":
+                                break
+                            time.sleep(0.05)
+                        try:
+                            connection, _ = server.accept()
+                        except TimeoutError:
+                            pass
+                        else:
+                            with connection:
+                                connection.settimeout(0.5)
+                                received.append(connection.recv(16).hex())
+                    try:
+                        fifo_remaining = os.read(fifo_descriptor, len(fifo_prefill))
+                    except BlockingIOError:
+                        fifo_remaining = b""
+                finally:
+                    os.close(fifo_descriptor)
+            print(
+                json.dumps(
+                    {
+                        "fifo_remaining": fifo_remaining.hex(),
+                        "received": received,
+                        "status": "completed",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
             )
+            '''
+        ) + "\n"
+
+        def start_host_ipc_helper(
+            selected_socket: Path,
+            selected_fifo: Path,
+            selected_go: Path,
+            selected_ready: Path,
+            *,
+            mode: str,
+        ) -> tuple[subprocess.Popen[bytes], tuple[int, ...]]:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    helper_source,
+                    mode,
+                    str(selected_socket),
+                    str(selected_fifo),
+                    str(selected_go),
+                    str(selected_ready),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                identity = _CANDIDATE_SUPPORT._process_identity(
+                    Path("/proc") / str(process.pid)
+                )
+                if identity is None or identity[0] != process.pid:
+                    raise AssertionError("host IPC helper identity is unavailable")
+            except BaseException:
+                def kill_unreaped_helper() -> None:
+                    if process.poll() is None:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+
+                kill_unreaped_helper()
+                try:
+                    process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    kill_unreaped_helper()
+                    process.communicate(timeout=2)
+                if process.poll() is None:
+                    raise AssertionError(
+                        "host IPC helper could not be reaped after acquisition failure"
+                    )
+                raise
+            return process, identity
+
+        def stop_host_ipc_helper(
+            process: subprocess.Popen[bytes],
+            identity: tuple[int, ...],
+            *,
+            expect_graceful: bool,
+        ) -> tuple[bytes, bytes]:
+            def assert_live_direct_child() -> None:
+                observed = _CANDIDATE_SUPPORT._process_identity(
+                    Path("/proc") / str(process.pid)
+                )
+                if process.poll() is not None or observed != identity:
+                    raise AssertionError(
+                        "host IPC helper is not the live unreaped direct child"
+                    )
+                children_path = (
+                    Path("/proc")
+                    / str(process.pid)
+                    / "task"
+                    / str(process.pid)
+                    / "children"
+                )
+                children = children_path.read_bytes()
+                if len(children) > 4096 or children.split():
+                    raise AssertionError("host IPC helper has a descendant")
+
+            if process.poll() is None:
+                assert_live_direct_child()
+                if process.stdin is not None:
+                    try:
+                        process.stdin.write(b"stop\n")
+                        process.stdin.flush()
+                    except BrokenPipeError:
+                        pass
+                    finally:
+                        process.stdin.close()
+                        process.stdin = None
+            try:
+                stdout, stderr = process.communicate(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                assert_live_direct_child()
+                process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    assert_live_direct_child()
+                    process.kill()
+                    stdout, stderr = process.communicate(timeout=2)
+            if (
+                process.poll() is None
+                or _CANDIDATE_SUPPORT._process_identity(
+                    Path("/proc") / str(process.pid)
+                )
+                == identity
+            ):
+                raise AssertionError("host IPC helper was not reaped")
+            if len(stdout) > 65536 or len(stderr) > 65536:
+                raise AssertionError("host IPC helper output exceeded its bound")
+            if expect_graceful:
+                if process.returncode != 0 or stderr:
+                    raise AssertionError(
+                        "host IPC helper did not stop cleanly: "
+                        + stderr.decode("utf-8", errors="replace")
+                    )
+            elif process.returncode != -signal.SIGKILL:
+                raise AssertionError(
+                    "hanging host IPC helper did not require the kill fallback"
+                )
+            return stdout, stderr
+
+        def parse_host_ipc_helper(
+            stdout: bytes,
+            expected_paths: tuple[Path, Path],
+            expected_pid: int,
+            *,
+            completed_required: bool,
+        ) -> tuple[
+            dict[Path, tuple[int, int, int]], list[bytes], bytes | None
+        ]:
+            try:
+                documents = [
+                    json.loads(line)
+                    for line in stdout.decode("utf-8").splitlines()
+                ]
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise AssertionError("host IPC helper output is malformed") from error
+            expected_count = 2 if completed_required else 1
+            if len(documents) != expected_count:
+                raise AssertionError("host IPC helper output count is wrong")
+            ready = documents[0]
+            if (
+                type(ready) is not dict
+                or ready.get("status") != "ready"
+                or ready.get("pid") != expected_pid
+                or ready.get("go_observed") is not True
+                or type(ready.get("nodes")) is not dict
+            ):
+                raise AssertionError("host IPC helper readiness is malformed")
+            nodes: dict[Path, tuple[int, int, int]] = {}
+            for path in expected_paths:
+                value = ready["nodes"].get(str(path))
+                if (
+                    type(value) is not list
+                    or len(value) != 4
+                    or any(type(item) is not int for item in value)
+                    or value[3] != os.getuid()
+                ):
+                    raise AssertionError("host IPC helper node binding is malformed")
+                nodes[path] = (value[0], value[1], value[2])
+            if not completed_required:
+                return nodes, [], None
+            terminal = documents[1]
+            if (
+                type(terminal) is not dict
+                or terminal.get("status") != "completed"
+                or type(terminal.get("received")) is not list
+                or type(terminal.get("fifo_remaining")) is not str
+                or any(
+                    type(value) is not str
+                    for value in terminal.get("received", [])
+                )
+            ):
+                raise AssertionError("host IPC helper terminal output is malformed")
+            try:
+                received = [bytes.fromhex(value) for value in terminal["received"]]
+                fifo_remaining = bytes.fromhex(terminal["fifo_remaining"])
+            except ValueError as error:
+                raise AssertionError(
+                    "host IPC helper receipt bytes are malformed"
+                ) from error
+            return nodes, received, fifo_remaining
+
+        def remove_host_ipc_node(
+            path: Path,
+            expected: tuple[int, int, int] | None,
+            expected_kind,
+        ) -> None:
+            root_metadata = ipc_root.lstat()
+            if (
+                root_metadata.st_dev,
+                root_metadata.st_ino,
+            ) != ipc_root_identity:
+                raise AssertionError("host IPC scaffold identity changed")
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                if expected is not None:
+                    raise AssertionError(f"host IPC node disappeared: {path}")
+                return
+            if expected is not None and (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+            ) != expected:
+                raise AssertionError(f"host IPC node identity changed: {path}")
+            if (
+                not expected_kind(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+            ):
+                raise AssertionError(
+                    f"host IPC node ownership/type changed: {path}"
+                )
+            path.unlink()
+
+        def remove_host_regular(
+            path: Path, expected: tuple[int, int] | None
+        ) -> None:
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                if expected is not None:
+                    raise AssertionError(f"host IPC marker disappeared: {path}")
+                return
+            if expected is not None and (
+                metadata.st_dev,
+                metadata.st_ino,
+            ) != expected:
+                raise AssertionError(f"host IPC marker identity changed: {path}")
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+            ):
+                raise AssertionError(
+                    f"host IPC marker ownership/type changed: {path}"
+                )
+            path.unlink()
+
+        hang_socket = ipc_root / "hang.sock"
+        hang_fifo = ipc_root / "hang.fifo"
+        hang_go = ipc_root / "hang-go"
+        hang_ready = ipc_root / "hang-ready"
+        hang_process: subprocess.Popen[bytes] | None = None
+        hang_identity: tuple[int, ...] | None = None
+        hang_nodes: dict[Path, tuple[int, int, int]] = {}
+        hang_go_identity: tuple[int, int] | None = None
+        hang_ready_identity: tuple[int, int] | None = None
+        hang_cleanup_errors: list[str] = []
+        try:
+            hang_process, hang_identity = start_host_ipc_helper(
+                hang_socket,
+                hang_fifo,
+                hang_go,
+                hang_ready,
+                mode="hang",
+            )
+            hang_go.write_text("go\n", encoding="utf-8")
+            metadata = hang_go.lstat()
+            hang_go_identity = (metadata.st_dev, metadata.st_ino)
+            deadline = time.monotonic() + 5.0
+            while not hang_ready.exists():
+                if hang_process.poll() is not None:
+                    raise AssertionError(
+                        "hanging host IPC helper exited before readiness"
+                    )
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        "hanging host IPC helper did not become ready"
+                    )
+                time.sleep(0.01)
+            if hang_ready.read_text(encoding="utf-8") != "ready\n":
+                raise AssertionError("hanging host IPC helper readiness changed")
+            metadata = hang_ready.lstat()
+            hang_ready_identity = (metadata.st_dev, metadata.st_ino)
+            stdout, stderr = stop_host_ipc_helper(
+                hang_process,
+                hang_identity,
+                expect_graceful=False,
+            )
+            if stderr:
+                raise AssertionError("hanging host IPC helper wrote stderr")
+            hang_nodes, received, fifo_remaining = parse_host_ipc_helper(
+                stdout,
+                (hang_socket, hang_fifo),
+                hang_process.pid,
+                completed_required=False,
+            )
+            if received:
+                raise AssertionError(
+                    "hanging host IPC helper unexpectedly received candidate data"
+                )
+            if fifo_remaining is not None:
+                raise AssertionError(
+                    "hanging host IPC helper emitted a terminal FIFO receipt"
+                )
+        finally:
+            if (
+                hang_process is not None
+                and hang_identity is not None
+                and (
+                    hang_process.poll() is None
+                    or _CANDIDATE_SUPPORT._process_identity(
+                        Path("/proc") / str(hang_process.pid)
+                    )
+                    == hang_identity
+                )
+            ):
+                try:
+                    stop_host_ipc_helper(
+                        hang_process,
+                        hang_identity,
+                        expect_graceful=False,
+                    )
+                except BaseException as error:
+                    hang_cleanup_errors.append(str(error))
+            helper_terminal = (
+                hang_process is None
+                or (
+                    hang_process.poll() is not None
+                    and (
+                        hang_identity is None
+                        or _CANDIDATE_SUPPORT._process_identity(
+                            Path("/proc") / str(hang_process.pid)
+                        )
+                        != hang_identity
+                    )
+                )
+            )
+            if not helper_terminal:
+                hang_cleanup_errors.append(
+                    "hanging host IPC helper remained active"
+                )
+            else:
+                for path, kind in (
+                    (hang_socket, stat.S_ISSOCK),
+                    (hang_fifo, stat.S_ISFIFO),
+                ):
+                    try:
+                        remove_host_ipc_node(path, hang_nodes.get(path), kind)
+                    except BaseException as error:
+                        hang_cleanup_errors.append(str(error))
+                for path, expected in (
+                    (hang_ready, hang_ready_identity),
+                    (hang_go, hang_go_identity),
+                ):
+                    try:
+                        remove_host_regular(path, expected)
+                    except BaseException as error:
+                        hang_cleanup_errors.append(str(error))
+                try:
+                    if tuple(ipc_root.iterdir()):
+                        raise AssertionError(
+                            "hanging host IPC helper left scaffold residue"
+                        )
+                except BaseException as error:
+                    hang_cleanup_errors.append(str(error))
+            if hang_cleanup_errors:
+                raise AssertionError("; ".join(hang_cleanup_errors))
+
+        try:
+            rw_hint_path.write_bytes(b"required-ci-rw-hint\n")
+            rw_hint_path.chmod(0o444)
+            metadata = rw_hint_path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o444
+            ):
+                raise AssertionError("host fcntl sentinel identity is unsafe")
+            rw_hint_identity = (metadata.st_dev, metadata.st_ino)
+            rw_hint_descriptor = os.open(
+                rw_hint_path,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            try:
+                rw_hint_baseline = fcntl.fcntl(
+                    rw_hint_descriptor, 1035, bytes(8)
+                )
+            except OSError as error:
+                raise AssertionError(
+                    "strict live host filesystem does not support F_GET_RW_HINT"
+                ) from error
+            if type(rw_hint_baseline) is not bytes or len(rw_hint_baseline) != 8:
+                raise AssertionError("strict live F_GET_RW_HINT result is malformed")
+            with _CANDIDATE_SUPPORT.candidate_fixture_directory(
+                "required-ci-access-policy-"
+            ) as temporary_directory, _CANDIDATE_SUPPORT.candidate_fixture_directory(
+                "required-ci-access-allowed-"
+            ) as explicit_directory:
+                _, candidate_root = self.prepare_roots(temporary_directory)
+                explicit_root = Path(explicit_directory).resolve(strict=True)
+                go_marker = explicit_root / "candidate-go"
+                ready_marker = explicit_root / "host-ipc-ready"
+                explicit_marker = explicit_root / "allowed-write"
+                git_root = explicit_root / "git-fixture"
+                git_root.mkdir()
+                (git_root / "tracked.txt").write_text(
+                    "tracked\n", encoding="utf-8"
+                )
+                trusted_git = _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE
+                git_environment = os.environ.copy()
+                git_environment.update(
+                    {
+                        "GIT_CONFIG_GLOBAL": "/dev/null",
+                        "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_OPTIONAL_LOCKS": "0",
+                        "GIT_TERMINAL_PROMPT": "0",
+                    }
+                )
+                subprocess.run(
+                    [
+                        trusted_git,
+                        "init",
+                        "--quiet",
+                        "--object-format=sha1",
+                        str(git_root),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    env=git_environment,
+                    timeout=5,
+                )
+                subprocess.run(
+                    [trusted_git, "-C", str(git_root), "add", "tracked.txt"],
+                    check=True,
+                    capture_output=True,
+                    env=git_environment,
+                    timeout=5,
+                )
+                subprocess.run(
+                    [
+                        trusted_git,
+                        "-c",
+                        "user.name=Required CI",
+                        "-c",
+                        "user.email=required-ci@example.invalid",
+                        "-c",
+                        "commit.gpgSign=false",
+                        "-C",
+                        str(git_root),
+                        "commit",
+                        "--quiet",
+                        "-m",
+                        "fixture",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    env=git_environment,
+                    timeout=5,
+                )
+                runner_path = (
+                    distribution_content_root(candidate_root)
+                    / "skills/waited-delivery/scripts/waited_delivery_runner.py"
+                )
+                candidate_source = inspect.cleandoc(
+                        r'''
+                        import ctypes
+                        from compression import zstd
+                        import errno
+                        import fcntl
+                        import json
+                        import os
+                        from pathlib import Path
+                        import resource
+                        import signal
+                        import socket
+                        import stat
+                        import struct
+                        import subprocess
+                        import sys
+                        import termios
+                        import time
+
+                        if len(sys.argv) != 10:
+                            raise SystemExit(90)
+                        explicit_root = Path(sys.argv[1])
+                        surface_roots = tuple(Path(value) for value in sys.argv[2:6])
+                        socket_path = Path(__REQUIRED_CI_SOCKET_PATH__)
+                        fifo_path = Path(__REQUIRED_CI_FIFO_PATH__)
+                        trusted_git = __REQUIRED_CI_GIT_PATH__
+                        rw_hint_path = Path(__REQUIRED_CI_RW_HINT_PATH__)
+                        sysv_key = int(sys.argv[6])
+                        trusted_relative = Path(sys.argv[7])
+                        host_ipc_namespace = sys.argv[8]
+                        mqueue_name = sys.argv[9]
+                        candidate_path = Path(__file__)
+                        candidate_root = next(
+                            parent for parent in candidate_path.parents
+                            if parent.name == "candidate-code"
+                        )
+                        trusted_control = (
+                            candidate_root.parent / "trusted-control" / trusted_relative
+                        )
+
+                        try:
+                            candidate_path.write_bytes(b"candidate mutation\n")
+                        except PermissionError:
+                            write_status = "write-denied"
+                        else:
+                            write_status = "write-allowed"
+                        try:
+                            trusted_control.read_bytes()
+                        except PermissionError:
+                            read_status = "read-denied"
+                        else:
+                            read_status = "read-allowed"
+                        stdlib_path = Path(os.__file__)
+                        stdlib_status = (
+                            "stdlib-readable"
+                            if stdlib_path.read_bytes()
+                            else "stdlib-empty"
+                        )
+                        try:
+                            with stdlib_path.open("ab"):
+                                pass
+                        except PermissionError:
+                            stdlib_write_status = "stdlib-write-denied"
+                        else:
+                            stdlib_write_status = "stdlib-write-allowed"
+                        try:
+                            with Path(sys.executable).open("ab"):
+                                pass
+                        except PermissionError:
+                            interpreter_write_status = "interpreter-write-denied"
+                        else:
+                            interpreter_write_status = "interpreter-write-allowed"
+
+                        workspace_marker = Path.cwd() / "workspace-write"
+                        runtime_marker = Path(os.environ["TMPDIR"]) / "runtime-write"
+                        explicit_marker = explicit_root / "allowed-write"
+                        for marker, payload in (
+                            (workspace_marker, "workspace\n"),
+                            (runtime_marker, "runtime\n"),
+                            (explicit_marker, "explicit\n"),
+                        ):
+                            marker.write_text(payload, encoding="utf-8")
+                            if marker.read_text(encoding="utf-8") != payload:
+                                raise SystemExit(91)
+                        allowed_writes = {
+                            "explicit": explicit_marker.read_text(encoding="utf-8"),
+                            "runtime": runtime_marker.read_text(encoding="utf-8"),
+                            "workspace": workspace_marker.read_text(encoding="utf-8"),
+                        }
+
+                        private_markers = {}
+                        for index, root in enumerate(surface_roots):
+                            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            name = (
+                                "posix-shm-private-marker"
+                                if index == 2
+                                else "candidate-private-marker"
+                            )
+                            marker = root / name
+                            marker.write_text("private\n", encoding="utf-8")
+                            private_markers[str(marker)] = marker.read_text(
+                                encoding="utf-8"
+                            )
+
+                        go_marker = explicit_root / "candidate-go"
+                        ready_marker = explicit_root / "host-ipc-ready"
+                        go_marker.write_text("go\n", encoding="utf-8")
+                        deadline = time.monotonic() + 15.0
+                        while not ready_marker.exists():
+                            if time.monotonic() >= deadline:
+                                raise SystemExit(92)
+                            time.sleep(0.01)
+                        if ready_marker.read_text(encoding="utf-8") != "ready\n":
+                            raise SystemExit(92)
+                        socket_metadata = socket_path.lstat()
+                        fifo_metadata = fifo_path.lstat()
+                        post_seal_nodes_visible = (
+                            stat.S_ISSOCK(socket_metadata.st_mode)
+                            and stat.S_IMODE(socket_metadata.st_mode) == 0o666
+                            and stat.S_ISFIFO(fifo_metadata.st_mode)
+                            and stat.S_IMODE(fifo_metadata.st_mode) == 0o666
+                        )
+                        if not post_seal_nodes_visible:
+                            raise SystemExit(92)
+
+                        def operation_errno(operation):
+                            try:
+                                operation()
+                            except OSError as error:
+                                return error.errno
+                            return 0
+
+                        limits_descriptor = os.open(
+                            "/proc/self/limits",
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        )
+                        try:
+                            limits_bytes = os.read(limits_descriptor, 65537)
+                        finally:
+                            os.close(limits_descriptor)
+                        if not limits_bytes or len(limits_bytes) > 65536:
+                            raise SystemExit(92)
+                        limits_lines = limits_bytes.decode("ascii").splitlines()
+                        core_limit_rows = [
+                            line.split()
+                            for line in limits_lines
+                            if line.startswith("Max core file size ")
+                        ]
+                        if len(core_limit_rows) != 1:
+                            raise SystemExit(92)
+                        core_limit_fields = core_limit_rows[0]
+                        if core_limit_fields[-3:] != ["1", "1", "bytes"]:
+                            raise SystemExit(92)
+                        core_limits = core_limit_fields[-3:]
+
+                        core_pattern_descriptor = os.open(
+                            "/proc/sys/kernel/core_pattern",
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        )
+                        try:
+                            core_pattern_bytes = os.read(
+                                core_pattern_descriptor, 4097
+                            )
+                        finally:
+                            os.close(core_pattern_descriptor)
+                        if not core_pattern_bytes or len(core_pattern_bytes) > 4096:
+                            raise SystemExit(92)
+                        core_pattern = core_pattern_bytes.decode("ascii")
+                        if core_pattern.endswith("\n"):
+                            core_pattern = core_pattern[:-1]
+                        if (
+                            not core_pattern
+                            or "\n" in core_pattern
+                            or "\r" in core_pattern
+                            or "\x00" in core_pattern
+                        ):
+                            raise SystemExit(92)
+                        if core_pattern.startswith("|"):
+                            if not core_pattern[1:].strip():
+                                raise SystemExit(92)
+                        elif (
+                            core_pattern in {".", ".."}
+                            or "/" in core_pattern
+                            or not all(
+                                0x21 <= ord(character) <= 0x7E
+                                for character in core_pattern
+                            )
+                        ):
+                            raise SystemExit(92)
+                        setrlimit_errno = operation_errno(
+                            lambda: resource.setrlimit(
+                                resource.RLIMIT_CORE, (0, 0)
+                            )
+                        )
+                        prlimit_errno = operation_errno(
+                            lambda: resource.prlimit(
+                                0, resource.RLIMIT_CORE, (0, 0)
+                            )
+                        )
+
+                        crash_root = explicit_root / "core-crash"
+                        crash_root.mkdir(mode=0o700)
+                        crash = subprocess.run(
+                            [
+                                sys.executable,
+                                "-I",
+                                "-B",
+                                "-c",
+                                "import ctypes; ctypes.string_at(0)",
+                            ],
+                            check=False,
+                            cwd=crash_root,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5,
+                        )
+                        core_files = []
+                        for core_file in sorted(crash_root.iterdir()):
+                            core_metadata = core_file.lstat()
+                            if (
+                                not stat.S_ISREG(core_metadata.st_mode)
+                                or core_metadata.st_nlink != 1
+                                or core_metadata.st_size > 1
+                            ):
+                                raise SystemExit(92)
+                            core_files.append(
+                                {"name": core_file.name, "size": core_metadata.st_size}
+                            )
+                        if len(core_files) > 1:
+                            raise SystemExit(92)
+                        core_returncode = crash.returncode
+
+                        def pathname_socket_operation():
+                            candidate_socket = socket.socket(
+                                socket.AF_UNIX, socket.SOCK_STREAM
+                            )
+                            try:
+                                candidate_socket.connect(str(socket_path))
+                                candidate_socket.sendall(b"socket")
+                            finally:
+                                candidate_socket.close()
+
+                        def socketpair_operation():
+                            first, second = socket.socketpair()
+                            try:
+                                first.sendall(b"pair")
+                            finally:
+                                first.close()
+                                second.close()
+
+                        def fifo_operation():
+                            descriptor = os.open(
+                                fifo_path, os.O_WRONLY | os.O_NONBLOCK
+                            )
+                            try:
+                                os.write(descriptor, b"fifo")
+                            finally:
+                                os.close(descriptor)
+
+                        def fifo_read_operation():
+                            descriptor = os.open(
+                                fifo_path, os.O_RDONLY | os.O_NONBLOCK
+                            )
+                            try:
+                                os.read(descriptor, 64)
+                            finally:
+                                os.close(descriptor)
+
+                        socket_errno = operation_errno(pathname_socket_operation)
+                        socketpair_errno = operation_errno(socketpair_operation)
+                        fifo_errno = operation_errno(fifo_operation)
+                        fifo_read_errno = operation_errno(fifo_read_operation)
+
+                        link_source = explicit_root / "link-source"
+                        link_target = explicit_root / "link-target"
+                        link_source.write_text("source\n", encoding="utf-8")
+                        link_errno = operation_errno(
+                            lambda: os.link(link_source, link_target)
+                        )
+
+                        rw_hint_descriptor = os.open(
+                            rw_hint_path,
+                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        )
+                        try:
+                            rw_hint_before = fcntl.fcntl(
+                                rw_hint_descriptor, 1035, bytes(8)
+                            )
+                            selected_hint = (
+                                4 if struct.unpack("=Q", rw_hint_before)[0] == 5 else 5
+                            )
+                            rw_hint_set_errno = operation_errno(
+                                lambda: fcntl.fcntl(
+                                    rw_hint_descriptor,
+                                    1036,
+                                    struct.pack("=Q", selected_hint),
+                                )
+                            )
+                        finally:
+                            os.close(rw_hint_descriptor)
+
+                        ioctl_read, ioctl_write = os.pipe()
+                        try:
+                            tcgets_errno = operation_errno(
+                                lambda: fcntl.ioctl(
+                                    ioctl_read,
+                                    termios.TCGETS,
+                                    bytearray(64),
+                                    True,
+                                )
+                            )
+                            arbitrary_ioctl_errno = operation_errno(
+                                lambda: fcntl.ioctl(
+                                    ioctl_read,
+                                    0x12345678,
+                                    bytearray(64),
+                                    True,
+                                )
+                            )
+                        finally:
+                            os.close(ioctl_read)
+                            os.close(ioctl_write)
+
+                        libc = ctypes.CDLL(None, use_errno=True)
+                        libc.syscall.restype = ctypes.c_long
+                        libc.shmget.argtypes = (
+                            ctypes.c_int,
+                            ctypes.c_size_t,
+                            ctypes.c_int,
+                        )
+                        libc.shmget.restype = ctypes.c_int
+
+                        machine = os.uname().machine
+                        syscall_numbers = {
+                            "x86_64": (272, 435, 250, 425, 321),
+                            "aarch64": (97, 435, 219, 425, 280),
+                        }.get(machine)
+                        if syscall_numbers is None:
+                            raise SystemExit(93)
+
+                        def syscall_errno(number, *arguments):
+                            ctypes.set_errno(0)
+                            result = libc.syscall(number, *arguments)
+                            return 0 if result >= 0 else ctypes.get_errno()
+
+                        (
+                            unshare_number,
+                            clone3_number,
+                            keyctl_number,
+                            io_uring_number,
+                            bpf_number,
+                        ) = syscall_numbers
+                        unshare_errno = syscall_errno(unshare_number, 0x08000000)
+                        clone3_errno = syscall_errno(clone3_number, 0, 0)
+                        keyctl_errno = syscall_errno(keyctl_number, 0, 0, 0, 0, 0)
+                        io_uring_errno = syscall_errno(io_uring_number, 1, 0)
+                        bpf_errno = syscall_errno(bpf_number, 0x7FFFFFFF, 0, 0)
+
+                        ctypes.set_errno(0)
+                        observed_shmid = libc.shmget(sysv_key, 0, 0)
+                        sysv_lookup_errno = (
+                            0 if observed_shmid >= 0 else ctypes.get_errno()
+                        )
+                        private_shmid = -1
+                        if sysv_lookup_errno == errno.ENOENT:
+                            ctypes.set_errno(0)
+                            private_shmid = libc.shmget(
+                                sysv_key,
+                                4096,
+                                0o1000 | 0o2000 | 0o600,
+                            )
+                            if private_shmid < 0:
+                                raise OSError(
+                                    ctypes.get_errno(), "private shmget failed"
+                                )
+
+                        candidate_ipc_namespace = os.readlink("/proc/self/ns/ipc")
+                        mqueue_created = False
+                        if candidate_ipc_namespace != host_ipc_namespace:
+                            libc.mq_open.argtypes = (
+                                ctypes.c_char_p,
+                                ctypes.c_int,
+                                ctypes.c_uint,
+                                ctypes.c_void_p,
+                            )
+                            libc.mq_open.restype = ctypes.c_int
+                            libc.mq_close.argtypes = (ctypes.c_int,)
+                            libc.mq_close.restype = ctypes.c_int
+                            ctypes.set_errno(0)
+                            queue = libc.mq_open(
+                                mqueue_name.encode("ascii"),
+                                os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC,
+                                0o600,
+                                None,
+                            )
+                            if queue < 0:
+                                raise OSError(
+                                    ctypes.get_errno(), "private mq_open failed"
+                                )
+                            if libc.mq_close(queue) != 0:
+                                raise OSError(
+                                    ctypes.get_errno(), "private mq_close failed"
+                                )
+                            mqueue_created = True
+
+                        subprocess_result = subprocess.run(
+                            [
+                                sys.executable,
+                                "-I",
+                                "-B",
+                                "-c",
+                                "print('subprocess-ok')",
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if subprocess_result.stdout != "subprocess-ok\n":
+                            raise SystemExit(96)
+                        subprocess.run(
+                            [
+                                sys.executable,
+                                "-I",
+                                "-B",
+                                "-c",
+                                "raise SystemExit(0)",
+                            ],
+                            check=True,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        with open("/dev/null", "rb", buffering=0) as null_read:
+                            if null_read.read(1) != b"":
+                                raise SystemExit(96)
+                        with open("/dev/null", "wb", buffering=0) as null_write:
+                            if null_write.write(b"x") != 1:
+                                raise SystemExit(96)
+
+                        def devzero_operation():
+                            descriptor = os.open(
+                                "/dev/zero", os.O_RDONLY | os.O_CLOEXEC
+                            )
+                            os.close(descriptor)
+
+                        devzero_errno = operation_errno(devzero_operation)
+
+                        entrypoint_usage = {}
+                        for name in (
+                            "waited_delivery_bridge.py",
+                            "waited_delivery_hook_adapter.py",
+                        ):
+                            entrypoint = candidate_path.with_name(name)
+                            completed = subprocess.run(
+                                [
+                                    sys.executable,
+                                    "-I",
+                                    "-B",
+                                    str(entrypoint),
+                                    "--help",
+                                ],
+                                check=True,
+                                capture_output=True,
+                                text=True,
+                                timeout=5,
+                            )
+                            first_line = completed.stdout.splitlines()[:1]
+                            expected_prefix = f"usage: {name} "
+                            if (
+                                completed.stderr
+                                or len(completed.stdout.encode("utf-8")) > 65536
+                                or len(first_line) != 1
+                                or not first_line[0].startswith(expected_prefix)
+                            ):
+                                raise SystemExit(96)
+                            entrypoint_usage[name] = first_line[0]
+
+                        zstd_payload = b"required-ci-zstd-round-trip\n" * 32
+                        zstd_encoded = zstd.compress(zstd_payload)
+                        if (
+                            not zstd_encoded
+                            or zstd.decompress(zstd_encoded) != zstd_payload
+                        ):
+                            raise SystemExit(96)
+
+                        git_root = explicit_root / "git-fixture"
+                        os.environ["GIT_OPTIONAL_LOCKS"] = "0"
+                        git_prefix = [
+                            trusted_git,
+                            "--no-pager",
+                            "-c",
+                            "core.hooksPath=/dev/null",
+                            "-c",
+                            "core.attributesFile=/dev/null",
+                            "-c",
+                            "core.fsmonitor=false",
+                            "-C",
+                            str(git_root),
+                        ]
+
+                        def run_git(arguments):
+                            completed = subprocess.run(
+                                [*git_prefix, *arguments],
+                                check=True,
+                                capture_output=True,
+                                timeout=5,
+                            )
+                            if (
+                                len(completed.stdout) > 65536
+                                or len(completed.stderr) > 65536
+                                or completed.stderr
+                            ):
+                                raise SystemExit(96)
+                            return completed.stdout
+
+                        git_head = run_git(
+                            ["rev-parse", "--verify", "HEAD^{commit}"]
+                        ).decode("ascii").strip()
+                        git_status = run_git(
+                            ["status", "--porcelain=v1", "--untracked-files=no"]
+                        ).decode("utf-8")
+                        git_tree = run_git(
+                            ["ls-tree", "--name-only", "HEAD"]
+                        ).decode("utf-8")
+                        git_archive = run_git(["archive", "--format=tar", "HEAD"])
+                        git_blob = run_git(
+                            ["cat-file", "blob", "HEAD:tracked.txt"]
+                        ).decode("utf-8")
+
+                        status = {}
+                        with open("/proc/self/status", encoding="ascii") as status_file:
+                            for line in status_file:
+                                if ":" in line:
+                                    key, value = line.split(":", 1)
+                                    status[key] = value.strip()
+
+                        mount_records = []
+                        with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+                            for line in mountinfo:
+                                fields = line.split()
+                                separator = fields.index("-")
+                                mount_records.append({
+                                    "id": int(fields[0]),
+                                    "mountpoint": fields[4],
+                                    "options": fields[5].split(","),
+                                    "filesystem": fields[separator + 1],
+                                    "source": fields[separator + 2],
+                                })
+                        if any(
+                            record["mountpoint"]
+                            in {
+                                "/tmp/required-ci-alias-probe-source",
+                                "/tmp/required-ci-alias-probe-target",
+                            }
+                            for record in mount_records
+                        ):
+                            raise SystemExit(94)
+                        dev_shm_mounts = [
+                            record
+                            for record in mount_records
+                            if record["mountpoint"] == "/dev/shm"
+                            and record["filesystem"] == "tmpfs"
+                            and record["source"] == "required-ci-private"
+                            and "rw" in record["options"]
+                            and "nodev" in record["options"]
+                        ]
+                        if len(dev_shm_mounts) != 1:
+                            raise SystemExit(94)
+                        dev_shm_mount = dev_shm_mounts[0]
+
+                        null_descriptor = os.open(
+                            "/dev/null",
+                            getattr(os, "O_PATH")
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC,
+                        )
+                        try:
+                            null_metadata = os.fstat(null_descriptor)
+                        finally:
+                            os.close(null_descriptor)
+                        devnull_mounts = [
+                            record
+                            for record in mount_records
+                            if record["mountpoint"] == "/dev/null"
+                            and "ro" in record["options"]
+                            and "nodev" not in record["options"]
+                        ]
+                        if (
+                            len(devnull_mounts) != 1
+                            or not stat.S_ISCHR(null_metadata.st_mode)
+                        ):
+                            raise SystemExit(94)
+                        devnull_mount = devnull_mounts[0]
+                        devnull_device = {
+                            "gid": null_metadata.st_gid,
+                            "major": os.major(null_metadata.st_rdev),
+                            "minor": os.minor(null_metadata.st_rdev),
+                            "mode": stat.S_IMODE(null_metadata.st_mode),
+                            "uid": null_metadata.st_uid,
+                        }
+
+                        sysctls = {}
+                        for path in (
+                            "/proc/sys/kernel/shmmax",
+                            "/proc/sys/kernel/shmall",
+                            "/proc/sys/kernel/shmmni",
+                            "/proc/sys/kernel/msgmax",
+                            "/proc/sys/kernel/msgmnb",
+                            "/proc/sys/kernel/msgmni",
+                            "/proc/sys/kernel/sem",
+                            "/proc/sys/fs/mqueue/queues_max",
+                            "/proc/sys/fs/mqueue/msg_max",
+                            "/proc/sys/fs/mqueue/msgsize_max",
+                            "/proc/sys/fs/mqueue/msg_default",
+                            "/proc/sys/fs/mqueue/msgsize_default",
+                        ):
+                            sysctls[path] = " ".join(
+                                Path(path).read_text(encoding="ascii").split()
+                            )
+
+                        result = {
+                            "allowed_writes": allowed_writes,
+                            "arbitrary_ioctl_errno": arbitrary_ioctl_errno,
+                            "bpf_errno": bpf_errno,
+                            "dev_shm_mount": dev_shm_mount,
+                            "devnull_device": devnull_device,
+                            "devnull_mount": devnull_mount,
+                            "devnull_subprocess": True,
+                            "devzero_errno": devzero_errno,
+                            "entrypoint_usage": entrypoint_usage,
+                            "fifo_errno": fifo_errno,
+                            "fifo_read_errno": fifo_read_errno,
+                            "ids": [
+                                os.getuid(),
+                                os.geteuid(),
+                                os.getgid(),
+                                os.getegid(),
+                            ],
+                            "interpreter_write_status": interpreter_write_status,
+                            "ipc_namespace": candidate_ipc_namespace,
+                            "io_uring_errno": io_uring_errno,
+                            "git": {
+                                "archive_size": len(git_archive),
+                                "blob": git_blob,
+                                "head": git_head,
+                                "status": git_status,
+                                "tree": git_tree,
+                            },
+                            "keyctl_errno": keyctl_errno,
+                            "link_errno": link_errno,
+                            "clone3_errno": clone3_errno,
+                            "core_files": core_files,
+                            "core_limits": core_limits,
+                            "core_pattern": core_pattern,
+                            "core_returncode": core_returncode,
+                            "mqueue_created": mqueue_created,
+                            "mqueue_visible": Path(
+                                "/dev/mqueue", mqueue_name[1:]
+                            ).exists(),
+                            "mount_namespace": os.readlink("/proc/self/ns/mnt"),
+                            "no_new_privs": status.get("NoNewPrivs"),
+                            "post_seal_nodes_visible": post_seal_nodes_visible,
+                            "prlimit_errno": prlimit_errno,
+                            "private_markers": private_markers,
+                            "read_status": read_status,
+                            "rw_hint_before": rw_hint_before.hex(),
+                            "rw_hint_set_errno": rw_hint_set_errno,
+                            "runtime": sys.executable,
+                            "seccomp": status.get("Seccomp"),
+                            "seccomp_filters": status.get("Seccomp_filters"),
+                            "setrlimit_errno": setrlimit_errno,
+                            "socket_errno": socket_errno,
+                            "socketpair_errno": socketpair_errno,
+                            "stdlib_status": stdlib_status,
+                            "stdlib_write_status": stdlib_write_status,
+                            "subprocess": subprocess_result.stdout,
+                            "sysctls": sysctls,
+                            "sysv_private_created": private_shmid >= 0,
+                            "sysv_lookup_errno": sysv_lookup_errno,
+                            "tcgets_errno": tcgets_errno,
+                            "unshare_errno": unshare_errno,
+                            "version": ".".join(map(str, sys.version_info[:3])),
+                            "write_status": write_status,
+                            "zstd": {
+                                "compressed_size": len(zstd_encoded),
+                                "payload_size": len(zstd_payload),
+                            },
+                        }
+                        print(json.dumps(result, sort_keys=True))
+                        if (
+                            result["ids"]
+                            != [os.getuid(), os.getuid(), os.getgid(), os.getgid()]
+                            or write_status != "write-denied"
+                            or read_status != "read-denied"
+                            or stdlib_status != "stdlib-readable"
+                            or stdlib_write_status != "stdlib-write-denied"
+                            or interpreter_write_status
+                            != "interpreter-write-denied"
+                            or set(private_markers.values()) != {"private\n"}
+                            or socket_errno != errno.EACCES
+                            or socketpair_errno != errno.EACCES
+                            or fifo_errno != errno.EACCES
+                            or fifo_read_errno != errno.EACCES
+                            or link_errno != errno.EACCES
+                            or unshare_errno != errno.EACCES
+                            or clone3_errno != errno.ENOSYS
+                            or core_limits != ["1", "1", "bytes"]
+                            or core_returncode != -signal.SIGSEGV
+                            or len(core_files) > 1
+                            or setrlimit_errno != errno.EACCES
+                            or prlimit_errno != errno.EACCES
+                            or keyctl_errno != errno.EACCES
+                            or io_uring_errno != errno.EACCES
+                            or tcgets_errno != errno.EACCES
+                            or arbitrary_ioctl_errno != errno.EACCES
+                            or bpf_errno != errno.EACCES
+                            or devzero_errno != errno.EACCES
+                            or devnull_mount["mountpoint"] != "/dev/null"
+                            or "ro" not in devnull_mount["options"]
+                            or "nodev" in devnull_mount["options"]
+                            or devnull_device
+                            != {
+                                "gid": 0,
+                                "major": 1,
+                                "minor": 3,
+                                "mode": 0o666,
+                                "uid": 0,
+                            }
+                            or rw_hint_set_errno != errno.EACCES
+                            or sysv_lookup_errno != errno.ENOENT
+                            or private_shmid < 0
+                            or not mqueue_created
+                            or not result["mqueue_visible"]
+                            or subprocess_result.stdout != "subprocess-ok\n"
+                            or git_status
+                            or git_tree != "tracked.txt\n"
+                            or git_blob != "tracked\n"
+                            or len(git_head) != 40
+                            or not git_archive
+                        ):
+                            raise SystemExit(95)
+                        '''
+                    )
+                candidate_source = candidate_source.replace(
+                    "__REQUIRED_CI_SOCKET_PATH__", repr(str(socket_path))
+                ).replace(
+                    "__REQUIRED_CI_FIFO_PATH__", repr(str(fifo_path))
+                ).replace(
+                    "__REQUIRED_CI_GIT_PATH__", repr(trusted_git)
+                ).replace(
+                    "__REQUIRED_CI_RW_HINT_PATH__", repr(str(rw_hint_path))
+                )
+                self.assertNotIn("/proc/self/fdinfo/", candidate_source)
+                runner_path.write_text(
+                    candidate_source + "\n",
+                    encoding="utf-8",
+                )
+                candidate_sha = self.initialize_candidate_checkout(candidate_root)
+                listener_process, listener_identity = start_host_ipc_helper(
+                    socket_path,
+                    fifo_path,
+                    go_marker,
+                    ready_marker,
+                    mode="normal",
+                )
+                try:
+                    with mock.patch.dict(
+                        os.environ,
+                        {
+                            REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                            REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                        },
+                        clear=False,
+                    ):
+                        completed = _CANDIDATE_SUPPORT.run_candidate_python(
+                            runner_path,
+                            arguments=(
+                                str(explicit_root),
+                                *(str(root) for root in surface_roots),
+                                str(sysv_key),
+                                trusted_control_relative,
+                                host_ipc_namespace,
+                                mqueue_name,
+                            ),
+                            writable_roots=(explicit_root,),
+                            readable_roots=(rw_hint_path,),
+                        )
+                finally:
+                    try:
+                        helper_stdout, helper_stderr = stop_host_ipc_helper(
+                            listener_process,
+                            listener_identity,
+                            expect_graceful=True,
+                        )
+                        (
+                            listener_nodes,
+                            listener_received,
+                            listener_fifo_remaining,
+                        ) = parse_host_ipc_helper(
+                            helper_stdout,
+                            (socket_path, fifo_path),
+                            listener_process.pid,
+                            completed_required=True,
+                        )
+                        if helper_stderr:
+                            raise AssertionError(
+                                "host IPC helper wrote unexpected stderr"
+                            )
+                        listener_created.append(True)
+                    except BaseException as error:
+                        listener_errors.append(error)
+
+                self.assertIsNotNone(listener_process.returncode)
+                self.assertNotEqual(
+                    _CANDIDATE_SUPPORT._process_identity(
+                        Path("/proc") / str(listener_process.pid)
+                    ),
+                    listener_identity,
+                )
+                self.assertFalse(listener_errors, listener_errors)
+                self.assertEqual(listener_created, [True])
+                self.assertEqual(listener_received, [])
+                self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")
+                self.assertEqual(set(listener_nodes), {socket_path, fifo_path})
+                assert completed is not None
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                result = json.loads(completed.stdout)
+                self.assertEqual(
+                    result["ids"],
+                    [target_uid, target_uid, target_gid, target_gid],
+                )
+                self.assertEqual(result["write_status"], "write-denied")
+                self.assertEqual(result["read_status"], "read-denied")
+                self.assertEqual(result["stdlib_status"], "stdlib-readable")
+                self.assertEqual(
+                    result["stdlib_write_status"], "stdlib-write-denied"
+                )
+                self.assertEqual(
+                    result["interpreter_write_status"],
+                    "interpreter-write-denied",
+                )
+                self.assertEqual(
+                    result["runtime"], str(Path(sys.executable).resolve(strict=True))
+                )
+                self.assertEqual(
+                    result["version"], ".".join(map(str, sys.version_info[:3]))
+                )
+                self.assertEqual(result["mount_namespace"] == host_mount_namespace, False)
+                self.assertEqual(result["ipc_namespace"] == host_ipc_namespace, False)
+                self.assertEqual(result["no_new_privs"], "1")
+                self.assertIs(result["post_seal_nodes_visible"], True)
+                self.assertEqual(result["seccomp"], "2")
+                self.assertGreaterEqual(int(result["seccomp_filters"]), 1)
+                self.assertEqual(result["socket_errno"], errno.EACCES)
+                self.assertEqual(result["socketpair_errno"], errno.EACCES)
+                self.assertEqual(result["fifo_errno"], errno.EACCES)
+                self.assertEqual(result["fifo_read_errno"], errno.EACCES)
+                self.assertEqual(result["link_errno"], errno.EACCES)
+                self.assertEqual(result["unshare_errno"], errno.EACCES)
+                self.assertEqual(result["clone3_errno"], errno.ENOSYS)
+                self.assertEqual(result["io_uring_errno"], errno.EACCES)
+                self.assertEqual(result["keyctl_errno"], errno.EACCES)
+                self.assertEqual(result["tcgets_errno"], errno.EACCES)
+                self.assertEqual(
+                    result["arbitrary_ioctl_errno"], errno.EACCES
+                )
+                self.assertEqual(result["bpf_errno"], errno.EACCES)
+                self.assertEqual(result["core_limits"], ["1", "1", "bytes"])
+                self.assertEqual(result["core_returncode"], -signal.SIGSEGV)
+                self.assertLessEqual(len(result["core_files"]), 1)
+                for core_file in result["core_files"]:
+                    self.assertEqual(set(core_file), {"name", "size"})
+                    self.assertIsInstance(core_file["name"], str)
+                    self.assertLessEqual(core_file["size"], 1)
+                core_pattern = result["core_pattern"]
+                self.assertIsInstance(core_pattern, str)
+                if core_pattern.startswith("|"):
+                    self.assertTrue(core_pattern[1:].strip())
+                else:
+                    self.assertNotIn(core_pattern, {".", ".."})
+                    self.assertNotIn("/", core_pattern)
+                    self.assertTrue(
+                        all(
+                            0x21 <= ord(character) <= 0x7E
+                            for character in core_pattern
+                        )
+                    )
+                self.assertEqual(result["setrlimit_errno"], errno.EACCES)
+                self.assertEqual(result["prlimit_errno"], errno.EACCES)
+                actual_core_files = []
+                for core_file in sorted((explicit_root / "core-crash").iterdir()):
+                    core_metadata = core_file.lstat()
+                    self.assertTrue(stat.S_ISREG(core_metadata.st_mode))
+                    self.assertEqual(core_metadata.st_nlink, 1)
+                    self.assertLessEqual(core_metadata.st_size, 1)
+                    actual_core_files.append(
+                        {"name": core_file.name, "size": core_metadata.st_size}
+                    )
+                self.assertEqual(actual_core_files, result["core_files"])
+                self.assertEqual(result["devzero_errno"], errno.EACCES)
+                self.assertEqual(result["rw_hint_set_errno"], errno.EACCES)
+                assert rw_hint_baseline is not None
+                self.assertEqual(result["rw_hint_before"], rw_hint_baseline.hex())
+                self.assertEqual(result["sysv_lookup_errno"], errno.ENOENT)
+                self.assertIs(result["sysv_private_created"], True)
+                self.assertIs(result["mqueue_created"], True)
+                self.assertIs(result["mqueue_visible"], True)
+                self.assertEqual(result["subprocess"], "subprocess-ok\n")
+                self.assertIs(result["devnull_subprocess"], True)
+                self.assertEqual(result["devnull_mount"]["mountpoint"], "/dev/null")
+                self.assertIn("ro", result["devnull_mount"]["options"])
+                self.assertNotIn("nodev", result["devnull_mount"]["options"])
+                self.assertEqual(
+                    result["devnull_device"],
+                    {
+                        "gid": 0,
+                        "major": 1,
+                        "minor": 3,
+                        "mode": 0o666,
+                        "uid": 0,
+                    },
+                )
+                self.assertEqual(
+                    set(result["entrypoint_usage"]),
+                    {
+                        "waited_delivery_bridge.py",
+                        "waited_delivery_hook_adapter.py",
+                    },
+                )
+                for name, usage in result["entrypoint_usage"].items():
+                    self.assertTrue(usage.startswith(f"usage: {name} "))
+                self.assertGreater(result["zstd"]["compressed_size"], 0)
+                self.assertEqual(result["zstd"]["payload_size"], 896)
+                self.assertEqual(
+                    result["allowed_writes"],
+                    {
+                        "explicit": "explicit\n",
+                        "runtime": "runtime\n",
+                        "workspace": "workspace\n",
+                    },
+                )
+                self.assertEqual(result["git"]["status"], "")
+                self.assertEqual(result["git"]["tree"], "tracked.txt\n")
+                self.assertEqual(result["git"]["blob"], "tracked\n")
+                self.assertRegex(result["git"]["head"], r"\A[0-9a-f]{40}\Z")
+                self.assertGreater(result["git"]["archive_size"], 0)
+                self.assertEqual(
+                    result["dev_shm_mount"]["mountpoint"], "/dev/shm"
+                )
+                self.assertEqual(result["dev_shm_mount"]["filesystem"], "tmpfs")
+                self.assertEqual(
+                    result["dev_shm_mount"]["source"], "required-ci-private"
+                )
+                self.assertIn("rw", result["dev_shm_mount"]["options"])
+                expected_sysctls = {
+                    "/proc/sys/kernel/shmmax": "8388608",
+                    "/proc/sys/kernel/shmall": str(
+                        8388608 // os.sysconf("SC_PAGE_SIZE")
+                    ),
+                    "/proc/sys/kernel/shmmni": "64",
+                    "/proc/sys/kernel/msgmax": "8192",
+                    "/proc/sys/kernel/msgmnb": "65536",
+                    "/proc/sys/kernel/msgmni": "64",
+                    "/proc/sys/kernel/sem": "64 256 32 64",
+                    "/proc/sys/fs/mqueue/queues_max": "64",
+                    "/proc/sys/fs/mqueue/msg_max": "64",
+                    "/proc/sys/fs/mqueue/msgsize_max": "8192",
+                    "/proc/sys/fs/mqueue/msg_default": "16",
+                    "/proc/sys/fs/mqueue/msgsize_default": "8192",
+                }
+                self.assertEqual(result["sysctls"], expected_sysctls)
+                self.assertEqual(
+                    result["private_markers"],
+                    {
+                        str(marker): "private\n"
+                        for marker in surface_markers.values()
+                    },
+                )
+                assert explicit_marker is not None
+                self.assertEqual(
+                    explicit_marker.read_text(encoding="utf-8"), "explicit\n"
+                )
+                for marker in surface_markers.values():
+                    self.assertFalse(marker.exists())
+                self.assertFalse(host_mqueue_path.exists())
+                ctypes.set_errno(0)
+                self.assertEqual(libc.shmget(sysv_key, 0, 0), host_shmid)
+                assert rw_hint_descriptor is not None
+                self.assertEqual(
+                    fcntl.fcntl(rw_hint_descriptor, 1035, bytes(8)),
+                    rw_hint_baseline,
+                )
+        finally:
+            cleanup_errors: list[str] = []
+            if (
+                listener_process is not None
+                and listener_identity is not None
+                and (
+                    listener_process.poll() is None
+                    or _CANDIDATE_SUPPORT._process_identity(
+                        Path("/proc") / str(listener_process.pid)
+                    )
+                    == listener_identity
+                )
+            ):
+                try:
+                    stop_host_ipc_helper(
+                        listener_process,
+                        listener_identity,
+                        expect_graceful=True,
+                    )
+                except BaseException as error:
+                    cleanup_errors.append(str(error))
+            listener_terminal = (
+                listener_process is None
+                or (
+                    listener_process.poll() is not None
+                    and (
+                        listener_identity is None
+                        or _CANDIDATE_SUPPORT._process_identity(
+                            Path("/proc") / str(listener_process.pid)
+                        )
+                        != listener_identity
+                    )
+                )
+            )
+            if not listener_terminal:
+                cleanup_errors.append(
+                    "host IPC listener remained active during exact cleanup"
+                )
+            else:
+                for path, expected_kind in (
+                    (socket_path, stat.S_ISSOCK),
+                    (fifo_path, stat.S_ISFIFO),
+                ):
+                    try:
+                        remove_host_ipc_node(
+                            path,
+                            listener_nodes.get(path),
+                            expected_kind,
+                        )
+                    except BaseException as error:
+                        cleanup_errors.append(str(error))
+            if rw_hint_descriptor is not None:
+                try:
+                    os.close(rw_hint_descriptor)
+                except OSError as error:
+                    cleanup_errors.append(str(error))
+                rw_hint_descriptor = None
+            try:
+                metadata = rw_hint_path.lstat()
+                if rw_hint_identity is not None and (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ) != rw_hint_identity:
+                    raise AssertionError("host fcntl sentinel identity changed")
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or metadata.st_nlink != 1
+                    or stat.S_IMODE(metadata.st_mode) != 0o444
+                ):
+                    raise AssertionError(
+                        "host fcntl sentinel ownership/type changed"
+                    )
+                rw_hint_path.unlink()
+            except FileNotFoundError:
+                if rw_hint_identity is not None:
+                    cleanup_errors.append("host fcntl sentinel disappeared")
+            except BaseException as error:
+                cleanup_errors.append(str(error))
+            for root in surface_roots:
+                try:
+                    metadata = root.lstat()
+                    if (metadata.st_dev, metadata.st_ino) != surface_identities[root]:
+                        raise AssertionError(
+                            f"host private-surface scaffold identity changed: {root}"
+                        )
+                    marker = surface_markers[root]
+                    try:
+                        marker_metadata = marker.lstat()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if (
+                            not stat.S_ISREG(marker_metadata.st_mode)
+                            or marker_metadata.st_nlink != 1
+                        ):
+                            raise AssertionError(
+                                f"unsafe host private-surface residue: {marker}"
+                            )
+                        marker.unlink()
+                    root.rmdir()
+                except BaseException as error:
+                    cleanup_errors.append(str(error))
+            if listener_terminal:
+                try:
+                    metadata = ipc_root.lstat()
+                    if (metadata.st_dev, metadata.st_ino) != ipc_root_identity:
+                        raise AssertionError("host IPC scaffold identity changed")
+                    ipc_root.rmdir()
+                except BaseException as error:
+                    cleanup_errors.append(str(error))
+            ctypes.set_errno(0)
+            mqueue_cleanup = libc.mq_unlink(mqueue_name.encode("ascii"))
+            if mqueue_cleanup != 0 and ctypes.get_errno() != errno.ENOENT:
+                cleanup_errors.append(
+                    f"POSIX mqueue cleanup failed: errno {ctypes.get_errno()}"
+                )
+            if host_shmid >= 0:
+                ctypes.set_errno(0)
+                if libc.shmctl(host_shmid, 0, None) != 0:
+                    cleanup_errors.append(
+                        f"SysV sentinel cleanup failed: errno {ctypes.get_errno()}"
+                    )
+                else:
+                    ctypes.set_errno(0)
+                    if (
+                        libc.shmget(sysv_key, 0, 0) != -1
+                        or ctypes.get_errno() != errno.ENOENT
+                    ):
+                        cleanup_errors.append(
+                            "SysV sentinel remained after exact cleanup"
+                        )
+            if cleanup_errors:
+                raise AssertionError("; ".join(cleanup_errors))
 
     def test_candidate_cannot_use_runner_environment_for_trusted_source_aba(
         self,

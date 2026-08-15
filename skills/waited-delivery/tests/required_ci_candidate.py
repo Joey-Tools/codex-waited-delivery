@@ -21,6 +21,7 @@ import signal
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -54,10 +55,34 @@ CANDIDATE_WORKSPACE_DIRECTORY_LIMIT = 256
 CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES = 3 * 1024 * 1024
 CANDIDATE_WORKSPACE_ARCHIVE_LIMIT_BYTES = 4 * 1024 * 1024
 _CANDIDATE_WORKSPACE_TAR_RECORD_BYTES = 20 * 512
-_STRICT_PROCESS_LIMIT = 64
-_STRICT_CPU_LIMIT_SECONDS = 20
-_STRICT_ADDRESS_SPACE_LIMIT_BYTES = 1024 * 1024 * 1024
-_STRICT_NOFILE_LIMIT = 64
+_STRICT_WRITABLE_ROOT_LIMIT = 64
+_STRICT_HOST_READ_ROOT_LIMIT = 32
+_STRICT_MOUNTINFO_LIMIT_BYTES = 1024 * 1024
+_STRICT_PRIVATE_SURFACE_PATHS = (
+    Path("/tmp"),
+    Path("/var/tmp"),
+    Path("/run"),
+    Path("/dev/shm"),
+)
+_STRICT_HOST_READ_ROOT_PURPOSES = {
+    "configured-destshared": "directory",
+    "configured-executable": "file",
+    "configured-libdir": "directory",
+    "configured-platstdlib": "directory",
+    "configured-pyvenv": "file",
+    "configured-stdlib": "directory",
+    "continuation-env": "file",
+    "continuation-python": "file",
+    "continuation-setpriv": "file",
+    "ld-cache": "file",
+    "localtime": "file",
+    "system-arch-library": "directory",
+    "system-loader": "file",
+    "system-python-dynload": "directory",
+    "system-python-stdlib": "directory",
+    "trusted-git": "file",
+    "trusted-test-file": "file",
+}
 _STRICT_ZERO_SCAN_COUNT = 3
 _STRICT_ZERO_SCAN_INTERVAL_SECONDS = 0.05
 _STRICT_REGISTRY_ENTRY_LIMIT = 256
@@ -78,7 +103,6 @@ _STRICT_PRIMITIVES = {
     "sudo": Path("/usr/bin/sudo"),
     "python": Path("/usr/bin/python3"),
     "unshare": Path("/usr/bin/unshare"),
-    "prlimit": Path("/usr/bin/prlimit"),
     "setpriv": Path("/usr/bin/setpriv"),
     "env": Path("/usr/bin/env"),
     "true": Path("/usr/bin/true"),
@@ -171,18 +195,91 @@ def _resolve_trusted_git() -> str:
     selected = shutil.which("git")
     if selected is None:
         raise AssertionError("trusted runner PATH does not provide Git")
-    path = Path(selected)
+    path = Path(selected).resolve(strict=True)
+    _capture_trusted_git_binding(path)
+    return str(path)
+
+
+def _capture_trusted_git_binding(path: Path) -> dict[str, object]:
+    if not path.is_absolute():
+        raise AssertionError("trusted Git executable path is not absolute")
     try:
         resolved = path.resolve(strict=True)
-        metadata = resolved.stat()
+    except FileNotFoundError as error:
+        raise AssertionError("trusted Git executable path is missing") from error
+    except PermissionError as error:
+        raise AssertionError("trusted Git executable path is unreadable") from error
     except OSError as error:
-        raise AssertionError("trusted Git executable cannot be resolved") from error
-    if not resolved.is_absolute() or not stat.S_ISREG(metadata.st_mode):
-        raise AssertionError("trusted Git executable must be an absolute ordinary file")
-    return str(resolved)
+        raise AssertionError("trusted Git executable path cannot be inspected") from error
+    if resolved != path:
+        raise AssertionError("trusted Git executable path is not canonical")
+    objects: list[tuple[str, int, int, int]] = []
+    policies: list[tuple[str, int, int, int]] = []
+    current = Path(path.anchor)
+    for index, part in enumerate(path.parts[1:]):
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError as error:
+            raise AssertionError("trusted Git executable path is missing") from error
+        except PermissionError as error:
+            raise AssertionError("trusted Git executable path is unreadable") from error
+        except OSError as error:
+            raise AssertionError(
+                "trusted Git executable path cannot be inspected"
+            ) from error
+        is_leaf = index == len(path.parts[1:]) - 1
+        if not (
+            stat.S_ISREG(metadata.st_mode)
+            if is_leaf
+            else stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise AssertionError("trusted Git executable path has an unsafe object type")
+        objects.append(
+            (
+                str(current),
+                metadata.st_dev,
+                metadata.st_ino,
+                stat.S_IFMT(metadata.st_mode),
+            )
+        )
+        policies.append(
+            (
+                str(current),
+                metadata.st_uid,
+                metadata.st_gid,
+                stat.S_IMODE(metadata.st_mode),
+            )
+        )
+    if not policies or not policies[-1][3] & 0o111:
+        raise AssertionError("trusted Git executable is not executable")
+    return {
+        "path": str(path),
+        # dev/inode/type protect the selected object chain; uid/gid/mode
+        # separately protect the access policy.  Size, times, and link count
+        # do not serve either property and are intentionally excluded.
+        "objects": tuple(objects),
+        "policies": tuple(policies),
+    }
+
+
+def _revalidate_trusted_git_binding(binding: Mapping[str, object]) -> Path:
+    path_value = binding.get("path")
+    if type(path_value) is not str:
+        raise AssertionError("trusted Git executable binding is malformed")
+    current = _capture_trusted_git_binding(Path(path_value))
+    if current["objects"] != binding.get("objects"):
+        raise AssertionError("trusted Git executable object identity changed")
+    if current["policies"] != binding.get("policies"):
+        raise AssertionError("trusted Git executable access policy changed")
+    return Path(path_value)
 
 
 TRUSTED_GIT_EXECUTABLE = _resolve_trusted_git()
+_TRUSTED_GIT_BINDING = _capture_trusted_git_binding(
+    Path(TRUSTED_GIT_EXECUTABLE)
+)
+_STRICT_PRIMITIVES["git"] = Path(TRUSTED_GIT_EXECUTABLE)
 _GIT_SAFE_ARGUMENTS = (
     "--no-pager",
     "-c",
@@ -1949,6 +2046,554 @@ def _revalidate_configured_candidate_interpreter(
     return recaptured
 
 
+def _strict_host_read_component_document(
+    path: Path, metadata: os.stat_result, kind: str
+) -> dict[str, object]:
+    # dev/inode/kind protect object identity; uid/gid/mode independently
+    # protect the target credential's access policy.  Metadata transitions
+    # outside those selected properties are not treated as mutation.
+    return {
+        "path": str(path),
+        "kind": kind,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "permissions": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def _capture_strict_host_read_root_binding(
+    path: Path,
+    *,
+    purpose: str,
+    kind: str,
+    target_uid: int,
+    target_gid: int,
+) -> dict[str, object]:
+    if _STRICT_HOST_READ_ROOT_PURPOSES.get(purpose) != kind:
+        raise AssertionError("strict host read root purpose or kind is malformed")
+    if (
+        type(target_uid) is not int
+        or type(target_gid) is not int
+        or not 50000 <= target_uid <= 64999
+        or target_uid != target_gid
+    ):
+        raise AssertionError("strict host read root target identity is malformed")
+    if not path.is_absolute() or path.anchor != os.path.sep or path == Path(path.anchor):
+        raise AssertionError("strict host read root path is malformed")
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise AssertionError("strict host read root is missing") from error
+    except OSError as error:
+        raise AssertionError("strict host read root is unreadable") from error
+    if resolved != path:
+        raise AssertionError("strict host read root path binding changed")
+    o_path = getattr(os, "O_PATH", None)
+    if type(o_path) is not int:
+        raise AssertionError("strict host read root binding is unavailable")
+    documents: list[dict[str, object]] = []
+    with ExitStack() as descriptors:
+        anchor_descriptor = os.open(
+            path.anchor,
+            o_path | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        descriptors.callback(os.close, anchor_descriptor)
+        parent_descriptor = anchor_descriptor
+        anchor_metadata = os.fstat(anchor_descriptor)
+        _assert_strict_target_runtime_policy(
+            anchor_metadata,
+            target_uid=target_uid,
+            target_gid=target_gid,
+            description="strict host read root",
+            directory=True,
+            executable=False,
+        )
+        _strict_runtime_acl_is_absent(Path(path.anchor), "strict host read root")
+        documents.append(
+            _strict_host_read_component_document(
+                Path(path.anchor), anchor_metadata, "directory"
+            )
+        )
+        opened_components: list[
+            tuple[int, str, int, dict[str, object]]
+        ] = []
+        current = Path(path.anchor)
+        for index, component in enumerate(path.parts[1:]):
+            current /= component
+            is_leaf = index == len(path.parts[1:]) - 1
+            expected_kind = kind if is_leaf else "directory"
+            flags = o_path | os.O_NOFOLLOW | os.O_CLOEXEC
+            if expected_kind == "directory":
+                flags |= os.O_DIRECTORY
+            try:
+                selected = os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                descriptor = os.open(component, flags, dir_fd=parent_descriptor)
+            except FileNotFoundError as error:
+                raise AssertionError(
+                    "strict host read root disappeared during binding"
+                ) from error
+            except OSError as error:
+                if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise AssertionError(
+                        "strict host read root path binding changed"
+                    ) from error
+                raise AssertionError("strict host read root is unreadable") from error
+            descriptors.callback(os.close, descriptor)
+            opened = os.fstat(descriptor)
+            if (
+                _strict_runtime_kind(selected) != expected_kind
+                or _strict_runtime_kind(opened) != expected_kind
+                or (selected.st_dev, selected.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise AssertionError("strict host read root object identity changed")
+            _assert_strict_target_runtime_policy(
+                opened,
+                target_uid=target_uid,
+                target_gid=target_gid,
+                description="strict host read root",
+                directory=expected_kind == "directory",
+                executable=False,
+            )
+            _strict_runtime_acl_is_absent(current, "strict host read root")
+            document = _strict_host_read_component_document(
+                current, opened, expected_kind
+            )
+            documents.append(document)
+            opened_components.append(
+                (parent_descriptor, component, descriptor, document)
+            )
+            parent_descriptor = descriptor
+        for parent_fd, component, descriptor, expected in opened_components:
+            try:
+                selected = os.stat(
+                    component, dir_fd=parent_fd, follow_symlinks=False
+                )
+                opened = os.fstat(descriptor)
+            except FileNotFoundError as error:
+                raise AssertionError(
+                    "strict host read root disappeared during revalidation"
+                ) from error
+            except OSError as error:
+                raise AssertionError(
+                    "strict host read root is unreadable during revalidation"
+                ) from error
+            expected_kind = str(expected["kind"])
+            if (
+                _strict_runtime_kind(selected) != expected_kind
+                or _strict_runtime_kind(opened) != expected_kind
+                or _strict_host_read_component_document(
+                    Path(str(expected["path"])), selected, expected_kind
+                )
+                != expected
+                or _strict_host_read_component_document(
+                    Path(str(expected["path"])), opened, expected_kind
+                )
+                != expected
+            ):
+                raise AssertionError(
+                    "strict host read root object identity or access policy changed"
+                )
+        if (
+            _strict_host_read_component_document(
+                Path(path.anchor), os.fstat(anchor_descriptor), "directory"
+            )
+            != documents[0]
+        ):
+            raise AssertionError(
+                "strict host read root object identity or access policy changed"
+            )
+    binding: dict[str, object] = {
+        "schema_version": 1,
+        "purpose": purpose,
+        "kind": kind,
+        "path": str(path),
+        "target_uid": target_uid,
+        "target_gid": target_gid,
+        "components": documents,
+        "host_mount_id": None,
+    }
+    if kind == "directory":
+        binding["host_mount_id"] = _strict_host_read_root_mount_binding(path)
+    return binding
+
+
+def _canonical_existing_directory(path: Path, description: str) -> Path:
+    if not path.is_absolute() or path.anchor != os.path.sep:
+        raise AssertionError(f"{description} must be an absolute POSIX path")
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+    except FileNotFoundError as error:
+        raise AssertionError(f"{description} is missing") from error
+    except OSError as error:
+        raise AssertionError(f"{description} is unreadable") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise AssertionError(f"{description} is not a directory")
+    return resolved
+
+
+def _strict_host_read_root_bindings(
+    runtime_binding: Mapping[str, object] | None,
+    target_uid: int,
+    target_gid: int,
+    *,
+    readable_roots: Sequence[Path] = (),
+) -> list[dict[str, object]]:
+    selected: list[tuple[str, str, Path]] = []
+    exact_runtime: dict[str, object] | None = None
+    if runtime_binding is not None:
+        exact_runtime = _revalidate_configured_candidate_interpreter(
+            dict(runtime_binding)
+        )
+        if (
+            exact_runtime["target_uid"] != target_uid
+            or exact_runtime["target_gid"] != target_gid
+        ):
+            raise AssertionError(
+                "strict configured read root target identity changed"
+            )
+        early_interpreter = Path(str(exact_runtime["resolved"]))
+        early_prefix = early_interpreter.parent.parent
+        if (
+            early_interpreter.parent.name != "bin"
+            or early_interpreter.parent != early_prefix / "bin"
+            or early_prefix
+            in {Path(os.path.sep), Path("/opt"), Path("/usr"), Path("/usr/local")}
+        ):
+            raise AssertionError(
+                "configured candidate runtime prefix is not narrowly bound"
+            )
+    machine = os.uname().machine
+    architecture = {
+        "x86_64": (
+            "x86_64-linux-gnu",
+            (
+                Path("/lib64/ld-linux-x86-64.so.2"),
+                Path("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+            ),
+        ),
+        "aarch64": (
+            "aarch64-linux-gnu",
+            (
+                Path("/lib/ld-linux-aarch64.so.1"),
+                Path("/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"),
+            ),
+        ),
+    }.get(machine)
+    if architecture is None:
+        raise AssertionError("strict host runtime architecture is unsupported")
+    multiarch, loader_selectors = architecture
+    system_library_roots: list[Path] = []
+    for selector in (Path("/lib") / multiarch, Path("/usr/lib") / multiarch):
+        try:
+            resolved = selector.resolve(strict=True)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise AssertionError(
+                "strict system library root is unreadable"
+            ) from error
+        try:
+            metadata = resolved.stat()
+        except OSError as error:
+            raise AssertionError(
+                "strict system library root is unreadable"
+            ) from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise AssertionError("strict system library root is not a directory")
+        if resolved not in system_library_roots:
+            system_library_roots.append(resolved)
+            selected.append(("system-arch-library", "directory", resolved))
+    if not system_library_roots:
+        raise AssertionError("strict system library root inventory is empty")
+    loader_path = None
+    for selector in loader_selectors:
+        try:
+            loader_path = selector.resolve(strict=True)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise AssertionError("strict system loader is unreadable") from error
+        break
+    if loader_path is None:
+        raise AssertionError("strict system loader is missing")
+    selected.append(("system-loader", "file", loader_path))
+    try:
+        Path("/etc/ld.so.preload").lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise AssertionError("strict ld.so.preload state is unreadable") from error
+    else:
+        raise AssertionError("strict ld.so.preload is unsupported")
+
+    try:
+        system_python = _STRICT_PRIMITIVES["python"].resolve(strict=True)
+    except FileNotFoundError as error:
+        raise AssertionError("strict system Python executable is missing") from error
+    except OSError as error:
+        raise AssertionError("strict system Python executable is unreadable") from error
+    version_match = re.fullmatch(r"python(3\.[0-9]+)", system_python.name)
+    if system_python.parent != Path("/usr/bin") or version_match is None:
+        raise AssertionError("strict system Python layout is unsupported")
+    system_stdlib = _canonical_existing_directory(
+        Path("/usr/lib") / f"python{version_match.group(1)}",
+        "strict system Python standard library",
+    )
+    selected.append(("system-python-stdlib", "directory", system_stdlib))
+    system_dynload = _canonical_existing_directory(
+        system_stdlib / "lib-dynload",
+        "strict system Python dynamic library directory",
+    )
+    selected.append(("system-python-dynload", "directory", system_dynload))
+
+    if exact_runtime is not None:
+        resolved_interpreter = Path(str(exact_runtime["resolved"]))
+        prefix = resolved_interpreter.parent.parent
+        forbidden_prefixes = {
+            Path(os.path.sep),
+            Path("/opt"),
+            Path("/usr"),
+            Path("/usr/local"),
+            *system_library_roots,
+        }
+        runtime_version = exact_runtime.get("version")
+        version_prefix = (
+            f"{runtime_version[0]}.{runtime_version[1]}"
+            if isinstance(runtime_version, list)
+            and len(runtime_version) == 3
+            and all(type(value) is int for value in runtime_version)
+            else None
+        )
+        if (
+            resolved_interpreter.parent.name != "bin"
+            or resolved_interpreter.parent != prefix / "bin"
+            or prefix in forbidden_prefixes
+            or prefix.resolve(strict=True) != prefix
+            or version_prefix is None
+            or not any(
+                re.fullmatch(
+                    rf"{re.escape(version_prefix)}(?:\.[0-9]+)?", component
+                )
+                for component in prefix.parts
+            )
+        ):
+            raise AssertionError(
+                "configured candidate runtime prefix is not narrowly bound"
+            )
+        stdlib_sentinel = Path(str(exact_runtime["stdlib_resolved"]))
+        if prefix not in stdlib_sentinel.parents:
+            raise AssertionError(
+                "configured candidate standard library escapes its narrow prefix"
+            )
+        # The configured candidate argv uses -I but deliberately not -S, so
+        # its versioned prefix/lib tree must cover both the standard library
+        # and that installation's isolated site initialization.  The prefix
+        # shape checks above prevent this rule from degenerating to /opt,
+        # /usr, /usr/local, or a system multiarch library root.
+        runtime_paths = sysconfig.get_paths()
+        if type(runtime_paths) is not dict:
+            raise AssertionError("configured candidate sysconfig paths are malformed")
+        runtime_directories: list[tuple[str, Path]] = []
+        for purpose, key in (
+            ("configured-stdlib", "stdlib"),
+            ("configured-platstdlib", "platstdlib"),
+        ):
+            value = runtime_paths.get(key)
+            if type(value) is not str or not value:
+                raise AssertionError(
+                    f"configured candidate sysconfig {key} is malformed"
+                )
+            runtime_directories.append(
+                (
+                    purpose,
+                    _canonical_existing_directory(
+                        Path(value), f"configured candidate sysconfig {key}"
+                    ),
+                )
+            )
+        for purpose, key in (
+            ("configured-libdir", "LIBDIR"),
+            ("configured-destshared", "DESTSHARED"),
+        ):
+            value = sysconfig.get_config_var(key)
+            if type(value) is not str or not value:
+                raise AssertionError(
+                    f"configured candidate sysconfig {key} is malformed"
+                )
+            runtime_directories.append(
+                (
+                    purpose,
+                    _canonical_existing_directory(
+                        Path(value), f"configured candidate sysconfig {key}"
+                    ),
+                )
+            )
+        if not any(
+            path == stdlib_sentinel.parent
+            or path in stdlib_sentinel.parents
+            for _, path in runtime_directories
+        ):
+            raise AssertionError(
+                "configured candidate standard library is not in sysconfig"
+            )
+        for purpose, path in runtime_directories:
+            if prefix not in path.parents:
+                raise AssertionError(
+                    "configured candidate sysconfig path escapes its narrow prefix"
+                )
+            selected.append((purpose, "directory", path))
+        selected.append(
+            ("configured-executable", "file", resolved_interpreter)
+        )
+        pyvenv_selector = prefix / "pyvenv.cfg"
+        try:
+            pyvenv_path = pyvenv_selector.resolve(strict=True)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise AssertionError(
+                "configured candidate pyvenv file is unreadable"
+            ) from error
+        else:
+            selected.append(("configured-pyvenv", "file", pyvenv_path))
+
+    for purpose, primitive in (
+        ("continuation-setpriv", _STRICT_PRIMITIVES["setpriv"]),
+        ("continuation-env", _STRICT_PRIMITIVES["env"]),
+        ("continuation-python", _STRICT_PRIMITIVES["python"]),
+    ):
+        try:
+            selected.append((purpose, "file", primitive.resolve(strict=True)))
+        except FileNotFoundError as error:
+            raise AssertionError("strict continuation executable is missing") from error
+        except OSError as error:
+            raise AssertionError("strict continuation executable is unreadable") from error
+
+    trusted_git = _revalidate_trusted_git_binding(_TRUSTED_GIT_BINDING)
+    if sys.platform == "linux":
+        try:
+            expected_git = Path("/usr/bin/git").resolve(strict=True)
+        except OSError as error:
+            raise AssertionError("strict trusted Git executable is missing") from error
+        if trusted_git != expected_git or trusted_git.parent != Path("/usr/bin"):
+            raise AssertionError(
+                "strict trusted Git executable is outside /usr/bin"
+            )
+    selected.append(("trusted-git", "file", trusted_git))
+
+    for purpose, selector, required in (
+        ("ld-cache", Path("/etc/ld.so.cache"), True),
+        ("localtime", Path("/etc/localtime"), False),
+    ):
+        try:
+            path = selector.resolve(strict=True)
+        except FileNotFoundError as error:
+            if not required:
+                continue
+            raise AssertionError(f"strict {purpose} read file is missing") from error
+        except OSError as error:
+            raise AssertionError(f"strict {purpose} read file is unreadable") from error
+        selected.append((purpose, "file", path))
+
+    for value in readable_roots:
+        path = Path(value)
+        try:
+            resolved = path.resolve(strict=True)
+            metadata = resolved.stat()
+        except FileNotFoundError as error:
+            raise AssertionError("strict trusted test read file is missing") from error
+        except OSError as error:
+            raise AssertionError("strict trusted test read file is unreadable") from error
+        if resolved != path or not stat.S_ISREG(metadata.st_mode):
+            raise AssertionError("strict trusted test read file is unsafe")
+        selected.append(("trusted-test-file", "file", resolved))
+
+    bindings: list[dict[str, object]] = []
+    observed_paths: set[Path] = set()
+    for purpose, kind, path in selected:
+        if path in observed_paths:
+            continue
+        observed_paths.add(path)
+        bindings.append(
+            _capture_strict_host_read_root_binding(
+                path,
+                purpose=purpose,
+                kind=kind,
+                target_uid=target_uid,
+                target_gid=target_gid,
+            )
+        )
+    if not 1 <= len(bindings) <= _STRICT_HOST_READ_ROOT_LIMIT:
+        raise AssertionError("strict host read root inventory exceeds its fixed limit")
+    return bindings
+
+
+def _revalidate_strict_host_read_root_bindings(
+    value: object,
+) -> list[dict[str, object]]:
+    if (
+        type(value) is not list
+        or not 1 <= len(value) <= _STRICT_HOST_READ_ROOT_LIMIT
+    ):
+        raise AssertionError("strict host read root binding is malformed")
+    bindings: list[dict[str, object]] = []
+    observed_paths: set[str] = set()
+    for document in value:
+        if (
+            type(document) is not dict
+            or set(document)
+            != {
+                "schema_version",
+                "purpose",
+                "kind",
+                "path",
+                "target_uid",
+                "target_gid",
+                "components",
+                "host_mount_id",
+            }
+            or document.get("schema_version") != 1
+            or _STRICT_HOST_READ_ROOT_PURPOSES.get(document.get("purpose"))
+            != document.get("kind")
+            or type(document.get("path")) is not str
+            or type(document.get("target_uid")) is not int
+            or type(document.get("target_gid")) is not int
+            or type(document.get("components")) is not list
+            or (
+                document.get("kind") == "directory"
+                and type(document.get("host_mount_id")) is not int
+            )
+            or (
+                document.get("kind") == "file"
+                and document.get("host_mount_id") is not None
+            )
+        ):
+            raise AssertionError("strict host read root binding is malformed")
+        path = str(document["path"])
+        if path in observed_paths:
+            raise AssertionError("strict host read root binding contains a duplicate")
+        observed_paths.add(path)
+        recaptured = _capture_strict_host_read_root_binding(
+            Path(path),
+            purpose=str(document["purpose"]),
+            kind=str(document["kind"]),
+            target_uid=int(document["target_uid"]),
+            target_gid=int(document["target_gid"]),
+        )
+        if recaptured != document:
+            raise AssertionError("strict host read root binding changed")
+        bindings.append(recaptured)
+    return bindings
+
+
 def _minimal_supervisor_environment() -> dict[str, str]:
     return {
         "HOME": "/root",
@@ -2269,12 +2914,1631 @@ if (
     raise SystemExit(118)
 os.execve(candidate_argv[0], candidate_argv, closed_environment)
 '''.strip()
-_CANDIDATE_BOOTSTRAP_SOURCE = r'''
+_MOUNT_NAMESPACE_BOOTSTRAP_SOURCE = r'''
+import ctypes
 import errno
 import json
 import os
 import resource
-import socket
+import stat
+import sys
+
+STRICT_LIMITS = {
+    resource.RLIMIT_NPROC: 64,
+    resource.RLIMIT_CPU: 20,
+    resource.RLIMIT_AS: 1073741824,
+    resource.RLIMIT_FSIZE: 1048576,
+    resource.RLIMIT_NOFILE: 64,
+    resource.RLIMIT_MSGQUEUE: 8388608,
+    resource.RLIMIT_CORE: 1,
+}
+for limit_name, value in STRICT_LIMITS.items():
+    resource.setrlimit(limit_name, (value, value))
+    if resource.getrlimit(limit_name) != (value, value):
+        raise SystemExit(150)
+
+core_pattern_descriptor = None
+try:
+    core_pattern_descriptor = os.open(
+        "/proc/sys/kernel/core_pattern",
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    core_pattern_bytes = os.read(core_pattern_descriptor, 4097)
+except OSError:
+    raise SystemExit(150)
+finally:
+    if core_pattern_descriptor is not None:
+        os.close(core_pattern_descriptor)
+if not core_pattern_bytes or len(core_pattern_bytes) > 4096:
+    raise SystemExit(150)
+try:
+    core_pattern = core_pattern_bytes.decode("ascii")
+except UnicodeDecodeError:
+    raise SystemExit(150)
+if core_pattern.endswith("\n"):
+    core_pattern = core_pattern[:-1]
+if (
+    not core_pattern
+    or "\n" in core_pattern
+    or "\r" in core_pattern
+    or "\x00" in core_pattern
+):
+    raise SystemExit(150)
+if core_pattern.startswith("|"):
+    if not core_pattern[1:].strip():
+        raise SystemExit(150)
+elif (
+    core_pattern in {".", ".."}
+    or "/" in core_pattern
+    or not all(0x21 <= ord(character) <= 0x7E for character in core_pattern)
+):
+    raise SystemExit(150)
+
+AT_EMPTY_PATH = 0x1000
+AT_RECURSIVE = 0x8000
+AT_SYMLINK_NOFOLLOW = 0x100
+MS_BIND = 4096
+MS_PRIVATE = 1 << 18
+MS_REC = 16384
+MS_NOSUID = 2
+MS_NODEV = 4
+MS_NOEXEC = 8
+MOUNT_ATTR_RDONLY = 1
+MOUNT_ATTR_NODEV = 4
+PR_SET_NO_NEW_PRIVS = 38
+PR_SET_SECCOMP = 22
+SECCOMP_MODE_FILTER = 2
+SECCOMP_RET_ALLOW = 0x7FFF0000
+SECCOMP_RET_ERRNO = 0x00050000
+SECCOMP_RET_KILL_PROCESS = 0x80000000
+BPF_LD_W_ABS = 0x20
+BPF_JMP_JEQ_K = 0x15
+BPF_JMP_JSET_K = 0x45
+BPF_RET_K = 0x06
+LANDLOCK_CREATE_RULESET = 444
+LANDLOCK_ADD_RULE = 445
+LANDLOCK_RESTRICT_SELF = 446
+LANDLOCK_CREATE_RULESET_VERSION = 1
+LANDLOCK_RULE_PATH_BENEATH = 1
+LANDLOCK_MINIMUM_ABI = 4
+LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2
+LANDLOCK_ACCESS_FS_WRITE_FILE = 1 << 1
+LANDLOCK_ACCESS_FS_REMOVE_DIR = 1 << 4
+LANDLOCK_ACCESS_FS_REMOVE_FILE = 1 << 5
+LANDLOCK_ACCESS_FS_MAKE_CHAR = 1 << 6
+LANDLOCK_ACCESS_FS_MAKE_DIR = 1 << 7
+LANDLOCK_ACCESS_FS_MAKE_REG = 1 << 8
+LANDLOCK_ACCESS_FS_MAKE_SOCK = 1 << 9
+LANDLOCK_ACCESS_FS_MAKE_FIFO = 1 << 10
+LANDLOCK_ACCESS_FS_MAKE_BLOCK = 1 << 11
+LANDLOCK_ACCESS_FS_MAKE_SYM = 1 << 12
+LANDLOCK_ACCESS_FS_REFER = 1 << 13
+LANDLOCK_ACCESS_FS_TRUNCATE = 1 << 14
+LANDLOCK_WRITE_ACCESS = (
+    LANDLOCK_ACCESS_FS_WRITE_FILE
+    | LANDLOCK_ACCESS_FS_REMOVE_DIR
+    | LANDLOCK_ACCESS_FS_REMOVE_FILE
+    | LANDLOCK_ACCESS_FS_MAKE_CHAR
+    | LANDLOCK_ACCESS_FS_MAKE_DIR
+    | LANDLOCK_ACCESS_FS_MAKE_REG
+    | LANDLOCK_ACCESS_FS_MAKE_SOCK
+    | LANDLOCK_ACCESS_FS_MAKE_FIFO
+    | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+    | LANDLOCK_ACCESS_FS_MAKE_SYM
+    | LANDLOCK_ACCESS_FS_REFER
+    | LANDLOCK_ACCESS_FS_TRUNCATE
+)
+LANDLOCK_ROOT_WRITE_ACCESS = (
+    LANDLOCK_ACCESS_FS_WRITE_FILE
+    | LANDLOCK_ACCESS_FS_REMOVE_DIR
+    | LANDLOCK_ACCESS_FS_REMOVE_FILE
+    | LANDLOCK_ACCESS_FS_MAKE_DIR
+    | LANDLOCK_ACCESS_FS_MAKE_REG
+    | LANDLOCK_ACCESS_FS_MAKE_SYM
+    | LANDLOCK_ACCESS_FS_REFER
+    | LANDLOCK_ACCESS_FS_TRUNCATE
+)
+MOUNTINFO_LIMIT = 1048576
+WRITABLE_ROOT_LIMIT = 64
+READ_ROOT_LIMIT = 32
+PRIVATE_SURFACES = (
+    ("/tmp", "mode=1777,size=33554432,nr_inodes=4096"),
+    ("/var/tmp", "mode=1777,size=33554432,nr_inodes=4096"),
+    ("/run", "mode=0755,size=8388608,nr_inodes=2048"),
+    ("/dev/shm", "mode=1777,size=33554432,nr_inodes=4096"),
+)
+PRIVATE_SURFACE_LIMITS = {
+    "/tmp": (33554432, 4096),
+    "/var/tmp": (33554432, 4096),
+    "/run": (8388608, 2048),
+    "/dev/shm": (33554432, 4096),
+}
+IPC_MEMORY_LIMIT = 8388608
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+if (
+    type(PAGE_SIZE) is not int
+    or PAGE_SIZE <= 0
+    or IPC_MEMORY_LIMIT % PAGE_SIZE != 0
+):
+    raise SystemExit(152)
+IPC_SYSCTLS = (
+    ("/proc/sys/kernel/shmmax", str(IPC_MEMORY_LIMIT)),
+    ("/proc/sys/kernel/shmall", str(IPC_MEMORY_LIMIT // PAGE_SIZE)),
+    ("/proc/sys/kernel/shmmni", "64"),
+    ("/proc/sys/kernel/msgmax", "8192"),
+    ("/proc/sys/kernel/msgmnb", "65536"),
+    ("/proc/sys/kernel/msgmni", "64"),
+    ("/proc/sys/kernel/sem", "64 256 32 64"),
+    ("/proc/sys/fs/mqueue/queues_max", "64"),
+    ("/proc/sys/fs/mqueue/msg_max", "64"),
+    ("/proc/sys/fs/mqueue/msgsize_max", "8192"),
+    ("/proc/sys/fs/mqueue/msg_default", "16"),
+    ("/proc/sys/fs/mqueue/msgsize_default", "8192"),
+)
+READ_ROOT_PURPOSES = {
+    "configured-destshared": "directory",
+    "configured-executable": "file",
+    "configured-libdir": "directory",
+    "configured-platstdlib": "directory",
+    "configured-pyvenv": "file",
+    "configured-stdlib": "directory",
+    "continuation-env": "file",
+    "continuation-python": "file",
+    "continuation-setpriv": "file",
+    "ld-cache": "file",
+    "localtime": "file",
+    "system-arch-library": "directory",
+    "system-loader": "file",
+    "system-python-dynload": "directory",
+    "system-python-stdlib": "directory",
+    "trusted-git": "file",
+    "trusted-test-file": "file",
+}
+NAMESPACE_READ_PATHS = (
+    ("/proc/self/status", "file"),
+    ("/proc/self/limits", "file"),
+    ("/proc/self/mountinfo", "file"),
+    ("/proc/sys/kernel/core_pattern", "file"),
+    ("/proc/sys/kernel/cap_last_cap", "file"),
+    *((path, "file") for path, _ in IPC_SYSCTLS),
+)
+
+if len(sys.argv) < 7:
+    raise SystemExit(150)
+try:
+    readiness_fd = int(sys.argv[1])
+except ValueError:
+    raise SystemExit(150)
+host_mount_namespace = sys.argv[2]
+host_ipc_namespace = sys.argv[3]
+try:
+    writable_roots = json.loads(sys.argv[4])
+except json.JSONDecodeError:
+    raise SystemExit(150)
+try:
+    read_roots = json.loads(sys.argv[5])
+except json.JSONDecodeError:
+    raise SystemExit(150)
+continuation_argv = sys.argv[6:]
+if (
+    readiness_fd <= 2
+    or not host_mount_namespace.startswith("mnt:[")
+    or not host_ipc_namespace.startswith("ipc:[")
+    or type(writable_roots) is not list
+    or not 1 <= len(writable_roots) <= WRITABLE_ROOT_LIMIT
+    or type(read_roots) is not list
+    or not 1 <= len(read_roots) <= READ_ROOT_LIMIT
+    or not continuation_argv
+):
+    raise SystemExit(150)
+if (
+    os.readlink("/proc/self/ns/mnt") == host_mount_namespace
+    or os.readlink("/proc/self/ns/ipc") == host_ipc_namespace
+):
+    raise SystemExit(151)
+
+
+class MountAttr(ctypes.Structure):
+    _fields_ = (
+        ("attr_set", ctypes.c_uint64),
+        ("attr_clr", ctypes.c_uint64),
+        ("propagation", ctypes.c_uint64),
+        ("userns_fd", ctypes.c_uint64),
+    )
+
+
+class SockFilter(ctypes.Structure):
+    _fields_ = (
+        ("code", ctypes.c_ushort),
+        ("jt", ctypes.c_ubyte),
+        ("jf", ctypes.c_ubyte),
+        ("k", ctypes.c_uint32),
+    )
+
+
+class SockFprog(ctypes.Structure):
+    _fields_ = (
+        ("length", ctypes.c_ushort),
+        ("filters", ctypes.POINTER(SockFilter)),
+    )
+
+
+class LandlockRulesetAttr(ctypes.Structure):
+    _fields_ = (
+        ("handled_access_fs", ctypes.c_uint64),
+        ("handled_access_net", ctypes.c_uint64),
+    )
+
+
+class LandlockPathBeneathAttr(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = (
+        ("allowed_access", ctypes.c_uint64),
+        ("parent_fd", ctypes.c_int),
+    )
+
+
+libc = ctypes.CDLL(None, use_errno=True)
+try:
+    mount_setattr = libc.mount_setattr
+except AttributeError:
+    raise SystemExit(152)
+libc.mount.argtypes = (
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_ulong,
+    ctypes.c_void_p,
+)
+libc.mount.restype = ctypes.c_int
+libc.umount2.argtypes = (ctypes.c_char_p, ctypes.c_int)
+libc.umount2.restype = ctypes.c_int
+mount_setattr.argtypes = (
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_uint,
+    ctypes.POINTER(MountAttr),
+    ctypes.c_size_t,
+)
+mount_setattr.restype = ctypes.c_int
+libc.prctl.argtypes = (
+    ctypes.c_int,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+)
+libc.prctl.restype = ctypes.c_int
+libc.syscall.restype = ctypes.c_long
+
+
+def mount_call(source, target, filesystem, flags, data):
+    encoded_source = None if source is None else os.fsencode(source)
+    encoded_filesystem = None if filesystem is None else os.fsencode(filesystem)
+    encoded_data = None if data is None else os.fsencode(data)
+    if libc.mount(
+        encoded_source,
+        os.fsencode(target),
+        encoded_filesystem,
+        flags,
+        encoded_data,
+    ) != 0:
+        raise SystemExit(153)
+
+
+def set_mount_attributes(
+    path, *, recursive, descriptor=None, readonly=None, nodev=None
+):
+    if readonly is None and nodev is None:
+        raise SystemExit(154)
+    attr_set = 0
+    attr_clr = 0
+    if readonly is True:
+        attr_set |= MOUNT_ATTR_RDONLY
+    elif readonly is False:
+        attr_clr |= MOUNT_ATTR_RDONLY
+    if nodev is True:
+        attr_set |= MOUNT_ATTR_NODEV
+    elif nodev is False:
+        attr_clr |= MOUNT_ATTR_NODEV
+    attributes = MountAttr(
+        attr_set=attr_set,
+        attr_clr=attr_clr,
+        propagation=0,
+        userns_fd=0,
+    )
+    flags = AT_RECURSIVE | AT_SYMLINK_NOFOLLOW if recursive else 0
+    selected_descriptor = -100 if descriptor is None else descriptor
+    selected_path = os.fsencode(path) if descriptor is None else b""
+    if descriptor is not None:
+        flags |= AT_EMPTY_PATH
+    if mount_setattr(
+        selected_descriptor,
+        selected_path,
+        flags,
+        ctypes.byref(attributes),
+        ctypes.sizeof(attributes),
+    ) != 0:
+        raise SystemExit(154)
+
+
+def install_candidate_seccomp_filter():
+    machine = os.uname().machine
+    architecture = {
+        "x86_64": (
+            0xC000003E,
+            56,
+            72,
+            302,
+            (
+                16, 41, 42, 43, 44, 45, 46, 47, 48,
+                49, 50, 51, 52, 53, 54, 55,
+                86, 160, 248, 249, 250, 265, 272, 288,
+                299, 307, 308, 321, 425,
+            ),
+        ),
+        "aarch64": (
+            0xC00000B7,
+            220,
+            25,
+            261,
+            (
+                29, 37, 97, 164, 198, 199, 200, 201, 202,
+                203, 204, 205, 206, 207, 208, 209,
+                210, 211, 212, 217, 218, 219, 242,
+                243, 268, 269, 280, 425,
+            ),
+        ),
+    }.get(machine)
+    if architecture is None:
+        raise SystemExit(152)
+    (
+        audit_arch,
+        clone_syscall,
+        fcntl_syscall,
+        prlimit_syscall,
+        denied_syscalls,
+    ) = architecture
+    filter_values = [
+        SockFilter(BPF_LD_W_ABS, 0, 0, 4),
+        SockFilter(BPF_JMP_JEQ_K, 1, 0, audit_arch),
+        SockFilter(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+        SockFilter(BPF_LD_W_ABS, 0, 0, 0),
+    ]
+    if machine == "x86_64":
+        filter_values.extend(
+            (
+                SockFilter(BPF_JMP_JSET_K, 0, 1, 0x40000000),
+                SockFilter(BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+            )
+        )
+    filter_values.extend(
+        (
+            SockFilter(BPF_JMP_JEQ_K, 0, 3, clone_syscall),
+            SockFilter(BPF_LD_W_ABS, 0, 0, 16),
+            SockFilter(BPF_JMP_JSET_K, 0, 1, 0x7E020080),
+            SockFilter(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | errno.EACCES),
+            SockFilter(BPF_LD_W_ABS, 0, 0, 0),
+            SockFilter(BPF_JMP_JEQ_K, 0, 1, 435),
+            SockFilter(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | errno.ENOSYS),
+            SockFilter(BPF_JMP_JEQ_K, 0, 3, fcntl_syscall),
+            SockFilter(BPF_LD_W_ABS, 0, 0, 24),
+            SockFilter(BPF_JMP_JEQ_K, 0, 1, 1036),
+            SockFilter(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | errno.EACCES),
+            SockFilter(BPF_LD_W_ABS, 0, 0, 0),
+            # prlimit64 queries have a NULL new-limit pointer.  Reject either
+            # nonzero half so the candidate cannot lower the exact CORE=1
+            # sentinel or relax any other bootstrap limit.
+            SockFilter(BPF_JMP_JEQ_K, 0, 5, prlimit_syscall),
+            SockFilter(BPF_LD_W_ABS, 0, 0, 32),
+            SockFilter(BPF_JMP_JEQ_K, 0, 2, 0),
+            SockFilter(BPF_LD_W_ABS, 0, 0, 36),
+            SockFilter(BPF_JMP_JEQ_K, 1, 0, 0),
+            SockFilter(BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | errno.EACCES),
+            SockFilter(BPF_LD_W_ABS, 0, 0, 0),
+        )
+    )
+    for denied_syscall in denied_syscalls:
+        filter_values.extend(
+            (
+                SockFilter(BPF_JMP_JEQ_K, 0, 1, denied_syscall),
+                SockFilter(
+                    BPF_RET_K,
+                    0,
+                    0,
+                    SECCOMP_RET_ERRNO | errno.EACCES,
+                ),
+            )
+        )
+    filter_values.append(SockFilter(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW))
+    instructions = (SockFilter * len(filter_values))(*filter_values)
+    program = SockFprog(len(instructions), instructions)
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        raise SystemExit(164)
+    if (
+        libc.prctl(
+            PR_SET_SECCOMP,
+            SECCOMP_MODE_FILTER,
+            ctypes.addressof(program),
+            0,
+            0,
+        )
+        != 0
+    ):
+        raise SystemExit(164)
+
+
+def prepare_candidate_landlock(descriptors, read_descriptors):
+    # READ_FILE blocks direct reads from host-backed objects outside exact
+    # parent-selected runtime roots.  Authorized runtime directories are an
+    # explicit trust boundary whose target access is read/execute-only; a
+    # trusted root/controller concurrently changing their contents is a
+    # non-guarantee.  This is not a host-confidentiality boundary because
+    # READ_DIR, metadata lookup, and readlink remain unhandled.
+    if (
+        ctypes.sizeof(LandlockRulesetAttr) != 16
+        or ctypes.sizeof(LandlockPathBeneathAttr) != 12
+    ):
+        raise SystemExit(152)
+    abi = libc.syscall(
+        LANDLOCK_CREATE_RULESET,
+        0,
+        0,
+        LANDLOCK_CREATE_RULESET_VERSION,
+    )
+    if abi < LANDLOCK_MINIMUM_ABI:
+        raise SystemExit(165)
+    ruleset = LandlockRulesetAttr(
+        handled_access_fs=LANDLOCK_WRITE_ACCESS | LANDLOCK_ACCESS_FS_READ_FILE,
+        handled_access_net=0,
+    )
+    ruleset_fd = libc.syscall(
+        LANDLOCK_CREATE_RULESET,
+        ctypes.c_void_p(ctypes.addressof(ruleset)),
+        ctypes.sizeof(ruleset),
+        0,
+    )
+    if ruleset_fd < 0:
+        raise SystemExit(165)
+    private_descriptors = []
+    safe_device_descriptors = []
+    namespace_read_descriptors = []
+    try:
+        o_path = getattr(os, "O_PATH", None)
+        if type(o_path) is not int:
+            raise SystemExit(152)
+        flags = o_path | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        for path, _ in PRIVATE_SURFACES:
+            private_descriptors.append(os.open(path, flags))
+        private_descriptors.append(os.open("/dev/mqueue", flags))
+        null_descriptor = os.open(
+            "/dev/null", o_path | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        null_metadata = os.fstat(null_descriptor)
+        if (
+            not stat.S_ISCHR(null_metadata.st_mode)
+            or os.major(null_metadata.st_rdev) != 1
+            or os.minor(null_metadata.st_rdev) != 3
+            or null_metadata.st_uid != 0
+        ):
+            os.close(null_descriptor)
+            raise SystemExit(165)
+        safe_device_descriptors.append(null_descriptor)
+        namespace_read_descriptors.extend(open_namespace_read_descriptors())
+        rules = (
+            *(
+                (
+                    descriptor,
+                    LANDLOCK_ROOT_WRITE_ACCESS | LANDLOCK_ACCESS_FS_READ_FILE,
+                )
+                for descriptor in descriptors
+            ),
+            *(
+                (
+                    descriptor,
+                    LANDLOCK_WRITE_ACCESS | LANDLOCK_ACCESS_FS_READ_FILE,
+                )
+                for descriptor in private_descriptors
+            ),
+            *(
+                (
+                    descriptor,
+                    LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE,
+                )
+                for descriptor in safe_device_descriptors
+            ),
+            *(
+                (descriptor, LANDLOCK_ACCESS_FS_READ_FILE)
+                for descriptor in read_descriptors
+            ),
+            *(
+                (descriptor, LANDLOCK_ACCESS_FS_READ_FILE)
+                for descriptor in namespace_read_descriptors
+            ),
+        )
+        for descriptor, allowed_access in rules:
+            rule = LandlockPathBeneathAttr(
+                allowed_access=allowed_access,
+                parent_fd=descriptor,
+            )
+            if (
+                libc.syscall(
+                    LANDLOCK_ADD_RULE,
+                    ruleset_fd,
+                    LANDLOCK_RULE_PATH_BENEATH,
+                    ctypes.c_void_p(ctypes.addressof(rule)),
+                    0,
+                )
+                != 0
+            ):
+                raise SystemExit(165)
+        return ruleset_fd
+    except BaseException:
+        os.close(ruleset_fd)
+        raise
+    finally:
+        for descriptor in (
+            *private_descriptors,
+            *safe_device_descriptors,
+            *namespace_read_descriptors,
+        ):
+            os.close(descriptor)
+
+
+def activate_candidate_landlock(ruleset_fd):
+    try:
+        if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            raise SystemExit(165)
+        if libc.syscall(LANDLOCK_RESTRICT_SELF, ruleset_fd, 0) != 0:
+            raise SystemExit(165)
+    finally:
+        os.close(ruleset_fd)
+
+
+def decode_mount_field(value):
+    if type(value) is not str or not value:
+        raise SystemExit(155)
+    escapes = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+    decoded = []
+    index = 0
+    while index < len(value):
+        if value[index] != "\\":
+            decoded.append(value[index])
+            index += 1
+            continue
+        escape = value[index + 1 : index + 4]
+        if len(escape) != 3 or escape not in escapes:
+            raise SystemExit(155)
+        decoded.append(escapes[escape])
+        index += 4
+    decoded_value = "".join(decoded)
+    if "\x00" in decoded_value:
+        raise SystemExit(155)
+    return decoded_value
+
+
+def decode_mount_path(value):
+    decoded_value = decode_mount_field(value)
+    if not decoded_value.startswith("/"):
+        raise SystemExit(155)
+    components = decoded_value.split("/")
+    if (
+        (decoded_value != "/" and decoded_value.endswith("/"))
+        or (
+            decoded_value != "/"
+            and any(
+                component in ("", ".", "..")
+                for component in components[1:]
+            )
+        )
+        or os.path.normpath(decoded_value) != decoded_value
+    ):
+        raise SystemExit(155)
+    return decoded_value
+
+
+def mount_inventory():
+    descriptor = os.open(
+        "/proc/self/mountinfo",
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, MOUNTINFO_LIMIT + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MOUNTINFO_LIMIT:
+                raise SystemExit(155)
+    finally:
+        os.close(descriptor)
+    try:
+        text = b"".join(chunks).decode("utf-8", errors="surrogateescape")
+    except UnicodeError:
+        raise SystemExit(155)
+    records = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 10 or "-" not in fields:
+            raise SystemExit(155)
+        separator = fields.index("-")
+        if separator < 6 or len(fields) != separator + 4:
+            raise SystemExit(155)
+        try:
+            mount_id = int(fields[0])
+            parent_id = int(fields[1])
+            major_value, minor_value = fields[2].split(":", 1)
+            major_minor = (int(major_value), int(minor_value))
+        except ValueError:
+            raise SystemExit(155)
+        if (
+            mount_id <= 0
+            or parent_id <= 0
+            or any(value < 0 for value in major_minor)
+            or mount_id in records
+        ):
+            raise SystemExit(155)
+        options = frozenset(fields[5].split(","))
+        if ("ro" in options) == ("rw" in options):
+            raise SystemExit(155)
+        records[mount_id] = {
+            "parent_id": parent_id,
+            "major_minor": major_minor,
+            # Filesystems may supply a custom show_path() representation for
+            # this field.  It is retained as bounded opaque evidence and is
+            # never interpreted as a source coordinate.
+            "root": fields[3],
+            "mountpoint": decode_mount_path(fields[4]),
+            "options": options,
+            "optional": tuple(fields[6:separator]),
+            "filesystem": fields[separator + 1],
+            "source": decode_mount_field(fields[separator + 2]),
+            "super_options": frozenset(fields[separator + 3].split(",")),
+        }
+    if not records:
+        raise SystemExit(155)
+    visible_roots = {
+        mount_id
+        for mount_id, record in records.items()
+        if record["parent_id"] == mount_id
+        or record["parent_id"] not in records
+    }
+    if len(visible_roots) != 1:
+        raise SystemExit(155)
+    visible_root_id = next(iter(visible_roots))
+    for mount_id in records:
+        current_id = mount_id
+        observed = set()
+        while current_id != visible_root_id:
+            if current_id not in records:
+                raise SystemExit(155)
+            if current_id in observed:
+                raise SystemExit(155)
+            observed.add(current_id)
+            current_id = records[current_id]["parent_id"]
+    return records
+
+
+def path_at_or_below(path, root):
+    try:
+        return path == root or os.path.commonpath((path, root)) == root
+    except ValueError:
+        return False
+
+
+def validate_directory_mount_topology(
+    path, mount_id, device, inventory, exit_code
+):
+    containing_record = inventory.get(mount_id)
+    required_keys = {
+        "parent_id",
+        "major_minor",
+        "root",
+        "mountpoint",
+        "options",
+        "optional",
+        "filesystem",
+        "source",
+        "super_options",
+    }
+    if containing_record is None:
+        raise SystemExit(exit_code)
+    for record in inventory.values():
+        if (
+            set(record) != required_keys
+            or type(record.get("parent_id")) is not int
+            or type(record.get("major_minor")) is not tuple
+            or len(record["major_minor"]) != 2
+            or any(type(value) is not int for value in record["major_minor"])
+            or type(record.get("root")) is not str
+            or type(record.get("mountpoint")) is not str
+        ):
+            raise SystemExit(155)
+    containing_mountpoint = containing_record["mountpoint"]
+    containing_major_minor = containing_record["major_minor"]
+    if (
+        type(device) is not int
+        or containing_major_minor != (os.major(device), os.minor(device))
+        or not path_at_or_below(path, containing_mountpoint)
+    ):
+        raise SystemExit(exit_code)
+    same_filesystem_mount_ids = [
+        candidate_id
+        for candidate_id, record in inventory.items()
+        if record["major_minor"] == containing_major_minor
+    ]
+    # mountinfo root is filesystem-defined (show_path), not a universal
+    # source coordinate.  A unique visible record for this st_dev is the
+    # filesystem-independent proof that no bind alias can inherit the rule.
+    if same_filesystem_mount_ids != [mount_id]:
+        raise SystemExit(exit_code)
+    if containing_mountpoint == path:
+        raise SystemExit(exit_code)
+    for candidate_id, record in inventory.items():
+        if (
+            candidate_id != mount_id
+            and path_at_or_below(record["mountpoint"], path)
+        ):
+            raise SystemExit(exit_code)
+
+
+def descriptor_mount_id(descriptor):
+    path = f"/proc/self/fdinfo/{descriptor}"
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        data = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    if len(data) > 4096:
+        raise SystemExit(155)
+    try:
+        lines = data.decode("ascii").splitlines()
+        values = [
+            int(line.split()[1])
+            for line in lines
+            if line.startswith("mnt_id:")
+        ]
+    except (UnicodeError, IndexError, ValueError):
+        raise SystemExit(155)
+    if len(values) != 1:
+        raise SystemExit(155)
+    return values[0]
+
+
+def validate_binding(document):
+    if (
+        type(document) is not dict
+        or set(document) != {"path", "device", "inode"}
+        or type(document.get("path")) is not str
+        or type(document.get("device")) is not int
+        or type(document.get("inode")) is not int
+        or not os.path.isabs(document["path"])
+    ):
+        raise SystemExit(156)
+    metadata = os.stat(document["path"], follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino)
+        != (document["device"], document["inode"])
+    ):
+        raise SystemExit(156)
+    return document["path"]
+
+
+def target_mode_allows(metadata, target_uid, target_gid, mask):
+    shift = 6 if metadata.st_uid == target_uid else 3 if metadata.st_gid == target_gid else 0
+    return ((metadata.st_mode >> shift) & mask) == mask
+
+
+def read_root_component_document(path, metadata, kind):
+    return {
+        "path": path,
+        "kind": kind,
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "permissions": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def validate_read_root(document, inventory):
+    required_keys = {
+        "schema_version",
+        "purpose",
+        "kind",
+        "path",
+        "target_uid",
+        "target_gid",
+        "components",
+    }
+    if (
+        type(document) is not dict
+        or set(document) != required_keys
+        or document.get("schema_version") != 1
+        or READ_ROOT_PURPOSES.get(document.get("purpose"))
+        != document.get("kind")
+        or type(document.get("path")) is not str
+        or not os.path.isabs(document["path"])
+        or document["path"] == "/"
+        or type(document.get("target_uid")) is not int
+        or type(document.get("target_gid")) is not int
+        or not 50000 <= document["target_uid"] <= 64999
+        or document["target_uid"] != document["target_gid"]
+        or type(document.get("components")) is not list
+        or not document["components"]
+    ):
+        raise SystemExit(166)
+    path = document["path"]
+    if os.path.realpath(path) != path:
+        raise SystemExit(166)
+    expected_paths = ["/"]
+    current_path = ""
+    for component in path.split(os.sep)[1:]:
+        if not component or component in (".", ".."):
+            raise SystemExit(166)
+        current_path = os.path.join(current_path, component)
+        expected_paths.append(os.path.join("/", current_path))
+    if len(document["components"]) != len(expected_paths):
+        raise SystemExit(166)
+    o_path = getattr(os, "O_PATH", None)
+    if type(o_path) is not int:
+        raise SystemExit(152)
+    descriptors = []
+    parent_descriptor = None
+    try:
+        for index, (component_path, expected) in enumerate(
+            zip(expected_paths, document["components"])
+        ):
+            is_leaf = index == len(expected_paths) - 1
+            expected_kind = document["kind"] if is_leaf else "directory"
+            if (
+                type(expected) is not dict
+                or set(expected)
+                != {
+                    "path",
+                    "kind",
+                    "device",
+                    "inode",
+                    "uid",
+                    "gid",
+                    "permissions",
+                }
+                or expected.get("path") != component_path
+                or expected.get("kind") != expected_kind
+                or any(
+                    type(expected.get(key)) is not int
+                    for key in (
+                        "device",
+                        "inode",
+                        "uid",
+                        "gid",
+                        "permissions",
+                    )
+                )
+            ):
+                raise SystemExit(166)
+            flags = o_path | os.O_NOFOLLOW | os.O_CLOEXEC
+            if expected_kind == "directory":
+                flags |= os.O_DIRECTORY
+            try:
+                if index == 0:
+                    descriptor = os.open("/", flags)
+                    selected = os.stat("/", follow_symlinks=False)
+                else:
+                    name = component_path.rsplit(os.sep, 1)[1]
+                    selected = os.stat(
+                        name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                raise SystemExit(167)
+            except OSError:
+                raise SystemExit(168)
+            descriptors.append(descriptor)
+            opened = os.fstat(descriptor)
+            selected_kind = (
+                "directory"
+                if stat.S_ISDIR(opened.st_mode)
+                else "file"
+                if stat.S_ISREG(opened.st_mode)
+                else None
+            )
+            if (
+                selected_kind != expected_kind
+                or (
+                    stat.S_ISDIR(selected.st_mode)
+                    if expected_kind == "directory"
+                    else stat.S_ISREG(selected.st_mode)
+                )
+                is not True
+                or (selected.st_dev, selected.st_ino)
+                != (opened.st_dev, opened.st_ino)
+                or read_root_component_document(
+                    component_path, selected, expected_kind
+                )
+                != expected
+                or read_root_component_document(
+                    component_path, opened, expected_kind
+                )
+                != expected
+            ):
+                raise SystemExit(169)
+            required_access = os.X_OK if expected_kind == "directory" else os.R_OK
+            if (
+                opened.st_uid == document["target_uid"]
+                or not target_mode_allows(
+                    opened,
+                    document["target_uid"],
+                    document["target_gid"],
+                    required_access,
+                )
+                or target_mode_allows(
+                    opened,
+                    document["target_uid"],
+                    document["target_gid"],
+                    os.W_OK,
+                )
+                or (
+                    expected_kind == "file"
+                    and opened.st_mode & (stat.S_ISUID | stat.S_ISGID)
+                )
+            ):
+                raise SystemExit(170)
+            try:
+                attributes = os.listxattr(f"/proc/self/fd/{descriptor}")
+            except OSError:
+                raise SystemExit(171)
+            if {"system.posix_acl_access", "system.posix_acl_default"}.intersection(
+                attributes
+            ):
+                raise SystemExit(170)
+            parent_descriptor = descriptor
+        leaf_descriptor = descriptors[-1]
+        if document["kind"] == "directory" and inventory is not None:
+            mount_id = descriptor_mount_id(leaf_descriptor)
+            leaf_metadata = os.fstat(leaf_descriptor)
+            validate_directory_mount_topology(
+                path, mount_id, leaf_metadata.st_dev, inventory, 172
+            )
+        for descriptor in descriptors[:-1]:
+            os.close(descriptor)
+        return leaf_descriptor
+    except BaseException:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def revalidate_held_read_root(document, held_descriptor):
+    current_descriptor = validate_read_root(document, None)
+    try:
+        kind = document["kind"]
+        path = document["path"]
+        expected = document["components"][-1]
+        held_metadata = os.fstat(held_descriptor)
+        current_metadata = os.fstat(current_descriptor)
+        held_kind = (
+            "directory"
+            if stat.S_ISDIR(held_metadata.st_mode)
+            else "file"
+            if stat.S_ISREG(held_metadata.st_mode)
+            else None
+        )
+        current_kind = (
+            "directory"
+            if stat.S_ISDIR(current_metadata.st_mode)
+            else "file"
+            if stat.S_ISREG(current_metadata.st_mode)
+            else None
+        )
+        if (
+            held_kind != kind
+            or current_kind != kind
+            or read_root_component_document(path, held_metadata, kind) != expected
+            or read_root_component_document(path, current_metadata, kind) != expected
+            or (held_metadata.st_dev, held_metadata.st_ino)
+            != (current_metadata.st_dev, current_metadata.st_ino)
+        ):
+            raise SystemExit(169)
+    finally:
+        os.close(current_descriptor)
+
+
+def open_namespace_read_descriptors():
+    o_path = getattr(os, "O_PATH", None)
+    if type(o_path) is not int:
+        raise SystemExit(152)
+    descriptors = []
+    observed = set()
+    try:
+        for path, kind in NAMESPACE_READ_PATHS:
+            if path in observed:
+                raise SystemExit(173)
+            observed.add(path)
+            flags = o_path | os.O_NOFOLLOW | os.O_CLOEXEC
+            if kind == "directory":
+                flags |= os.O_DIRECTORY
+            descriptor = os.open(path, flags)
+            descriptors.append(descriptor)
+            metadata = os.fstat(descriptor)
+            if not (
+                stat.S_ISDIR(metadata.st_mode)
+                if kind == "directory"
+                else stat.S_ISREG(metadata.st_mode)
+            ):
+                raise SystemExit(173)
+        return descriptors
+    except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+
+
+def private_surface_for(path):
+    matches = [
+        surface
+        for surface, _ in PRIVATE_SURFACES
+        if path != surface and os.path.commonpath((path, surface)) == surface
+    ]
+    return max(matches, key=len) if matches else None
+
+
+def create_private_mountpoint(path, surface):
+    relative = os.path.relpath(path, surface)
+    if relative == "." or relative.startswith(".."):
+        raise SystemExit(157)
+    current = surface
+    parts = relative.split(os.sep)
+    for index, part in enumerate(parts):
+        if not part or part in (".", ".."):
+            raise SystemExit(157)
+        current = os.path.join(current, part)
+        try:
+            os.mkdir(current, 0o700 if index == len(parts) - 1 else 0o711)
+        except FileExistsError:
+            pass
+        metadata = os.stat(current, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_mode & 0o066
+        ):
+            raise SystemExit(157)
+
+
+def write_ipc_sysctl(path, value):
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    try:
+        payload = value.encode("ascii")
+        if os.write(descriptor, payload) != len(payload):
+            raise SystemExit(158)
+    finally:
+        os.close(descriptor)
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    try:
+        observed = os.read(descriptor, 129)
+    finally:
+        os.close(descriptor)
+    try:
+        observed_values = observed.decode("ascii").split()
+    except UnicodeError:
+        raise SystemExit(158)
+    if len(observed) > 128 or observed_values != value.split():
+        raise SystemExit(158)
+
+
+def prove_directory_alias_rejection(inventory):
+    source = "/tmp/required-ci-alias-probe-source"
+    target = "/tmp/required-ci-alias-probe-target"
+    if os.path.lexists(source) or os.path.lexists(target):
+        raise SystemExit(174)
+    os.mkdir(source, 0o700)
+    os.mkdir(target, 0o700)
+    descriptor = None
+    mounted = False
+    try:
+        descriptor = os.open(source, root_flags)
+        metadata = os.fstat(descriptor)
+        source_mount_id = descriptor_mount_id(descriptor)
+        validate_directory_mount_topology(
+            source, source_mount_id, metadata.st_dev, inventory, 174
+        )
+        before_ids = set(inventory)
+        mount_call(source, target, None, MS_BIND, None)
+        mounted = True
+        aliased_inventory = mount_inventory()
+        created = set(aliased_inventory) - before_ids
+        if (
+            len(created) != 1
+            or aliased_inventory[next(iter(created))]["mountpoint"] != target
+        ):
+            raise SystemExit(174)
+        try:
+            validate_directory_mount_topology(
+                source,
+                source_mount_id,
+                metadata.st_dev,
+                aliased_inventory,
+                174,
+            )
+        except SystemExit as error:
+            if error.code != 174:
+                raise
+        else:
+            raise SystemExit(174)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if mounted and libc.umount2(os.fsencode(target), 0) != 0:
+            raise SystemExit(174)
+        os.rmdir(target)
+        os.rmdir(source)
+    restored_inventory = mount_inventory()
+    if restored_inventory != inventory:
+        raise SystemExit(174)
+    return restored_inventory
+
+
+mount_call(None, "/", None, MS_REC | MS_PRIVATE, None)
+initial_inventory = mount_inventory()
+if any(
+    field.startswith(("shared:", "master:", "propagate_from:"))
+    for record in initial_inventory.values()
+    for field in record["optional"]
+):
+    raise SystemExit(158)
+
+root_flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+o_path = getattr(os, "O_PATH", None)
+if type(o_path) is not int:
+    raise SystemExit(152)
+root_flags |= o_path
+source_descriptors = []
+bound_descriptors = []
+read_descriptors = []
+binding_paths = []
+landlock_ruleset_fd = None
+safe_device_source_descriptor = None
+safe_device_descriptor = None
+safe_device_identity = None
+safe_device_mount_id = None
+original_cwd = os.getcwd()
+try:
+    for document in writable_roots:
+        path = validate_binding(document)
+        if path in binding_paths:
+            raise SystemExit(156)
+        if any(
+            path == surface
+            or os.path.commonpath((path, surface)) == path
+            for surface, _ in PRIVATE_SURFACES
+        ) or path in ("/dev", "/dev/mqueue"):
+            raise SystemExit(156)
+        descriptor = os.open(path, root_flags)
+        metadata = os.fstat(descriptor)
+        source_mount_id = descriptor_mount_id(descriptor)
+        source_mount_record = initial_inventory.get(source_mount_id)
+        # dev/ino bind the selected directory object.  The parent mount ID is
+        # intentionally not compared after unshare: cloned mount objects
+        # receive fresh IDs.  Full local mount roots, filesystem identities,
+        # and parent links prove there is no bind alias or mounted subtree
+        # through which the directory Landlock rule could expand.
+        if (
+            (metadata.st_dev, metadata.st_ino)
+            != (document["device"], document["inode"])
+            or source_mount_record is None
+            or not (
+                source_mount_record["mountpoint"] == path
+                or os.path.commonpath(
+                    (path, source_mount_record["mountpoint"])
+                )
+                == source_mount_record["mountpoint"]
+            )
+        ):
+            raise SystemExit(156)
+        validate_directory_mount_topology(
+            path, source_mount_id, metadata.st_dev, initial_inventory, 156
+        )
+        source_descriptors.append(descriptor)
+        binding_paths.append(path)
+    if not any(
+        original_cwd == path
+        or os.path.commonpath((original_cwd, path)) == path
+        for path in binding_paths
+    ):
+        raise SystemExit(156)
+
+    # /usr/bin/unshare is an identity-bound trusted supervisor that shares
+    # this mount namespace while waiting/signalling.  Concurrent mutation by
+    # that trusted control-plane process is a non-guarantee; exact final
+    # inventory and path/object revalidation below still close accidental
+    # topology or pathname drift before Landlock activation.
+    #
+    # Validate and hold every host-backed directory read rule against the
+    # cloned pre-mutation topology.  Later intentional writable self-binds may
+    # share st_dev with system read roots; they are exact controller-created
+    # mounts, not pre-existing aliases.  Path overlap checks ensure none can
+    # cover or sit beneath a held read hierarchy before Landlock activation.
+    read_paths = set()
+    protected_surfaces = tuple(path for path, _ in PRIVATE_SURFACES) + (
+        "/dev",
+        "/dev/mqueue",
+        "/dev/null",
+    )
+    for document in read_roots:
+        path = document.get("path") if type(document) is dict else None
+        if type(path) is not str or path in read_paths:
+            raise SystemExit(166)
+        read_paths.add(path)
+        if any(
+            path == writable_path
+            or os.path.commonpath((path, writable_path)) == path
+            or os.path.commonpath((path, writable_path)) == writable_path
+            for writable_path in binding_paths
+        ) or any(
+            path == surface
+            or os.path.commonpath((path, surface)) == path
+            or os.path.commonpath((path, surface)) == surface
+            for surface in protected_surfaces
+        ):
+            raise SystemExit(166)
+        read_descriptors.append(validate_read_root(document, initial_inventory))
+
+    safe_device_source_descriptor = os.open(
+        "/dev/null", o_path | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    safe_device_metadata = os.fstat(safe_device_source_descriptor)
+    if (
+        not stat.S_ISCHR(safe_device_metadata.st_mode)
+        or os.major(safe_device_metadata.st_rdev) != 1
+        or os.minor(safe_device_metadata.st_rdev) != 3
+        or safe_device_metadata.st_uid != 0
+        or safe_device_metadata.st_gid != 0
+        or stat.S_IMODE(safe_device_metadata.st_mode) != 0o666
+    ):
+        raise SystemExit(156)
+    safe_device_identity = (
+        safe_device_metadata.st_dev,
+        safe_device_metadata.st_ino,
+        safe_device_metadata.st_rdev,
+        safe_device_metadata.st_uid,
+        safe_device_metadata.st_gid,
+        safe_device_metadata.st_mode,
+    )
+
+    for sysctl_path, value in IPC_SYSCTLS:
+        write_ipc_sysctl(sysctl_path, value)
+
+    set_mount_attributes("/", recursive=True, readonly=True, nodev=True)
+
+    current_inventory = mount_inventory()
+    private_mount_records = []
+    for surface, options in PRIVATE_SURFACES:
+        metadata = os.stat(surface, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SystemExit(159)
+        before_ids = set(current_inventory)
+        mount_call(
+            "required-ci-private",
+            surface,
+            "tmpfs",
+            MS_NOSUID | MS_NODEV | MS_NOEXEC,
+            options,
+        )
+        current_inventory = mount_inventory()
+        created = set(current_inventory) - before_ids
+        if len(created) != 1:
+            raise SystemExit(159)
+        mount_id = created.pop()
+        record = current_inventory[mount_id]
+        filesystem = os.statvfs(surface)
+        byte_limit, inode_limit = PRIVATE_SURFACE_LIMITS[surface]
+        if (
+            record["mountpoint"] != surface
+            or record["filesystem"] != "tmpfs"
+            or record["source"] != "required-ci-private"
+            or "rw" not in record["options"]
+            or not {"nosuid", "nodev", "noexec"}.issubset(record["options"])
+            or filesystem.f_frsize <= 0
+            or filesystem.f_blocks <= 0
+            or filesystem.f_blocks * filesystem.f_frsize > byte_limit
+            or filesystem.f_files <= 0
+            or filesystem.f_files > inode_limit
+        ):
+            raise SystemExit(159)
+        private_mount_records.append((surface, mount_id))
+    current_inventory = prove_directory_alias_rejection(current_inventory)
+    os.mkdir("/run/lock", 0o1777)
+    os.chmod("/run/lock", 0o1777)
+    if not stat.S_ISDIR(os.stat("/dev/mqueue", follow_symlinks=False).st_mode):
+        raise SystemExit(159)
+    before_ids = set(current_inventory)
+    mount_call(
+        "mqueue",
+        "/dev/mqueue",
+        "mqueue",
+        MS_NOSUID | MS_NODEV | MS_NOEXEC,
+        None,
+    )
+    current_inventory = mount_inventory()
+    created = set(current_inventory) - before_ids
+    if len(created) != 1:
+        raise SystemExit(159)
+    mqueue_mount_id = created.pop()
+    if (
+        current_inventory[mqueue_mount_id]["mountpoint"] != "/dev/mqueue"
+        or current_inventory[mqueue_mount_id]["filesystem"] != "mqueue"
+        or current_inventory[mqueue_mount_id]["source"] != "mqueue"
+        or "rw" not in current_inventory[mqueue_mount_id]["options"]
+        or not {"nosuid", "nodev", "noexec"}.issubset(
+            current_inventory[mqueue_mount_id]["options"]
+        )
+    ):
+        raise SystemExit(159)
+    private_mount_records.append(("/dev/mqueue", mqueue_mount_id))
+
+    before_ids = set(current_inventory)
+    mount_call(
+        f"/proc/self/fd/{safe_device_source_descriptor}",
+        "/dev/null",
+        None,
+        MS_BIND,
+        None,
+    )
+    current_inventory = mount_inventory()
+    created = set(current_inventory) - before_ids
+    if len(created) != 1:
+        raise SystemExit(159)
+    safe_device_mount_id = created.pop()
+    safe_device_descriptor = os.open(
+        "/dev/null", o_path | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    safe_device_metadata = os.fstat(safe_device_descriptor)
+    if (
+        current_inventory[safe_device_mount_id]["mountpoint"] != "/dev/null"
+        or descriptor_mount_id(safe_device_descriptor)
+        != safe_device_mount_id
+        or (
+            safe_device_metadata.st_dev,
+            safe_device_metadata.st_ino,
+            safe_device_metadata.st_rdev,
+            safe_device_metadata.st_uid,
+            safe_device_metadata.st_gid,
+            safe_device_metadata.st_mode,
+        )
+        != safe_device_identity
+    ):
+        raise SystemExit(159)
+    set_mount_attributes(
+        "",
+        recursive=False,
+        descriptor=safe_device_descriptor,
+        nodev=False,
+    )
+
+    writable_mount_records = []
+    for path, source_descriptor, document in zip(
+        binding_paths, source_descriptors, writable_roots
+    ):
+        surface = private_surface_for(path)
+        if surface is not None:
+            create_private_mountpoint(path, surface)
+        before_ids = set(current_inventory)
+        mount_call(
+            f"/proc/self/fd/{source_descriptor}",
+            path,
+            None,
+            MS_BIND,
+            None,
+        )
+        current_inventory = mount_inventory()
+        created = set(current_inventory) - before_ids
+        if len(created) != 1:
+            raise SystemExit(160)
+        mount_id = created.pop()
+        bound_descriptor = os.open(path, root_flags)
+        bound_descriptors.append(bound_descriptor)
+        metadata = os.fstat(bound_descriptor)
+        if (
+            current_inventory[mount_id]["mountpoint"] != path
+            or descriptor_mount_id(bound_descriptor) != mount_id
+            or (metadata.st_dev, metadata.st_ino)
+            != (document["device"], document["inode"])
+        ):
+            raise SystemExit(160)
+        set_mount_attributes(
+            "",
+            recursive=False,
+            descriptor=bound_descriptor,
+            readonly=False,
+        )
+        writable_mount_records.append(
+            (mount_id, path, bound_descriptor, document)
+        )
+
+    os.chdir(original_cwd)
+    final_inventory = mount_inventory()
+    exact_writable_ids = {
+        mount_id for _, mount_id in private_mount_records
+    } | {
+        record[0] for record in writable_mount_records
+    }
+    observed_writable_ids = {
+        mount_id
+        for mount_id, record in final_inventory.items()
+        if "rw" in record["options"]
+    }
+    expected_mount_ids = (
+        set(initial_inventory)
+        | exact_writable_ids
+        | {safe_device_mount_id}
+    )
+    if (
+        observed_writable_ids != exact_writable_ids
+        or set(final_inventory) != expected_mount_ids
+    ):
+        raise SystemExit(161)
+    if any(
+        field.startswith(("shared:", "master:", "propagate_from:"))
+        for record in final_inventory.values()
+        for field in record["optional"]
+    ):
+        raise SystemExit(161)
+    if (
+        type(safe_device_mount_id) is not int
+        or safe_device_descriptor is None
+        or safe_device_identity is None
+    ):
+        raise SystemExit(161)
+    safe_device_record = final_inventory.get(safe_device_mount_id)
+    safe_device_metadata = os.fstat(safe_device_descriptor)
+    if (
+        safe_device_record is None
+        or safe_device_record["mountpoint"] != "/dev/null"
+        or "ro" not in safe_device_record["options"]
+        or "nodev" in safe_device_record["options"]
+        or descriptor_mount_id(safe_device_descriptor)
+        != safe_device_mount_id
+        or (
+            safe_device_metadata.st_dev,
+            safe_device_metadata.st_ino,
+            safe_device_metadata.st_rdev,
+            safe_device_metadata.st_uid,
+            safe_device_metadata.st_gid,
+            safe_device_metadata.st_mode,
+        )
+        != safe_device_identity
+        or any(
+            mount_id != safe_device_mount_id
+            and "nodev" not in record["options"]
+            for mount_id, record in final_inventory.items()
+        )
+    ):
+        raise SystemExit(161)
+    for path, mount_id in private_mount_records:
+        descriptor = os.open(path, root_flags)
+        try:
+            record = final_inventory.get(mount_id)
+            if (
+                record is None
+                or record["mountpoint"] != path
+                or "rw" not in record["options"]
+                or descriptor_mount_id(descriptor) != mount_id
+                or (
+                    path in PRIVATE_SURFACE_LIMITS
+                    and (
+                        record["filesystem"] != "tmpfs"
+                        or record["source"] != "required-ci-private"
+                        or not {"nosuid", "nodev", "noexec"}.issubset(
+                            record["options"]
+                        )
+                    )
+                )
+                or (
+                    path == "/dev/mqueue"
+                    and (
+                        record["filesystem"] != "mqueue"
+                        or record["source"] != "mqueue"
+                    )
+                )
+            ):
+                raise SystemExit(161)
+        finally:
+            os.close(descriptor)
+    for mount_id, path, descriptor, document in writable_mount_records:
+        metadata = os.fstat(descriptor)
+        record = final_inventory.get(mount_id)
+        if (
+            record is None
+            or record["mountpoint"] != path
+            or "rw" not in record["options"]
+            or descriptor_mount_id(descriptor) != mount_id
+            or (metadata.st_dev, metadata.st_ino)
+            != (document["device"], document["inode"])
+        ):
+            raise SystemExit(161)
+    for document, descriptor in zip(
+        read_roots, read_descriptors, strict=True
+    ):
+        revalidate_held_read_root(document, descriptor)
+    landlock_ruleset_fd = prepare_candidate_landlock(
+        tuple(bound_descriptors), tuple(read_descriptors)
+    )
+finally:
+    for descriptor in (*bound_descriptors, *source_descriptors):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    for descriptor in read_descriptors:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    for descriptor in (
+        safe_device_descriptor,
+        safe_device_source_descriptor,
+    ):
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+if type(landlock_ruleset_fd) is not int or landlock_ruleset_fd < 0:
+    raise SystemExit(165)
+activate_candidate_landlock(landlock_ruleset_fd)
+
+try:
+    open_descriptors = set()
+    for name in os.listdir("/proc/self/fd"):
+        if not name.isdecimal() or int(name) <= 2:
+            continue
+        descriptor = int(name)
+        try:
+            os.fstat(descriptor)
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                continue
+            raise
+        open_descriptors.add(descriptor)
+except OSError:
+    raise SystemExit(162)
+standard_modes = tuple(os.fstat(descriptor).st_mode for descriptor in (0, 1, 2))
+if (
+    not stat.S_ISFIFO(standard_modes[0])
+    or not stat.S_ISREG(standard_modes[1])
+    or not stat.S_ISREG(standard_modes[2])
+):
+    raise SystemExit(162)
+if open_descriptors != {readiness_fd}:
+    raise SystemExit(162)
+install_candidate_seccomp_filter()
+try:
+    if os.write(readiness_fd, b"G") != 1:
+        raise SystemExit(163)
+finally:
+    os.close(readiness_fd)
+os.execve(continuation_argv[0], continuation_argv, os.environ.copy())
+'''.strip()
+_CANDIDATE_BOOTSTRAP_SOURCE = r'''
+import errno
+import json
+import os
 import sys
 
 uid = int(sys.argv[1])
@@ -2307,12 +4571,20 @@ if status.get("Groups", "").split():
     raise SystemExit(123)
 if status.get("NoNewPrivs") != "1":
     raise SystemExit(124)
+if status.get("Seccomp") != "2":
+    raise SystemExit(124)
+try:
+    seccomp_filters = int(status.get("Seccomp_filters", "0"))
+except ValueError:
+    raise SystemExit(124)
+if seccomp_filters < 1:
+    raise SystemExit(124)
 for capability in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
     if int(status.get(capability, "1"), 16) != 0:
         raise SystemExit(125)
 if not os.path.isfile("/proc/1/status"):
     raise SystemExit(126)
-if set(name for _, name in socket.if_nameindex()) != {"lo"}:
+if set(os.listdir("/sys/class/net")) != {"lo"}:
     raise SystemExit(127)
 try:
     os.kill(host_parent_pid, 0)
@@ -2323,7 +4595,6 @@ else:
 for operation in (
     lambda: open(trusted_sentinel, "rb"),
     lambda: open(trusted_sentinel, "ab"),
-    lambda: os.listdir(trusted_root),
 ):
     try:
         operation()
@@ -2331,17 +4602,42 @@ for operation in (
         pass
     else:
         raise SystemExit(129)
-expected_limits = {
-    resource.RLIMIT_NPROC: 64,
-    resource.RLIMIT_CPU: 20,
-    resource.RLIMIT_AS: 1073741824,
-    resource.RLIMIT_FSIZE: 1048576,
-    resource.RLIMIT_NOFILE: 64,
-    resource.RLIMIT_CORE: 0,
+expected_limit_rows = {
+    "Max address space": ("1073741824", "1073741824", "bytes"),
+    "Max core file size": ("1", "1", "bytes"),
+    "Max cpu time": ("20", "20", "seconds"),
+    "Max file size": ("1048576", "1048576", "bytes"),
+    "Max msgqueue size": ("8388608", "8388608", "bytes"),
+    "Max open files": ("64", "64", "files"),
+    "Max processes": ("64", "64", "processes"),
 }
-for limit_name, expected in expected_limits.items():
-    if resource.getrlimit(limit_name) != (expected, expected):
-        raise SystemExit(130)
+limits_descriptor = None
+try:
+    limits_descriptor = os.open(
+        "/proc/self/limits",
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    limits_bytes = os.read(limits_descriptor, 65537)
+except OSError:
+    raise SystemExit(130)
+finally:
+    if limits_descriptor is not None:
+        os.close(limits_descriptor)
+if not limits_bytes or len(limits_bytes) > 65536:
+    raise SystemExit(130)
+try:
+    limit_lines = limits_bytes.decode("ascii").splitlines()
+except UnicodeDecodeError:
+    raise SystemExit(130)
+observed_limit_rows = {}
+for line in limit_lines:
+    for label in expected_limit_rows:
+        if line.startswith(label + " "):
+            if label in observed_limit_rows:
+                raise SystemExit(130)
+            observed_limit_rows[label] = tuple(line[len(label) :].split())
+if observed_limit_rows != expected_limit_rows:
+    raise SystemExit(130)
 runtime_binding = json.loads(runtime_binding_json)
 if runtime_binding is None:
     os.execve(candidate_argv[0], candidate_argv, os.environ.copy())
@@ -3308,7 +5604,7 @@ def _read_root_bounded_output(path: Path, description: str) -> bytes:
 
 
 def _root_controller_candidate_command(
-    config: dict[str, object], host_parent_pid: int
+    config: dict[str, object], host_parent_pid: int, mount_readiness_fd: int
 ) -> list[str]:
     uid = config.get("uid")
     gid = config.get("gid")
@@ -3327,8 +5623,53 @@ def _root_controller_candidate_command(
         raise AssertionError("strict root controller configuration is malformed")
     trusted_root = config.get("trusted_root")
     trusted_sentinel = config.get("trusted_sentinel")
-    if type(trusted_root) is not str or type(trusted_sentinel) is not str:
+    host_mount_namespace = config.get("host_mount_namespace")
+    host_ipc_namespace = config.get("host_ipc_namespace")
+    if (
+        type(trusted_root) is not str
+        or type(trusted_sentinel) is not str
+        or type(mount_readiness_fd) is not int
+        or mount_readiness_fd <= 2
+        or type(host_mount_namespace) is not str
+        or re.fullmatch(r"mnt:\[[1-9][0-9]*\]", host_mount_namespace) is None
+        or type(host_ipc_namespace) is not str
+        or re.fullmatch(r"ipc:\[[1-9][0-9]*\]", host_ipc_namespace) is None
+    ):
         raise AssertionError("strict root controller trusted boundary is malformed")
+    writable_root_bindings = _revalidate_strict_writable_root_bindings(
+        config.get("writable_roots")
+    )
+    read_root_bindings = _revalidate_strict_host_read_root_bindings(
+        config.get("read_roots")
+    )
+    if any(
+        binding["target_uid"] != uid or binding["target_gid"] != gid
+        for binding in read_root_bindings
+    ):
+        raise AssertionError(
+            "strict root controller read root target identity changed"
+        )
+    writable_paths = [
+        Path(str(binding["path"])) for binding in writable_root_bindings
+    ]
+    for binding in read_root_bindings:
+        read_path = Path(str(binding["path"]))
+        if any(
+            read_path == writable_path
+            or read_path in writable_path.parents
+            or writable_path in read_path.parents
+            for writable_path in writable_paths
+        ):
+            raise AssertionError(
+                "strict root controller read and writable roots overlap"
+            )
+    if (
+        _strict_host_namespace_identity("mnt") != host_mount_namespace
+        or _strict_host_namespace_identity("ipc") != host_ipc_namespace
+    ):
+        raise AssertionError(
+            "strict root controller host namespace identity changed"
+        )
     if runtime_binding is not None:
         runtime_binding = _revalidate_configured_candidate_interpreter(
             runtime_binding
@@ -3354,6 +5695,31 @@ def _root_controller_candidate_command(
     environment_arguments = [
         f"{key}={value}" for key, value in sorted(environment.items())
     ]
+    # Host mount IDs fence topology before unshare.  A cloned mount tree gets
+    # new IDs, so the namespace bootstrap receives only stable object identity
+    # and derives its own local mount IDs from held O_PATH descriptors.
+    namespace_writable_roots = [
+        {
+            "path": binding["path"],
+            "device": binding["device"],
+            "inode": binding["inode"],
+        }
+        for binding in writable_root_bindings
+    ]
+    writable_root_json = json.dumps(
+        namespace_writable_roots, sort_keys=True, separators=(",", ":")
+    )
+    namespace_read_roots = [
+        {
+            key: value
+            for key, value in binding.items()
+            if key != "host_mount_id"
+        }
+        for binding in read_root_bindings
+    ]
+    read_root_json = json.dumps(
+        namespace_read_roots, sort_keys=True, separators=(",", ":")
+    )
     bootstrap_arguments = [
         str(uid),
         str(gid),
@@ -3368,16 +5734,22 @@ def _root_controller_candidate_command(
         str(_STRICT_PRIMITIVES["unshare"]),
         "--fork",
         "--pid",
+        "--mount",
         "--mount-proc",
+        "--ipc",
         "--net",
+        "--propagation",
+        "private",
         "--kill-child=SIGKILL",
-        str(_STRICT_PRIMITIVES["prlimit"]),
-        f"--nproc={_STRICT_PROCESS_LIMIT}:{_STRICT_PROCESS_LIMIT}",
-        f"--cpu={_STRICT_CPU_LIMIT_SECONDS}:{_STRICT_CPU_LIMIT_SECONDS}",
-        f"--as={_STRICT_ADDRESS_SPACE_LIMIT_BYTES}:{_STRICT_ADDRESS_SPACE_LIMIT_BYTES}",
-        f"--fsize={CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES}:{CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES}",
-        f"--nofile={_STRICT_NOFILE_LIMIT}:{_STRICT_NOFILE_LIMIT}",
-        "--core=0:0",
+        str(_STRICT_PRIMITIVES["python"]),
+        *_ROOT_PYTHON_ARGUMENTS,
+        "-c",
+        _MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
+        str(mount_readiness_fd),
+        host_mount_namespace,
+        host_ipc_namespace,
+        writable_root_json,
+        read_root_json,
         str(_STRICT_PRIMITIVES["setpriv"]),
         f"--reuid={uid}",
         f"--regid={gid}",
@@ -3402,6 +5774,7 @@ def _root_wrapper_command(
     config: dict[str, object],
     controller_identity: tuple[int, int, int, int],
     barrier_fd: int,
+    mount_readiness_fd: int,
 ) -> list[str]:
     return [
         str(_STRICT_PRIMITIVES["python"]),
@@ -3411,7 +5784,9 @@ def _root_wrapper_command(
         str(controller_identity[0]),
         str(controller_identity[1]),
         str(barrier_fd),
-        *_root_controller_candidate_command(config, controller_identity[0]),
+        *_root_controller_candidate_command(
+            config, controller_identity[0], mount_readiness_fd
+        ),
     ]
 
 
@@ -3423,6 +5798,43 @@ def _release_wrapper_barrier(barrier_fd: int) -> None:
         raise AssertionError("strict root wrapper barrier cannot be released") from error
     finally:
         os.close(barrier_fd)
+
+
+def _wait_mount_namespace_ready(
+    readiness_fd: int,
+    wrapper_pidfd: int,
+    *,
+    timeout_seconds: float = _STRICT_WATCHDOG_TIMEOUT_SECONDS,
+) -> None:
+    if (
+        type(readiness_fd) is not int
+        or readiness_fd <= 2
+        or type(wrapper_pidfd) is not int
+        or wrapper_pidfd <= 2
+        or type(timeout_seconds) not in (int, float)
+        or timeout_seconds <= 0
+    ):
+        raise AssertionError("strict mount namespace readiness gate is malformed")
+    readable, _, _ = select.select(
+        [readiness_fd, wrapper_pidfd], [], [], float(timeout_seconds)
+    )
+    if readiness_fd in readable:
+        try:
+            marker = os.read(readiness_fd, 2)
+        except OSError as error:
+            raise AssertionError(
+                "strict mount namespace readiness marker is unreadable"
+            ) from error
+        if marker != b"G":
+            raise AssertionError(
+                "strict mount namespace bootstrap did not become ready"
+            )
+        return
+    if wrapper_pidfd in readable:
+        raise AssertionError(
+            "strict mount namespace bootstrap exited before readiness"
+        )
+    raise AssertionError("strict mount namespace bootstrap readiness timed out")
 
 
 def _signal_process_pidfd(descriptor: int, selected_signal: int) -> None:
@@ -3446,6 +5858,8 @@ def _root_controller_main(config_value: str) -> int:
     wrapper_pidfd: int | None = None
     barrier_read_fd: int | None = None
     barrier_write_fd: int | None = None
+    mount_readiness_read_fd: int | None = None
+    mount_readiness_write_fd: int | None = None
     active_probe: tuple[
         Path,
         int,
@@ -3597,8 +6011,14 @@ def _root_controller_main(config_value: str) -> int:
                 "strict root controller identity is invalid"
             )
         barrier_read_fd, barrier_write_fd = os.pipe2(os.O_CLOEXEC)
+        mount_readiness_read_fd, mount_readiness_write_fd = os.pipe2(
+            os.O_CLOEXEC
+        )
         command = _root_wrapper_command(
-            config, controller_identity, barrier_read_fd
+            config,
+            controller_identity,
+            barrier_read_fd,
+            mount_readiness_write_fd,
         )
         output_directory = tempfile.TemporaryDirectory(
             prefix="required-ci-root-output-"
@@ -3613,10 +6033,12 @@ def _root_controller_main(config_value: str) -> int:
                 stdin=subprocess.PIPE,
                 stdout=stdout_file,
                 stderr=stderr_file,
-                pass_fds=(barrier_read_fd,),
+                pass_fds=(barrier_read_fd, mount_readiness_write_fd),
             )
             os.close(barrier_read_fd)
             barrier_read_fd = None
+            os.close(mount_readiness_write_fd)
+            mount_readiness_write_fd = None
             wrapper_pidfd = os.pidfd_open(process.pid, 0)
             wrapper_identity = _root_chain_identity(process.pid)
             wrapper_process_identity = _process_identity(
@@ -3650,6 +6072,15 @@ def _root_controller_main(config_value: str) -> int:
                 signal.raise_signal(signal.SIGSTOP)
             _release_wrapper_barrier(barrier_write_fd)
             barrier_write_fd = None
+            if mount_readiness_read_fd is None:
+                raise AssertionError(
+                    "strict mount namespace readiness descriptor is missing"
+                )
+            _wait_mount_namespace_ready(
+                mount_readiness_read_fd, wrapper_pidfd
+            )
+            os.close(mount_readiness_read_fd)
+            mount_readiness_read_fd = None
             if active_probe is not None:
                 if stdout_path is None:
                     raise AssertionError(
@@ -3765,6 +6196,8 @@ def _root_controller_main(config_value: str) -> int:
             for descriptor in (
                 barrier_read_fd,
                 barrier_write_fd,
+                mount_readiness_read_fd,
+                mount_readiness_write_fd,
                 wrapper_pidfd,
                 active_owner_pidfd,
             ):
@@ -4967,6 +7400,7 @@ def _execution_root_binding(root: Path) -> dict[str, object]:
     if (
         not root.is_absolute()
         or root == Path(root.anchor)
+        or any(ord(character) < 32 or ord(character) == 127 for character in str(root))
         or not stat.S_ISDIR(metadata.st_mode)
         or root.resolve(strict=True) != root
     ):
@@ -4976,6 +7410,383 @@ def _execution_root_binding(root: Path) -> dict[str, object]:
         "device": metadata.st_dev,
         "inode": metadata.st_ino,
     }
+
+
+def _decode_strict_mountinfo_path(value: str) -> Path:
+    if not value or not value.startswith("/"):
+        raise AssertionError("strict host mount topology is malformed")
+    decoded: list[str] = []
+    index = 0
+    escapes = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+    while index < len(value):
+        if value[index] != "\\":
+            decoded.append(value[index])
+            index += 1
+            continue
+        escape = value[index + 1 : index + 4]
+        if len(escape) != 3 or escape not in escapes:
+            raise AssertionError("strict host mount topology is malformed")
+        decoded.append(escapes[escape])
+        index += 4
+    decoded_value = "".join(decoded)
+    components = decoded_value.split("/")
+    if (
+        "\x00" in decoded_value
+        or (decoded_value != "/" and decoded_value.endswith("/"))
+        or (
+            decoded_value != "/"
+            and any(
+                component in ("", ".", "..")
+                for component in components[1:]
+            )
+        )
+    ):
+        raise AssertionError("strict host mount topology is malformed")
+    path = Path(decoded_value)
+    if not path.is_absolute() or str(path) != decoded_value:
+        raise AssertionError("strict host mount topology is malformed")
+    return path
+
+
+def _strict_mount_inventory() -> dict[int, dict[str, object]]:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            "/proc/self/mountinfo",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(65536, _STRICT_MOUNTINFO_LIMIT_BYTES + 1 - size),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > _STRICT_MOUNTINFO_LIMIT_BYTES:
+                raise AssertionError(
+                    "strict host mount topology exceeds its fixed limit"
+                )
+    except OSError as error:
+        raise AssertionError("strict host mount topology is unreadable") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
+        text = b"".join(chunks).decode(
+            "utf-8", errors="surrogateescape"
+        )
+    except UnicodeError as error:
+        raise AssertionError("strict host mount topology is malformed") from error
+    inventory: dict[int, dict[str, object]] = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 10 or "-" not in fields:
+            raise AssertionError("strict host mount topology is malformed")
+        separator = fields.index("-")
+        if separator < 6 or len(fields) != separator + 4:
+            raise AssertionError("strict host mount topology is malformed")
+        try:
+            mount_id = int(fields[0])
+            parent_id = int(fields[1])
+            major_value, minor_value = fields[2].split(":", 1)
+            major_minor = (int(major_value), int(minor_value))
+        except ValueError as error:
+            raise AssertionError("strict host mount topology is malformed") from error
+        if (
+            mount_id <= 0
+            or parent_id <= 0
+            or any(value < 0 for value in major_minor)
+            or mount_id in inventory
+        ):
+            raise AssertionError("strict host mount topology is malformed")
+        inventory[mount_id] = {
+            "parent_id": parent_id,
+            "major_minor": major_minor,
+            # mountinfo root is filesystem-defined show_path() output.  Keep
+            # the bounded raw token for diagnostics, but never use it as a
+            # universal source-coordinate system.
+            "root": fields[3],
+            "mountpoint": _decode_strict_mountinfo_path(fields[4]),
+        }
+    if not inventory:
+        raise AssertionError("strict host mount topology is malformed")
+    visible_roots = {
+        mount_id
+        for mount_id, record in inventory.items()
+        if record["parent_id"] == mount_id
+        or record["parent_id"] not in inventory
+    }
+    if len(visible_roots) != 1:
+        raise AssertionError("strict host mount topology is malformed")
+    visible_root_id = next(iter(visible_roots))
+    for mount_id in inventory:
+        current_id = mount_id
+        observed: set[int] = set()
+        while current_id != visible_root_id:
+            if current_id not in inventory:
+                raise AssertionError("strict host mount topology is malformed")
+            if current_id in observed:
+                raise AssertionError("strict host mount topology is malformed")
+            observed.add(current_id)
+            parent_id = inventory[current_id]["parent_id"]
+            if type(parent_id) is not int:
+                raise AssertionError("strict host mount topology is malformed")
+            current_id = parent_id
+    return inventory
+
+
+def _strict_path_at_or_below(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _strict_validate_directory_mount_topology(
+    root: Path,
+    mount_id: int,
+    device: int,
+    inventory: Mapping[int, Mapping[str, object]],
+    description: str,
+) -> None:
+    boundary_error = (
+        "strict writable root contains a host mount boundary"
+        if description == "writable root"
+        else f"strict {description} contains a mount boundary"
+    )
+    containing_record = inventory.get(mount_id)
+    if containing_record is None:
+        raise AssertionError(f"strict {description} mount identity changed")
+    for record in inventory.values():
+        if (
+            set(record)
+            != {"parent_id", "major_minor", "root", "mountpoint"}
+            or type(record.get("parent_id")) is not int
+            or type(record.get("major_minor")) is not tuple
+            or len(record["major_minor"]) != 2
+            or any(type(value) is not int for value in record["major_minor"])
+            or type(record.get("root")) is not str
+            or not isinstance(record.get("mountpoint"), Path)
+        ):
+            raise AssertionError("strict host mount topology is malformed")
+    containing_mountpoint = containing_record["mountpoint"]
+    containing_major_minor = containing_record["major_minor"]
+    if (
+        not isinstance(containing_mountpoint, Path)
+        or type(containing_major_minor) is not tuple
+        or type(device) is not int
+        or containing_major_minor != (os.major(device), os.minor(device))
+        or not _strict_path_at_or_below(root, containing_mountpoint)
+    ):
+        raise AssertionError(f"strict {description} mount identity changed")
+    same_filesystem_mount_ids = [
+        candidate_id
+        for candidate_id, record in inventory.items()
+        if record["major_minor"] == containing_major_minor
+    ]
+    # Filesystems may override mountinfo show_path(), so its root field is not
+    # a universal source-coordinate system.  Requiring the held directory's
+    # filesystem identity to have exactly one visible mount record is the
+    # conservative, filesystem-independent proof that no bind alias exists.
+    if same_filesystem_mount_ids != [mount_id]:
+        raise AssertionError(f"strict {description} has a mount alias")
+    if containing_mountpoint == root:
+        raise AssertionError(boundary_error)
+    if any(
+        candidate_id != mount_id
+        and isinstance(record.get("mountpoint"), Path)
+        and _strict_path_at_or_below(record["mountpoint"], root)
+        for candidate_id, record in inventory.items()
+    ):
+        raise AssertionError(boundary_error)
+
+
+def _strict_descriptor_mount_id(descriptor: int) -> int:
+    fdinfo_descriptor: int | None = None
+    try:
+        fdinfo_descriptor = os.open(
+            f"/proc/self/fdinfo/{descriptor}",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        data = os.read(fdinfo_descriptor, 4097)
+    except OSError as error:
+        raise AssertionError("strict writable root mount identity is unreadable") from error
+    finally:
+        if fdinfo_descriptor is not None:
+            os.close(fdinfo_descriptor)
+    if len(data) > 4096:
+        raise AssertionError("strict writable root mount identity is malformed")
+    try:
+        mount_ids = [
+            int(line.split()[1])
+            for line in data.decode("ascii").splitlines()
+            if line.startswith("mnt_id:")
+        ]
+    except (UnicodeError, IndexError, ValueError) as error:
+        raise AssertionError("strict writable root mount identity is malformed") from error
+    if len(mount_ids) != 1 or mount_ids[0] <= 0:
+        raise AssertionError("strict writable root mount identity is malformed")
+    return mount_ids[0]
+
+
+def _strict_writable_root_mount_binding(root: Path) -> int:
+    o_path = getattr(os, "O_PATH", None)
+    if type(o_path) is not int:
+        raise AssertionError("strict writable root mount binding is unavailable")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            root,
+            o_path | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        metadata = os.fstat(descriptor)
+        mount_id = _strict_descriptor_mount_id(descriptor)
+    except OSError as error:
+        raise AssertionError("strict writable root mount binding is unreadable") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    expected = _execution_root_binding(root)
+    # dev/ino protect directory object identity.  The held FD's st_dev must
+    # have one visible mount record, excluding bind aliases independently of
+    # filesystem-specific show_path output; lexical mountpoint checks exclude
+    # mounted subtrees.  Timestamps and child counts are not relevant signals.
+    if (metadata.st_dev, metadata.st_ino) != (
+        expected["device"],
+        expected["inode"],
+    ):
+        raise AssertionError("strict writable root mount binding changed")
+    inventory = _strict_mount_inventory()
+    _strict_validate_directory_mount_topology(
+        root, mount_id, metadata.st_dev, inventory, "writable root"
+    )
+    return mount_id
+
+
+def _strict_host_read_root_mount_binding(root: Path) -> int:
+    o_path = getattr(os, "O_PATH", None)
+    if type(o_path) is not int:
+        raise AssertionError("strict host read root mount binding is unavailable")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            root,
+            o_path | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        metadata = os.fstat(descriptor)
+        mount_id = _strict_descriptor_mount_id(descriptor)
+    except OSError as error:
+        raise AssertionError(
+            "strict host read root mount binding is unreadable"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    inventory = _strict_mount_inventory()
+    # Landlock directory rules follow bind aliases.  A unique visible mount
+    # record for the held FD's st_dev excludes those aliases without trusting
+    # filesystem-specific show_path output; lexical mountpoint checks exclude
+    # mounted subtrees.  Size, timestamps, and link count do not protect this
+    # access-policy property.
+    _strict_validate_directory_mount_topology(
+        root, mount_id, metadata.st_dev, inventory, "host read root"
+    )
+    return mount_id
+
+
+def _strict_writable_root_bindings(
+    execution_root: Path, writable_roots: Sequence[Path]
+) -> list[dict[str, object]]:
+    selected_roots = [execution_root, *writable_roots]
+    if not 1 <= len(selected_roots) <= _STRICT_WRITABLE_ROOT_LIMIT:
+        raise AssertionError("strict writable root inventory exceeds its fixed limit")
+    bindings: list[dict[str, object]] = []
+    observed_paths: set[str] = set()
+    for value in selected_roots:
+        binding = _execution_root_binding(Path(value))
+        path = str(binding["path"])
+        selected_path = Path(path)
+        protected_mountpoints = (
+            *_STRICT_PRIVATE_SURFACE_PATHS,
+            Path("/dev/mqueue"),
+        )
+        if any(
+            selected_path == mountpoint
+            or selected_path in mountpoint.parents
+            for mountpoint in protected_mountpoints
+        ):
+            raise AssertionError(
+                "strict writable root would expose a private host surface"
+            )
+        if path in observed_paths:
+            raise AssertionError("strict writable root inventory contains a duplicate")
+        observed_paths.add(path)
+        binding["host_mount_id"] = _strict_writable_root_mount_binding(
+            selected_path
+        )
+        bindings.append(binding)
+    for index, left in enumerate(bindings):
+        left_path = Path(str(left["path"]))
+        for right in bindings[index + 1 :]:
+            right_path = Path(str(right["path"]))
+            if left_path in right_path.parents or right_path in left_path.parents:
+                raise AssertionError("strict writable roots must not overlap")
+    return bindings
+
+
+def _revalidate_strict_writable_root_bindings(
+    value: object,
+) -> list[dict[str, object]]:
+    if (
+        type(value) is not list
+        or not 1 <= len(value) <= _STRICT_WRITABLE_ROOT_LIMIT
+    ):
+        raise AssertionError("strict writable root binding is malformed")
+    bindings: list[dict[str, object]] = []
+    for document in value:
+        if (
+            type(document) is not dict
+            or set(document) != {
+                "path",
+                "device",
+                "inode",
+                "host_mount_id",
+            }
+            or type(document.get("path")) is not str
+            or type(document.get("device")) is not int
+            or type(document.get("inode")) is not int
+            or type(document.get("host_mount_id")) is not int
+        ):
+            raise AssertionError("strict writable root binding is malformed")
+        path = Path(str(document["path"]))
+        recaptured = _execution_root_binding(path)
+        recaptured["host_mount_id"] = _strict_writable_root_mount_binding(path)
+        if recaptured != document:
+            raise AssertionError("strict writable root binding changed")
+        bindings.append(recaptured)
+    if bindings != _strict_writable_root_bindings(
+        Path(str(bindings[0]["path"])),
+        tuple(Path(str(binding["path"])) for binding in bindings[1:]),
+    ):
+        raise AssertionError("strict writable root binding changed")
+    return bindings
+
+
+def _strict_host_namespace_identity(namespace: str) -> str:
+    if namespace not in ("mnt", "ipc"):
+        raise AssertionError("strict host namespace selector is malformed")
+    try:
+        identity = os.readlink(f"/proc/self/ns/{namespace}")
+    except OSError as error:
+        raise AssertionError(
+            f"strict host {namespace} namespace identity is unreadable"
+        ) from error
+    if re.fullmatch(rf"{namespace}:\[[1-9][0-9]*\]", identity) is None:
+        raise AssertionError(
+            f"strict host {namespace} namespace identity is malformed"
+        )
+    return identity
 
 
 def _session_from_environment() -> dict[str, object] | None:
@@ -9216,6 +12027,13 @@ def _closed_candidate_environment(
     safe_git_directories: Sequence[Path] = (),
 ) -> dict[str, str]:
     source = {} if supplied is None else dict(supplied)
+    trusted_git = _revalidate_trusted_git_binding(_TRUSTED_GIT_BINDING)
+    trusted_git_directory = str(trusted_git.parent)
+    if os.pathsep in trusted_git_directory or "\x00" in trusted_git_directory:
+        raise AssertionError("trusted Git executable directory is malformed")
+    candidate_path = os.pathsep.join(
+        dict.fromkeys((trusted_git_directory, "/usr/bin", "/bin"))
+    )
     environment = {
         "HOME": str(home),
         "GIT_ATTR_NOSYSTEM": "1",
@@ -9224,7 +12042,7 @@ def _closed_candidate_environment(
         "LANG": "C",
         "LC_ALL": "C",
         "LOGNAME": "required-ci-candidate",
-        "PATH": "/usr/bin:/bin",
+        "PATH": candidate_path,
         "SHELL": "/bin/sh",
         "TEMP": str(temporary_root),
         "TMP": str(temporary_root),
@@ -9309,6 +12127,8 @@ def _invoke_strict_controller(
     trusted_completion_sentinel: Path | None = None,
     registered_session_id: str | None = None,
     candidate_interpreter_binding: Mapping[str, object] | None = None,
+    writable_roots: Sequence[Path] = (),
+    readable_roots: Sequence[Path] = (),
 ) -> dict[str, object]:
     exact_candidate_argv = list(candidate_argv)
     if (
@@ -9420,6 +12240,29 @@ def _invoke_strict_controller(
         or not isinstance(execution_root, Path)
     ):
         raise AssertionError("strict execution snapshot is malformed")
+    writable_root_bindings = _strict_writable_root_bindings(
+        execution_root, tuple(Path(path) for path in writable_roots)
+    )
+    read_root_bindings = _strict_host_read_root_bindings(
+        exact_interpreter_binding,
+        int(realm["uid"]),
+        int(realm["gid"]),
+        readable_roots=tuple(Path(path) for path in readable_roots),
+    )
+    writable_paths = [
+        Path(str(binding["path"])) for binding in writable_root_bindings
+    ]
+    for binding in read_root_bindings:
+        read_path = Path(str(binding["path"]))
+        if any(
+            read_path == writable_path
+            or read_path in writable_path.parents
+            or writable_path in read_path.parents
+            for writable_path in writable_paths
+        ):
+            raise AssertionError("strict read and writable roots overlap")
+    host_mount_namespace = _strict_host_namespace_identity("mnt")
+    host_ipc_namespace = _strict_host_namespace_identity("ipc")
     inner_fault_point = (
         trusted_fault_point
         if trusted_fault_point
@@ -9442,6 +12285,10 @@ def _invoke_strict_controller(
         "trusted_sentinel": str(_TRUSTED_SUPPORT_PATH),
         "candidate_argv": exact_candidate_argv,
         "candidate_interpreter": exact_interpreter_binding,
+        "writable_roots": writable_root_bindings,
+        "read_roots": read_root_bindings,
+        "host_mount_namespace": host_mount_namespace,
+        "host_ipc_namespace": host_ipc_namespace,
         "environment": dict(environment),
         "cwd": str(cwd),
         "timeout_seconds": timeout_seconds,
@@ -10011,6 +12858,7 @@ def _outer_owner_fault_probe_main(arguments: Sequence[str]) -> int:
                         str(_STRICT_PRIMITIVES["python"]),
                         "-I",
                         "-B",
+                        "-S",
                         str(probe_path),
                         nonce,
                     ],
@@ -10379,7 +13227,13 @@ def _ensure_strict_backend() -> None:
             )
             receipt = _invoke_strict_controller(
                 snapshot,
-                [str(_STRICT_PRIMITIVES["python"]), "-I", "-B", str(probe_path)],
+                [
+                    str(_STRICT_PRIMITIVES["python"]),
+                    "-I",
+                    "-B",
+                    "-S",
+                    str(probe_path),
+                ],
                 environment,
                 runtime_root,
                 b"",
@@ -10426,6 +13280,7 @@ def _ensure_strict_backend() -> None:
                         str(_STRICT_PRIMITIVES["python"]),
                         "-I",
                         "-B",
+                        "-S",
                         str(probe_path),
                     ],
                     environment,
@@ -10573,6 +13428,7 @@ def _run_candidate_process(
     env: Mapping[str, str] | None = None,
     input_text: str | None = None,
     writable_roots: Sequence[Path] = (),
+    readable_roots: Sequence[Path] = (),
 ) -> subprocess.CompletedProcess[str]:
     strict_isolation_platform_preflight()
     strict = _strict_isolation_requested()
@@ -10721,6 +13577,8 @@ def _run_candidate_process(
                     candidate_interpreter_binding=(
                         configured_interpreter_binding
                     ),
+                    writable_roots=prepared_roots,
+                    readable_roots=readable_roots,
                 )
                 if receipt.get("status") != "completed":
                     raise AssertionError(
@@ -10799,6 +13657,7 @@ def run_candidate_python(
     env: Mapping[str, str] | None = None,
     input_text: str | None = None,
     writable_roots: Sequence[Path] = (),
+    readable_roots: Sequence[Path] = (),
 ) -> subprocess.CompletedProcess[str]:
     command = [sys.executable, "-I", str(script), *arguments]
     return _run_candidate_process(
@@ -10808,6 +13667,7 @@ def run_candidate_python(
         env=env,
         input_text=input_text,
         writable_roots=writable_roots,
+        readable_roots=readable_roots,
     )
 
 
