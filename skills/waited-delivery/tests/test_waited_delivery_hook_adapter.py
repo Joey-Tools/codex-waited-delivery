@@ -4,6 +4,7 @@ import ast
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -215,16 +216,92 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 calls.append(node.func.attr)
         return calls
 
+    def _run_fail_open_fault_probe(self) -> subprocess.CompletedProcess[str]:
+        probe_path = self.root / "fail_open_fault_probe.py"
+        probe_path.write_text(
+            textwrap.dedent(
+                """\
+                import importlib.util
+                import json
+                import pathlib
+                import sys
+
+                adapter_path = pathlib.Path(sys.argv[1]).resolve(strict=True)
+                spec = importlib.util.spec_from_file_location(
+                    "_waited_delivery_fail_open_probe", adapter_path
+                )
+                if spec is None or spec.loader is None:
+                    raise AssertionError("candidate adapter cannot be loaded")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+
+                log_attempts = []
+                stderr_attempts = []
+                stdout_messages = []
+
+                def fail_log_write(entry):
+                    log_attempts.append(entry)
+                    raise RuntimeError("injected hook log failure")
+
+                def fail_debug_stderr(message="", *args, file=None, **kwargs):
+                    if file is module.sys.stderr:
+                        stderr_attempts.append(str(message))
+                        raise RuntimeError("injected debug stderr failure")
+                    stdout_messages.append(str(message))
+
+                module._append_hook_log = fail_log_write
+                module.print = fail_debug_stderr
+                error = RuntimeError("injected hook failure")
+                error.hook_command = "stop-hook"
+                error.hook_payload = {"session_id": "session-fail-open-probe"}
+                result = module._fail_open_hook_response(error)
+                receipt = {
+                    "log_attempt_count": len(log_attempts),
+                    "result": result,
+                    "stderr_attempts": stderr_attempts,
+                    "stdout_messages": stdout_messages,
+                }
+                sys.stdout.write(json.dumps(receipt, sort_keys=True) + "\\n")
+                """
+            ),
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment.pop("CODEX_THREAD_ID", None)
+        environment["HOME"] = str(self.root)
+        environment["WAITED_DELIVERY_HOOK_DEBUG"] = "1"
+        return candidate_support._run_candidate_process(
+            ADAPTER_PATH,
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(probe_path),
+                str(ADAPTER_PATH),
+            ],
+            env=environment,
+            writable_roots=(self.root,),
+        )
+
     def _run_stop_fault_probe(
-        self, *faults: str
+        self,
+        *faults: str,
+        label: str = "prompt-fault",
+        attach_child: bool = True,
+        child_status: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
-        session_id = "session-prompt-fault"
-        child_session_id = "child-prompt-fault"
-        home = self.root / "fault-probe-home"
+        session_id = f"session-{label}"
+        child_session_id = f"child-{label}"
+        home = self.root / f"{label}-home"
         home.mkdir()
         environment = os.environ.copy()
         environment.pop("CODEX_THREAD_ID", None)
         environment["HOME"] = str(home)
+        if env_overrides:
+            environment.update(env_overrides)
         observed = self._run_adapter(
             "user-prompt-submit-hook",
             input_payload=self._session_payload(session_id=session_id),
@@ -246,19 +323,30 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         )
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
         run_dir = json.loads(prepared.stdout)["run_dir"]
-        attached = self._run_adapter(
-            "attach-child-active-run",
-            "--repo",
-            str(self.repo),
-            "--run-dir",
-            run_dir,
-            "--child-session-id",
-            child_session_id,
-            "--session-id",
-            session_id,
-            env_overrides={"HOME": str(home)},
-        )
-        self.assertEqual(attached.returncode, 0, attached.stderr)
+        if attach_child:
+            attached = self._run_adapter(
+                "attach-child-active-run",
+                "--repo",
+                str(self.repo),
+                "--run-dir",
+                run_dir,
+                "--child-session-id",
+                child_session_id,
+                "--session-id",
+                session_id,
+                env_overrides={"HOME": str(home)},
+            )
+            self.assertEqual(attached.returncode, 0, attached.stderr)
+        if child_status is not None:
+            state_path = pathlib.Path(run_dir) / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            orchestration = state["orchestration"]
+            self.assertIsInstance(orchestration, dict)
+            orchestration["child_status"] = child_status
+            state_path.write_text(
+                json.dumps(state, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         stop_payload = {
             "session_id": session_id,
             "transcript_path": "/tmp/prompt-fault-transcript.jsonl",
@@ -890,25 +978,102 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertIn("waited-delivery hook fail-open (stop-hook)", completed.stderr)
 
     def test_fail_open_survives_debug_stderr_and_log_write_failures(self) -> None:
-        record_node, record_source = self._adapter_function("_record_hook_failure")
-        fail_open_node, fail_open_source = self._adapter_function(
-            "_fail_open_hook_response"
+        completed = self._run_fail_open_fault_probe()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        receipt = json.loads(completed.stdout)
+        self.assertEqual(
+            receipt,
+            {
+                "log_attempt_count": 1,
+                "result": 0,
+                "stderr_attempts": [
+                    "waited-delivery hook diagnostics write failed: "
+                    "injected hook log failure",
+                    "waited-delivery hook fail-open (stop-hook): "
+                    "injected hook failure",
+                ],
+                "stdout_messages": ["{}"],
+            },
         )
-        self.assertGreaterEqual(
-            sum(isinstance(node, ast.Try) for node in ast.walk(record_node)), 2
-        )
-        self.assertGreaterEqual(
-            sum(isinstance(node, ast.Try) for node in ast.walk(fail_open_node)), 1
-        )
-        self.assertIn("except Exception as log_error", record_source)
-        self.assertIn("except Exception", fail_open_source)
-        self.assertIn("return _success_hook_response()", fail_open_source)
 
     def test_hook_archive_label_is_unique(self) -> None:
-        _, source = self._adapter_function("_hook_archive_label")
-        self.assertIn("uuid.uuid4().hex[:12]", source)
-        self.assertIn("path.stem", source)
-        self.assertIn('strftime("%Y%m%dT%H%M%SZ")', source)
+        no_zstd_path = self.root / "archive-label-no-zstd"
+        no_zstd_path.mkdir()
+        git_wrapper = no_zstd_path / "git"
+        git_wrapper.write_text(
+            "#!/bin/sh\nexec "
+            + shlex.quote(candidate_support.TRUSTED_GIT_EXECUTABLE)
+            + ' "$@"\n',
+            encoding="utf-8",
+        )
+        git_wrapper.chmod(0o755)
+        candidate_environment_keys = candidate_support._CANDIDATE_ENV_KEYS | {"PATH"}
+        same_second_entries: list[dict[str, object]] | None = None
+        same_second_archives: list[pathlib.Path] | None = None
+        with mock.patch.object(
+            candidate_support,
+            "_CANDIDATE_ENV_KEYS",
+            candidate_environment_keys,
+        ):
+            for attempt in range(3):
+                label = f"archive-label-{attempt}"
+                completed, _ = self._run_stop_fault_probe(
+                    "continuation",
+                    "fallback",
+                    "last-resort",
+                    label=label,
+                    env_overrides={
+                        "PATH": str(no_zstd_path),
+                        "WAITED_DELIVERY_HOOK_LOG_MAX_BYTES": "1",
+                        "WAITED_DELIVERY_HOOK_LOG_UNCOMPRESSED_SLOTS": "1",
+                    },
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                log_dir = self._home_log_dir(self.root / f"{label}-home")
+                archives = sorted(
+                    log_dir.glob("waited-delivery-hooks-*.jsonl")
+                )
+                log_paths = [*archives, log_dir / "waited-delivery-hooks.jsonl"]
+                entries = [
+                    json.loads(line)
+                    for path in log_paths
+                    if path.is_file()
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                ]
+                archive_prefix = "waited-delivery-hooks-"
+                archive_timestamps = {
+                    path.name[len(archive_prefix) : len(archive_prefix) + 16]
+                    for path in archives
+                }
+                if (
+                    len(entries) == 3
+                    and len({entry["ts"] for entry in entries}) == 1
+                    and len(archives) == 2
+                    and len(archive_timestamps) == 1
+                ):
+                    same_second_entries = entries
+                    same_second_archives = archives
+                    break
+        self.assertIsNotNone(
+            same_second_entries,
+            "could not observe all three diagnostic events in one second",
+        )
+        self.assertIsNotNone(same_second_archives)
+        self.assertEqual(len(same_second_archives or []), 2)
+        self.assertEqual(
+            sorted(
+                str(entry["error_message"])
+                for entry in (same_second_entries or [])
+            ),
+            sorted(
+                [
+                    "required-ci injected continuation failure",
+                    "required-ci injected fallback failure",
+                    "required-ci injected last-resort failure",
+                ]
+            ),
+        )
 
     def test_hook_diagnostics_rotate_to_jsonl_when_zstd_missing(self) -> None:
         fake_home = self.root / "home-rotation-no-zstd"
@@ -1324,12 +1489,30 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(events[0]["session_id"], "session-prompt-fault")
 
     def test_stop_hook_fallback_prompt_preserves_terminal_child_status(self) -> None:
-        _, source = self._adapter_function("_build_stop_fallback_prompt")
-        self.assertIn("if child_status in CHILD_TERMINAL_STATUSES", source)
-        self.assertIn('"--child-status"', source)
-        self.assertIn('"--child-session-id"', source)
-        self.assertIn("child_status", source)
-        self.assertIn("child_session_id", source)
+        for child_status in ("completed", "failed"):
+            label = f"terminal-fallback-{child_status}"
+            with self.subTest(child_status=child_status):
+                completed, events = self._run_stop_fault_probe(
+                    "continuation",
+                    label=label,
+                    child_status=child_status,
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertEqual(completed.stdout, "")
+                self.assertIn(
+                    "could not render the full continuation prompt",
+                    completed.stderr,
+                )
+                self.assertIn(
+                    f"--child-status {child_status}", completed.stderr
+                )
+                self.assertIn(
+                    f"--child-session-id child-{label}", completed.stderr
+                )
+                self.assertEqual(
+                    [event["error_message"] for event in events],
+                    ["required-ci injected continuation failure"],
+                )
 
     def test_stop_hook_fallback_prompt_waits_for_active_child(self) -> None:
         _, source = self._adapter_function("_build_stop_fallback_prompt")
@@ -1338,10 +1521,21 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertIn("unless the user explicitly interrupts", source)
 
     def test_stop_hook_fallback_prompt_requires_spawn_when_child_missing(self) -> None:
-        _, source = self._adapter_function("_build_stop_fallback_prompt")
+        completed, events = self._run_stop_fault_probe(
+            "continuation",
+            label="missing-child-fallback",
+            attach_child=False,
+        )
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.stdout, "")
         self.assertIn(
-            'lines.append("Continue the required spawn -> attach-child -> wait sequence.")',
-            source,
+            "Continue the required spawn -> attach-child -> wait sequence.",
+            completed.stderr,
+        )
+        self.assertNotIn("Keep waiting for delivery child", completed.stderr)
+        self.assertEqual(
+            [event["error_message"] for event in events],
+            ["required-ci injected continuation failure"],
         )
 
     def test_stop_hook_keeps_blocking_when_fallback_builder_fails(self) -> None:

@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -116,12 +117,12 @@ TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES = (
     + TRUSTED_COMPILE_TIMEOUT_MINUTES
     + TRUSTED_STRUCTURE_TIMEOUT_MINUTES
 )
-TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 8 * 60
+TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 10 * 60
 TRUSTED_TEST_CLEANUP_RESERVE_SECONDS = 2 * 60
 TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS = (
     TRUSTED_TEST_SUITE_TIMEOUT_SECONDS + TRUSTED_TEST_CLEANUP_RESERVE_SECONDS
 )
-TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS = 5 * 60
+TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS = 3 * 60
 TRUSTED_JOB_RUNNER_MARGIN_MINUTES = 5
 TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS = 1
 TRUSTED_TEST_CHILD_REAP_TIMEOUT_SECONDS = 5
@@ -876,7 +877,7 @@ def _validated_trusted_child_receipt(
             "trusted Required CI child returned a malformed completion receipt"
         )
     try:
-        receipt = json.loads(completed.stdout.removeprefix(TRUSTED_TEST_RECEIPT_SENTINEL))
+        receipt = json.loads(completed.stdout[len(TRUSTED_TEST_RECEIPT_SENTINEL) :])
     except (json.JSONDecodeError, TypeError) as error:
         raise AssertionError(
             "trusted Required CI child returned a malformed completion receipt"
@@ -2794,7 +2795,8 @@ def _frozen_candidate_file_bytes(
         output_limit=128,
     )
     try:
-        size = int(size_output.decode("ascii").removesuffix("\n"))
+        size_text = size_output.decode("ascii")
+        size = int(size_text[:-1] if size_text.endswith("\n") else size_text)
     except (UnicodeDecodeError, ValueError) as error:
         raise AssertionError(
             f"frozen candidate size is malformed: {relative_path}"
@@ -3839,7 +3841,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             ),
             "supervisor deadline is extended": secure_workflow.replace(
                 TRUSTED_TEST_SUPERVISOR_COMMAND,
-                TRUSTED_TEST_SUPERVISOR_COMMAND.replace("+600", "+601", 1),
+                TRUSTED_TEST_SUPERVISOR_COMMAND.replace("+720", "+721", 1),
                 1,
             ),
             "supervisor launcher does not exec": secure_workflow.replace(
@@ -5201,9 +5203,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertTrue(stdout.getvalue().startswith(CI_STRICT_RUNTIME_LIVE_SENTINEL))
         receipt = json.loads(
-            stdout.getvalue().removeprefix(
-                CI_STRICT_RUNTIME_LIVE_SENTINEL
-            )
+            stdout.getvalue()[len(CI_STRICT_RUNTIME_LIVE_SENTINEL) :]
         )
         self.assertEqual(
             receipt,
@@ -5635,7 +5635,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "rev-parse",
             "--show-object-format",
             output_limit=32,
-        ).decode("ascii").removesuffix("\n")
+        ).decode("ascii")
+        object_format = (
+            object_format[:-1]
+            if object_format.endswith("\n")
+            else object_format
+        )
         tree_output = _CANDIDATE_SUPPORT._run_candidate_git(
             candidate_root,
             "ls-tree",
@@ -7366,7 +7371,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "exponent": "7e2",
             "nonfinite": "nan",
             "expired": "100.000000000",
-            "extended": "1000.002000000",
+            "extended": "1120.002000000",
         }
         for name, encoded in fixtures.items():
             environment = {}
@@ -7386,11 +7391,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     def test_child_timeout_deducts_preflight_time_and_cleanup_reserve(
         self,
     ) -> None:
-        deadline = 700.0
+        deadline = 820.0
         cases = {
-            "full child maximum": (100.0, 480.0),
-            "45 seconds spent before launch": (145.0, 435.0),
-            "479 seconds spent since launcher": (579.0, 1.0),
+            "full child maximum": (100.0, 600.0),
+            "45 seconds spent before launch": (145.0, 555.0),
+            "599 seconds spent since launcher": (699.0, 1.0),
         }
         for name, (now, expected) in cases.items():
             with self.subTest(name=name), mock.patch.object(
@@ -7400,7 +7405,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     _remaining_trusted_test_child_timeout(deadline), expected
                 )
 
-        with mock.patch.object(time, "monotonic", return_value=580.0):
+        with mock.patch.object(time, "monotonic", return_value=700.0):
             with self.assertRaisesRegex(
                 AssertionError, "insufficient budget before child launch"
             ):
@@ -7820,7 +7825,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                 candidate_sha = _CANDIDATE_SUPPORT._run_candidate_git(
                     candidate_root, "rev-parse", "--verify", "HEAD^{commit}"
-                ).decode("ascii").removesuffix("\n")
+                ).decode("ascii")
+                candidate_sha = (
+                    candidate_sha[:-1]
+                    if candidate_sha.endswith("\n")
+                    else candidate_sha
+                )
                 selected_path.write_bytes(trusted_source)
 
                 with self.assertRaisesRegex(
@@ -7875,7 +7885,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr)
             candidate_sha = _CANDIDATE_SUPPORT._run_candidate_git(
                 candidate_root, "rev-parse", "--verify", "HEAD^{commit}"
-            ).decode("ascii").removesuffix("\n")
+            ).decode("ascii")
+            candidate_sha = (
+                candidate_sha[:-1]
+                if candidate_sha.endswith("\n")
+                else candidate_sha
+            )
             caller_path.unlink()
 
             with self.assertRaisesRegex(
@@ -9915,6 +9930,275 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertNotIn("_recover_registered_entry", parent_source)
         self.assertNotIn("close_trusted_isolation_chains", parent_source)
         self.assertNotIn("os.kill(", parent_source)
+
+    def test_outer_fault_ack_early_exit_reports_bounded_sanitized_output(
+        self,
+    ) -> None:
+        stdout_payload = (
+            b"probe-start\n  ::warning title=forged::probe-output\n"
+            + (b"stdout-middle" * 400)
+        )
+        stderr_payload = (
+            b"\x1b[31m\r\n::stop-commands::forged\n"
+            + (b"stderr-middle" * 400)
+            + b"\xff\nAssertionError: terminal-cause\n"
+        )
+
+        class EarlyExitProcess:
+            pid = 73123
+            returncode = 73
+            inherited_descriptors: list[int] = []
+
+            def poll(self) -> int:
+                while self.inherited_descriptors:
+                    os.close(self.inherited_descriptors.pop())
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                return self.returncode
+
+        process = EarlyExitProcess()
+
+        def pipe2_cloexec(_flags: int) -> tuple[int, int]:
+            read_descriptor, write_descriptor = os.pipe()
+            os.set_inheritable(read_descriptor, False)
+            os.set_inheritable(write_descriptor, False)
+            return read_descriptor, write_descriptor
+
+        def launch_early_exit(*_arguments: object, **options: object) -> object:
+            stdout = options["stdout"]
+            stderr = options["stderr"]
+            self.assertTrue(hasattr(stdout, "write"))
+            self.assertTrue(hasattr(stderr, "write"))
+            stdout.write(stdout_payload)  # type: ignore[union-attr]
+            stderr.write(stderr_payload)  # type: ignore[union-attr]
+            stdout.flush()  # type: ignore[union-attr]
+            stderr.flush()  # type: ignore[union-attr]
+            process.inherited_descriptors = [
+                os.dup(descriptor)
+                for descriptor in options["pass_fds"]  # type: ignore[union-attr]
+            ]
+            return process
+
+        owner_identity = (
+            process.pid,
+            17,
+            process.pid,
+            process.pid,
+            process.pid,
+            (os.getuid(),) * 4,
+        )
+        original_pread = os.pread
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent_registry_root = Path(temporary_directory) / "registry"
+            parent_registry_root.mkdir()
+            candidate_root = Path(temporary_directory) / "candidate"
+            candidate_root.mkdir()
+            with tempfile.TemporaryFile() as lock_file, tempfile.TemporaryFile() as pidfd:
+                with contextlib.ExitStack() as patch_stack:
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_active_strict_session",
+                            return_value={"root": parent_registry_root},
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_strict_realm",
+                            return_value={
+                                "lock": lock_file,
+                                "uid": 60000,
+                                "gid": 60000,
+                            },
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_minimal_supervisor_environment",
+                            return_value={},
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.subprocess,
+                            "Popen",
+                            side_effect=launch_early_exit,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "pipe2",
+                            side_effect=pipe2_cloexec,
+                            create=True,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "pidfd_open",
+                            return_value=os.dup(pidfd.fileno()),
+                            create=True,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_process_identity",
+                            return_value=owner_identity,
+                        )
+                    )
+                    signal_process = patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_signal_process_pidfd",
+                        )
+                    )
+                    validate_ack = patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_validate_outer_owner_fault_ack",
+                        )
+                    )
+                    pread = patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "pread",
+                            side_effect=original_pread,
+                        )
+                    )
+                    with self.assertRaises(AssertionError) as raised:
+                        _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault(
+                            "after-outer-bound",
+                            signal.SIGSTOP,
+                            candidate_root=candidate_root,
+                            candidate_sha="a" * 40,
+                        )
+
+        message = str(raised.exception)
+        self.assertTrue(
+            message.startswith(
+                "strict outer owner exited before publishing its fault ACK"
+            )
+        )
+        self.assertIn('"boundary":"after-outer-bound"', message)
+        self.assertIn('"returncode":73', message)
+        self.assertIn('"selected_signal":"SIGSTOP"', message)
+        self.assertIn("stdout: probe-start", message)
+        self.assertIn("\\::warning title=forged::probe-output", message)
+        self.assertIn("stderr:", message)
+        self.assertIn("\\::stop-commands::forged", message)
+        self.assertIn("\\xff", message)
+        self.assertIn("AssertionError: terminal-cause", message)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\r", message)
+        for line in message.splitlines():
+            self.assertFalse(line.lstrip().startswith("::"), line)
+        self.assertLessEqual(len(message), 2200)
+        bytes_requested_by_descriptor: dict[int, int] = {}
+        for call in pread.call_args_list:
+            descriptor, length, _offset = call.args
+            bytes_requested_by_descriptor[descriptor] = (
+                bytes_requested_by_descriptor.get(descriptor, 0) + length
+            )
+        self.assertEqual(len(bytes_requested_by_descriptor), 2)
+        self.assertTrue(
+            all(
+                requested <= 4096
+                for requested in bytes_requested_by_descriptor.values()
+            )
+        )
+        signal_process.assert_not_called()
+        validate_ack.assert_not_called()
+
+    def test_outer_fault_ack_reads_output_only_after_terminal_exit(self) -> None:
+        class LiveProcess:
+            def poll(self) -> None:
+                return None
+
+        class UnexpectedPollProcess:
+            def poll(self) -> int:
+                raise AssertionError("valid ACK unexpectedly polled the owner")
+
+        class BooleanReturnProcess:
+            def poll(self) -> bool:
+                return False
+
+        def malformed_ack(*_arguments: object, **_options: object) -> object:
+            try:
+                raise json.JSONDecodeError("injected", "{", 1)
+            except json.JSONDecodeError as error:
+                raise AssertionError("strict outer owner fault ACK is malformed") from error
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ack_path = Path(temporary_directory) / "fault-ack.json"
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_read_outer_owner_terminal_diagnostic",
+                ) as read_diagnostic:
+                    with self.assertRaisesRegex(AssertionError, "timed out"):
+                        _CANDIDATE_SUPPORT._wait_outer_owner_fault_ack(
+                            ack_path,
+                            LiveProcess(),  # type: ignore[arg-type]
+                            boundary="after-outer-popen",
+                            selected_signal=signal.SIGKILL,
+                            stdout_file=stdout,
+                            stderr_file=stderr,
+                            timeout_seconds=0.01,
+                        )
+                    read_diagnostic.assert_not_called()
+
+                    expected = {"schema_version": 1}
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_read_outer_owner_json",
+                        return_value=expected,
+                    ):
+                        self.assertIs(
+                            _CANDIDATE_SUPPORT._wait_outer_owner_fault_ack(
+                                ack_path,
+                                UnexpectedPollProcess(),  # type: ignore[arg-type]
+                                boundary="after-target-active",
+                                selected_signal=signal.SIGSTOP,
+                                stdout_file=stdout,
+                                stderr_file=stderr,
+                            ),
+                            expected,
+                        )
+                    read_diagnostic.assert_not_called()
+
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_read_outer_owner_json",
+                        side_effect=malformed_ack,
+                    ), self.assertRaisesRegex(AssertionError, "ACK is malformed"):
+                        _CANDIDATE_SUPPORT._wait_outer_owner_fault_ack(
+                            ack_path,
+                            UnexpectedPollProcess(),  # type: ignore[arg-type]
+                            boundary="after-root-authorized",
+                            selected_signal=signal.SIGKILL,
+                            stdout_file=stdout,
+                            stderr_file=stderr,
+                        )
+                    read_diagnostic.assert_not_called()
+
+                    with self.assertRaisesRegex(
+                        AssertionError, "terminal return code is malformed"
+                    ):
+                        _CANDIDATE_SUPPORT._wait_outer_owner_fault_ack(
+                            ack_path,
+                            BooleanReturnProcess(),  # type: ignore[arg-type]
+                            boundary="after-root-authorized-barrier",
+                            selected_signal=signal.SIGSTOP,
+                            stdout_file=stdout,
+                            stderr_file=stderr,
+                        )
+                    read_diagnostic.assert_not_called()
 
     def test_outer_fault_ack_binds_every_recovery_identity(self) -> None:
         publish_source = inspect.getsource(
@@ -11986,6 +12270,440 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertLess(command.index("--ipc"), command.index("/usr/bin/setpriv"))
         self.assertNotIn("/usr/bin/prlimit", command)
 
+    def test_strict_bootstrap_nofile_capacity_matches_live_descriptor_peak(
+        self,
+    ) -> None:
+        def bindings(
+            writable_count: int,
+            read_count: int,
+            component_depth: int,
+        ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+            writable = [
+                {
+                    "path": f"/writable-{index}",
+                    "device": 1,
+                    "inode": index + 1,
+                    "host_mount_id": index + 100,
+                }
+                for index in range(writable_count)
+            ]
+            components = [
+                {
+                    "path": "/" if index == 0 else f"/component-{index}",
+                    "kind": "directory",
+                    "device": 2,
+                    "inode": index + 1,
+                    "uid": 0,
+                    "gid": 0,
+                    "permissions": 0o755,
+                }
+                for index in range(component_depth)
+            ]
+            readable = [
+                {
+                    "schema_version": 1,
+                    "purpose": "system-arch-library",
+                    "kind": "directory",
+                    "path": f"/read-{index}",
+                    "target_uid": 60000,
+                    "target_gid": 60000,
+                    "components": components,
+                    "host_mount_id": index + 200,
+                }
+                for index in range(read_count)
+            ]
+            return writable, readable
+
+        cases = (
+            (64, 32, 24, 191),
+            (16, 1, 24, 64),
+            (16, 2, 24, 65),
+            (16, 1, 25, 65),
+        )
+        for writable_count, read_count, depth, expected in cases:
+            with self.subTest(
+                writable=writable_count, readable=read_count, depth=depth
+            ):
+                writable, readable = bindings(
+                    writable_count, read_count, depth
+                )
+                self.assertEqual(
+                    _CANDIDATE_SUPPORT._strict_bootstrap_nofile_requirement(
+                        writable, readable
+                    ),
+                    expected,
+                )
+
+        writable, readable = bindings(64, 32, 88)
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._strict_bootstrap_nofile_requirement(
+                writable, readable
+            ),
+            _CANDIDATE_SUPPORT._STRICT_BOOTSTRAP_NOFILE_LIMIT - 1,
+        )
+        writable, readable = bindings(64, 32, 89)
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._strict_bootstrap_nofile_requirement(
+                writable, readable
+            ),
+            _CANDIDATE_SUPPORT._STRICT_BOOTSTRAP_NOFILE_LIMIT,
+        )
+        writable, readable = bindings(64, 32, 90)
+        with self.assertRaisesRegex(
+            AssertionError, "descriptor capacity exceeds its fixed limit"
+        ):
+            _CANDIDATE_SUPPORT._strict_bootstrap_nofile_requirement(
+                writable, readable
+            )
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.resource,
+            "getrlimit",
+            return_value=(64, 190),
+        ), self.assertRaisesRegex(
+            AssertionError, "inherited hard limit is insufficient"
+        ):
+            _CANDIDATE_SUPPORT._assert_strict_bootstrap_nofile_capacity(191)
+        for hard_limit in (191, 192, _CANDIDATE_SUPPORT.resource.RLIM_INFINITY):
+            with self.subTest(hard_limit=hard_limit), mock.patch.object(
+                _CANDIDATE_SUPPORT.resource,
+                "getrlimit",
+                return_value=(32, hard_limit),
+            ):
+                _CANDIDATE_SUPPORT._assert_strict_bootstrap_nofile_capacity(
+                    191
+                )
+
+    def test_strict_bootstrap_nofile_capacity_is_bound_before_launch(self) -> None:
+        bootstrap_source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        bootstrap_nodes = ast.parse(bootstrap_source).body
+        requirement_node = next(
+            node
+            for node in bootstrap_nodes
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "bootstrap_nofile_requirement"
+        )
+        limit_node = next(
+            node
+            for node in bootstrap_nodes
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "set_bootstrap_nofile_limit"
+        )
+        requirement_module = ast.Module(
+            body=[requirement_node, limit_node], type_ignores=[]
+        )
+        ast.fix_missing_locations(requirement_module)
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                requirement_module,
+                "<strict-bootstrap-nofile-requirement>",
+                "exec",
+            ),
+            namespace,
+        )
+        embedded_requirement = namespace["bootstrap_nofile_requirement"]
+        writable = [{} for _ in range(64)]
+        readable = [
+            {"components": [{} for _ in range(24)]} for _ in range(32)
+        ]
+        self.assertEqual(embedded_requirement(writable, readable), 191)
+        cap_readable = [
+            {"components": [{} for _ in range(89)]} for _ in range(32)
+        ]
+        self.assertEqual(
+            embedded_requirement(writable, cap_readable),
+            _CANDIDATE_SUPPORT._STRICT_BOOTSTRAP_NOFILE_LIMIT,
+        )
+        over_cap_readable = [
+            {"components": [{} for _ in range(90)]} for _ in range(32)
+        ]
+        with self.assertRaises(SystemExit) as over_cap:
+            embedded_requirement(writable, over_cap_readable)
+        self.assertEqual(over_cap.exception.code, 150)
+
+        class FakeResource:
+            RLIMIT_NOFILE = 7
+            RLIM_INFINITY = -1
+
+            def __init__(self, hard_limit: int) -> None:
+                self.limit = (32, hard_limit)
+                self.calls: list[tuple[int, tuple[int, int]]] = []
+
+            def getrlimit(self, selected: int) -> tuple[int, int]:
+                self.assert_selected(selected)
+                return self.limit
+
+            def setrlimit(
+                self, selected: int, value: tuple[int, int]
+            ) -> None:
+                self.assert_selected(selected)
+                self.calls.append((selected, value))
+                self.limit = value
+
+            def assert_selected(self, selected: int) -> None:
+                if selected != self.RLIMIT_NOFILE:
+                    raise AssertionError("unexpected resource selector")
+
+        set_embedded_limit = namespace["set_bootstrap_nofile_limit"]
+        for hard_limit, accepted in ((190, False), (191, True), (192, True)):
+            with self.subTest(embedded_hard_limit=hard_limit):
+                fake_resource = FakeResource(hard_limit)
+                namespace["resource"] = fake_resource
+                if accepted:
+                    set_embedded_limit(191)
+                    self.assertEqual(fake_resource.limit, (191, 191))
+                    self.assertEqual(
+                        fake_resource.calls, [(fake_resource.RLIMIT_NOFILE, (191, 191))]
+                    )
+                else:
+                    with self.assertRaises(SystemExit) as rejected:
+                        set_embedded_limit(191)
+                    self.assertEqual(rejected.exception.code, 150)
+                    self.assertEqual(fake_resource.calls, [])
+
+        default_config = self.root_command_config()
+        with self.root_command_mount_contract(), mock.patch.object(
+            _CANDIDATE_SUPPORT.resource,
+            "getrlimit",
+            return_value=(32, 64),
+        ):
+            low_command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                default_config, 1234, 9
+            )
+            high_command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                default_config, 1234, 300
+            )
+        for command, readiness in ((low_command, "9"), (high_command, "300")):
+            bootstrap_index = command.index(bootstrap_source)
+            self.assertEqual(command[bootstrap_index + 1], readiness)
+            self.assertEqual(command[bootstrap_index + 2], "64")
+
+        maximal_writable = [
+            {
+                "path": f"/writable-{index}",
+                "device": 1,
+                "inode": index + 1,
+                "host_mount_id": index + 100,
+            }
+            for index in range(64)
+        ]
+        maximal_readable = [
+            {
+                **self.root_command_config()["read_roots"][0],
+                "path": f"/read-{index}",
+                "components": [{} for _ in range(24)],
+                "host_mount_id": index + 200,
+            }
+            for index in range(32)
+        ]
+        maximal_config = self.root_command_config(
+            writable_roots=maximal_writable,
+            read_roots=maximal_readable,
+        )
+        with self.root_command_mount_contract(), mock.patch.object(
+            _CANDIDATE_SUPPORT.resource,
+            "getrlimit",
+            return_value=(64, 191),
+        ):
+            maximal_command = (
+                _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                    maximal_config, 1234, 9
+                )
+            )
+        maximal_bootstrap_index = maximal_command.index(bootstrap_source)
+        self.assertEqual(maximal_command[maximal_bootstrap_index + 2], "191")
+
+        temp_limit = "set_bootstrap_nofile_limit(required_nofile)"
+        final_limit = "resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))"
+        self.assertIn(temp_limit, bootstrap_source)
+        self.assertIn(final_limit, bootstrap_source)
+        self.assertLess(
+            bootstrap_source.index(temp_limit),
+            bootstrap_source.index("os.open("),
+        )
+        self.assertLess(
+            bootstrap_source.index(temp_limit),
+            bootstrap_source.index(
+                "os.dup2(readiness_fd, NETWORK_INTERFACE_FD"
+            ),
+        )
+        self.assertLess(
+            bootstrap_source.index(
+                "activate_candidate_landlock(landlock_ruleset_fd)"
+            ),
+            bootstrap_source.index(final_limit),
+        )
+        self.assertLess(
+            bootstrap_source.index(final_limit),
+            bootstrap_source.index("open_descriptors = set()"),
+        )
+        invoke_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._invoke_strict_controller
+        )
+        self.assertLess(
+            invoke_source.index("_assert_strict_bootstrap_nofile_capacity"),
+            invoke_source.index("_run_registered_sudo("),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            snapshot_root = Path(temporary_directory).resolve(strict=True)
+            snapshot = {
+                "config_path": snapshot_root / "config.json",
+                "controller_path": snapshot_root / "controller.py",
+                "handshake_path": snapshot_root / "handshake.json",
+                "execution_root": snapshot_root,
+            }
+            writable_bindings = self.root_command_config()["writable_roots"]
+            read_bindings = self.root_command_config()["read_roots"]
+            with contextlib.ExitStack() as patch_stack:
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_realm",
+                        return_value={"uid": 60000, "gid": 60000},
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_writable_root_bindings",
+                        return_value=writable_bindings,
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_host_read_root_bindings",
+                        return_value=read_bindings,
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT.resource,
+                        "getrlimit",
+                        return_value=(32, 63),
+                    )
+                )
+                root_tree = patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+                    )
+                )
+                registered_sudo = patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT, "_run_registered_sudo"
+                    )
+                )
+                popen = patch_stack.enter_context(
+                    mock.patch.object(_CANDIDATE_SUPPORT.subprocess, "Popen")
+                )
+                patch_stack.enter_context(
+                    self.assertRaisesRegex(
+                        AssertionError, "inherited hard limit is insufficient"
+                    )
+                )
+                _CANDIDATE_SUPPORT._invoke_strict_controller(
+                    snapshot,
+                    ["/usr/bin/python3", "-I", "/probe.py"],
+                    {},
+                    snapshot_root,
+                    b"",
+                    timeout_seconds=1,
+                )
+        root_tree.assert_not_called()
+        registered_sudo.assert_not_called()
+        popen.assert_not_called()
+
+    def test_strict_bootstrap_nofile_allocator_honors_limit_boundary(
+        self,
+    ) -> None:
+        probe = textwrap.dedent(
+            """\
+            import errno
+            import json
+            import os
+            import resource
+            import sys
+
+            limit = int(sys.argv[1])
+            readiness = int(sys.argv[2])
+            source = os.open("/dev/null", os.O_WRONLY)
+            try:
+                os.dup2(source, readiness, inheritable=False)
+                os.dup2(source, 63, inheritable=False)
+            finally:
+                os.close(source)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limit))
+            if resource.getrlimit(resource.RLIMIT_NOFILE) != (limit, limit):
+                raise SystemExit(90)
+            os.fstat(readiness)
+            os.fstat(63)
+            opened = []
+            failure_errno = None
+            while True:
+                try:
+                    opened.append(
+                        os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+                    )
+                except OSError as error:
+                    failure_errno = error.errno
+                    break
+            report = {
+                "failure_errno": failure_errno,
+                "maximum": max(opened),
+                "opened": len(opened),
+                "readiness_live": os.fstat(readiness).st_mode > 0,
+            }
+            for descriptor in opened:
+                os.close(descriptor)
+            os.close(readiness)
+            os.close(63)
+            sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
+            """
+        )
+        for limit in (64, 65):
+            for readiness in (9, 80):
+                with self.subTest(limit=limit, readiness=readiness):
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-B",
+                            "-S",
+                            "-c",
+                            probe,
+                            str(limit),
+                            str(readiness),
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        completed.returncode, 0, completed.stderr
+                    )
+                    report = json.loads(completed.stdout)
+                    occupied = {0, 1, 2, 63, readiness}
+                    occupied_below_limit = {
+                        descriptor
+                        for descriptor in occupied
+                        if descriptor < limit
+                    }
+                    available = set(range(limit)) - occupied_below_limit
+                    self.assertEqual(
+                        report,
+                        {
+                            "failure_errno": errno.EMFILE,
+                            "maximum": max(available),
+                            "opened": len(available),
+                            "readiness_live": True,
+                        },
+                    )
+
     def test_strict_root_command_binds_network_namespace_and_uses_proc_inventory(
         self,
     ) -> None:
@@ -12003,7 +12721,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         candidate_index = command.index(candidate_source)
         self.assertIn("--net", command)
         self.assertLess(command.index("--net"), command.index("/usr/bin/setpriv"))
-        self.assertEqual(command[bootstrap_index + 4], "net:[103]")
+        self.assertEqual(command[bootstrap_index + 5], "net:[103]")
         self.assertEqual(command[candidate_index + 5], "1234")
         self.assertEqual(command[candidate_index + 6], "net:[103]")
         self.assertEqual(command[candidate_index + 7], "63")
@@ -12618,12 +13336,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             'source_mount_record["mountpoint"] == path', bootstrap_source
         )
         bootstrap_index = command.index(bootstrap_source)
-        namespace_bindings = json.loads(command[bootstrap_index + 5])
+        namespace_bindings = json.loads(command[bootstrap_index + 6])
         self.assertEqual(
             namespace_bindings,
             [{"device": 1, "inode": 2, "path": "/execution"}],
         )
-        namespace_read_bindings = json.loads(command[bootstrap_index + 6])
+        namespace_read_bindings = json.loads(command[bootstrap_index + 7])
         expected_read_binding = dict(self.root_command_config()["read_roots"][0])
         expected_read_binding.pop("host_mount_id")
         self.assertEqual(namespace_read_bindings, [expected_read_binding])
@@ -19217,10 +19935,10 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             + TRUSTED_JOB_RUNNER_MARGIN_MINUTES,
             int(EXPECTED_TEST_TIMEOUT_MINUTES),
         )
-        self.assertEqual(TRUSTED_TEST_SUITE_TIMEOUT_SECONDS, 8 * 60)
+        self.assertEqual(TRUSTED_TEST_SUITE_TIMEOUT_SECONDS, 10 * 60)
         self.assertEqual(TRUSTED_TEST_CLEANUP_RESERVE_SECONDS, 2 * 60)
-        self.assertEqual(TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS, 10 * 60)
-        self.assertEqual(TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS, 5 * 60)
+        self.assertEqual(TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS, 12 * 60)
+        self.assertEqual(TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS, 3 * 60)
         self.assertEqual(TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS, 1)
         self.assertEqual(
             TRUSTED_TEST_SUITE_TIMEOUT_SECONDS
@@ -19246,6 +19964,115 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             source.startswith("from __future__ import annotations\n"),
             "workflow tests must import on Python 3.9 before builtin generic "
             "annotations are evaluated",
+        )
+
+    def test_documented_python_entrypoints_avoid_python_39_affix_apis(
+        self,
+    ) -> None:
+        candidate_source = TRUSTED_CANDIDATE_SUPPORT_PATH.read_text(
+            encoding="utf-8"
+        )
+        workflow_source = Path(__file__).resolve(strict=True).read_text(
+            encoding="utf-8"
+        )
+        for description, source in (
+            ("candidate support", candidate_source),
+            ("workflow tests", workflow_source),
+        ):
+            forbidden = sorted(
+                {
+                    node.attr
+                    for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.Attribute)
+                    and node.attr in {"removeprefix", "removesuffix"}
+                }
+            )
+            self.assertEqual(
+                forbidden,
+                [],
+                f"{description} must avoid Python 3.9-only string-affix APIs",
+            )
+
+        if DISTRIBUTION_PROFILE == "canonical":
+            documented_commands = (
+                TrustedCandidateTestSupervisorRegressionTests.readme_test_commands(
+                    REPO_ROOT
+                )
+            )
+            self.assertEqual(
+                documented_commands,
+                [README_COMPILE_COMMAND, README_DISCOVERY_COMMAND],
+            )
+        candidate_sha = "a" * 40
+        with mock.patch.dict(
+            os.environ, {REQUIRED_CI_CANDIDATE_SHA_ENV: ""}, clear=False
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_run_candidate_git",
+            return_value=f"{candidate_sha}\n".encode("ascii"),
+        ):
+            os.environ.pop(REQUIRED_CI_CANDIDATE_SHA_ENV, None)
+            observed_sha, require_clean = (
+                _CANDIDATE_SUPPORT.expected_candidate_sha(REPO_ROOT)
+            )
+        self.assertEqual(observed_sha, candidate_sha)
+        self.assertFalse(require_clean)
+
+        candidate_binding = {"candidate_sha": candidate_sha}
+        trusted_inventory = [
+            {"module": "test_runtime.py", "test_ids": ["RuntimeTests.test_ok"]}
+        ]
+        trusted_source_sha256 = {"test_runtime.py": "b" * 64}
+        expected_receipt = {
+            "schema_version": TRUSTED_TEST_RECEIPT_SCHEMA_VERSION,
+            "status": "completed",
+            **candidate_binding,
+            "trusted_inventory": trusted_inventory,
+            "trusted_source_sha256": trusted_source_sha256,
+            "expected_test_count": 1,
+            "executed_test_count": 1,
+            "failures": 0,
+            "errors": 0,
+            "skipped": 0,
+            "expected_failures": 0,
+            "unexpected_successes": 0,
+        }
+        completed = subprocess.CompletedProcess(
+            args=["trusted-child"],
+            returncode=TRUSTED_TEST_CHILD_SUCCESS_EXIT,
+            stdout=(
+                TRUSTED_TEST_RECEIPT_SENTINEL
+                + json.dumps(
+                    expected_receipt, sort_keys=True, separators=(",", ":")
+                )
+                + "\n"
+            ),
+            stderr="",
+        )
+        self.assertEqual(
+            _validated_trusted_child_receipt(
+                completed,
+                trusted_inventory,
+                trusted_source_sha256,
+                candidate_binding,
+            ),
+            expected_receipt,
+        )
+
+    def test_workflow_tests_avoid_python_310_parenthesized_context_managers(
+        self,
+    ) -> None:
+        source = Path(__file__).resolve(strict=True).read_text(encoding="utf-8")
+        parenthesized_with_lines = [
+            source.count("\n", 0, match.start()) + 1
+            for match in re.finditer(r"(?m)^[ \t]*with[ \t]+\(", source)
+        ]
+
+        self.assertEqual(
+            parenthesized_with_lines,
+            [],
+            "workflow tests must avoid Python 3.10-only parenthesized "
+            "multiple-context-manager syntax",
         )
 
     def test_trusted_checkout_requires_an_explicit_candidate_root(self) -> None:

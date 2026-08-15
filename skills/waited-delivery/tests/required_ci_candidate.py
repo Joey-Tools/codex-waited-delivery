@@ -58,6 +58,8 @@ CANDIDATE_WORKSPACE_ARCHIVE_LIMIT_BYTES = 4 * 1024 * 1024
 _CANDIDATE_WORKSPACE_TAR_RECORD_BYTES = 20 * 512
 _STRICT_WRITABLE_ROOT_LIMIT = 64
 _STRICT_HOST_READ_ROOT_LIMIT = 32
+_STRICT_BOOTSTRAP_NOFILE_MINIMUM = 64
+_STRICT_BOOTSTRAP_NOFILE_LIMIT = 256
 _STRICT_MOUNTINFO_LIMIT_BYTES = 1024 * 1024
 _STRICT_NETWORK_INTERFACE_FD = 63
 _STRICT_PRIVATE_SURFACE_PATHS = (
@@ -85,6 +87,69 @@ _STRICT_HOST_READ_ROOT_PURPOSES = {
     "trusted-git": "file",
     "trusted-test-file": "file",
 }
+
+
+def _strict_bootstrap_nofile_requirement(
+    writable_bindings: Sequence[Mapping[str, object]],
+    read_bindings: Sequence[Mapping[str, object]],
+) -> int:
+    if (
+        type(writable_bindings) not in (list, tuple)
+        or not 1 <= len(writable_bindings) <= _STRICT_WRITABLE_ROOT_LIMIT
+        or type(read_bindings) not in (list, tuple)
+        or not 1 <= len(read_bindings) <= _STRICT_HOST_READ_ROOT_LIMIT
+    ):
+        raise AssertionError(
+            "strict bootstrap descriptor capacity binding is malformed"
+        )
+    component_depths: list[int] = []
+    for binding in read_bindings:
+        if type(binding) is not dict:
+            raise AssertionError(
+                "strict bootstrap descriptor capacity binding is malformed"
+            )
+        components = binding.get("components")
+        if type(components) is not list or not components:
+            raise AssertionError(
+                "strict bootstrap descriptor capacity binding is malformed"
+            )
+        component_depths.append(len(components))
+    # The bootstrap simultaneously holds 2W writable source/bind FDs and R
+    # read-root FDs.  Landlock adds 31 fixed FDs, while component revalidation
+    # adds D+7 instead.  The fixed ceiling admits the public W=64/R=32 maxima
+    # through D=89 and turns deeper control-plane input into a prelaunch error.
+    required = max(
+        _STRICT_BOOTSTRAP_NOFILE_MINIMUM,
+        (2 * len(writable_bindings))
+        + len(read_bindings)
+        + max(31, max(component_depths) + 7),
+    )
+    if required > _STRICT_BOOTSTRAP_NOFILE_LIMIT:
+        raise AssertionError(
+            "strict bootstrap descriptor capacity exceeds its fixed limit"
+        )
+    return required
+
+
+def _assert_strict_bootstrap_nofile_capacity(required: int) -> None:
+    if (
+        type(required) is not int
+        or not _STRICT_BOOTSTRAP_NOFILE_MINIMUM
+        <= required
+        <= _STRICT_BOOTSTRAP_NOFILE_LIMIT
+    ):
+        raise AssertionError("strict bootstrap descriptor capacity is malformed")
+    _soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if (
+        type(hard_limit) is not int
+        or (
+            hard_limit != resource.RLIM_INFINITY
+            and hard_limit < required
+        )
+    ):
+        raise AssertionError(
+            "strict bootstrap inherited hard limit is insufficient"
+        )
 _STRICT_ZERO_SCAN_COUNT = 3
 _STRICT_ZERO_SCAN_INTERVAL_SECONDS = 0.05
 _STRICT_REGISTRY_ENTRY_LIMIT = 256
@@ -729,6 +794,10 @@ def _parse_candidate_sha(value: str, description: str) -> str:
     return value
 
 
+def _without_single_trailing_newline(value: str) -> str:
+    return value[:-1] if value.endswith("\n") else value
+
+
 def expected_candidate_sha(root: Path) -> tuple[str, bool]:
     value = os.environ.get(CANDIDATE_SHA_ENV)
     if value is not None:
@@ -742,7 +811,9 @@ def expected_candidate_sha(root: Path) -> tuple[str, bool]:
         decoded = head.decode("ascii")
     except UnicodeDecodeError as error:
         raise AssertionError("candidate HEAD is not ASCII") from error
-    return _parse_candidate_sha(decoded.removesuffix("\n"), "candidate HEAD"), False
+    return _parse_candidate_sha(
+        _without_single_trailing_newline(decoded), "candidate HEAD"
+    ), False
 
 
 def _ordinary_candidate_file(root: Path, relative_path: Path) -> Path:
@@ -1057,7 +1128,9 @@ def _candidate_script_manifest(
             )
             try:
                 tracked_size = int(
-                    size_output.decode("ascii").removesuffix("\n")
+                    _without_single_trailing_newline(
+                        size_output.decode("ascii")
+                    )
                 )
             except (UnicodeDecodeError, ValueError) as error:
                 raise AssertionError(
@@ -1416,7 +1489,9 @@ def _candidate_workspace_sources(
         output_limit=32,
     )
     try:
-        object_format = object_format_output.decode("ascii").removesuffix("\n")
+        object_format = _without_single_trailing_newline(
+            object_format_output.decode("ascii")
+        )
     except UnicodeDecodeError as error:
         raise AssertionError("candidate Git object format is malformed") from error
     if object_format != "sha1" or len(candidate_sha) != 40:
@@ -2983,6 +3058,57 @@ import sys
 NETWORK_INTERFACE_FD = 63
 
 
+def bootstrap_nofile_requirement(writable_roots, read_roots):
+    if (
+        type(writable_roots) is not list
+        or not 1 <= len(writable_roots) <= 64
+        or type(read_roots) is not list
+        or not 1 <= len(read_roots) <= 32
+    ):
+        raise SystemExit(150)
+    component_depths = []
+    for document in read_roots:
+        if type(document) is not dict:
+            raise SystemExit(150)
+        components = document.get("components")
+        if type(components) is not list or not components:
+            raise SystemExit(150)
+        component_depths.append(len(components))
+    # Match the parent/root proof: 2W+R held FDs plus the greater of the 31
+    # fixed Landlock FDs and D+7 component-revalidation FDs.
+    required = max(
+        64,
+        (2 * len(writable_roots))
+        + len(read_roots)
+        + max(31, max(component_depths) + 7),
+    )
+    if required > 256:
+        raise SystemExit(150)
+    return required
+
+
+def set_bootstrap_nofile_limit(required_nofile):
+    _inherited_soft, inherited_hard = resource.getrlimit(
+        resource.RLIMIT_NOFILE
+    )
+    if (
+        type(inherited_hard) is not int
+        or (
+            inherited_hard != resource.RLIM_INFINITY
+            and inherited_hard < required_nofile
+        )
+    ):
+        raise SystemExit(150)
+    resource.setrlimit(
+        resource.RLIMIT_NOFILE, (required_nofile, required_nofile)
+    )
+    if resource.getrlimit(resource.RLIMIT_NOFILE) != (
+        required_nofile,
+        required_nofile,
+    ):
+        raise SystemExit(150)
+
+
 def reject_mount_network_probe(stage, error=None):
     error_number = getattr(error, "errno", None)
     suffix = (
@@ -2998,13 +3124,18 @@ def reject_mount_network_probe(stage, error=None):
     raise SystemExit(150)
 
 
-if len(sys.argv) < 7:
+if len(sys.argv) < 9:
     reject_mount_network_probe("arguments")
 try:
     readiness_fd = int(sys.argv[1])
+    required_nofile = int(sys.argv[2])
 except ValueError:
     reject_mount_network_probe("readiness-number")
-if readiness_fd <= 2 or readiness_fd == NETWORK_INTERFACE_FD:
+if (
+    readiness_fd <= 2
+    or readiness_fd == NETWORK_INTERFACE_FD
+    or str(required_nofile) != sys.argv[2]
+):
     reject_mount_network_probe("readiness-number")
 try:
     os.fstat(NETWORK_INTERFACE_FD)
@@ -3014,12 +3145,27 @@ except OSError as error:
 else:
     reject_mount_network_probe("reserved-fd-occupied")
 
+host_mount_namespace = sys.argv[3]
+host_ipc_namespace = sys.argv[4]
+host_network_namespace = sys.argv[5]
+try:
+    writable_roots = json.loads(sys.argv[6])
+    read_roots = json.loads(sys.argv[7])
+except json.JSONDecodeError:
+    raise SystemExit(150)
+continuation_argv = sys.argv[8:]
+if required_nofile != bootstrap_nofile_requirement(
+    writable_roots, read_roots
+):
+    raise SystemExit(150)
+
+set_bootstrap_nofile_limit(required_nofile)
+
 STRICT_LIMITS = {
     resource.RLIMIT_NPROC: 64,
     resource.RLIMIT_CPU: 20,
     resource.RLIMIT_AS: 1073741824,
     resource.RLIMIT_FSIZE: 1048576,
-    resource.RLIMIT_NOFILE: 64,
     resource.RLIMIT_MSGQUEUE: 8388608,
     resource.RLIMIT_CORE: 1,
 }
@@ -3205,18 +3351,6 @@ NAMESPACE_READ_PATHS = (
     *((path, "file") for path, _ in IPC_SYSCTLS),
 )
 
-host_mount_namespace = sys.argv[2]
-host_ipc_namespace = sys.argv[3]
-host_network_namespace = sys.argv[4]
-try:
-    writable_roots = json.loads(sys.argv[5])
-except json.JSONDecodeError:
-    raise SystemExit(150)
-try:
-    read_roots = json.loads(sys.argv[6])
-except json.JSONDecodeError:
-    raise SystemExit(150)
-continuation_argv = sys.argv[7:]
 if (
     readiness_fd <= 2
     or not host_mount_namespace.startswith("mnt:[")
@@ -4680,6 +4814,9 @@ finally:
 if type(landlock_ruleset_fd) is not int or landlock_ruleset_fd < 0:
     raise SystemExit(165)
 activate_candidate_landlock(landlock_ruleset_fd)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+if resource.getrlimit(resource.RLIMIT_NOFILE) != (64, 64):
+    raise SystemExit(162)
 
 try:
     open_descriptors = set()
@@ -5956,6 +6093,10 @@ def _root_controller_candidate_command(
     read_root_bindings = _revalidate_strict_host_read_root_bindings(
         config.get("read_roots")
     )
+    bootstrap_nofile = _strict_bootstrap_nofile_requirement(
+        writable_root_bindings, read_root_bindings
+    )
+    _assert_strict_bootstrap_nofile_capacity(bootstrap_nofile)
     if any(
         binding["target_uid"] != uid or binding["target_gid"] != gid
         for binding in read_root_bindings
@@ -6063,6 +6204,7 @@ def _root_controller_candidate_command(
         "-c",
         _MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
         str(mount_readiness_fd),
+        str(bootstrap_nofile),
         host_mount_namespace,
         host_ipc_namespace,
         host_network_namespace,
@@ -12567,6 +12709,10 @@ def _invoke_strict_controller(
         int(realm["gid"]),
         readable_roots=tuple(Path(path) for path in readable_roots),
     )
+    bootstrap_nofile = _strict_bootstrap_nofile_requirement(
+        writable_root_bindings, read_root_bindings
+    )
+    _assert_strict_bootstrap_nofile_capacity(bootstrap_nofile)
     writable_paths = [
         Path(str(binding["path"])) for binding in writable_root_bindings
     ]
@@ -12907,8 +13053,19 @@ def _wait_outer_owner_fault_ack(
     path: Path,
     process: subprocess.Popen[bytes],
     *,
+    boundary: str,
+    selected_signal: int,
+    stdout_file: IO[bytes],
+    stderr_file: IO[bytes],
     timeout_seconds: float = _STRICT_WATCHDOG_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
+    if (
+        boundary not in _OUTER_OWNER_FAULT_BOUNDARIES
+        or selected_signal not in (signal.SIGKILL, signal.SIGSTOP)
+    ):
+        raise AssertionError(
+            "strict outer owner fault diagnostic context is malformed"
+        )
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         try:
@@ -12916,12 +13073,73 @@ def _wait_outer_owner_fault_ack(
         except AssertionError as error:
             if not isinstance(error.__cause__, FileNotFoundError):
                 raise
-        if process.poll() is not None:
+        returncode = process.poll()
+        if returncode is not None:
+            if type(returncode) is not int:
+                raise AssertionError(
+                    "strict outer owner terminal return code is malformed"
+                )
+            signal_name = {
+                signal.SIGKILL: "SIGKILL",
+                signal.SIGSTOP: "SIGSTOP",
+            }[selected_signal]
+            context = json.dumps(
+                {
+                    "boundary": boundary,
+                    "returncode": returncode,
+                    "selected_signal": signal_name,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            stdout = _read_outer_owner_terminal_diagnostic(stdout_file)
+            stderr = _read_outer_owner_terminal_diagnostic(stderr_file)
+            detail = _bounded_failure_text(
+                context + "\nstdout: " + stdout + "\nstderr: " + stderr,
+                2000,
+            )
             raise AssertionError(
-                "strict outer owner exited before publishing its fault ACK"
+                "strict outer owner exited before publishing its fault ACK: "
+                + detail
             )
         time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
     raise AssertionError("strict outer owner fault ACK timed out")
+
+
+def _read_outer_owner_terminal_diagnostic(
+    stream: IO[bytes],
+    *,
+    byte_limit: int = 4096,
+    text_limit: int = 700,
+) -> str:
+    if byte_limit != 4096 or text_limit != 700:
+        raise AssertionError("strict outer owner diagnostic bounds are malformed")
+    try:
+        descriptor = stream.fileno()
+        if type(descriptor) is not int or descriptor < 0:
+            raise OSError(errno.EBADF, "invalid diagnostic descriptor")
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size < 0:
+            raise OSError(errno.EINVAL, "invalid diagnostic object")
+        if metadata.st_size <= byte_limit:
+            data = os.pread(descriptor, metadata.st_size, 0)
+        else:
+            head_limit = byte_limit // 2
+            tail_limit = byte_limit - head_limit
+            head = os.pread(descriptor, head_limit, 0)
+            tail = os.pread(
+                descriptor,
+                tail_limit,
+                metadata.st_size - tail_limit,
+            )
+            data = head + b"...[output middle truncated]..." + tail
+    except OSError as error:
+        error_number = error.errno if type(error.errno) is int else errno.EIO
+        return f"[diagnostic unavailable errno={error_number}]"
+    return _bounded_failure_text(
+        data.decode("utf-8", errors="backslashreplace"),
+        text_limit,
+    )
 
 
 def _validate_outer_owner_fault_ack(
@@ -13437,6 +13655,10 @@ def _probe_independent_outer_owner_fault(
         ack = _wait_outer_owner_fault_ack(
             ack_path,
             process,
+            boundary=boundary,
+            selected_signal=selected_signal,
+            stdout_file=stdout_file,
+            stderr_file=stderr_file,
             timeout_seconds=(
                 _STRICT_WATCHDOG_TIMEOUT_SECONDS
                 if boundary != "after-target-active"

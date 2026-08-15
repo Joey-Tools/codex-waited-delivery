@@ -98,4 +98,4 @@ jobs:
           REQUIRED_CI_CANDIDATE_SHA: ${{ github.sha }}
           REQUIRED_CI_ISOLATION_MODE: sudo-setpriv-v1
         run: |
-          python3 -I -B -S -c 'import os,sys,time; environment=os.environ.copy(); environment["REQUIRED_CI_SUPERVISOR_DEADLINE"]=f"{time.monotonic()+600:.9f}"; os.execve(sys.executable,[sys.executable,"-I","-B","-S",environment["GITHUB_WORKSPACE"]+"/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py","--run-trusted-tests"],environment)'
+          python3 -I -B -S -c 'import os,sys,time; environment=os.environ.copy(); environment["REQUIRED_CI_SUPERVISOR_DEADLINE"]=f"{time.monotonic()+720:.9f}"; os.execve(sys.executable,[sys.executable,"-I","-B","-S",environment["GITHUB_WORKSPACE"]+"/.required-ci/skills/waited-delivery/tests/test_required_ci_workflow.py","--run-trusted-tests"],environment)'
