@@ -155,6 +155,24 @@ _STRICT_ZERO_SCAN_INTERVAL_SECONDS = 0.05
 _STRICT_REGISTRY_ENTRY_LIMIT = 256
 _STRICT_WATCHDOG_HEARTBEAT_SECONDS = 1.0
 _STRICT_WATCHDOG_TIMEOUT_SECONDS = 5.0
+_REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS = (
+    _STRICT_WATCHDOG_TIMEOUT_SECONDS
+    + (CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS * 2)
+)
+_OUTER_OWNER_FAILURE_PROPAGATION_TIMEOUT_SECONDS = (
+    CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS * 2
+)
+_OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS = (
+    _STRICT_WATCHDOG_TIMEOUT_SECONDS
+)
+# The parent must outlive the nested ACK wait, registered-sudo cleanup/reap,
+# and a separate bounded terminal-diagnostic handoff.  Keep this a strict
+# inequality so a failure at an inner deadline cannot race the outer deadline.
+_OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS = (
+    _REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS
+    + _OUTER_OWNER_FAILURE_PROPAGATION_TIMEOUT_SECONDS
+    + _OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS
+)
 _STRICT_WATCHDOG_REPLAY_BACKOFF_INITIAL_SECONDS = 0.05
 _STRICT_WATCHDOG_REPLAY_BACKOFF_MAX_SECONDS = 1.0
 _WATCHDOG_READY_PREFIX = "REQUIRED_CI_WATCHDOG_READY:"
@@ -9249,7 +9267,11 @@ def _wait_registered_root_active(
     ],
 ]:
     expected_prefix = _ROOT_TARGET_ACTIVE_PREFIX.encode("ascii")
-    deadline = time.monotonic() + CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS
+    # The root controller may consume one watchdog window reaching namespace
+    # readiness and a full reap window waiting for the target-active marker
+    # before it can publish this ACK.  Keep this parser strict, but give that
+    # nested protocol a dedicated envelope instead of reusing the 5s reap cap.
+    deadline = time.monotonic() + _REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         try:
             metadata = os.fstat(output_file.fileno())
@@ -13725,6 +13747,14 @@ def _outer_owner_candidate_root_selector(candidate_root: Path) -> str | None:
     return None if selector is None else str(selected_root)
 
 
+def _outer_owner_fault_ack_timeout_seconds(boundary: str) -> float:
+    if boundary not in _OUTER_OWNER_FAULT_BOUNDARIES:
+        raise AssertionError("strict outer owner fault boundary is malformed")
+    if boundary == "after-target-active":
+        return _OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS
+    return _STRICT_WATCHDOG_TIMEOUT_SECONDS
+
+
 def _probe_independent_outer_owner_fault(
     boundary: str,
     selected_signal: int,
@@ -13853,12 +13883,7 @@ def _probe_independent_outer_owner_fault(
             selected_signal=selected_signal,
             stdout_file=stdout_file,
             stderr_file=stderr_file,
-            timeout_seconds=(
-                _STRICT_WATCHDOG_TIMEOUT_SECONDS
-                if boundary != "after-target-active"
-                else _STRICT_WATCHDOG_TIMEOUT_SECONDS
-                + (CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS * 3)
-            ),
+            timeout_seconds=_outer_owner_fault_ack_timeout_seconds(boundary),
         )
         (
             registry_root,

@@ -11126,6 +11126,189 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             parent_source.count("_signal_process_pidfd(owner_pidfd"), 2
         )
 
+    def test_registered_root_active_ack_covers_the_nested_wait_envelope(
+        self,
+    ) -> None:
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS,
+            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_TIMEOUT_SECONDS
+            + (_CANDIDATE_SUPPORT.CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS * 2),
+        )
+        self.assertGreater(
+            _CANDIDATE_SUPPORT._OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS,
+            _CANDIDATE_SUPPORT._REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT.CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT._OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS,
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS,
+            _CANDIDATE_SUPPORT._REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT._OUTER_OWNER_FAILURE_PROPAGATION_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT._OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS,
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS,
+            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._outer_owner_fault_ack_timeout_seconds(
+                "after-target-active"
+            ),
+            _CANDIDATE_SUPPORT._OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._outer_owner_fault_ack_timeout_seconds(
+                "after-outer-bound"
+            ),
+            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_TIMEOUT_SECONDS,
+        )
+        with self.assertRaisesRegex(AssertionError, "boundary is malformed"):
+            _CANDIDATE_SUPPORT._outer_owner_fault_ack_timeout_seconds(
+                "unsupported"
+            )
+        nonce = "a" * 32
+        session_id = "b" * 32
+        outer = (61000, 100, 61000, 61000)
+        target_uid = 60000
+        document = {"schema_version": 1, "nonce": nonce}
+        payload = (
+            _CANDIDATE_SUPPORT._ROOT_TARGET_ACTIVE_PREFIX.encode("ascii")
+            + json.dumps(
+                document, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+            + b"\n"
+        )
+        accepted_identities = ("accepted-identities",)
+
+        class DelayedTerminalProcess:
+            returncode: int | None = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+        process = DelayedTerminalProcess()
+        with tempfile.TemporaryFile() as output_file:
+            writer = os.dup(output_file.fileno())
+            monotonic_calls = 0
+
+            def delayed_monotonic() -> float:
+                nonlocal monotonic_calls
+                monotonic_calls += 1
+                if monotonic_calls <= 2:
+                    return 0.0
+                if monotonic_calls == 3:
+                    self.assertEqual(os.write(writer, payload), len(payload))
+                    process.returncode = 0
+                    return 6.0
+                raise AssertionError("root-active ACK wait exceeded its fixture")
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT.time,
+                    "monotonic",
+                    side_effect=delayed_monotonic,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.time, "sleep"
+                ) as sleep, mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_validate_registered_root_active",
+                    return_value=accepted_identities,
+                ) as validate:
+                    accepted = (
+                        _CANDIDATE_SUPPORT._wait_registered_root_active(
+                            output_file,
+                            process,  # type: ignore[arg-type]
+                            nonce=nonce,
+                            session_id=session_id,
+                            outer=outer,
+                            target_uid=target_uid,
+                        )
+                    )
+            finally:
+                os.close(writer)
+
+        self.assertEqual(accepted, (document, accepted_identities))
+        self.assertEqual(monotonic_calls, 3)
+        sleep.assert_called_once_with(
+            _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_INTERVAL_SECONDS
+        )
+        validate.assert_called_once_with(
+            document,
+            nonce=nonce,
+            outer=outer,
+            target_uid=target_uid,
+            expected_session_id=session_id,
+        )
+
+        class UnexpectedPollProcess:
+            def poll(self) -> int:
+                raise AssertionError("complete root-active ACK was polled")
+
+        for invalid_payload, expected_error in (
+            (payload + payload, "framing is malformed"),
+            (
+                _CANDIDATE_SUPPORT._ROOT_TARGET_ACTIVE_PREFIX.encode("ascii")
+                + b"{\n",
+                "ACK is malformed",
+            ),
+        ):
+            with self.subTest(expected_error=expected_error):
+                with tempfile.TemporaryFile() as output_file:
+                    self.assertEqual(
+                        os.write(output_file.fileno(), invalid_payload),
+                        len(invalid_payload),
+                    )
+                    with self.assertRaisesRegex(AssertionError, expected_error):
+                        _CANDIDATE_SUPPORT._wait_registered_root_active(
+                            output_file,
+                            UnexpectedPollProcess(),  # type: ignore[arg-type]
+                            nonce=nonce,
+                            session_id=session_id,
+                            outer=outer,
+                            target_uid=target_uid,
+                        )
+
+        class TerminalWithoutAckProcess:
+            def poll(self) -> int:
+                return 0
+
+        with tempfile.TemporaryFile() as output_file, self.assertRaisesRegex(
+            AssertionError, "exited before root-active ACK"
+        ):
+            _CANDIDATE_SUPPORT._wait_registered_root_active(
+                output_file,
+                TerminalWithoutAckProcess(),  # type: ignore[arg-type]
+                nonce=nonce,
+                session_id=session_id,
+                outer=outer,
+                target_uid=target_uid,
+            )
+
+        class LiveWithoutAckProcess:
+            def poll(self) -> None:
+                return None
+
+        with tempfile.TemporaryFile() as output_file, mock.patch.object(
+            _CANDIDATE_SUPPORT.time,
+            "monotonic",
+            side_effect=(0.0, 0.0, 16.0),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.time, "sleep"
+        ) as sleep, self.assertRaisesRegex(
+            AssertionError, "root-active ACK timed out"
+        ):
+            _CANDIDATE_SUPPORT._wait_registered_root_active(
+                output_file,
+                LiveWithoutAckProcess(),  # type: ignore[arg-type]
+                nonce=nonce,
+                session_id=session_id,
+                outer=outer,
+                target_uid=target_uid,
+            )
+        sleep.assert_called_once_with(
+            _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_INTERVAL_SECONDS
+        )
+
     def test_root_active_ack_requires_exact_full_ancestry(self) -> None:
         outer = (61000, 100, 61000, 61000)
         target_uid = 60000
@@ -11207,6 +11390,16 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "handshake"):
                 _CANDIDATE_SUPPORT._validate_registered_root_active(
                     forged_session,
+                    nonce=nonce,
+                    outer=outer,
+                    target_uid=target_uid,
+                    expected_session_id="b" * 32,
+                )
+            forged_nonce = dict(document)
+            forged_nonce["nonce"] = "c" * 32
+            with self.assertRaisesRegex(AssertionError, "inexact"):
+                _CANDIDATE_SUPPORT._validate_registered_root_active(
+                    forged_nonce,
                     nonce=nonce,
                     outer=outer,
                     target_uid=target_uid,
