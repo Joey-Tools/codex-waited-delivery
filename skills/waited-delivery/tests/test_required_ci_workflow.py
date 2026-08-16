@@ -25,6 +25,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import traceback
 import unittest
 import uuid
 from collections.abc import Iterator, Mapping
@@ -1325,6 +1326,146 @@ def _strict_runtime_live_owner_realm(
             "strict runtime live owner identity realm is malformed"
         )
     return realm
+
+
+_STRICT_LIVE_RUNNER_TEMP_DIAGNOSTIC_LIMIT_BYTES = 4096
+_STRICT_LIVE_RUNNER_TEMP_ACL_ATTRIBUTES = {
+    "system.posix_acl_access",
+    "system.posix_acl_default",
+}
+
+
+def _raise_strict_live_runner_temp_policy_rejection(
+    ancestors: list[dict[str, object]],
+    failure_index: int,
+    failure_reason: str,
+    target_uid: int,
+    target_gid: int,
+) -> None:
+    document: dict[str, object] = {
+        "ancestors": ancestors,
+        "first_failure": {
+            "index": failure_index,
+            "reason": failure_reason,
+        },
+        "target_gid": target_gid,
+        "target_uid": target_uid,
+    }
+    prefix = "strict live RUNNER_TEMP access policy rejected: "
+    message = prefix + json.dumps(document, sort_keys=True, separators=(",", ":"))
+    if (
+        len(message.encode("utf-8"))
+        > _STRICT_LIVE_RUNNER_TEMP_DIAGNOSTIC_LIMIT_BYTES
+    ):
+        failure_record = dict(ancestors[failure_index])
+        path = str(failure_record["path"])
+        failure_record["path"] = (
+            "<sha256:"
+            + hashlib.sha256(
+                path.encode("utf-8", errors="surrogatepass")
+            ).hexdigest()
+            + ">"
+        )
+        document["ancestors"] = [failure_record]
+        message = prefix + json.dumps(
+            document, sort_keys=True, separators=(",", ":")
+        )
+        if (
+            len(message.encode("utf-8"))
+            > _STRICT_LIVE_RUNNER_TEMP_DIAGNOSTIC_LIMIT_BYTES
+        ):
+            raise AssertionError(
+                "strict live RUNNER_TEMP access policy diagnostic exceeded its bound"
+            ) from None
+    raise AssertionError(message) from None
+
+
+def _validate_strict_live_runner_temp_access_policy(
+    runner_temp: Path,
+    target_uid: int,
+    target_gid: int,
+) -> None:
+    ancestor_records: list[dict[str, object]] = []
+    for index, ancestor in enumerate((runner_temp, *runner_temp.parents)):
+        try:
+            metadata = ancestor.lstat()
+        except OSError:
+            ancestor_records.append(
+                {
+                    "acl_status": "not-checked",
+                    "dev": None,
+                    "gid": None,
+                    "ino": None,
+                    "is_dir": None,
+                    "ix_other": None,
+                    "mode": None,
+                    "path": str(ancestor),
+                    "uid": None,
+                }
+            )
+            _raise_strict_live_runner_temp_policy_rejection(
+                ancestor_records,
+                index,
+                "lstat-unreadable",
+                target_uid,
+                target_gid,
+            )
+        is_directory = stat.S_ISDIR(metadata.st_mode)
+        has_other_execute = bool(metadata.st_mode & stat.S_IXOTH)
+        record: dict[str, object] = {
+            "acl_status": "not-checked",
+            "dev": metadata.st_dev,
+            "gid": metadata.st_gid,
+            "ino": metadata.st_ino,
+            "is_dir": is_directory,
+            "ix_other": has_other_execute,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "path": str(ancestor),
+            "uid": metadata.st_uid,
+        }
+        ancestor_records.append(record)
+        if not is_directory:
+            _raise_strict_live_runner_temp_policy_rejection(
+                ancestor_records,
+                index,
+                "not-directory",
+                target_uid,
+                target_gid,
+            )
+        if not has_other_execute:
+            _raise_strict_live_runner_temp_policy_rejection(
+                ancestor_records,
+                index,
+                "missing-other-execute",
+                target_uid,
+                target_gid,
+            )
+        try:
+            attributes = os.listxattr(ancestor, follow_symlinks=False)
+        except (AttributeError, OSError):
+            record["acl_status"] = "unreadable"
+            _raise_strict_live_runner_temp_policy_rejection(
+                ancestor_records,
+                index,
+                "acl-unreadable",
+                target_uid,
+                target_gid,
+            )
+        if _STRICT_LIVE_RUNNER_TEMP_ACL_ATTRIBUTES.intersection(attributes):
+            record["acl_status"] = "present"
+            _raise_strict_live_runner_temp_policy_rejection(
+                ancestor_records,
+                index,
+                "acl-present",
+                target_uid,
+                target_gid,
+            )
+        record["acl_status"] = "absent"
+        if ancestor == Path("/"):
+            return
+    raise AssertionError(
+        "strict live RUNNER_TEMP ancestor inventory is incomplete"
+    ) from None
 
 
 def _strict_runtime_live_main() -> int:
@@ -5427,6 +5568,86 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     "\U000e0001",
                 )
             )
+        )
+
+    def test_strict_live_entry_suppresses_runner_temp_filesystem_context(
+        self,
+    ) -> None:
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        registry: dict[str, object] = {}
+        realm = {"uid": 60000, "gid": 60000}
+        runner_temp = Path("/trusted/runner-temp")
+        metadata = os.stat_result(
+            (stat.S_IFDIR | 0o711, 37, 41, 2, 1001, 122, 0, 0, 0, 0)
+        )
+        raw_failure = (
+            "raw live diagnostic must not escape\n"
+            "  ::warning title=forged::context\n"
+            "noise ##[warning] forged\x1b[31m"
+        )
+
+        def reject_fixture() -> None:
+            _validate_strict_live_runner_temp_access_policy(
+                runner_temp,
+                60000,
+                60000,
+            )
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_candidate_binding",
+            return_value=(Path("/candidate"), candidate_sha, binding),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "trusted_isolation_chain_registry",
+            return_value=registry,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_owner_realm",
+            return_value=realm,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+            return_value=binding,
+        ), mock.patch.object(
+            sys.modules[__name__], "_close_and_verify_trusted_isolation"
+        ) as cleanup, mock.patch.object(
+            type(self),
+            CI_STRICT_RUNTIME_LIVE_TEST_METHOD,
+            side_effect=reject_fixture,
+        ), mock.patch.object(
+            Path, "lstat", return_value=metadata
+        ), mock.patch.object(
+            os,
+            "listxattr",
+            side_effect=OSError(errno.EACCES, raw_failure),
+            create=True,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", True
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(_strict_runtime_live_main(), 1)
+
+        cleanup.assert_called_once_with(registry)
+        self.assertEqual(stdout.getvalue(), "")
+        diagnostic = stderr.getvalue()
+        self.assertIn(
+            "strict live RUNNER_TEMP access policy rejected:", diagnostic
+        )
+        self.assertIn('"acl_status":"unreadable"', diagnostic)
+        self.assertIn('"reason":"acl-unreadable"', diagnostic)
+        self.assertIn(str(runner_temp), diagnostic)
+        self.assertNotIn("raw live diagnostic must not escape", diagnostic)
+        self.assertNotIn("::warning", diagnostic)
+        self.assertNotIn("##[warning]", diagnostic)
+        self.assertNotIn("\x1b", diagnostic)
+        self.assertLessEqual(
+            len(diagnostic),
+            len("strict runtime live evidence failed: ") + 2000 + 1,
         )
 
     def test_strict_live_entry_rejects_a_test_that_never_reaches_the_backend(
@@ -19520,6 +19741,246 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
             self.assertEqual(execution_marker.read_text(encoding="utf-8"), "ran")
 
+    def test_strict_live_runner_temp_policy_failure_reports_exact_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            runner_temp = Path(temporary_directory).resolve(strict=True)
+            runner_temp.chmod(0o700)
+            original_lstat = Path.lstat
+            observed_snapshots: list[Path] = []
+
+            def tracked_lstat(path: Path) -> os.stat_result:
+                observed_snapshots.append(path)
+                return original_lstat(path)
+
+            with mock.patch.object(sys, "platform", "linux"), mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE,
+                    "RUNNER_TEMP": str(runner_temp),
+                },
+                clear=False,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_ensure_strict_backend"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_realm",
+                return_value={"uid": 60000, "gid": 60000},
+            ), mock.patch.object(
+                os, "readlink", return_value="namespace:[1]"
+            ), mock.patch.object(
+                Path, "lstat", tracked_lstat
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_acl_is_absent"
+            ) as acl_is_absent, self.assertRaises(AssertionError) as captured:
+                self.test_strict_target_access_policy_blocks_snapshot_write_and_control_read()
+
+            metadata = original_lstat(runner_temp)
+            expected = {
+                "ancestors": [
+                    {
+                        "acl_status": "not-checked",
+                        "dev": metadata.st_dev,
+                        "gid": metadata.st_gid,
+                        "ino": metadata.st_ino,
+                        "is_dir": True,
+                        "ix_other": False,
+                        "mode": 0o700,
+                        "path": str(runner_temp),
+                        "uid": metadata.st_uid,
+                    }
+                ],
+                "first_failure": {
+                    "index": 0,
+                    "reason": "missing-other-execute",
+                },
+                "target_gid": 60000,
+                "target_uid": 60000,
+            }
+            prefix = "strict live RUNNER_TEMP access policy rejected: "
+            expected_message = prefix + json.dumps(
+                expected, sort_keys=True, separators=(",", ":")
+            )
+            self.assertEqual(str(captured.exception), expected_message)
+            self.assertLessEqual(len(expected_message.encode("utf-8")), 4096)
+            self.assertEqual(observed_snapshots, [runner_temp])
+            acl_is_absent.assert_not_called()
+
+    def test_strict_live_runner_temp_policy_reports_fixed_acl_failures(
+        self,
+    ) -> None:
+        runner_temp = Path("/trusted/runner-temp")
+        metadata = os.stat_result(
+            (stat.S_IFDIR | 0o711, 37, 41, 2, 1001, 122, 0, 0, 0, 0)
+        )
+        cases = (
+            (
+                "present",
+                ["system.posix_acl_access"],
+                "acl-present",
+            ),
+            (
+                "unreadable",
+                OSError(
+                    errno.EACCES,
+                    "raw diagnostic must not escape\n"
+                    "  ::warning title=forged::context\n"
+                    "noise ##[warning] forged\x1b[31m",
+                ),
+                "acl-unreadable",
+            ),
+        )
+        prefix = "strict live RUNNER_TEMP access policy rejected: "
+        for acl_status, listxattr_result, reason in cases:
+            with self.subTest(acl_status=acl_status):
+                listxattr_patch = (
+                    mock.patch.object(
+                        os,
+                        "listxattr",
+                        side_effect=listxattr_result,
+                        create=True,
+                    )
+                    if isinstance(listxattr_result, OSError)
+                    else mock.patch.object(
+                        os,
+                        "listxattr",
+                        return_value=listxattr_result,
+                        create=True,
+                    )
+                )
+                with mock.patch.object(
+                    Path, "lstat", return_value=metadata
+                ) as lstat_path, listxattr_patch as listxattr_path, self.assertRaises(
+                    AssertionError
+                ) as captured:
+                    _validate_strict_live_runner_temp_access_policy(
+                        runner_temp,
+                        60000,
+                        60000,
+                    )
+
+                message = str(captured.exception)
+                self.assertTrue(message.startswith(prefix), message)
+                document = json.loads(message[len(prefix) :])
+                self.assertEqual(
+                    document,
+                    {
+                        "ancestors": [
+                            {
+                                "acl_status": acl_status,
+                                "dev": 41,
+                                "gid": 122,
+                                "ino": 37,
+                                "is_dir": True,
+                                "ix_other": True,
+                                "mode": 0o711,
+                                "path": str(runner_temp),
+                                "uid": 1001,
+                            }
+                        ],
+                        "first_failure": {"index": 0, "reason": reason},
+                        "target_gid": 60000,
+                        "target_uid": 60000,
+                    },
+                )
+                self.assertLessEqual(len(message.encode("utf-8")), 4096)
+                self.assertNotIn("raw diagnostic must not escape", message)
+                formatted = "".join(
+                    traceback.format_exception(
+                        type(captured.exception),
+                        captured.exception,
+                        captured.exception.__traceback__,
+                    )
+                )
+                self.assertIn(prefix, formatted)
+                self.assertNotIn("raw diagnostic must not escape", formatted)
+                self.assertNotIn("::warning", formatted)
+                self.assertNotIn("##[warning]", formatted)
+                self.assertNotIn("\x1b", formatted)
+                lstat_path.assert_called_once_with()
+                listxattr_path.assert_called_once_with(
+                    runner_temp, follow_symlinks=False
+                )
+
+    def test_strict_live_runner_temp_policy_stops_at_first_unsafe_ancestor(
+        self,
+    ) -> None:
+        runner_temp = Path("/trusted/runner-temp")
+        safe_metadata = os.stat_result(
+            (stat.S_IFDIR | 0o711, 37, 41, 2, 1001, 122, 0, 0, 0, 0)
+        )
+        unsafe_metadata = os.stat_result(
+            (stat.S_IFDIR | 0o700, 43, 41, 2, 1001, 122, 0, 0, 0, 0)
+        )
+        observed: list[Path] = []
+
+        def lstat_ancestor(path: Path) -> os.stat_result:
+            observed.append(path)
+            if path == runner_temp:
+                return safe_metadata
+            if path == runner_temp.parent:
+                return unsafe_metadata
+            raise AssertionError("validation continued past the first failure")
+
+        with mock.patch.object(
+            Path, "lstat", lstat_ancestor
+        ), mock.patch.object(
+            os, "listxattr", return_value=[], create=True
+        ) as listxattr_path, self.assertRaises(AssertionError) as captured:
+            _validate_strict_live_runner_temp_access_policy(
+                runner_temp,
+                60000,
+                60000,
+            )
+
+        prefix = "strict live RUNNER_TEMP access policy rejected: "
+        message = str(captured.exception)
+        self.assertTrue(message.startswith(prefix), message)
+        document = json.loads(message[len(prefix) :])
+        self.assertEqual(
+            document["first_failure"],
+            {"index": 1, "reason": "missing-other-execute"},
+        )
+        self.assertEqual(
+            [record["acl_status"] for record in document["ancestors"]],
+            ["absent", "not-checked"],
+        )
+        self.assertEqual(observed, [runner_temp, runner_temp.parent])
+        listxattr_path.assert_called_once_with(
+            runner_temp, follow_symlinks=False
+        )
+
+    def test_strict_live_runner_temp_policy_diagnostic_is_bounded(
+        self,
+    ) -> None:
+        runner_temp = Path("/") / ("long-component" * 400)
+        metadata = os.stat_result(
+            (stat.S_IFDIR | 0o700, 37, 41, 2, 1001, 122, 0, 0, 0, 0)
+        )
+        with mock.patch.object(
+            Path, "lstat", return_value=metadata
+        ), self.assertRaises(AssertionError) as captured:
+            _validate_strict_live_runner_temp_access_policy(
+                runner_temp,
+                60000,
+                60000,
+            )
+
+        prefix = "strict live RUNNER_TEMP access policy rejected: "
+        message = str(captured.exception)
+        self.assertTrue(message.startswith(prefix), message)
+        self.assertLessEqual(len(message.encode("utf-8")), 4096)
+        document = json.loads(message[len(prefix) :])
+        self.assertRegex(
+            document["ancestors"][0]["path"],
+            r"^<sha256:[0-9a-f]{64}>$",
+        )
+        self.assertEqual(
+            document["first_failure"],
+            {"index": 0, "reason": "missing-other-execute"},
+        )
+
     def test_strict_target_access_policy_blocks_snapshot_write_and_control_read(
         self,
     ) -> None:
@@ -19556,17 +20017,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             raise AssertionError(
                 "strict live RUNNER_TEMP must be outside private mount surfaces"
             )
-        for ancestor in (runner_temp, *runner_temp.parents):
-            metadata = ancestor.stat()
-            if not stat.S_ISDIR(metadata.st_mode) or not metadata.st_mode & 0o001:
-                raise AssertionError(
-                    "strict live RUNNER_TEMP is not traversable by the target UID"
-                )
-            _CANDIDATE_SUPPORT._acl_is_absent(
-                ancestor, "strict live RUNNER_TEMP ancestor"
-            )
-            if ancestor == Path("/"):
-                break
+        _validate_strict_live_runner_temp_access_policy(
+            runner_temp,
+            target_uid,
+            target_gid,
+        )
 
         surface_roots: list[Path] = []
         surface_identities: dict[Path, tuple[int, int]] = {}
