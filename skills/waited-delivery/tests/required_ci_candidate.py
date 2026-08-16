@@ -9426,15 +9426,22 @@ def _publish_outer_owner_fault_ack(
     root = session.get("root")
     watchdog_identity = session.get("watchdog_identity")
     target_uid = session.get("target_uid")
+    realm = _strict_realm()
+    realm_uid = realm.get("uid")
+    realm_gid = realm.get("gid")
     if (
         session.get("inherited") is not False
         or not isinstance(root, Path)
         or type(watchdog_identity) is not tuple
         or len(watchdog_identity) != 6
         or type(target_uid) is not int
+        or type(realm_uid) is not int
+        or type(realm_gid) is not int
+        or target_uid != realm_uid
     ):
         raise AssertionError("strict outer owner fault session is not independent")
     root_metadata = root.lstat()
+    expected_root_mode = 0o710 if boundary == "after-target-active" else 0o700
     owner_identity = _process_identity(Path("/proc") / str(os.getpid()))
     if (
         owner_identity is None
@@ -9457,7 +9464,11 @@ def _publish_outer_owner_fault_ack(
         or watchdog_identity[5] != (os.getuid(),) * 4
         or not stat.S_ISDIR(root_metadata.st_mode)
         or root_metadata.st_uid != os.getuid()
-        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or stat.S_IMODE(root_metadata.st_mode) != expected_root_mode
+        or (
+            boundary == "after-target-active"
+            and root_metadata.st_gid != realm_gid
+        )
         or entry_path.parent != root / "entries"
     ):
         raise AssertionError("strict outer owner fault process binding is invalid")
@@ -9513,6 +9524,9 @@ def _publish_outer_owner_fault_ack(
             "path": str(root),
             "device": root_metadata.st_dev,
             "inode": root_metadata.st_ino,
+            "uid": root_metadata.st_uid,
+            "gid": root_metadata.st_gid,
+            "mode": stat.S_IMODE(root_metadata.st_mode),
         },
         "entry": {
             "path": str(entry_path),
@@ -13410,11 +13424,13 @@ def _validate_outer_owner_fault_ack(
     nonce: str,
     boundary: str,
     expected_session_id: str,
+    expected_target_uid: int,
+    expected_registry_gid: int,
     owner_identity: tuple[int, int, int, int, int, tuple[int, int, int, int]],
     parent_registry_root: Path,
 ) -> tuple[
     Path,
-    tuple[int, int],
+    tuple[int, int, int, int, int],
     tuple[int, int, int, int],
     tuple[int, int, int, int],
     int,
@@ -13451,16 +13467,31 @@ def _validate_outer_owner_fault_ack(
         "after-root-authorized-barrier": "root-authorized",
         "after-target-active": "root-authorized",
     }.get(boundary)
+    expected_root_mode = 0o710 if boundary == "after-target-active" else 0o700
     if (
-        ack.get("schema_version") != 1
+        type(expected_target_uid) is not int
+        or not 50000 <= expected_target_uid <= 64999
+        or type(expected_registry_gid) is not int
+        or expected_registry_gid < 0
+        or ack.get("schema_version") != 1
         or ack.get("nonce") != nonce
         or ack.get("boundary") != boundary
         or owner != tuple(_registered_process_binding(owner_identity))
         or type(root_binding) is not dict
-        or set(root_binding) != {"path", "device", "inode"}
+        or set(root_binding)
+        != {"path", "device", "inode", "uid", "gid", "mode"}
         or type(root_binding.get("path")) is not str
         or type(root_binding.get("device")) is not int
         or type(root_binding.get("inode")) is not int
+        or type(root_binding.get("uid")) is not int
+        or type(root_binding.get("gid")) is not int
+        or type(root_binding.get("mode")) is not int
+        or root_binding.get("uid") != os.getuid()
+        or root_binding.get("mode") != expected_root_mode
+        or (
+            boundary == "after-target-active"
+            and root_binding.get("gid") != expected_registry_gid
+        )
         or type(entry_binding) is not dict
         or set(entry_binding) != {"path", "session_id", "state"}
         or type(entry_binding.get("path")) is not str
@@ -13471,7 +13502,7 @@ def _validate_outer_owner_fault_ack(
         or entry_binding.get("session_id") != expected_session_id
         or entry_binding.get("state") != expected_state
         or type(ack.get("target_uid")) is not int
-        or not 50000 <= int(ack["target_uid"]) <= 64999
+        or ack.get("target_uid") != expected_target_uid
         or ack.get("wrapper_post_gate_ready")
         is not (
             boundary
@@ -13480,7 +13511,14 @@ def _validate_outer_owner_fault_ack(
     ):
         raise AssertionError("strict outer owner fault ACK binding is malformed")
     root = Path(str(root_binding["path"]))
-    root_identity = (int(root_binding["device"]), int(root_binding["inode"]))
+    root_policy_binding = (
+        int(root_binding["device"]),
+        int(root_binding["inode"]),
+        int(root_binding["uid"]),
+        int(root_binding["gid"]),
+        int(root_binding["mode"]),
+    )
+    root_identity = root_policy_binding[:2]
     entry_path = Path(str(entry_binding["path"]))
     session_id = str(entry_binding["session_id"])
     try:
@@ -13493,8 +13531,9 @@ def _validate_outer_owner_fault_ack(
         not root.is_absolute()
         or root == parent_registry_root
         or not stat.S_ISDIR(root_metadata.st_mode)
-        or root_metadata.st_uid != os.getuid()
-        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        or root_metadata.st_uid != root_binding["uid"]
+        or root_metadata.st_gid != root_binding["gid"]
+        or stat.S_IMODE(root_metadata.st_mode) != root_binding["mode"]
         or (root_metadata.st_dev, root_metadata.st_ino) != root_identity
         or entry_path
         != root / "entries" / f"chain-{session_id}.json"
@@ -13552,12 +13591,45 @@ def _validate_outer_owner_fault_ack(
         root_active_identities = ()
     return (
         root,
-        root_identity,
+        root_policy_binding,
         outer,
         watchdog,
         int(ack["target_uid"]),
         root_active_identities,
     )
+
+
+def _assert_outer_owner_registry_descriptor_binding(
+    descriptor: int,
+    binding: tuple[int, int, int, int, int],
+) -> None:
+    if (
+        type(descriptor) is not int
+        or descriptor < 0
+        or type(binding) is not tuple
+        or len(binding) != 5
+        or any(type(value) is not int or value < 0 for value in binding)
+    ):
+        raise AssertionError(
+            "strict outer owner registry descriptor binding is malformed"
+        )
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise AssertionError(
+            "strict outer owner registry descriptor is unreadable"
+        ) from error
+    observed = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+    )
+    if not stat.S_ISDIR(metadata.st_mode) or observed != binding:
+        raise AssertionError(
+            "strict outer owner registry descriptor access policy changed"
+        )
 
 
 def _wait_exact_registry_root_absent(
@@ -13947,7 +14019,7 @@ def _probe_independent_outer_owner_fault(
         )
         (
             registry_root,
-            registry_identity,
+            registry_policy_binding,
             outer,
             watchdog,
             target_uid,
@@ -13957,19 +14029,24 @@ def _probe_independent_outer_owner_fault(
             nonce=nonce,
             boundary=boundary,
             expected_session_id=session_id,
+            expected_target_uid=int(realm["uid"]),
+            expected_registry_gid=int(realm["gid"]),
             owner_identity=owner_identity,
             parent_registry_root=parent_registry_root,
         )
-        registry_descriptor = os.open(
-            registry_root,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        registry_identity = registry_policy_binding[:2]
+        try:
+            registry_descriptor = os.open(
+                registry_root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        except OSError as error:
+            raise AssertionError(
+                "strict outer owner registry descriptor cannot be opened"
+            ) from error
+        _assert_outer_owner_registry_descriptor_binding(
+            registry_descriptor, registry_policy_binding
         )
-        registry_metadata = os.fstat(registry_descriptor)
-        if (
-            (registry_metadata.st_dev, registry_metadata.st_ino)
-            != registry_identity
-        ):
-            raise AssertionError("strict outer owner registry descriptor changed")
         outer_pidfd = os.pidfd_open(outer[0], 0)
         watchdog_pidfd = os.pidfd_open(watchdog[0], 0)
         if (
@@ -13997,6 +14074,9 @@ def _probe_independent_outer_owner_fault(
                     f"at index {index}"
                 )
         _assert_outer_owner_sentinel(sentinel_path, nonce)
+        _assert_outer_owner_registry_descriptor_binding(
+            registry_descriptor, registry_policy_binding
+        )
         _signal_process_pidfd(owner_pidfd, selected_signal)
         process.wait(
             timeout=(

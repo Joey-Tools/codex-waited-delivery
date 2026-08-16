@@ -10994,6 +10994,681 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertIn("os.O_DIRECTORY | os.O_NOFOLLOW", parent_source)
         self.assertIn("bound_metadata.st_nlink != 0", absence_source)
 
+    def test_outer_fault_ack_binds_prepared_registry_root_policy(
+        self,
+    ) -> None:
+        nonce = "a" * 32
+        session_id = "b" * 32
+        target_uid = 60000
+        realm_gid = os.getgid()
+        owner_pid = os.getpid()
+        outer_pid = owner_pid + 10000
+        watchdog_pid = owner_pid + 10001
+        owner_identity = (
+            owner_pid,
+            101,
+            os.getppid(),
+            owner_pid,
+            owner_pid,
+            (os.getuid(),) * 4,
+        )
+        outer_identity = (
+            outer_pid,
+            102,
+            owner_pid,
+            outer_pid,
+            outer_pid,
+            (os.getuid(),) * 4,
+        )
+        watchdog_identity = (
+            watchdog_pid,
+            103,
+            owner_pid,
+            watchdog_pid,
+            watchdog_pid,
+            (os.getuid(),) * 4,
+        )
+        outer = tuple(
+            _CANDIDATE_SUPPORT._registered_process_binding(outer_identity)
+        )
+        sudo_parent_identity = (
+            owner_pid + 10002,
+            104,
+            outer_pid,
+            outer_pid,
+            outer_pid,
+            (os.getuid(), 0, 0, 0),
+        )
+        controller_identity = (
+            owner_pid + 10003,
+            105,
+            sudo_parent_identity[0],
+            outer_pid,
+            outer_pid,
+            (0, 0, 0, 0),
+        )
+        wrapper_identity = (
+            owner_pid + 10004,
+            106,
+            controller_identity[0],
+            outer_pid,
+            outer_pid,
+            (0, 0, 0, 0),
+        )
+        target_identity = (
+            owner_pid + 10005,
+            107,
+            wrapper_identity[0],
+            owner_pid + 10005,
+            owner_pid + 10005,
+            (target_uid,) * 4,
+        )
+        root_active = {
+            "schema_version": 1,
+            "nonce": nonce,
+            "root_handshake": {
+                "schema_version": 2,
+                "phase": "wrapper-bound",
+                "nonce": nonce,
+                "session_id": session_id,
+                "target_uid": target_uid,
+                "controller": _CANDIDATE_SUPPORT._registered_process_binding(
+                    controller_identity
+                ),
+                "sudo_parent": _CANDIDATE_SUPPORT._registered_process_binding(
+                    sudo_parent_identity
+                ),
+                "wrapper": _CANDIDATE_SUPPORT._registered_process_binding(
+                    wrapper_identity
+                ),
+            },
+            "target_marker": {
+                "schema_version": 1,
+                "nonce": nonce,
+                "uid": target_uid,
+                "gid": target_uid,
+            },
+            "sudo_parent": _CANDIDATE_SUPPORT._process_identity_document(
+                sudo_parent_identity
+            ),
+            "controller": _CANDIDATE_SUPPORT._process_identity_document(
+                controller_identity
+            ),
+            "wrapper": _CANDIDATE_SUPPORT._process_identity_document(
+                wrapper_identity
+            ),
+            "target": _CANDIDATE_SUPPORT._process_identity_document(
+                target_identity
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            control_root = Path(temporary_directory).resolve(strict=True)
+            root = control_root / "registry"
+            entries = root / "entries"
+            resources = root / "resources"
+            tombstones = root / ".tombstones"
+            trusted_control = root / "trusted-control"
+            for directory in (
+                root,
+                entries,
+                resources,
+                tombstones,
+                trusted_control,
+            ):
+                directory.mkdir(mode=0o700)
+            controller_path = trusted_control / "controller.py"
+            controller_path.write_bytes(b"trusted-controller")
+            ack_path = control_root / "fault-ack.json"
+            entry_path = entries / f"chain-{session_id}.json"
+            parent_registry_root = control_root / "parent-registry"
+            parent_registry_root.mkdir(mode=0o700)
+            entry_document = {
+                "session_id": session_id,
+                "state": "root-authorized",
+                "target_uid": target_uid,
+                "launcher_parent": list(
+                    _CANDIDATE_SUPPORT._registered_process_binding(
+                        owner_identity
+                    )
+                ),
+                "outer": list(outer),
+            }
+            session = {
+                "root": root,
+                "entries": entries,
+                "resources": resources,
+                "tombstones": tombstones,
+                "controller_path": controller_path,
+                "target_uid": target_uid,
+                "inherited": False,
+                "watchdog_identity": watchdog_identity,
+            }
+            identities = {
+                owner_pid: owner_identity,
+                outer_pid: outer_identity,
+                watchdog_pid: watchdog_identity,
+                sudo_parent_identity[0]: sudo_parent_identity,
+                controller_identity[0]: controller_identity,
+                wrapper_identity[0]: wrapper_identity,
+                target_identity[0]: target_identity,
+            }
+            real_lstat = Path.lstat
+            root_policy_override: dict[str, int] = {}
+
+            def prepared_lstat(path: Path) -> os.stat_result | object:
+                metadata = real_lstat(path)
+                if path == root and root_policy_override:
+                    return mock.Mock(
+                        st_dev=metadata.st_dev,
+                        st_ino=metadata.st_ino,
+                        st_mode=(
+                            stat.S_IFDIR
+                            | root_policy_override.get(
+                                "mode", stat.S_IMODE(metadata.st_mode)
+                            )
+                        ),
+                        st_uid=root_policy_override.get(
+                            "uid", metadata.st_uid
+                        ),
+                        st_gid=root_policy_override.get(
+                            "gid", metadata.st_gid
+                        ),
+                    )
+                if path != tombstones:
+                    return metadata
+                return mock.Mock(
+                    st_dev=metadata.st_dev,
+                    st_ino=metadata.st_ino,
+                    st_mode=stat.S_IFDIR | 0o710,
+                    st_uid=0,
+                    st_gid=os.getgid(),
+                )
+
+            def own_root(
+                _controller: Path,
+                operation: str,
+                path: Path,
+                uid: int,
+                gid: int,
+                purpose: str,
+            ) -> None:
+                self.assertEqual(operation, "own-root")
+                self.assertIn(path, (root, resources))
+                self.assertEqual(uid, os.getuid())
+                self.assertEqual(gid, realm_gid)
+                self.assertEqual(purpose, "isolation-ancestor")
+                path.chmod(0o710)
+
+            def process_identity(path: Path):
+                return identities.get(int(path.name))
+
+            with contextlib.ExitStack() as patch_stack:
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        Path,
+                        "lstat",
+                        autospec=True,
+                        side_effect=prepared_lstat,
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_realm",
+                        return_value={"uid": target_uid, "gid": realm_gid},
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_active_strict_session",
+                        return_value=session,
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_invoke_root_tree_operation",
+                        side_effect=own_root,
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        side_effect=process_identity,
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_chain_registry_lock",
+                        return_value=contextlib.nullcontext(),
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_load_chain_registry_entry",
+                        return_value=entry_document,
+                    )
+                )
+                patch_stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_read_outer_owner_json",
+                        return_value=entry_document,
+                    )
+                )
+                validate_root_active = patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_validate_registered_root_active",
+                            wraps=(
+                                _CANDIDATE_SUPPORT._validate_registered_root_active
+                            ),
+                        )
+                    )
+
+                def validate_ack(
+                    document: dict[str, object], boundary: str
+                ):
+                    return _CANDIDATE_SUPPORT._validate_outer_owner_fault_ack(
+                        document,
+                        nonce=nonce,
+                        boundary=boundary,
+                        expected_session_id=session_id,
+                        expected_target_uid=target_uid,
+                        expected_registry_gid=realm_gid,
+                        owner_identity=owner_identity,
+                        parent_registry_root=parent_registry_root,
+                    )
+
+                early_ack_path = control_root / "early-fault-ack.json"
+                _CANDIDATE_SUPPORT._publish_outer_owner_fault_ack(
+                    early_ack_path,
+                    nonce,
+                    "after-root-authorized",
+                    entry_path,
+                    outer,
+                    wrapper_post_gate_ready=False,
+                )
+                _CANDIDATE_SUPPORT._prepare_isolation_resource_ancestors(
+                    session
+                )
+                prepared = root.lstat()
+                self.assertEqual(prepared.st_uid, os.getuid())
+                self.assertEqual(prepared.st_gid, realm_gid)
+                self.assertEqual(stat.S_IMODE(prepared.st_mode), 0o710)
+                _CANDIDATE_SUPPORT._publish_outer_owner_fault_ack(
+                    ack_path,
+                    nonce,
+                    "after-target-active",
+                    entry_path,
+                    outer,
+                    wrapper_post_gate_ready=True,
+                    root_active=root_active,
+                )
+                ack = json.loads(ack_path.read_text(encoding="utf-8"))
+
+                for rejected_policy in (
+                    {"mode": 0o700},
+                    {"mode": 0o711},
+                    {"gid": realm_gid + 1},
+                ):
+                    with self.subTest(rejected_policy=rejected_policy):
+                        root_policy_override.update(rejected_policy)
+                        rejected_ack = control_root / "rejected-fault-ack.json"
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            "strict outer owner fault process binding is invalid",
+                        ):
+                            _CANDIDATE_SUPPORT._publish_outer_owner_fault_ack(
+                                rejected_ack,
+                                nonce,
+                                "after-target-active",
+                                entry_path,
+                                outer,
+                                wrapper_post_gate_ready=True,
+                                root_active=root_active,
+                            )
+                        self.assertFalse(rejected_ack.exists())
+                        root_policy_override.clear()
+                self.assertEqual(
+                    ack["registry_root"],
+                    {
+                        "path": str(root),
+                        "device": prepared.st_dev,
+                        "inode": prepared.st_ino,
+                        "uid": os.getuid(),
+                        "gid": realm_gid,
+                        "mode": 0o710,
+                    },
+                )
+
+                early_ack = json.loads(
+                    early_ack_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(early_ack["registry_root"]["mode"], 0o700)
+                root.chmod(0o700)
+                try:
+                    early_accepted = validate_ack(
+                        early_ack, "after-root-authorized"
+                    )
+                finally:
+                    root.chmod(0o710)
+                accepted = validate_ack(ack, "after-target-active")
+                for field, value in (
+                    ("mode", 0o700),
+                    ("mode", 0o711),
+                    ("gid", realm_gid + 1),
+                ):
+                    with self.subTest(field=field, value=value):
+                        changed_ack = json.loads(json.dumps(ack))
+                        changed_ack["registry_root"][field] = value
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            "strict outer owner fault ACK binding is malformed",
+                        ):
+                            validate_ack(changed_ack, "after-target-active")
+                original_root = root.with_name("registry-original")
+                root.rename(original_root)
+                try:
+                    root.mkdir(mode=0o710)
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "strict outer owner registry root binding changed",
+                    ):
+                        validate_ack(ack, "after-target-active")
+                finally:
+                    root.rmdir()
+                    original_root.rename(root)
+
+        self.assertEqual(accepted[0], root)
+        self.assertEqual(early_accepted[0], root)
+        self.assertEqual(
+            accepted[1],
+            (
+                prepared.st_dev,
+                prepared.st_ino,
+                os.getuid(),
+                realm_gid,
+                0o710,
+            ),
+        )
+        self.assertEqual(accepted[2], outer)
+        self.assertEqual(
+            accepted[3],
+            tuple(
+                _CANDIDATE_SUPPORT._registered_process_binding(
+                    watchdog_identity
+                )
+            ),
+        )
+        self.assertEqual(accepted[4], target_uid)
+        self.assertEqual(
+            accepted[5],
+            (
+                sudo_parent_identity,
+                controller_identity,
+                wrapper_identity,
+                target_identity,
+            ),
+        )
+        expected_root_active_call = mock.call(
+            root_active,
+            nonce=nonce,
+            outer=outer,
+            target_uid=target_uid,
+            expected_session_id=session_id,
+        )
+        self.assertEqual(
+            validate_root_active.call_args_list,
+            [expected_root_active_call, expected_root_active_call],
+        )
+
+    def test_outer_fault_descriptor_revalidates_registry_access_policy(
+        self,
+    ) -> None:
+        class CompletedOwner:
+            pid = os.getpid() + 20000
+            returncode = 0
+
+            def __init__(self) -> None:
+                self.inherited_descriptors: list[int] = []
+
+            def poll(self) -> int:
+                while self.inherited_descriptors:
+                    os.close(self.inherited_descriptors.pop())
+                return self.returncode
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                return self.returncode
+
+        process = CompletedOwner()
+        owner_identity = (
+            process.pid,
+            101,
+            os.getpid(),
+            process.pid,
+            process.pid,
+            (os.getuid(),) * 4,
+        )
+        outer_identity = (
+            process.pid + 1,
+            102,
+            process.pid,
+            process.pid + 1,
+            process.pid + 1,
+            (os.getuid(),) * 4,
+        )
+        watchdog_identity = (
+            process.pid + 2,
+            103,
+            process.pid,
+            process.pid + 2,
+            process.pid + 2,
+            (os.getuid(),) * 4,
+        )
+        outer = tuple(
+            _CANDIDATE_SUPPORT._registered_process_binding(outer_identity)
+        )
+        watchdog = tuple(
+            _CANDIDATE_SUPPORT._registered_process_binding(
+                watchdog_identity
+            )
+        )
+        identities = {
+            process.pid: owner_identity,
+            outer_identity[0]: outer_identity,
+            watchdog_identity[0]: watchdog_identity,
+        }
+        real_open = os.open
+        mutated_mode = {"value": 0o700}
+
+        def pipe2_cloexec(_flags: int) -> tuple[int, int]:
+            read_descriptor, write_descriptor = os.pipe()
+            os.set_inheritable(read_descriptor, False)
+            os.set_inheritable(write_descriptor, False)
+            return read_descriptor, write_descriptor
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            parent_registry_root = fixture_root / "parent-registry"
+            parent_registry_root.mkdir(mode=0o700)
+            registry_root = fixture_root / "child-registry"
+            registry_root.mkdir(mode=0o710)
+            registry_metadata = registry_root.lstat()
+            candidate_root = _CANDIDATE_SUPPORT.candidate_repository_root()
+            with tempfile.TemporaryFile() as lock_file, tempfile.TemporaryFile() as pidfd:
+                def launch_owner(
+                    *_arguments: object, **options: object
+                ) -> CompletedOwner:
+                    process.inherited_descriptors = [
+                        os.dup(descriptor)
+                        for descriptor in options["pass_fds"]  # type: ignore[union-attr]
+                    ]
+                    return process
+
+                def mutate_then_open(
+                    path: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    if Path(path) == registry_root:  # type: ignore[arg-type]
+                        registry_root.chmod(mutated_mode["value"])
+                    if dir_fd is None:
+                        return real_open(path, flags, mode)  # type: ignore[arg-type]
+                    return real_open(  # type: ignore[call-overload]
+                        path, flags, mode, dir_fd=dir_fd
+                    )
+
+                def process_identity(path: Path):
+                    return identities.get(int(path.name))
+
+                def legacy_identity_only_binding(
+                    descriptor: int,
+                    binding: tuple[int, int, int, int, int],
+                ) -> None:
+                    metadata = os.fstat(descriptor)
+                    if (metadata.st_dev, metadata.st_ino) != binding[:2]:
+                        raise AssertionError(
+                            "strict outer owner registry descriptor changed"
+                        )
+
+                with contextlib.ExitStack() as patch_stack:
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_active_strict_session",
+                            return_value={"root": parent_registry_root},
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_strict_realm",
+                            return_value={
+                                "lock": lock_file,
+                                "uid": 60000,
+                                "gid": os.getgid(),
+                            },
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_minimal_supervisor_environment",
+                            return_value={},
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.subprocess,
+                            "Popen",
+                            side_effect=launch_owner,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "pipe2",
+                            side_effect=pipe2_cloexec,
+                            create=True,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "pidfd_open",
+                            side_effect=lambda *_args: os.dup(pidfd.fileno()),
+                            create=True,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_process_identity",
+                            side_effect=process_identity,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_wait_outer_owner_fault_ack",
+                            return_value={},
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_validate_outer_owner_fault_ack",
+                            return_value=(
+                                registry_root,
+                                (
+                                    registry_metadata.st_dev,
+                                    registry_metadata.st_ino,
+                                    registry_metadata.st_uid,
+                                    registry_metadata.st_gid,
+                                    0o710,
+                                ),
+                                outer,
+                                watchdog,
+                                60000,
+                                (),
+                            ),
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "open",
+                            side_effect=mutate_then_open,
+                        )
+                    )
+                    signal_owner = patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_signal_process_pidfd",
+                        )
+                    )
+                    for rejected_mode in (0o700, 0o711):
+                        with self.subTest(rejected_mode=oct(rejected_mode)):
+                            registry_root.chmod(0o710)
+                            mutated_mode["value"] = rejected_mode
+                            with mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_assert_outer_owner_registry_descriptor_binding",
+                                side_effect=legacy_identity_only_binding,
+                            ), self.assertRaisesRegex(
+                                AssertionError,
+                                "was not terminated by an exact SIGKILL",
+                            ):
+                                _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault(
+                                    "after-target-active",
+                                    signal.SIGKILL,
+                                    candidate_root=candidate_root,
+                                    candidate_sha="a" * 40,
+                                )
+                            signal_owner.assert_called_once()
+                            signal_owner.reset_mock()
+                            registry_root.chmod(0o710)
+                            with self.assertRaisesRegex(
+                                AssertionError,
+                                "registry descriptor access policy changed",
+                            ):
+                                _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault(
+                                    "after-target-active",
+                                    signal.SIGKILL,
+                                    candidate_root=candidate_root,
+                                    candidate_sha="a" * 40,
+                                )
+                            signal_owner.assert_not_called()
+
     def test_registered_wrapper_waits_for_post_gate_continuation_before_sudo(
         self,
     ) -> None:
