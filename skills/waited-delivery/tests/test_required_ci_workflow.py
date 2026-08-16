@@ -9931,6 +9931,385 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertNotIn("close_trusted_isolation_chains", parent_source)
         self.assertNotIn("os.kill(", parent_source)
 
+    def test_after_target_active_outer_child_preserves_candidate_root_channel(
+        self,
+    ) -> None:
+        class LaunchCaptured(Exception):
+            pass
+
+        class ControllerReached(Exception):
+            pass
+
+        captured: dict[str, object] = {}
+
+        def pipe2_cloexec(_flags: int) -> tuple[int, int]:
+            read_descriptor, write_descriptor = os.pipe()
+            os.set_inheritable(read_descriptor, False)
+            os.set_inheritable(write_descriptor, False)
+            return read_descriptor, write_descriptor
+
+        def capture_launch(
+            command: object, **options: object
+        ) -> object:
+            captured["command"] = list(command)  # type: ignore[arg-type]
+            captured["environment"] = dict(options["env"])  # type: ignore[arg-type]
+            captured["cwd"] = options["cwd"]
+            raise LaunchCaptured
+
+        fixture_stack = contextlib.ExitStack()
+        self.addCleanup(fixture_stack.close)
+        candidate_directory = fixture_stack.enter_context(
+            tempfile.TemporaryDirectory()
+        )
+        candidate_root = Path(candidate_directory) / "checkout"
+        candidate_root.mkdir(mode=0o700)
+        fixture_stack.enter_context(
+            mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_TRUSTED_CHECKOUT_ROOT",
+                candidate_root,
+            )
+        )
+        self.assertNotEqual(candidate_root.name, ".candidate")
+        self.assertNotEqual(candidate_root.name, ".required-ci")
+        candidate_sha = "a" * 40
+        original_root_selector = os.environ.pop(
+            REQUIRED_CI_CANDIDATE_ROOT_ENV, None
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                registry_root = Path(temporary_directory) / "registry"
+                registry_root.mkdir(mode=0o700)
+                with tempfile.TemporaryFile() as lock_file:
+                    with contextlib.ExitStack() as patch_stack:
+                        patch_stack.enter_context(
+                            mock.patch.dict(
+                                os.environ,
+                                {
+                                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                                },
+                                clear=False,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_active_strict_session",
+                                return_value={"root": registry_root},
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_strict_realm",
+                                return_value={
+                                    "lock": lock_file,
+                                    "uid": 60000,
+                                    "gid": 60000,
+                                },
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT.subprocess,
+                                "Popen",
+                                side_effect=capture_launch,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT.os,
+                                "pipe2",
+                                side_effect=pipe2_cloexec,
+                                create=True,
+                            )
+                        )
+                        with self.assertRaises(LaunchCaptured):
+                            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault(
+                                "after-target-active",
+                                signal.SIGKILL,
+                                candidate_root=candidate_root,
+                                candidate_sha=candidate_sha,
+                            )
+        finally:
+            if original_root_selector is not None:
+                os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = (
+                    original_root_selector
+                )
+
+        command = captured["command"]
+        self.assertIsInstance(command, list)
+        command = list(command)  # type: ignore[arg-type]
+        self.assertEqual(
+            command[:5],
+            [
+                str(_CANDIDATE_SUPPORT._STRICT_PRIMITIVES["python"]),
+                "-I",
+                "-B",
+                "-S",
+                str(_CANDIDATE_SUPPORT._TRUSTED_SUPPORT_PATH),
+            ],
+        )
+        selector_index = command.index("--outer-owner-fault-probe")
+        self.assertEqual(selector_index, 5)
+        self.assertEqual(captured["cwd"], str(candidate_root))
+        captured_environment = captured["environment"]
+        self.assertIsInstance(captured_environment, dict)
+        captured_environment = dict(captured_environment)  # type: ignore[arg-type]
+        self.assertEqual(
+            captured_environment[REQUIRED_CI_CANDIDATE_SHA_ENV], candidate_sha
+        )
+
+        original_arguments = command[selector_index + 1 :]
+        self.assertEqual(len(original_arguments), 7)
+        nonce = str(original_arguments[0])
+        boundary = str(original_arguments[1])
+        session_id = str(original_arguments[3])
+        self.assertEqual(boundary, "after-target-active")
+        snapshot_calls: list[tuple[Path, str, bytes]] = []
+        controller_calls: list[dict[str, object]] = []
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            control_root = Path(temporary_directory).resolve(strict=True)
+            ack_path = control_root / "fault-ack.json"
+            sentinel_path = control_root / "sentinel"
+            runtime_root = control_root / "runtime"
+            runtime_root.mkdir(mode=0o700)
+            probe_path = runtime_root / "probe.py"
+            _CANDIDATE_SUPPORT._write_single_link_file(
+                sentinel_path,
+                f"armed:{nonce}".encode("ascii"),
+                0o600,
+            )
+            bootstrap_read, bootstrap_write = os.pipe()
+            pause_read, pause_write = os.pipe()
+            os.write(bootstrap_write, b"G")
+            os.close(bootstrap_write)
+
+            @contextlib.contextmanager
+            def observe_snapshot(
+                root: Path,
+                sha: str,
+                *,
+                probe_source: bytes,
+            ) -> Iterator[dict[str, object]]:
+                snapshot_calls.append((root, sha, probe_source))
+                yield {
+                    "candidate_paths": {Path("probe.py"): probe_path},
+                    "runtime_root": runtime_root,
+                }
+
+            def reach_controller(
+                _snapshot: dict[str, object],
+                _command: list[str],
+                _environment: dict[str, str],
+                _runtime_root: Path,
+                _stdin: bytes,
+                **options: object,
+            ) -> None:
+                controller_calls.append(options)
+                raise ControllerReached("target-active boundary reached")
+
+            child_arguments = [
+                nonce,
+                boundary,
+                str(ack_path),
+                session_id,
+                str(bootstrap_read),
+                str(pause_read),
+                str(sentinel_path),
+            ]
+            stderr = io.StringIO()
+            try:
+                with contextlib.ExitStack() as patch_stack:
+                    patch_stack.enter_context(
+                        mock.patch.dict(
+                            os.environ, captured_environment, clear=True
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "strict_isolation_platform_preflight",
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "trusted_isolation_chain_registry",
+                            return_value={"inherited": False},
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "close_trusted_isolation_chains",
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_execution_snapshot",
+                            side_effect=observe_snapshot,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_closed_candidate_environment",
+                            return_value={},
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_invoke_strict_controller",
+                            side_effect=reach_controller,
+                        )
+                    )
+                    patch_stack.enter_context(contextlib.redirect_stderr(stderr))
+                    self.assertEqual(
+                        _CANDIDATE_SUPPORT._outer_owner_fault_probe_main(
+                            child_arguments
+                        ),
+                        1,
+                    )
+            finally:
+                os.close(pause_write)
+
+        self.assertEqual(
+            snapshot_calls,
+            [
+                (
+                    candidate_root,
+                    candidate_sha,
+                    _CANDIDATE_SUPPORT._TARGET_ACTIVE_PROBE_SOURCE,
+                )
+            ],
+        )
+        self.assertEqual(len(controller_calls), 1)
+        trusted_fault_probe = controller_calls[0]["trusted_outer_fault_probe"]
+        self.assertEqual(trusted_fault_probe[1:3], (nonce, boundary))
+        self.assertNotIn(
+            REQUIRED_CI_CANDIDATE_ROOT_ENV, captured_environment
+        )
+        self.assertIn("ControllerReached: target-active boundary reached", stderr.getvalue())
+        self.assertNotIn(
+            "REQUIRED_CI_CANDIDATE_ROOT must be an absolute .candidate path",
+            stderr.getvalue(),
+        )
+
+    def test_outer_fault_candidate_root_channel_preserves_split_selector(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory).resolve(strict=True)
+            trusted_root = workspace / ".required-ci"
+            candidate_root = workspace / ".candidate"
+            trusted_root.mkdir(mode=0o700)
+            candidate_root.mkdir(mode=0o700)
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_TRUSTED_CHECKOUT_ROOT",
+                trusted_root,
+            ):
+                with mock.patch.dict(
+                    os.environ,
+                    {REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root)},
+                    clear=False,
+                ):
+                    self.assertEqual(
+                        _CANDIDATE_SUPPORT._outer_owner_candidate_root_selector(
+                            candidate_root
+                        ),
+                        str(candidate_root),
+                    )
+
+                with mock.patch.dict(
+                    os.environ,
+                    {REQUIRED_CI_CANDIDATE_ROOT_ENV: str(trusted_root)},
+                    clear=False,
+                ), self.assertRaisesRegex(
+                    AssertionError, "must be an absolute .candidate path"
+                ):
+                    _CANDIDATE_SUPPORT._outer_owner_candidate_root_selector(
+                        trusted_root
+                    )
+
+                original_selector = os.environ.pop(
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV, None
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        AssertionError, "is required in the trusted checkout"
+                    ):
+                        _CANDIDATE_SUPPORT._outer_owner_candidate_root_selector(
+                            trusted_root
+                        )
+                finally:
+                    if original_selector is not None:
+                        os.environ[REQUIRED_CI_CANDIDATE_ROOT_ENV] = (
+                            original_selector
+                        )
+
+    def test_outer_fault_candidate_root_selector_is_captured_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory).resolve(strict=True)
+            trusted_root = workspace / "checkout"
+            first_candidate_root = workspace / "first" / ".candidate"
+            second_candidate_root = workspace / "second" / ".candidate"
+            trusted_root.mkdir(mode=0o700)
+            first_candidate_root.mkdir(parents=True, mode=0o700)
+            second_candidate_root.mkdir(parents=True, mode=0o700)
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_TRUSTED_CHECKOUT_ROOT",
+                trusted_root,
+            ):
+                absent_aba = mock.Mock(
+                    side_effect=(
+                        None,
+                        str(first_candidate_root),
+                        None,
+                    )
+                )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT.os.environ,
+                    "get",
+                    absent_aba,
+                ), self.assertRaisesRegex(
+                    AssertionError,
+                    "candidate root binding changed",
+                ):
+                    _CANDIDATE_SUPPORT._outer_owner_candidate_root_selector(
+                        first_candidate_root
+                    )
+                absent_aba.assert_called_once_with(
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV
+                )
+
+                explicit_aba = mock.Mock(
+                    side_effect=(
+                        str(first_candidate_root),
+                        str(second_candidate_root),
+                        str(first_candidate_root),
+                    )
+                )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT.os.environ,
+                    "get",
+                    explicit_aba,
+                ), self.assertRaisesRegex(
+                    AssertionError,
+                    "candidate root binding changed",
+                ):
+                    _CANDIDATE_SUPPORT._outer_owner_candidate_root_selector(
+                        second_candidate_root
+                    )
+                explicit_aba.assert_called_once_with(
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV
+                )
+
     def test_outer_fault_ack_early_exit_reports_bounded_sanitized_output(
         self,
     ) -> None:
@@ -9993,8 +10372,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent_registry_root = Path(temporary_directory) / "registry"
             parent_registry_root.mkdir()
-            candidate_root = Path(temporary_directory) / "candidate"
-            candidate_root.mkdir()
+            candidate_root = _CANDIDATE_SUPPORT.candidate_repository_root()
             with tempfile.TemporaryFile() as lock_file, tempfile.TemporaryFile() as pidfd:
                 with contextlib.ExitStack() as patch_stack:
                     patch_stack.enter_context(

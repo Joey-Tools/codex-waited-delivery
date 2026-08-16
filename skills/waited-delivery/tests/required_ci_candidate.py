@@ -415,8 +415,7 @@ _GIT_SAFE_ARGUMENTS = (
 )
 
 
-def candidate_repository_root() -> Path:
-    value = os.environ.get(CANDIDATE_ROOT_ENV)
+def _candidate_repository_root_from_selector(value: str | None) -> Path:
     if value is None:
         if _TRUSTED_CHECKOUT_ROOT.name == ".required-ci":
             raise AssertionError(
@@ -442,6 +441,12 @@ def candidate_repository_root() -> Path:
             f"{CANDIDATE_ROOT_ENV} must select a canonical directory"
         )
     return resolved
+
+
+def candidate_repository_root() -> Path:
+    return _candidate_repository_root_from_selector(
+        os.environ.get(CANDIDATE_ROOT_ENV)
+    )
 
 
 def _candidate_content_root_for_checkout(checkout_root: Path) -> Path:
@@ -13535,6 +13540,16 @@ def _assert_outer_owner_sentinel(path: Path, nonce: str) -> None:
         raise AssertionError("strict outer owner sentinel was executed or replaced")
 
 
+def _outer_owner_candidate_root_selector(candidate_root: Path) -> str | None:
+    selector = os.environ.get(CANDIDATE_ROOT_ENV)
+    selected_root = _candidate_repository_root_from_selector(selector)
+    if selected_root != candidate_root:
+        raise AssertionError(
+            "strict outer owner candidate root binding changed"
+        )
+    return None if selector is None else str(selected_root)
+
+
 def _probe_independent_outer_owner_fault(
     boundary: str,
     selected_signal: int,
@@ -13549,6 +13564,9 @@ def _probe_independent_outer_owner_fault(
         or re.fullmatch(r"[0-9a-f]{40}", candidate_sha) is None
     ):
         raise AssertionError("strict outer owner fault case is malformed")
+    candidate_root_selector = _outer_owner_candidate_root_selector(
+        candidate_root
+    )
     parent_session = _active_strict_session()
     parent_registry_root = parent_session.get("root")
     if not isinstance(parent_registry_root, Path):
@@ -13598,10 +13616,11 @@ def _probe_independent_outer_owner_fault(
                 _ISOLATION_UID_ENV: str(realm["uid"]),
                 _ISOLATION_GID_ENV: str(realm["gid"]),
                 _ISOLATION_LOCK_FD_ENV: str(lock_descriptor),
-                CANDIDATE_ROOT_ENV: str(candidate_root),
                 CANDIDATE_SHA_ENV: candidate_sha,
             }
         )
+        if candidate_root_selector is not None:
+            environment[CANDIDATE_ROOT_ENV] = candidate_root_selector
         if any(
             key in environment
             for key in (
