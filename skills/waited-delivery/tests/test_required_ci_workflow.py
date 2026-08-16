@@ -10209,6 +10209,47 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertIn("PR_SET_PDEATHSIG, 0", source)
         self.assertLess(source.index("os.fork()"), source.index("os.execve"))
 
+    def test_registered_wrapper_maps_wait_statuses_without_python_39_api(
+        self,
+    ) -> None:
+        source = _CANDIDATE_SUPPORT._REGISTERED_SUDO_WRAPPER_SOURCE
+        tree = ast.parse(source)
+        matches = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "wait_status_returncode"
+        ]
+        self.assertEqual(len(matches), 1)
+        function_module = ast.Module(body=matches, type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"os": os}
+        exec(
+            compile(function_module, "<registered-wait-status>", "exec"),
+            namespace,
+        )
+        convert = namespace["wait_status_returncode"]
+
+        self.assertEqual(convert(73 << 8), 73)
+        self.assertEqual(convert(int(signal.SIGKILL)), -int(signal.SIGKILL))
+        core_status = int(signal.SIGABRT) | 0x80
+        self.assertEqual(convert(core_status), -int(signal.SIGABRT))
+        stopped_status = (int(signal.SIGSTOP) << 8) | 0x7F
+        for malformed in (
+            stopped_status,
+            0x80,
+            0x101,
+            None,
+            False,
+            "0",
+            -1,
+            0x10000,
+        ):
+            with self.subTest(status=malformed):
+                with self.assertRaises(SystemExit) as rejected:
+                    convert(malformed)
+                self.assertEqual(rejected.exception.code, 166)
+
     def test_root_cleanup_drains_target_uid_before_waiting_for_anchor(self) -> None:
         source = inspect.getsource(_CANDIDATE_SUPPORT._root_cleanup_main)
 
@@ -14818,7 +14859,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
             def normalize_acl(root: Path, *, recursive: bool) -> None:
                 for path, entries in acl_entries.items():
-                    if path == root or (recursive and path.is_relative_to(root)):
+                    try:
+                        path.relative_to(root)
+                    except ValueError:
+                        descendant = False
+                    else:
+                        descendant = True
+                    if path == root or (recursive and descendant):
                         entries.clear()
 
             for path in fixture_paths:
@@ -20686,31 +20733,91 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             "annotations are evaluated",
         )
 
-    def test_documented_python_entrypoints_avoid_python_39_affix_apis(
+    def test_documented_python_entrypoints_avoid_python_39_only_apis(
         self,
     ) -> None:
-        candidate_source = TRUSTED_CANDIDATE_SUPPORT_PATH.read_text(
-            encoding="utf-8"
-        )
-        workflow_source = Path(__file__).resolve(strict=True).read_text(
-            encoding="utf-8"
-        )
-        for description, source in (
-            ("candidate support", candidate_source),
-            ("workflow tests", workflow_source),
-        ):
+        tests_root = Path(__file__).resolve(strict=True).parent
+        test_sources = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in sorted(tests_root.glob("*.py"))
+        }
+        source_assignment_policy = {
+            "required_ci_candidate.py": {
+                "_TRUSTED_SUPPORT_SOURCE": False,
+                "_CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE": True,
+                "_MOUNT_NAMESPACE_BOOTSTRAP_SOURCE": True,
+                "_CANDIDATE_BOOTSTRAP_SOURCE": True,
+                "_ROOT_WRAPPER_SOURCE": True,
+                "_REGISTERED_SUDO_WRAPPER_SOURCE": True,
+                "_TARGET_ACTIVE_PROBE_SOURCE": True,
+                "_OUTER_OWNER_SENTINEL_SOURCE": True,
+            },
+            "test_required_ci_workflow.py": {
+                "TRUSTED_CANDIDATE_SUPPORT_SOURCE": False,
+                "TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE": True,
+            },
+            "test_skill_contract.py": {},
+            "test_waited_delivery_bridge.py": {},
+            "test_waited_delivery_hook_adapter.py": {},
+            "test_waited_delivery_runner.py": {},
+        }
+        self.assertEqual(set(test_sources), set(source_assignment_policy))
+
+        def module_source_assignments(source: str) -> set[str]:
+            assigned: set[str] = set()
+            for statement in ast.walk(ast.parse(source)):
+                targets: list[ast.expr] = []
+                if isinstance(statement, ast.Assign):
+                    targets.extend(statement.targets)
+                elif isinstance(statement, ast.AnnAssign):
+                    targets.append(statement.target)
+                assigned.update(
+                    target.id
+                    for target in targets
+                    if isinstance(target, ast.Name)
+                    and target.id.endswith("SOURCE")
+                )
+            return assigned
+
+        source_namespaces = {
+            "required_ci_candidate.py": vars(_CANDIDATE_SUPPORT),
+            "test_required_ci_workflow.py": globals(),
+        }
+        runtime_sources: list[tuple[str, str]] = []
+        for filename, source in sorted(test_sources.items()):
+            assignment_policy = source_assignment_policy[filename]
+            self.assertEqual(
+                module_source_assignments(source), set(assignment_policy)
+            )
+            runtime_sources.append((f"tests/{filename}", source))
+            for name, is_executable in assignment_policy.items():
+                if not is_executable:
+                    continue
+                embedded = source_namespaces[filename][name]
+                if isinstance(embedded, bytes):
+                    embedded = embedded.decode("utf-8")
+                self.assertIsInstance(embedded, str)
+                runtime_sources.append((f"{filename}:{name}", embedded))
+
+        for description, source in runtime_sources:
             forbidden = sorted(
                 {
                     node.attr
                     for node in ast.walk(ast.parse(source))
                     if isinstance(node, ast.Attribute)
-                    and node.attr in {"removeprefix", "removesuffix"}
+                    and node.attr
+                    in {
+                        "is_relative_to",
+                        "removeprefix",
+                        "removesuffix",
+                        "waitstatus_to_exitcode",
+                    }
                 }
             )
             self.assertEqual(
                 forbidden,
                 [],
-                f"{description} must avoid Python 3.9-only string-affix APIs",
+                f"{description} must avoid Python 3.9-only runtime APIs",
             )
 
         if DISTRIBUTION_PROFILE == "canonical":

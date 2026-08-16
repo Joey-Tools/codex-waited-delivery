@@ -5357,6 +5357,19 @@ def has_terminal():
         os.close(tty_descriptor)
         return True
 
+def wait_status_returncode(status):
+    if type(status) is not int or status < 0 or status > 0xFFFF:
+        raise SystemExit(166)
+    if os.WIFEXITED(status):
+        if status & 0xFF:
+            raise SystemExit(166)
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        if status & ~0xFF:
+            raise SystemExit(166)
+        return -os.WTERMSIG(status)
+    raise SystemExit(166)
+
 if os.getppid() != parent_pid:
     raise SystemExit(151)
 libc = ctypes.CDLL(None, use_errno=True)
@@ -5420,7 +5433,7 @@ while True:
         sudo_status = child_status
 if sudo_status is None:
     raise SystemExit(160)
-sudo_returncode = os.waitstatus_to_exitcode(sudo_status)
+sudo_returncode = wait_status_returncode(sudo_status)
 raise SystemExit(
     sudo_returncode if sudo_returncode >= 0 else 128 - sudo_returncode
 )

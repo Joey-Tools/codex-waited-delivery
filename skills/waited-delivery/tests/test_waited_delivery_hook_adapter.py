@@ -1515,10 +1515,22 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 )
 
     def test_stop_hook_fallback_prompt_waits_for_active_child(self) -> None:
-        _, source = self._adapter_function("_build_stop_fallback_prompt")
-        self.assertIn("if child_session_id:", source)
-        self.assertIn("Keep waiting for delivery child", source)
-        self.assertIn("unless the user explicitly interrupts", source)
+        completed, events = self._run_stop_fault_probe(
+            "continuation", label="active-child-fallback"
+        )
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn(
+            "Keep waiting for delivery child `child-active-child-fallback`",
+            completed.stderr,
+        )
+        self.assertIn(
+            "unless the user explicitly interrupts the run.", completed.stderr
+        )
+        self.assertEqual(
+            [event["error_message"] for event in events],
+            ["required-ci injected continuation failure"],
+        )
 
     def test_stop_hook_fallback_prompt_requires_spawn_when_child_missing(self) -> None:
         completed, events = self._run_stop_fault_probe(
