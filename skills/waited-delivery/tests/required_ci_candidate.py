@@ -155,24 +155,11 @@ _STRICT_ZERO_SCAN_INTERVAL_SECONDS = 0.05
 _STRICT_REGISTRY_ENTRY_LIMIT = 256
 _STRICT_WATCHDOG_HEARTBEAT_SECONDS = 1.0
 _STRICT_WATCHDOG_TIMEOUT_SECONDS = 5.0
-_REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS = (
-    _STRICT_WATCHDOG_TIMEOUT_SECONDS
-    + (CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS * 2)
-)
-_OUTER_OWNER_FAILURE_PROPAGATION_TIMEOUT_SECONDS = (
-    CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS * 2
-)
-_OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS = (
-    _STRICT_WATCHDOG_TIMEOUT_SECONDS
-)
-# The parent must outlive the nested ACK wait, registered-sudo cleanup/reap,
-# and a separate bounded terminal-diagnostic handoff.  Keep this a strict
-# inequality so a failure at an inner deadline cannot race the outer deadline.
-_OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS = (
-    _REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS
-    + _OUTER_OWNER_FAILURE_PROPAGATION_TIMEOUT_SECONDS
-    + _OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS
-)
+# These are operational fail-closed cutoffs, not global scheduler or cleanup
+# bounds.  The outer cutoff leaves additional observation time after the
+# inner cutoff, while any deadline exhaustion still rejects the probe.
+_REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS = 15.0
+_OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS = 30.0
 _STRICT_WATCHDOG_REPLAY_BACKOFF_INITIAL_SECONDS = 0.05
 _STRICT_WATCHDOG_REPLAY_BACKOFF_MAX_SECONDS = 1.0
 _WATCHDOG_READY_PREFIX = "REQUIRED_CI_WATCHDOG_READY:"
@@ -9084,6 +9071,64 @@ def _read_registered_bounded_file(
     return data
 
 
+def _preload_registered_sudo_input(input_bytes: bytes) -> IO[bytes]:
+    if type(input_bytes) is not bytes:
+        raise AssertionError("strict registered sudo input is malformed")
+    if len(input_bytes) > CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES:
+        raise AssertionError(
+            "strict registered sudo input exceeds its fixed limit"
+        )
+    input_file: IO[bytes] | None = None
+    try:
+        input_file = tempfile.TemporaryFile()
+        initial = os.fstat(input_file.fileno())
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or initial.st_uid != os.getuid()
+            or stat.S_IMODE(initial.st_mode) & 0o077
+            or initial.st_nlink not in (0, 1)
+            or initial.st_size != 0
+        ):
+            raise AssertionError(
+                "strict registered sudo input file policy is invalid"
+            )
+        written = input_file.write(input_bytes)
+        if written != len(input_bytes):
+            raise AssertionError(
+                "strict registered sudo input file is incomplete"
+            )
+        input_file.flush()
+        populated = os.fstat(input_file.fileno())
+        if (
+            (populated.st_dev, populated.st_ino)
+            != (initial.st_dev, initial.st_ino)
+            or not stat.S_ISREG(populated.st_mode)
+            or populated.st_uid != os.getuid()
+            or stat.S_IMODE(populated.st_mode) & 0o077
+            or populated.st_nlink not in (0, 1)
+            or populated.st_size != len(input_bytes)
+        ):
+            raise AssertionError(
+                "strict registered sudo input file binding changed"
+            )
+        input_file.seek(0)
+        if input_file.tell() != 0:
+            raise AssertionError(
+                "strict registered sudo input file offset is invalid"
+            )
+        return input_file
+    except OSError as error:
+        if input_file is not None:
+            input_file.close()
+        raise AssertionError(
+            "strict registered sudo input file cannot be prepared"
+        ) from error
+    except BaseException:
+        if input_file is not None:
+            input_file.close()
+        raise
+
+
 def _registered_process_binding(
     identity: tuple[int, int, int, int, int, tuple[int, int, int, int]],
 ) -> list[int]:
@@ -9267,15 +9312,14 @@ def _wait_registered_root_active(
     ],
 ]:
     expected_prefix = _ROOT_TARGET_ACTIVE_PREFIX.encode("ascii")
-    # The root controller may consume one watchdog window reaching namespace
-    # readiness and a full reap window waiting for the target-active marker
-    # before it can publish this ACK.  Keep this parser strict, but give that
-    # nested protocol a dedicated envelope instead of reusing the 5s reap cap.
+    # This dedicated operational cutoff is longer than an ordinary watchdog
+    # interval, but it is not a global scheduler bound.  Timeout remains a
+    # fail-closed result.
     deadline = time.monotonic() + _REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         try:
-            metadata = os.fstat(output_file.fileno())
             data = os.pread(output_file.fileno(), 4097, 0)
+            metadata = os.fstat(output_file.fileno())
         except OSError as error:
             raise AssertionError(
                 "strict registered root-active ACK is unreadable"
@@ -9284,6 +9328,9 @@ def _wait_registered_root_active(
             raise AssertionError(
                 "strict registered root-active ACK is excessive"
             )
+        if metadata.st_size != len(data):
+            time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
+            continue
         if not data or b"\n" not in data:
             if process.poll() is not None:
                 raise AssertionError(
@@ -9292,8 +9339,7 @@ def _wait_registered_root_active(
             time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
             continue
         if (
-            metadata.st_size != len(data)
-            or not data.startswith(expected_prefix)
+            not data.startswith(expected_prefix)
             or data.count(b"\n") != 1
             or not data.endswith(b"\n")
         ):
@@ -9537,6 +9583,12 @@ def _run_registered_sudo_under_gate(
     trusted_fault_probe: tuple[Path, str, str, int] | None = None,
     diagnostic_phase: str = "registered-command",
 ) -> bytes:
+    if type(input_bytes) is not bytes:
+        raise AssertionError("strict registered sudo input is malformed")
+    if len(input_bytes) > CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES:
+        raise AssertionError(
+            "strict registered sudo input exceeds its fixed limit"
+        )
     if type(output_limit) is not int or output_limit <= 0:
         raise AssertionError("strict registered sudo output limit is invalid")
     if diagnostic_phase not in _REGISTERED_SUDO_DIAGNOSTIC_PHASES:
@@ -9585,6 +9637,7 @@ def _run_registered_sudo_under_gate(
     outer_pidfd: int | None = None
     stdout_file: IO[bytes] | None = None
     stderr_file: IO[bytes] | None = None
+    stdin_file: IO[bytes] | None = None
     stdout = b""
     stderr = b""
     timeout_error: subprocess.TimeoutExpired | None = None
@@ -9647,17 +9700,21 @@ def _run_registered_sudo_under_gate(
         launch_stage = "create-output-files"
         stdout_file = tempfile.TemporaryFile()
         stderr_file = tempfile.TemporaryFile()
+        launch_stage = "create-input-file"
+        stdin_file = _preload_registered_sudo_input(input_bytes)
         launch_stage = "popen"
         process = subprocess.Popen(
             command,
             cwd=str(_TRUSTED_CHECKOUT_ROOT if cwd is None else cwd),
             env=_minimal_supervisor_environment(),
-            stdin=subprocess.PIPE,
+            stdin=stdin_file,
             stdout=stdout_file,
             stderr=stderr_file,
             pass_fds=(barrier_read_fd, continuation_read_fd, ready_write_fd),
             start_new_session=True,
         )
+        stdin_file.close()
+        stdin_file = None
         os.close(barrier_read_fd)
         barrier_read_fd = -1
         os.close(continuation_read_fd)
@@ -9754,7 +9811,7 @@ def _run_registered_sudo_under_gate(
             )
         launch_stage = "communicate"
         try:
-            process.communicate(input_bytes, timeout=timeout)
+            process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
             timeout_error = error
     except BaseException as error:
@@ -9778,6 +9835,9 @@ def _run_registered_sudo_under_gate(
                 process.stdin.close()
             except (BrokenPipeError, OSError):
                 pass
+        if stdin_file is not None:
+            stdin_file.close()
+            stdin_file = None
         if not entry_owned:
             try:
                 entry_owned = _registered_entry_matches_publication_attempt(

@@ -11126,29 +11126,297 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             parent_source.count("_signal_process_pidfd(owner_pidfd"), 2
         )
 
-    def test_registered_root_active_ack_covers_the_nested_wait_envelope(
+    def test_registered_sudo_preloads_bounded_stdin_before_active_wait(
+        self,
+    ) -> None:
+        session_id = "a" * 32
+        nonce = "b" * 32
+        target_uid = 60000
+        document = {"schema_version": 1, "nonce": nonce}
+        marker = (
+            _CANDIDATE_SUPPORT._ROOT_TARGET_ACTIVE_PREFIX.encode("ascii")
+            + json.dumps(
+                document, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+            + b"\n"
+        )
+        real_popen = subprocess.Popen
+
+        for input_bytes in (b"", b"bounded-registered-input"):
+            with self.subTest(input_bytes=input_bytes), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory).resolve(strict=True)
+                entry_path = root / f"chain-{session_id}.json"
+                controller_path = root / "controller.py"
+                ack_path = root / "fault-ack.json"
+                pause_read_fd, pause_write_fd = os.pipe()
+                launched_processes: list[subprocess.Popen[bytes]] = []
+                observed_stdin: list[object] = []
+                observed_metadata: list[os.stat_result] = []
+                observed_offsets: list[int] = []
+                session = {
+                    "root": root,
+                    "entries": root,
+                    "controller_path": controller_path,
+                    "token": "c" * 32,
+                    "target_uid": target_uid,
+                    "closed": False,
+                    "inherited": False,
+                    "watchdog_authorized": True,
+                }
+                parent_identity = (
+                    os.getpid(),
+                    101,
+                    os.getppid(),
+                    os.getpid(),
+                    os.getpid(),
+                    (os.getuid(),) * 4,
+                )
+                child_source = (
+                    "import sys\n"
+                    f"expected = bytes.fromhex({input_bytes.hex()!r})\n"
+                    "received = sys.stdin.buffer.read()\n"
+                    "if received != expected:\n"
+                    "    raise SystemExit(73)\n"
+                    f"marker = bytes.fromhex({marker.hex()!r})\n"
+                    "if sys.stdout.buffer.write(marker) != len(marker):\n"
+                    "    raise SystemExit(74)\n"
+                    "sys.stdout.buffer.flush()\n"
+                )
+
+                def launch(
+                    _arguments: object, **options: object
+                ) -> subprocess.Popen[bytes]:
+                    input_stream = options["stdin"]
+                    observed_stdin.append(input_stream)
+                    if hasattr(input_stream, "fileno"):
+                        descriptor = input_stream.fileno()  # type: ignore[union-attr]
+                        observed_metadata.append(os.fstat(descriptor))
+                        observed_offsets.append(
+                            input_stream.tell()  # type: ignore[union-attr]
+                        )
+                    child = real_popen(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-B",
+                            "-S",
+                            "-c",
+                            child_source,
+                        ],
+                        cwd=options["cwd"],
+                        env=options["env"],
+                        stdin=input_stream,  # type: ignore[arg-type]
+                        stdout=options["stdout"],  # type: ignore[arg-type]
+                        stderr=options["stderr"],  # type: ignore[arg-type]
+                        start_new_session=True,
+                    )
+                    launched_processes.append(child)
+                    return child
+
+                def process_identity(path: Path):
+                    selected_pid = int(path.name)
+                    if selected_pid == os.getpid():
+                        return parent_identity
+                    if (
+                        launched_processes
+                        and selected_pid == launched_processes[0].pid
+                    ):
+                        child_pid = launched_processes[0].pid
+                        return (
+                            child_pid,
+                            102,
+                            os.getpid(),
+                            child_pid,
+                            child_pid,
+                            (os.getuid(),) * 4,
+                        )
+                    return None
+
+                def pipe2_cloexec(_flags: int) -> tuple[int, int]:
+                    read_descriptor, write_descriptor = os.pipe()
+                    os.set_inheritable(read_descriptor, False)
+                    os.set_inheritable(write_descriptor, False)
+                    return read_descriptor, write_descriptor
+
+                try:
+                    with tempfile.TemporaryFile() as pidfd_source, contextlib.ExitStack() as patch_stack:
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_active_strict_session",
+                                return_value=session,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_register_trusted_root_chain",
+                                return_value=entry_path,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_update_trusted_root_chain",
+                                return_value={},
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_transition_trusted_root_chain",
+                                return_value={},
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_process_identity",
+                                side_effect=process_identity,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT.subprocess,
+                                "Popen",
+                                side_effect=launch,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT.os,
+                                "pipe2",
+                                side_effect=pipe2_cloexec,
+                                create=True,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT.os,
+                                "pidfd_open",
+                                side_effect=lambda *_args: os.dup(
+                                    pidfd_source.fileno()
+                                ),
+                                create=True,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_release_wrapper_barrier",
+                                side_effect=os.close,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_read_registered_wrapper_ready",
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_release_registered_wrapper_continuation",
+                                side_effect=os.close,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_pause_at_outer_owner_fault_boundary",
+                            )
+                        )
+                        recover = patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_recover_registered_entry",
+                            )
+                        )
+                        validate = patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_validate_registered_root_active",
+                                return_value=("accepted-identities",),
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS",
+                                1.0,
+                            )
+                        )
+                        output = (
+                            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate(
+                                ["/ignored"],
+                                input_bytes=input_bytes,
+                                session_id=session_id,
+                                trusted_fault_probe=(
+                                    ack_path,
+                                    nonce,
+                                    "after-target-active",
+                                    pause_read_fd,
+                                ),
+                            )
+                        )
+                finally:
+                    os.close(pause_read_fd)
+                    os.close(pause_write_fd)
+                    for child in launched_processes:
+                        if child.poll() is None:
+                            child.kill()
+                        child.wait(timeout=5)
+
+                self.assertEqual(output, marker)
+                self.assertEqual(len(observed_stdin), 1)
+                self.assertTrue(hasattr(observed_stdin[0], "fileno"))
+                self.assertTrue(observed_stdin[0].closed)  # type: ignore[union-attr]
+                self.assertEqual(len(observed_metadata), 1)
+                metadata = observed_metadata[0]
+                self.assertTrue(stat.S_ISREG(metadata.st_mode))
+                self.assertEqual(metadata.st_uid, os.getuid())
+                self.assertEqual(stat.S_IMODE(metadata.st_mode) & 0o077, 0)
+                self.assertIn(metadata.st_nlink, (0, 1))
+                self.assertEqual(metadata.st_size, len(input_bytes))
+                self.assertEqual(observed_offsets, [0])
+                self.assertEqual(launched_processes[0].returncode, 0)
+                recover.assert_called_once_with(
+                    entry_path, allow_recovery_broker=True
+                )
+                validate.assert_called_once_with(
+                    document,
+                    nonce=nonce,
+                    outer=mock.ANY,
+                    target_uid=target_uid,
+                    expected_session_id=session_id,
+                )
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess, "Popen"
+        ) as launch, self.assertRaisesRegex(
+            AssertionError, "registered sudo input exceeds"
+        ):
+            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate(
+                ["/ignored"],
+                input_bytes=b"x"
+                * (_CANDIDATE_SUPPORT.CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES + 1),
+            )
+        launch.assert_not_called()
+
+    def test_registered_root_active_ack_uses_stable_bounded_snapshots(
         self,
     ) -> None:
         self.assertEqual(
             _CANDIDATE_SUPPORT._REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS,
-            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_TIMEOUT_SECONDS
-            + (_CANDIDATE_SUPPORT.CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS * 2),
+            15.0,
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS,
+            30.0,
         )
         self.assertGreater(
             _CANDIDATE_SUPPORT._OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS,
-            _CANDIDATE_SUPPORT._REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS
-            + _CANDIDATE_SUPPORT.CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS
-            + _CANDIDATE_SUPPORT._OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS,
-        )
-        self.assertEqual(
-            _CANDIDATE_SUPPORT._OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS,
-            _CANDIDATE_SUPPORT._REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS
-            + _CANDIDATE_SUPPORT._OUTER_OWNER_FAILURE_PROPAGATION_TIMEOUT_SECONDS
-            + _CANDIDATE_SUPPORT._OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS,
-        )
-        self.assertEqual(
-            _CANDIDATE_SUPPORT._OUTER_OWNER_TERMINAL_DIAGNOSTIC_MARGIN_SECONDS,
-            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_TIMEOUT_SECONDS,
+            _CANDIDATE_SUPPORT._REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS,
         )
         self.assertEqual(
             _CANDIDATE_SUPPORT._outer_owner_fault_ack_timeout_seconds(
@@ -11238,6 +11506,75 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             outer=outer,
             target_uid=target_uid,
             expected_session_id=session_id,
+        )
+
+        real_fstat = os.fstat
+        with tempfile.TemporaryFile() as output_file:
+            self.assertEqual(
+                os.write(output_file.fileno(), payload), len(payload)
+            )
+            stable_metadata = real_fstat(output_file.fileno())
+            growing_metadata = mock.Mock(st_size=0)
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "fstat",
+                side_effect=(growing_metadata, stable_metadata),
+            ) as observed_fstat, mock.patch.object(
+                _CANDIDATE_SUPPORT.time, "sleep"
+            ) as sleep, mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_validate_registered_root_active",
+                return_value=accepted_identities,
+            ) as validate:
+                accepted = _CANDIDATE_SUPPORT._wait_registered_root_active(
+                    output_file,
+                    DelayedTerminalProcess(),  # type: ignore[arg-type]
+                    nonce=nonce,
+                    session_id=session_id,
+                    outer=outer,
+                    target_uid=target_uid,
+                )
+
+        self.assertEqual(accepted, (document, accepted_identities))
+        self.assertEqual(observed_fstat.call_count, 2)
+        sleep.assert_called_once_with(
+            _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_INTERVAL_SECONDS
+        )
+        validate.assert_called_once_with(
+            document,
+            nonce=nonce,
+            outer=outer,
+            target_uid=target_uid,
+            expected_session_id=session_id,
+        )
+
+        with tempfile.TemporaryFile() as output_file:
+            self.assertEqual(
+                os.write(output_file.fileno(), payload), len(payload)
+            )
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "fstat",
+                return_value=mock.Mock(st_size=0),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.time,
+                "monotonic",
+                side_effect=(0.0, 0.0, 16.0),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.time, "sleep"
+            ) as sleep, self.assertRaisesRegex(
+                AssertionError, "root-active ACK timed out"
+            ):
+                _CANDIDATE_SUPPORT._wait_registered_root_active(
+                    output_file,
+                    DelayedTerminalProcess(),  # type: ignore[arg-type]
+                    nonce=nonce,
+                    session_id=session_id,
+                    outer=outer,
+                    target_uid=target_uid,
+                )
+        sleep.assert_called_once_with(
+            _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_INTERVAL_SECONDS
         )
 
         class UnexpectedPollProcess:
