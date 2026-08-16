@@ -4848,6 +4848,7 @@ class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
         )
         value = (
             "::warning title=forged::head\n"
+            "runner-prefix ##[warning]legacy-forged\n"
             "Traceback (most recent call last):\n"
             + "H" * 2500
             + "MIDDLE-DETAIL-MUST-BE-DROPPED"
@@ -4859,8 +4860,22 @@ class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
 
         bounded = _bounded_failure_text(value)
 
+        # GitHub Actions runner v2 command parsing trims leading whitespace
+        # and then recognizes a leading ``::`` command.  Its legacy parser
+        # searches for ``##[`` anywhere in the line.  A backslash is not an
+        # escape in either command grammar.
+        def runner_recognizes_command(line: str) -> bool:
+            return line.lstrip().startswith("::") or "##[" in line
+
         self.assertLessEqual(len(bounded), 2000)
-        self.assertTrue(bounded.startswith("\\::warning title=forged::head"))
+        self.assertTrue(
+            bounded.startswith(
+                "\\x3a\\x3awarning title=forged\\x3a\\x3ahead"
+            )
+        )
+        self.assertIn(
+            "runner-prefix \\x23\\x23[warning]legacy-forged", bounded
+        )
         self.assertIn("...[middle truncated]...", bounded)
         self.assertNotIn("MIDDLE-DETAIL-MUST-BE-DROPPED", bounded)
         self.assertTrue(
@@ -4872,7 +4887,7 @@ class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                not line.lstrip().startswith("::")
+                not runner_recognizes_command(line)
                 for line in bounded.split("\n")
             )
         )
@@ -4893,8 +4908,33 @@ class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
                 )
             )
         )
-        self.assertIn("   \\::stop-commands::forged-token\\x0d", bounded)
+        self.assertIn(
+            "   \\x3a\\x3astop-commands\\x3a\\x3aforged-token\\x0d",
+            bounded,
+        )
         self.assertEqual(_bounded_failure_text(bounded), bounded)
+
+        for value, limit in (
+            (":::", 2000),
+            (":::::", 2000),
+            ("left:::::middle:::right", 2000),
+            ((":" * 5001) + "terminal-cause", 127),
+            ("prefix ####[warning]legacy-forged", 2000),
+        ):
+            with self.subTest(value=value[:40], limit=limit):
+                selected = _bounded_failure_text(value, limit)
+                self.assertLessEqual(len(selected), limit)
+                self.assertNotIn("::", selected)
+                self.assertNotIn("##[", selected)
+                self.assertFalse(
+                    any(
+                        runner_recognizes_command(line)
+                        for line in selected.split("\n")
+                    )
+                )
+                self.assertEqual(
+                    _bounded_failure_text(selected, limit), selected
+                )
 
     def test_isolated_unittest_ignores_candidate_root_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -7298,7 +7338,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertLessEqual(len(message), len(prefix) + 2000)
         self.assertIn('"returncode":127', message)
         self.assertIn('"process_leak_observed":false', message)
-        self.assertIn("\\::warning title=forged::probe-output", message)
+        self.assertIn(
+            "\\x3a\\x3awarning title=forged\\x3a\\x3aprobe-output",
+            message,
+        )
         self.assertIn("probe-start", message)
         self.assertIn("...[middle truncated]...", message)
         self.assertNotIn("MIDDLE-DETAIL-MUST-BE-DROPPED", message)
@@ -9594,6 +9637,300 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
         self.assertEqual(trace, ["register", "bind-marker", "pipe", "recover"])
 
+    def test_registered_sudo_launch_failure_reports_bounded_sanitized_output(
+        self,
+    ) -> None:
+        class TerminalProcess:
+            pid = 73123
+            returncode: object = 73
+
+            def __init__(self) -> None:
+                self.stdin = io.BytesIO()
+
+            def poll(self) -> object:
+                return self.returncode
+
+        stdout_payload = (
+            b"stdout-head\n::warning title=forged::stdout\n"
+            + (b"stdout-middle" * 200)
+            + b"\nstdout-tail\n"
+        )
+        stderr_payload = (
+            b"\x1b[31m\r\n  ::stop-commands::forged\n"
+            b"prefix ##[warning]legacy-forged\n"
+            + (b"stderr-middle" * 200)
+            + b"\xff\nAssertionError: terminal-cause\n"
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entry_path = root / f"chain-{'a' * 32}.json"
+            controller_path = root / "controller.py"
+            session = {
+                "root": root,
+                "entries": root,
+                "controller_path": controller_path,
+                "token": "b" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            process = TerminalProcess()
+            parent_identity = (
+                os.getpid(),
+                456,
+                os.getpid(),
+                os.getpid(),
+                os.getpid(),
+                (os.getuid(),) * 4,
+            )
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+
+            def register(*_args: object, **_kwargs: object) -> Path:
+                return entry_path
+
+            def launch(*_args: object, **options: object) -> TerminalProcess:
+                stdout = options["stdout"]
+                stderr = options["stderr"]
+                stdout.write(stdout_payload)  # type: ignore[union-attr]
+                stderr.write(stderr_payload)  # type: ignore[union-attr]
+                stdout.flush()  # type: ignore[union-attr]
+                stderr.flush()  # type: ignore[union-attr]
+                return process
+
+            def pipe2_cloexec(_flags: int) -> tuple[int, int]:
+                read_descriptor, write_descriptor = os.pipe()
+                os.set_inheritable(read_descriptor, False)
+                os.set_inheritable(write_descriptor, False)
+                return read_descriptor, write_descriptor
+
+            try:
+                with tempfile.TemporaryFile() as pidfd_source:
+                    with contextlib.ExitStack() as patch_stack:
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_register_trusted_root_chain",
+                                side_effect=register,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_update_trusted_root_chain",
+                                return_value={},
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_process_identity",
+                                side_effect=(parent_identity, None),
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT.subprocess,
+                                "Popen",
+                                side_effect=launch,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT.os,
+                                "pipe2",
+                                side_effect=pipe2_cloexec,
+                                create=True,
+                            )
+                        )
+                        patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT.os,
+                                "pidfd_open",
+                                side_effect=lambda *_args: os.dup(
+                                    pidfd_source.fileno()
+                                ),
+                                create=True,
+                            )
+                        )
+                        recover = patch_stack.enter_context(
+                            mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_recover_registered_entry",
+                            )
+                        )
+                        with self.assertRaises(AssertionError) as raised:
+                            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate(
+                                ["/usr/bin/true"],
+                                session_id="a" * 32,
+                            )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+        message = str(raised.exception)
+        prefix = "strict registered sudo launch failed: "
+        self.assertTrue(message.startswith(prefix), message)
+        self.assertIn('"phase":"registered-command"', message)
+        self.assertIn('"stage":"outer-identity"', message)
+        self.assertIn('"process_created":true', message)
+        self.assertIn('"returncode":73', message)
+        self.assertIn(
+            "cause: AssertionError: "
+            "strict registered outer session binding is invalid",
+            message,
+        )
+        self.assertIn("stdout-head", message)
+        self.assertIn("AssertionError: terminal-cause", message)
+        self.assertIn(
+            "\\x3a\\x3awarning title=forged\\x3a\\x3astdout", message
+        )
+        self.assertIn(
+            "\\x3a\\x3astop-commands\\x3a\\x3aforged", message
+        )
+        self.assertIn(
+            "prefix \\x23\\x23[warning]legacy-forged", message
+        )
+        self.assertIn("summary-final=", message)
+        self.assertIn("\\x1b", message)
+        self.assertIn("\\x0d", message)
+        self.assertIn("\\xff", message)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\r", message)
+        self.assertNotIn("stdout-middle" * 100, message)
+        self.assertLessEqual(len(message), len(prefix) + 2000)
+        self.assertIsInstance(raised.exception.__cause__, AssertionError)
+        recover.assert_called_once_with(
+            entry_path, allow_recovery_broker=True
+        )
+
+        for malformed_returncode in (False, 0.0):
+            with self.subTest(returncode=malformed_returncode):
+                details = (
+                    _CANDIDATE_SUPPORT._registered_sudo_launch_failure_details(
+                        phase="root-controller",
+                        stage="outer-identity",
+                        launch_error=AssertionError("terminal-cause"),
+                        process_created=True,
+                        returncode=malformed_returncode,
+                        stdout=b"",
+                        stderr=b"",
+                    )
+                )
+                self.assertIn('"returncode":"<malformed>"', details)
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_registry_session_gate",
+            return_value=contextlib.nullcontext(),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_run_registered_sudo_under_gate",
+            return_value=b"forwarded",
+        ) as under_gate:
+            self.assertEqual(
+                _CANDIDATE_SUPPORT._run_registered_sudo(
+                    ["/usr/bin/true"], diagnostic_phase="root-controller"
+                ),
+                b"forwarded",
+            )
+        self.assertEqual(
+            under_gate.call_args.kwargs["diagnostic_phase"],
+            "root-controller",
+        )
+
+        class PhaseCaptureComplete(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            snapshot_root = Path(temporary_directory).resolve(strict=True)
+            execution_root = snapshot_root / "execution"
+            control_root = snapshot_root / "control"
+            execution_root.mkdir()
+            control_root.mkdir()
+            snapshot = {
+                "config_path": snapshot_root / "config.json",
+                "controller_path": snapshot_root / "controller.py",
+                "handshake_path": snapshot_root / "handshake.json",
+                "execution_root": execution_root,
+                "control_root": control_root,
+            }
+            phase_trace: list[tuple[str, object]] = []
+
+            def capture_root_tree(
+                *_args: object, **options: object
+            ) -> dict[str, object]:
+                phase_trace.append(("root-tree", options["diagnostic_phase"]))
+                return {"status": "complete"}
+
+            def capture_registered_sudo(
+                *_args: object, **options: object
+            ) -> bytes:
+                phase_trace.append(("registered-sudo", options["diagnostic_phase"]))
+                raise PhaseCaptureComplete
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_realm",
+                return_value={"uid": 60000, "gid": 60000},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_writable_root_bindings",
+                return_value=[
+                    {
+                        "path": str(execution_root),
+                        "device": 1,
+                        "inode": 2,
+                        "host_mount_id": 3,
+                    }
+                ],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_host_read_root_bindings",
+                return_value=self.root_command_config()["read_roots"],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_assert_strict_bootstrap_nofile_capacity",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_host_namespace_identity",
+                side_effect=lambda namespace: {
+                    "mnt": "mnt:[101]",
+                    "ipc": "ipc:[102]",
+                    "net": "net:[103]",
+                }[namespace],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_invoke_root_tree_operation",
+                side_effect=capture_root_tree,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_run_registered_sudo",
+                side_effect=capture_registered_sudo,
+            ), self.assertRaises(PhaseCaptureComplete):
+                _CANDIDATE_SUPPORT._invoke_strict_controller(
+                    snapshot,
+                    [
+                        str(_CANDIDATE_SUPPORT._STRICT_PRIMITIVES["python"]),
+                        "-I",
+                        "/probe.py",
+                    ],
+                    {},
+                    execution_root,
+                    b"",
+                    timeout_seconds=1,
+                )
+        self.assertEqual(
+            phase_trace,
+            [
+                ("root-tree", "control-own"),
+                ("registered-sudo", "root-controller"),
+            ],
+        )
+
     def test_registered_sudo_post_publish_failure_replays_only_owned_entry(
         self,
     ) -> None:
@@ -10467,9 +10804,14 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertIn('"returncode":73', message)
         self.assertIn('"selected_signal":"SIGSTOP"', message)
         self.assertIn("stdout: probe-start", message)
-        self.assertIn("\\::warning title=forged::probe-output", message)
+        self.assertIn(
+            "\\x3a\\x3awarning title=forged\\x3a\\x3aprobe-output",
+            message,
+        )
         self.assertIn("stderr:", message)
-        self.assertIn("\\::stop-commands::forged", message)
+        self.assertIn(
+            "\\x3a\\x3astop-commands\\x3a\\x3aforged", message
+        )
         self.assertIn("\\xff", message)
         self.assertIn("AssertionError: terminal-cause", message)
         self.assertNotIn("\x1b", message)

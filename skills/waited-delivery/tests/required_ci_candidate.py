@@ -215,15 +215,40 @@ _DISTRIBUTION_LAYOUTS = (
 
 
 def _neutralize_failure_workflow_commands(value: str) -> str:
-    lines: list[str] = []
-    for line in value.split("\n"):
-        prefix_length = 0
-        while prefix_length < len(line) and line[prefix_length].isspace():
-            prefix_length += 1
-        if line[prefix_length:].startswith("::"):
-            line = line[:prefix_length] + "\\" + line[prefix_length:]
-        lines.append(line)
-    return "\n".join(lines)
+    # GitHub Actions v2 commands begin with ``::`` after leading whitespace;
+    # legacy commands search for ``##[`` anywhere in a line.  Backslashes do
+    # not escape either grammar.  Encode whole maximal colon runs of length
+    # two or more and whole hash runs immediately before ``[``; processing a
+    # run atomically prevents replacement text from overlapping an unconsumed
+    # suffix.  The visible ASCII escapes contain neither token, making the
+    # transformation idempotent.
+    neutralized: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == ":":
+            end = index + 1
+            while end < len(value) and value[end] == ":":
+                end += 1
+            length = end - index
+            neutralized.append("\\x3a" * length if length >= 2 else ":")
+            index = end
+            continue
+        if character == "#":
+            end = index + 1
+            while end < len(value) and value[end] == "#":
+                end += 1
+            length = end - index
+            neutralized.append(
+                "\\x23" * length
+                if length >= 2 and end < len(value) and value[end] == "["
+                else "#" * length
+            )
+            index = end
+            continue
+        neutralized.append(character)
+        index += 1
+    return "".join(neutralized)
 
 
 def _canonical_failure_text(value: str) -> str:
@@ -253,10 +278,9 @@ def _bounded_failure_text(value: str, limit: int = 2000) -> str:
         return ""
     if limit <= len(marker) + 1:
         return marker[:limit]
-    # Existing logical-line prefixes are already neutralized.  Reserve one
-    # byte so the post-join pass can also neutralize any prefix exposed at a
-    # truncation boundary without exceeding the caller's total limit.
-    retained = limit - len(marker) - 1
+    # The marker contains neither workflow-command token, so joining it to
+    # already-neutralized fragments cannot reconstruct either token.
+    retained = limit - len(marker)
     head_length = retained // 2
     tail_length = retained - head_length
     bounded = normalized[:head_length] + marker + normalized[-tail_length:]
@@ -7453,6 +7477,7 @@ def _invoke_root_tree_operation(
     profile: str,
     *,
     deletion_authority: Mapping[str, object] | None = None,
+    diagnostic_phase: str = "root-tree",
 ) -> dict[str, object]:
     metadata = root.lstat()
     if deletion_authority is None:
@@ -7497,6 +7522,7 @@ def _invoke_root_tree_operation(
             *receipt_arguments,
         ],
         execution_root=root,
+        diagnostic_phase=diagnostic_phase,
     )
     expected_prefix = _ROOT_TREE_RECEIPT_PREFIX.encode("ascii")
     if not output.startswith(expected_prefix) or output.count(b"\n") != 1:
@@ -8908,6 +8934,106 @@ def _registered_sudo_command(arguments: Sequence[str]) -> list[str]:
     return [str(_STRICT_PRIMITIVES["sudo"]), "-n", *arguments]
 
 
+_REGISTERED_SUDO_DIAGNOSTIC_PHASES = (
+    "registered-command",
+    "root-tree",
+    "control-own",
+    "root-controller",
+)
+_REGISTERED_SUDO_LAUNCH_STAGES = (
+    "register-entry",
+    "bind-entry",
+    "create-control-fds",
+    "create-output-files",
+    "popen",
+    "pidfd-bind",
+    "outer-identity",
+    "after-outer-popen",
+    "outer-bind",
+    "root-authorize",
+    "barrier-release",
+    "wrapper-ready",
+    "after-root-authorized-barrier",
+    "continuation-release",
+    "target-active-wait",
+    "target-active-publish-pause",
+    "communicate",
+)
+
+
+def _registered_sudo_launch_failure_details(
+    *,
+    phase: object,
+    stage: object,
+    launch_error: BaseException,
+    process_created: object,
+    returncode: object,
+    stdout: object,
+    stderr: object,
+) -> str:
+    normalized_phase = (
+        phase if phase in _REGISTERED_SUDO_DIAGNOSTIC_PHASES else "<malformed>"
+    )
+    normalized_stage = (
+        stage if stage in _REGISTERED_SUDO_LAUNCH_STAGES else "<malformed>"
+    )
+    normalized_created = (
+        process_created if type(process_created) is bool else "<malformed>"
+    )
+    normalized_returncode = (
+        returncode
+        if type(returncode) is int or returncode is None
+        else "<malformed>"
+    )
+    error_number = getattr(launch_error, "errno", None)
+    normalized_errno = (
+        error_number
+        if type(error_number) is int or error_number is None
+        else "<malformed>"
+    )
+    error_type = type(launch_error).__name__
+    if type(error_type) is not str or len(error_type) > 80:
+        error_type = "<malformed>"
+    try:
+        cause = _bounded_failure_text(
+            f"{error_type}: {launch_error}", 500
+        )
+    except BaseException:
+        cause = f"{error_type}: <unprintable>"
+
+    def render_stream(value: object) -> str:
+        if type(value) is not bytes:
+            return "<malformed>"
+        return _bounded_failure_text(
+            value.decode("utf-8", errors="backslashreplace"), 450
+        )
+
+    summary = json.dumps(
+        {
+            "errno": normalized_errno,
+            "phase": normalized_phase,
+            "process_created": normalized_created,
+            "returncode": normalized_returncode,
+            "stage": normalized_stage,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return _bounded_failure_text(
+        "summary="
+        + summary
+        + "\ncause: "
+        + cause
+        + "\nstdout: "
+        + render_stream(stdout)
+        + "\nstderr: "
+        + render_stream(stderr)
+        + "\nsummary-final="
+        + summary,
+        2000,
+    )
+
+
 def _read_registered_bounded_file(
     output_file: IO[bytes], description: str, output_limit: int
 ) -> bytes:
@@ -9374,9 +9500,12 @@ def _run_registered_sudo_under_gate(
     output_limit: int = 4096,
     recovery_broker: bool = False,
     trusted_fault_probe: tuple[Path, str, str, int] | None = None,
+    diagnostic_phase: str = "registered-command",
 ) -> bytes:
     if type(output_limit) is not int or output_limit <= 0:
         raise AssertionError("strict registered sudo output limit is invalid")
+    if diagnostic_phase not in _REGISTERED_SUDO_DIAGNOSTIC_PHASES:
+        raise AssertionError("strict registered sudo diagnostic phase is invalid")
     if trusted_fault_probe is not None and (
         type(trusted_fault_probe) is not tuple
         or len(trusted_fault_probe) != 4
@@ -9427,12 +9556,14 @@ def _run_registered_sudo_under_gate(
     launch_error: BaseException | None = None
     recovery_error: BaseException | None = None
     outer_unreaped = False
+    launch_stage = "register-entry"
 
     def mark_entry_owned() -> None:
         nonlocal entry_owned
         entry_owned = True
 
     try:
+        launch_stage = "register-entry"
         registered_path = _register_trusted_root_chain(
             Path(session["controller_path"]),
             handshake_path,
@@ -9448,6 +9579,7 @@ def _run_registered_sudo_under_gate(
                 "strict registered publication path is inconsistent"
             )
         entry_owned = True
+        launch_stage = "bind-entry"
         _update_trusted_root_chain(
             entry_path,
             "prepared",
@@ -9459,6 +9591,7 @@ def _run_registered_sudo_under_gate(
             ],
             outer_marker=outer_marker,
         )
+        launch_stage = "create-control-fds"
         barrier_read_fd, barrier_write_fd = os.pipe2(os.O_CLOEXEC)
         continuation_read_fd, continuation_write_fd = os.pipe2(os.O_CLOEXEC)
         ready_read_fd, ready_write_fd = os.pipe2(os.O_CLOEXEC)
@@ -9476,8 +9609,10 @@ def _run_registered_sudo_under_gate(
             outer_marker,
             *_registered_sudo_command(arguments),
         ]
+        launch_stage = "create-output-files"
         stdout_file = tempfile.TemporaryFile()
         stderr_file = tempfile.TemporaryFile()
+        launch_stage = "popen"
         process = subprocess.Popen(
             command,
             cwd=str(_TRUSTED_CHECKOUT_ROOT if cwd is None else cwd),
@@ -9494,7 +9629,9 @@ def _run_registered_sudo_under_gate(
         continuation_read_fd = -1
         os.close(ready_write_fd)
         ready_write_fd = -1
+        launch_stage = "pidfd-bind"
         outer_pidfd = os.pidfd_open(process.pid, 0)
+        launch_stage = "outer-identity"
         outer_identity = _process_identity(Path("/proc") / str(process.pid))
         if (
             outer_identity is None
@@ -9510,12 +9647,14 @@ def _run_registered_sudo_under_gate(
             outer_identity[4],
         ]
         outer_binding = tuple(outer)
+        launch_stage = "after-outer-popen"
         _pause_at_outer_owner_fault_boundary(
             trusted_fault_probe,
             "after-outer-popen",
             entry_path,
             outer_binding,
         )
+        launch_stage = "outer-bind"
         _transition_trusted_root_chain(
             entry_path, ("prepared",), "outer-bound", outer=outer
         )
@@ -9525,6 +9664,7 @@ def _run_registered_sudo_under_gate(
             entry_path,
             outer_binding,
         )
+        launch_stage = "root-authorize"
         _transition_trusted_root_chain(
             entry_path, ("outer-bound",), "root-authorized"
         )
@@ -9534,11 +9674,14 @@ def _run_registered_sudo_under_gate(
             entry_path,
             outer_binding,
         )
+        launch_stage = "barrier-release"
         _release_wrapper_barrier(barrier_write_fd)
         barrier_write_fd = -1
+        launch_stage = "wrapper-ready"
         _read_registered_wrapper_ready(ready_read_fd, process)
         os.close(ready_read_fd)
         ready_read_fd = -1
+        launch_stage = "after-root-authorized-barrier"
         _pause_at_outer_owner_fault_boundary(
             trusted_fault_probe,
             "after-root-authorized-barrier",
@@ -9546,6 +9689,7 @@ def _run_registered_sudo_under_gate(
             outer_binding,
             wrapper_post_gate_ready=True,
         )
+        launch_stage = "continuation-release"
         _release_registered_wrapper_continuation(continuation_write_fd)
         continuation_write_fd = -1
         if trusted_fault_probe is not None and (
@@ -9555,6 +9699,7 @@ def _run_registered_sudo_under_gate(
                 raise AssertionError(
                     "strict registered root-active output was not acquired"
                 )
+            launch_stage = "target-active-wait"
             root_active, _ = _wait_registered_root_active(
                 stdout_file,
                 process,
@@ -9563,6 +9708,7 @@ def _run_registered_sudo_under_gate(
                 outer=outer_binding,
                 target_uid=target_uid,
             )
+            launch_stage = "target-active-publish-pause"
             _pause_at_outer_owner_fault_boundary(
                 trusted_fault_probe,
                 "after-target-active",
@@ -9571,6 +9717,7 @@ def _run_registered_sudo_under_gate(
                 wrapper_post_gate_ready=True,
                 root_active=root_active,
             )
+        launch_stage = "communicate"
         try:
             process.communicate(input_bytes, timeout=timeout)
         except subprocess.TimeoutExpired as error:
@@ -9663,7 +9810,18 @@ def _run_registered_sudo_under_gate(
     if timeout_error is not None:
         raise AssertionError("strict registered sudo command timed out") from timeout_error
     if launch_error is not None:
-        raise AssertionError("strict registered sudo launch failed") from launch_error
+        details = _registered_sudo_launch_failure_details(
+            phase=diagnostic_phase,
+            stage=launch_stage,
+            launch_error=launch_error,
+            process_created=process is not None,
+            returncode=(None if process is None else process.returncode),
+            stdout=stdout,
+            stderr=stderr,
+        )
+        raise AssertionError(
+            "strict registered sudo launch failed: " + details
+        ) from launch_error
     if process is None or process.returncode != 0 or stderr:
         decoded_stderr = stderr[:2000].decode("utf-8", errors="replace")
         raise AssertionError(
@@ -9686,6 +9844,7 @@ def _run_registered_sudo(
     output_limit: int = 4096,
     recovery_broker: bool = False,
     trusted_fault_probe: tuple[Path, str, str, int] | None = None,
+    diagnostic_phase: str = "registered-command",
 ) -> bytes:
     strict_isolation_platform_preflight()
     with _registry_session_gate(exclusive=False):
@@ -9701,6 +9860,7 @@ def _run_registered_sudo(
             output_limit=output_limit,
             recovery_broker=recovery_broker,
             trusted_fault_probe=trusted_fault_probe,
+            diagnostic_phase=diagnostic_phase,
         )
 
 
@@ -12790,6 +12950,7 @@ def _invoke_strict_controller(
         0,
         0,
         "trusted-control",
+        diagnostic_phase="control-own",
     )
     output = _run_registered_sudo(
         [
@@ -12812,6 +12973,7 @@ def _invoke_strict_controller(
         session_id=selected_session_id,
         output_limit=(CANDIDATE_PROCESS_OUTPUT_LIMIT_BYTES * 3),
         trusted_fault_probe=trusted_outer_fault_probe,
+        diagnostic_phase="root-controller",
     )
     receipt = _decode_controller_receipt(output, b"", nonce)
     return receipt
