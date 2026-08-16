@@ -154,6 +154,74 @@ def _direct_opt_witness_fixture(
     }
 
 
+def _strict_live_broker_witness_path(
+    marker: Mapping[str, object],
+    witness_binding: Mapping[str, object],
+    namespace_binding: Mapping[str, object],
+    file_binding: Mapping[str, object],
+) -> Path:
+    session_id = marker.get("session_id")
+    nonce = witness_binding.get("nonce")
+    basename = witness_binding.get("basename")
+    if (
+        type(session_id) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+        or type(nonce) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+    ):
+        raise AssertionError(
+            "strict live broker witness selector authority is malformed"
+        )
+    expected_basename = f"direct-opt-{session_id}-{nonce}.log"
+    if type(basename) is not str or basename != expected_basename:
+        raise AssertionError("strict live broker witness basename changed")
+    namespace_path = namespace_binding.get("path")
+    if type(namespace_path) is not str:
+        raise AssertionError("strict live broker witness namespace is malformed")
+    expected_path = Path(namespace_path) / basename
+    if (
+        not expected_path.is_absolute()
+        or file_binding.get("path") != str(expected_path)
+    ):
+        raise AssertionError("strict live broker witness path changed")
+    return expected_path
+
+
+def _assert_strict_live_terminal_witness_progress(
+    initial: Mapping[str, object],
+    terminal: Mapping[str, object],
+) -> None:
+    initial_size = initial.get("size")
+    terminal_size = terminal.get("size")
+    if type(initial_size) is not int or initial_size <= 0:
+        raise AssertionError("strict live initial witness size is malformed")
+    if type(terminal_size) is not int or terminal_size <= 0:
+        raise AssertionError("strict live terminal witness size is malformed")
+    if terminal_size <= initial_size:
+        raise AssertionError("strict live terminal witness size did not grow")
+    for field in ("sha256", "last_record_sha256"):
+        initial_digest = initial.get(field)
+        terminal_digest = terminal.get(field)
+        if (
+            type(initial_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", initial_digest) is None
+        ):
+            raise AssertionError(
+                f"strict live initial witness {field} is malformed"
+            )
+        if (
+            type(terminal_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", terminal_digest) is None
+        ):
+            raise AssertionError(
+                f"strict live terminal witness {field} is malformed"
+            )
+        if terminal_digest == initial_digest:
+            raise AssertionError(
+                f"strict live terminal witness {field} did not advance"
+            )
+
+
 CI_STRICT_RUNTIME_LIVE_SENTINEL = "REQUIRED_CI_STRICT_RUNTIME_LIVE_COMPLETED:"
 TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV = "REQUIRED_CI_SUPERVISOR_DEADLINE"
 LOCAL_SUPERVISOR_ISOLATION_ENV = (
@@ -5443,6 +5511,113 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         ):
             self.test_strict_runtime_live_end_to_end()
         self.assertEqual(trace, ["target-access", "owner-sigkill-watchdog"])
+
+    def test_strict_live_broker_witness_path_binds_session_and_nonce(
+        self,
+    ) -> None:
+        session_id = "a" * 32
+        nonce = "b" * 32
+        basename = f"direct-opt-{session_id}-{nonce}.log"
+        namespace_path = Path("/opt/.codex-required-ci-witnesses")
+        marker = {"session_id": session_id}
+        witness_binding = {"basename": basename, "nonce": nonce}
+        namespace_binding = {"path": str(namespace_path)}
+        file_binding = {"path": str(namespace_path / basename)}
+
+        self.assertEqual(
+            _strict_live_broker_witness_path(
+                marker,
+                witness_binding,
+                namespace_binding,
+                file_binding,
+            ),
+            namespace_path / basename,
+        )
+        with self.assertRaisesRegex(
+            AssertionError, "strict live broker witness path changed"
+        ):
+            _strict_live_broker_witness_path(
+                marker,
+                witness_binding,
+                namespace_binding,
+                {
+                    **file_binding,
+                    "path": str(namespace_path / "other-witness.log"),
+                },
+            )
+        with self.assertRaisesRegex(
+            AssertionError, "strict live broker witness basename changed"
+        ):
+            _strict_live_broker_witness_path(
+                marker,
+                {**witness_binding, "basename": "other-witness.log"},
+                namespace_binding,
+                file_binding,
+            )
+
+    def test_strict_live_terminal_witness_receipt_proves_mutable_progress(
+        self,
+    ) -> None:
+        initial = {
+            "size": 100,
+            "sha256": "a" * 64,
+            "last_record_sha256": "b" * 64,
+        }
+        terminal = {
+            "size": 200,
+            "sha256": "c" * 64,
+            "last_record_sha256": "d" * 64,
+        }
+        _assert_strict_live_terminal_witness_progress(initial, terminal)
+
+        regressions = (
+            (
+                "unchanged size",
+                {**terminal, "size": initial["size"]},
+                "strict live terminal witness size did not grow",
+            ),
+            (
+                "unchanged whole-file digest",
+                {**terminal, "sha256": initial["sha256"]},
+                "strict live terminal witness sha256 did not advance",
+            ),
+            (
+                "unchanged last-record digest",
+                {
+                    **terminal,
+                    "last_record_sha256": initial["last_record_sha256"],
+                },
+                (
+                    "strict live terminal witness last_record_sha256 "
+                    "did not advance"
+                ),
+            ),
+            (
+                "non-integer size",
+                {**terminal, "size": "200"},
+                "strict live terminal witness size is malformed",
+            ),
+            (
+                "malformed whole-file digest",
+                {**terminal, "sha256": "not-a-digest"},
+                "strict live terminal witness sha256 is malformed",
+            ),
+            (
+                "malformed last-record digest",
+                {**terminal, "last_record_sha256": "not-a-digest"},
+                (
+                    "strict live terminal witness last_record_sha256 "
+                    "is malformed"
+                ),
+            ),
+        )
+        for name, regressed, message in regressions:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                AssertionError, message
+            ):
+                _assert_strict_live_terminal_witness_progress(
+                    initial, regressed
+                )
 
     def test_real_watchdog_owner_wrapper_forwards_publication_callback(
         self,
@@ -25608,18 +25783,70 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             root_path = Path(str(root_binding["path"]))
             entry_path = Path(str(marker["entry_path"]))
             registry_root = Path(str(marker["registry_root"]))
+            witness_namespace = witness_binding["namespace"]
             witness_file = witness_binding["file"]
+            self.assertIsInstance(witness_namespace, dict)
             self.assertIsInstance(witness_file, dict)
+            assert isinstance(witness_namespace, dict)
             assert isinstance(witness_file, dict)
-            witness_path = Path(str(witness_file["path"]))
+            expected_witness_path = _strict_live_broker_witness_path(
+                marker,
+                witness_binding,
+                witness_namespace,
+                witness_file,
+            )
             self.assertEqual(parent_binding["path"], "/opt")
             self.assertEqual(root_path.parent, Path("/opt"))
             self.assertEqual(
-                witness_path.parent, Path("/opt/.codex-required-ci-witnesses")
+                expected_witness_path.parent,
+                Path("/opt/.codex-required-ci-witnesses"),
             )
+            self.assertEqual(
+                set(witness_namespace),
+                {"path", "device", "inode", "uid", "gid", "mode"},
+            )
+            self.assertEqual(
+                (
+                    witness_namespace["path"],
+                    witness_namespace["device"],
+                    witness_namespace["uid"],
+                    witness_namespace["gid"],
+                    witness_namespace["mode"],
+                ),
+                (
+                    str(expected_witness_path.parent),
+                    parent_binding["device"],
+                    0,
+                    0,
+                    0o700,
+                ),
+            )
+            self.assertEqual(
+                (
+                    witness_file["path"],
+                    witness_file["uid"],
+                    witness_file["gid"],
+                    witness_file["mode"],
+                    witness_file["nlink"],
+                    witness_file["phase"],
+                ),
+                (
+                    str(expected_witness_path),
+                    0,
+                    0,
+                    0o600,
+                    1,
+                    "root-bound",
+                ),
+            )
+            self.assertGreater(witness_file["size"], 0)
+            self.assertRegex(witness_file["sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(witness_file["last_record_sha256"], r"^[0-9a-f]{64}$")
             self.assertTrue(root_path.is_dir())
             self.assertTrue(entry_path.is_file())
-            self.assertTrue(witness_path.is_file())
+            with self.assertRaises(PermissionError) as denied_witness:
+                expected_witness_path.read_bytes()
+            self.assertEqual(denied_witness.exception.errno, errno.EACCES)
             preimport_document = json.loads(entry_path.read_bytes())
             self.assertIsNone(preimport_document["direct_opt_root"]["root"])
             self.assertIsNone(
@@ -25743,37 +25970,35 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 recovered_root["witness_nonce"], witness_binding["nonce"]
             )
             witness_retired = recovered_root["witness_retired"]
-            self.assertEqual(witness_retired, {**witness_file, "absent": False})
+            self.assertIsInstance(witness_retired, dict)
+            assert isinstance(witness_retired, dict)
+            self.assertEqual(set(witness_retired), {*witness_file, "absent"})
+            self.assertIs(witness_retired["absent"], False)
+            self.assertEqual(witness_retired["phase"], "deleted")
+            _assert_strict_live_terminal_witness_progress(
+                witness_file, witness_retired
+            )
+            self.assertEqual(
+                recovered_root["witness_last_record_sha256"],
+                witness_retired["last_record_sha256"],
+            )
+            stable_witness_fields = (
+                "path",
+                "device",
+                "inode",
+                "uid",
+                "gid",
+                "mode",
+                "nlink",
+            )
+            self.assertEqual(
+                tuple(witness_retired[field] for field in stable_witness_fields),
+                tuple(witness_file[field] for field in stable_witness_fields),
+            )
             self.assertFalse(root_path.exists())
-            self.assertTrue(witness_path.is_file())
-            retained_metadata = witness_path.stat()
-            self.assertEqual(
-                (
-                    retained_metadata.st_dev,
-                    retained_metadata.st_ino,
-                    retained_metadata.st_uid,
-                    retained_metadata.st_gid,
-                    stat.S_IMODE(retained_metadata.st_mode),
-                    retained_metadata.st_nlink,
-                    retained_metadata.st_size,
-                ),
-                tuple(
-                    witness_file[field]
-                    for field in (
-                        "device",
-                        "inode",
-                        "uid",
-                        "gid",
-                        "mode",
-                        "nlink",
-                        "size",
-                    )
-                ),
-            )
-            self.assertEqual(
-                hashlib.sha256(witness_path.read_bytes()).hexdigest(),
-                witness_file["sha256"],
-            )
+            with self.assertRaises(PermissionError) as denied_retired_witness:
+                expected_witness_path.read_bytes()
+            self.assertEqual(denied_retired_witness.exception.errno, errno.EACCES)
             self.assertFalse(registry_root.exists())
 
             deadline = time.monotonic() + 10
