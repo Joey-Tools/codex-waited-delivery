@@ -68,6 +68,23 @@ _STRICT_PRIVATE_SURFACE_PATHS = (
     Path("/run"),
     Path("/dev/shm"),
 )
+_STRICT_LIVE_IPC_PARENT = Path("/opt")
+_STRICT_LIVE_IPC_CLEANUP_KIND = "direct-opt-root-v1"
+_STRICT_LIVE_IPC_ROOT_MODE = 0o710
+_STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME = ".codex-required-ci-witnesses"
+_STRICT_LIVE_IPC_WITNESS_DIRECTORY_MODE = 0o700
+_STRICT_LIVE_IPC_WITNESS_FILE_MODE = 0o600
+_STRICT_LIVE_IPC_WITNESS_OWNER_UID = 0
+_STRICT_LIVE_IPC_WITNESS_OWNER_GID = 0
+_STRICT_LIVE_IPC_WITNESS_MAGIC = b"CODEX-REQUIRED-CI-WITNESS-V1\n"
+_STRICT_LIVE_IPC_WITNESS_LIMIT_BYTES = 16 * 1024
+_STRICT_LIVE_IPC_WITNESS_RECORD_LIMIT_BYTES = 4096
+_STRICT_LIVE_IPC_WITNESS_PHASES = (
+    "intended",
+    "root-bound",
+    "deleting",
+    "deleted",
+)
 _STRICT_HOST_READ_ROOT_PURPOSES = {
     "configured-destshared": "directory",
     "configured-executable": "file",
@@ -6990,6 +7007,149 @@ def _open_bound_tree_root(
     return descriptor
 
 
+def _descriptor_acl_is_absent(descriptor: int, description: str) -> None:
+    if not hasattr(os, "listxattr"):
+        if sys.platform == "linux":
+            raise AssertionError(f"{description} ACL is unreadable")
+        return
+    try:
+        names = os.listxattr(descriptor)
+    except OSError as error:
+        raise AssertionError(f"{description} ACL is unreadable") from error
+    if any(
+        name in ("system.posix_acl_access", "system.posix_acl_default")
+        for name in names
+    ):
+        raise AssertionError(f"{description} has an unexpected POSIX ACL")
+
+
+def _directory_policy_binding(
+    path: Path,
+    descriptor: int,
+    *,
+    description: str,
+) -> dict[str, object]:
+    try:
+        opened = os.fstat(descriptor)
+        selected = path.lstat()
+    except OSError as error:
+        raise AssertionError(f"{description} binding is unreadable") from error
+    if (
+        not path.is_absolute()
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(selected.st_mode)
+        or (opened.st_dev, opened.st_ino)
+        != (selected.st_dev, selected.st_ino)
+    ):
+        raise AssertionError(f"{description} object identity is unsafe")
+    _descriptor_acl_is_absent(descriptor, description)
+    return {
+        "path": str(path),
+        "device": opened.st_dev,
+        "inode": opened.st_ino,
+        "uid": opened.st_uid,
+        "gid": opened.st_gid,
+        "mode": stat.S_IMODE(opened.st_mode),
+    }
+
+
+def _open_strict_live_ipc_parent(
+    expected: Mapping[str, object] | None = None,
+) -> tuple[int, dict[str, object]]:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            _STRICT_LIVE_IPC_PARENT,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        binding = _directory_policy_binding(
+            _STRICT_LIVE_IPC_PARENT,
+            descriptor,
+            description="strict live IPC parent",
+        )
+        mount_id = _strict_descriptor_mount_id(descriptor)
+        inventory = _strict_mount_inventory()
+        metadata = os.fstat(descriptor)
+        _strict_validate_directory_mount_topology(
+            _STRICT_LIVE_IPC_PARENT,
+            mount_id,
+            metadata.st_dev,
+            inventory,
+            "live IPC parent",
+        )
+        binding["host_mount_id"] = mount_id
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    if (
+        binding["uid"] != 0
+        or int(binding["mode"]) & 0o022
+        or int(binding["mode"]) & 0o005 != 0o005
+        or (expected is not None and binding != dict(expected))
+    ):
+        os.close(descriptor)
+        raise AssertionError("strict live IPC parent access policy is unsafe")
+    return descriptor, binding
+
+
+def _strict_live_ipc_parent_binding() -> dict[str, object]:
+    descriptor, binding = _open_strict_live_ipc_parent()
+    os.close(descriptor)
+    return binding
+
+
+def _open_strict_live_registry_entries(
+    binding: Mapping[str, object], runner_uid: int
+) -> tuple[int, dict[str, object]]:
+    if (
+        not _direct_opt_root_binding_is_exact(binding, include_mount=False)
+        or type(runner_uid) is not int
+    ):
+        raise AssertionError("strict live IPC registry binding is malformed")
+    path = Path(str(binding["path"]))
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        recaptured = _directory_policy_binding(
+            path,
+            descriptor,
+            description="strict live IPC registry",
+        )
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    if (
+        recaptured != dict(binding)
+        or recaptured["uid"] != runner_uid
+        or recaptured["mode"] != 0o700
+    ):
+        os.close(descriptor)
+        raise AssertionError("strict live IPC registry access policy is unsafe")
+    return descriptor, recaptured
+
+
+def _strict_live_registry_entries_binding(entries: Path) -> dict[str, object]:
+    metadata = entries.lstat()
+    binding = {
+        "path": str(entries),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+    descriptor, recaptured = _open_strict_live_registry_entries(
+        binding, os.getuid()
+    )
+    os.close(descriptor)
+    return recaptured
+
+
 def _root_tree_main(arguments: Sequence[str]) -> int:
     try:
         if os.getuid() != 0 or os.geteuid() != 0:
@@ -7165,6 +7325,1958 @@ def _gc_bound_sealed_tombstone(
     if deleted.st_nlink != 0:
         raise AssertionError("strict sealed tombstone GC unlink is unproved")
     os.fsync(vault_fd)
+
+
+def _direct_opt_root_name(session_id: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{32}", session_id) is None:
+        raise AssertionError("strict live IPC root session identity is malformed")
+    return f"required-ci-host-ipc-{session_id}"
+
+
+def _direct_opt_root_binding_is_exact(
+    value: object,
+    *,
+    include_mount: bool,
+) -> bool:
+    expected_keys = {
+        "path",
+        "device",
+        "inode",
+        "uid",
+        "gid",
+        "mode",
+    }
+    if include_mount:
+        expected_keys.add("host_mount_id")
+    return bool(
+        type(value) is dict
+        and set(value) == expected_keys
+        and type(value.get("path")) is str
+        and Path(str(value.get("path"))).is_absolute()
+        and all(
+            type(value.get(field)) is int
+            for field in expected_keys - {"path"}
+        )
+    )
+
+
+def _root_registered_opt_ipc_root_operation(
+    operation: str,
+    parent_binding: Mapping[str, object],
+    name: str,
+    runner_uid: int,
+    target_gid: int,
+    expected_root: Mapping[str, object] | None,
+    *,
+    allow_controller_created_adoption: bool = False,
+) -> dict[str, object]:
+    if (
+        operation not in ("create", "cleanup", "adopt", "verify")
+        or type(allow_controller_created_adoption) is not bool
+        or (
+            allow_controller_created_adoption
+            and operation != "adopt"
+        )
+        or (
+            operation == "adopt"
+            and (
+                not allow_controller_created_adoption
+                or expected_root is not None
+            )
+        )
+        or not _direct_opt_root_binding_is_exact(
+            parent_binding, include_mount=True
+        )
+        or parent_binding.get("path") != str(_STRICT_LIVE_IPC_PARENT)
+        or re.fullmatch(r"required-ci-host-ipc-[0-9a-f]{32}", name) is None
+        or type(runner_uid) is not int
+        or type(target_gid) is not int
+        or (expected_root is not None and not _direct_opt_root_binding_is_exact(
+            expected_root, include_mount=False
+        ))
+    ):
+        raise AssertionError("strict live IPC root broker binding is malformed")
+    parent_fd, recaptured_parent = _open_strict_live_ipc_parent(parent_binding)
+    root_fd: int | None = None
+    adoption_synchronized = False
+    try:
+        try:
+            selected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            selected = None
+        except OSError as error:
+            raise AssertionError(
+                "strict live IPC root directory entry is unreadable"
+            ) from error
+        if operation == "create":
+            if selected is not None:
+                raise AssertionError("strict live IPC root already exists")
+            if selected is None:
+                try:
+                    os.mkdir(name, 0o700, dir_fd=parent_fd)
+                    root_fd = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                    os.fchown(root_fd, runner_uid, target_gid)
+                    os.fchmod(root_fd, _STRICT_LIVE_IPC_ROOT_MODE)
+                    os.fsync(root_fd)
+                    os.fsync(parent_fd)
+                except OSError as error:
+                    raise AssertionError(
+                        "strict live IPC root cannot be created"
+                    ) from error
+            else:
+                if not stat.S_ISDIR(selected.st_mode):
+                    raise AssertionError("strict live IPC root entry type changed")
+                try:
+                    root_fd = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                except OSError as error:
+                    raise AssertionError(
+                        "strict live IPC root cannot be opened"
+                    ) from error
+        elif selected is None:
+            if operation == "cleanup":
+                try:
+                    os.fsync(parent_fd)
+                except OSError as error:
+                    raise AssertionError(
+                        "strict live IPC root absence is not durable"
+                    ) from error
+            if operation == "verify":
+                raise AssertionError("strict live IPC root is unavailable")
+            return {
+                "status": "complete",
+                "operation": operation,
+                "parent": recaptured_parent,
+                "root": None if expected_root is None else dict(expected_root),
+                "origin_absent": operation == "cleanup",
+            }
+        else:
+            if expected_root is None and operation != "adopt":
+                raise AssertionError(
+                    "strict live IPC root creation provenance is unavailable"
+                )
+            if not stat.S_ISDIR(selected.st_mode):
+                raise AssertionError("strict live IPC root entry type changed")
+            try:
+                root_fd = os.open(
+                    name,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
+                )
+            except OSError as error:
+                raise AssertionError(
+                    "strict live IPC root cannot be opened"
+                ) from error
+
+        if root_fd is None:
+            raise AssertionError("strict live IPC root descriptor is unavailable")
+        root_path = _STRICT_LIVE_IPC_PARENT / name
+        root_binding = _directory_policy_binding(
+            root_path,
+            root_fd,
+            description="strict live IPC root",
+        )
+        opened_root = os.fstat(root_fd)
+        if selected is not None and (
+            not stat.S_ISDIR(selected.st_mode)
+            or (selected.st_dev, selected.st_ino)
+            != (opened_root.st_dev, opened_root.st_ino)
+        ):
+            raise AssertionError("strict live IPC root directory entry changed")
+        if operation == "adopt" and (
+            root_binding["uid"],
+            root_binding["gid"],
+            root_binding["mode"],
+        ) != (runner_uid, target_gid, _STRICT_LIVE_IPC_ROOT_MODE):
+            if (
+                root_binding["uid"],
+                root_binding["gid"],
+                root_binding["mode"],
+            ) not in (
+                (0, 0, 0o700),
+                (runner_uid, target_gid, 0o700),
+            ):
+                raise AssertionError(
+                    "strict live IPC root creation provenance is unsafe"
+                )
+            adopted_identity = (
+                root_binding["device"],
+                root_binding["inode"],
+            )
+            try:
+                os.fchown(root_fd, runner_uid, target_gid)
+                os.fchmod(root_fd, _STRICT_LIVE_IPC_ROOT_MODE)
+                os.fsync(root_fd)
+                os.fsync(parent_fd)
+                adoption_synchronized = True
+            except OSError as error:
+                raise AssertionError(
+                    "strict live IPC root creation cannot be resumed"
+                ) from error
+            root_binding = _directory_policy_binding(
+                root_path,
+                root_fd,
+                description="strict live IPC root",
+            )
+            if (
+                root_binding["device"],
+                root_binding["inode"],
+            ) != adopted_identity:
+                raise AssertionError(
+                    "strict live IPC root adoption identity changed"
+                )
+        if (
+            root_binding["uid"] != runner_uid
+            or root_binding["gid"] != target_gid
+            or root_binding["mode"] != _STRICT_LIVE_IPC_ROOT_MODE
+            or (
+                expected_root is not None
+                and root_binding != dict(expected_root)
+            )
+        ):
+            raise AssertionError("strict live IPC root access policy is unsafe")
+        if operation == "adopt" and not adoption_synchronized:
+            try:
+                os.fsync(root_fd)
+                os.fsync(parent_fd)
+            except OSError as error:
+                raise AssertionError(
+                    "strict live IPC root adoption is not durable"
+                ) from error
+        if operation in ("create", "adopt") and os.listdir(root_fd):
+            raise AssertionError("strict live IPC root creation is not empty")
+        if operation in ("create", "adopt", "verify"):
+            return {
+                "status": "complete",
+                "operation": operation,
+                "parent": recaptured_parent,
+                "root": root_binding,
+                "origin_absent": False,
+            }
+        try:
+            if os.listdir(root_fd):
+                raise AssertionError("strict live IPC root is not empty")
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (root_binding["device"], root_binding["inode"])
+            ):
+                raise AssertionError("strict live IPC root identity changed")
+            os.rmdir(name, dir_fd=parent_fd)
+            deleted = os.fstat(root_fd)
+            if (
+                (deleted.st_dev, deleted.st_ino)
+                != (root_binding["device"], root_binding["inode"])
+                or deleted.st_nlink != 0
+            ):
+                raise AssertionError("strict live IPC root unlink is unproved")
+            os.fsync(parent_fd)
+        except OSError as error:
+            raise AssertionError("strict live IPC root cannot be removed") from error
+        return {
+            "status": "complete",
+            "operation": "cleanup",
+            "parent": recaptured_parent,
+            "root": root_binding,
+            "origin_absent": True,
+        }
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
+
+
+def _strict_registry_entry_metadata_matches(
+    observed: os.stat_result, expected: os.stat_result
+) -> bool:
+    return all(
+        getattr(observed, field) == getattr(expected, field)
+        for field in (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_gid",
+            "st_nlink",
+            "st_size",
+        )
+    )
+
+
+def _strict_directory_entry_metadata_matches(
+    observed: os.stat_result, expected: os.stat_result
+) -> bool:
+    return bool(
+        stat.S_ISDIR(observed.st_mode)
+        and stat.S_ISDIR(expected.st_mode)
+        and all(
+            getattr(observed, field) == getattr(expected, field)
+            for field in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+            )
+        )
+    )
+
+
+def _strict_live_ipc_witness_basename(
+    session_id: str, witness_nonce: str
+) -> str:
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+        or re.fullmatch(r"[0-9a-f]{32}", witness_nonce) is None
+    ):
+        raise AssertionError("strict live IPC witness selector is malformed")
+    return f"direct-opt-{session_id}-{witness_nonce}.log"
+
+
+def _strict_live_ipc_witness_binding_is_exact(value: object) -> bool:
+    if type(value) is not dict or set(value) != {
+        "basename",
+        "nonce",
+        "namespace",
+        "file",
+        "retired",
+    }:
+        return False
+    basename = value.get("basename")
+    nonce = value.get("nonce")
+    namespace = value.get("namespace")
+    file_binding = value.get("file")
+    retired = value.get("retired")
+    if (
+        type(basename) is not str
+        or re.fullmatch(
+            r"direct-opt-[0-9a-f]{32}-[0-9a-f]{32}\.log", basename
+        )
+        is None
+        or type(nonce) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+        or not basename.endswith(f"-{nonce}.log")
+        or (
+            namespace is not None
+            and not _direct_opt_root_binding_is_exact(
+                namespace, include_mount=False
+            )
+        )
+    ):
+        return False
+    if file_binding is not None:
+        if type(file_binding) is not dict or set(file_binding) != {
+            "path",
+            "device",
+            "inode",
+            "uid",
+            "gid",
+            "mode",
+            "nlink",
+            "size",
+            "sha256",
+            "last_record_sha256",
+            "phase",
+        }:
+            return False
+        if (
+            type(file_binding.get("path")) is not str
+            or not Path(str(file_binding["path"])).is_absolute()
+            or any(
+                type(file_binding.get(field)) is not int
+                for field in (
+                    "device",
+                    "inode",
+                    "uid",
+                    "gid",
+                    "mode",
+                    "nlink",
+                    "size",
+                )
+            )
+            or file_binding.get("mode") != _STRICT_LIVE_IPC_WITNESS_FILE_MODE
+            or file_binding.get("nlink") != 1
+            or not 0 < int(file_binding.get("size", 0))
+            <= _STRICT_LIVE_IPC_WITNESS_LIMIT_BYTES
+            or type(file_binding.get("sha256")) is not str
+            or re.fullmatch(
+                r"[0-9a-f]{64}", file_binding["sha256"]
+            )
+            is None
+            or type(file_binding.get("last_record_sha256")) is not str
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                file_binding["last_record_sha256"],
+            )
+            is None
+            or file_binding.get("phase") not in _STRICT_LIVE_IPC_WITNESS_PHASES
+        ):
+            return False
+    if retired is not None:
+        if (
+            file_binding is None
+            or type(retired) is not dict
+            or set(retired) != {*file_binding, "absent"}
+            or any(
+                type(retired.get(field)) is not type(expected)
+                or retired.get(field) != expected
+                for field, expected in file_binding.items()
+            )
+            or retired.get("absent") is not False
+        ):
+            return False
+    return True
+
+
+def _strict_live_ipc_witness_namespace_path() -> Path:
+    return _STRICT_LIVE_IPC_PARENT / _STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+
+
+def _strict_live_ipc_witness_intent_sha256(
+    document: Mapping[str, object],
+) -> str:
+    direct_binding = _direct_opt_root_document(document)
+    witness = direct_binding["witness"]
+    intent = {
+        "schema_version": document["schema_version"],
+        "token": document["token"],
+        "session_id": document["session_id"],
+        "publication_nonce": document["publication_nonce"],
+        "registry_owner_uid": document["registry_owner_uid"],
+        "target_uid": document["target_uid"],
+        "controller_path": document["controller_path"],
+        "recovery_controller_path": document["recovery_controller_path"],
+        "cleanup_kind": document["cleanup_kind"],
+        "registry": direct_binding["registry"],
+        "parent": direct_binding["parent"],
+        "name": direct_binding["name"],
+        "target_gid": direct_binding["target_gid"],
+        "mode": direct_binding["mode"],
+        "witness_basename": witness["basename"],
+        "witness_nonce": witness["nonce"],
+    }
+    return hashlib.sha256(
+        json.dumps(intent, sort_keys=True, separators=(",", ":")).encode(
+            "ascii"
+        )
+    ).hexdigest()
+
+
+def _root_open_strict_live_ipc_witness_namespace(
+    parent_fd: int,
+    expected_binding: Mapping[str, object] | None,
+) -> tuple[int, dict[str, object]]:
+    namespace_fd: int | None = None
+    owner_uid = _STRICT_LIVE_IPC_WITNESS_OWNER_UID
+    owner_gid = _STRICT_LIVE_IPC_WITNESS_OWNER_GID
+    if os.geteuid() != owner_uid or os.getegid() != owner_gid:
+        raise AssertionError(
+            "strict live IPC witness namespace requires its fixed root owner"
+        )
+    try:
+        try:
+            selected = os.stat(
+                _STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if expected_binding is not None:
+                raise AssertionError(
+                    "strict live IPC witness namespace disappeared"
+                )
+            os.mkdir(
+                _STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME,
+                _STRICT_LIVE_IPC_WITNESS_DIRECTORY_MODE,
+                dir_fd=parent_fd,
+            )
+            namespace_fd = os.open(
+                _STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+            os.fchown(namespace_fd, owner_uid, owner_gid)
+            os.fchmod(
+                namespace_fd, _STRICT_LIVE_IPC_WITNESS_DIRECTORY_MODE
+            )
+            os.fsync(namespace_fd)
+            os.fsync(parent_fd)
+            selected = os.stat(
+                _STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        else:
+            namespace_fd = os.open(
+                _STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+        opened = os.fstat(namespace_fd)
+        binding = _directory_policy_binding(
+            _strict_live_ipc_witness_namespace_path(),
+            namespace_fd,
+            description="strict live IPC witness namespace",
+        )
+        namespace_mount_id = _strict_descriptor_mount_id(namespace_fd)
+        parent_mount_id = _strict_descriptor_mount_id(parent_fd)
+        parent_metadata = os.fstat(parent_fd)
+        if (
+            not _strict_directory_entry_metadata_matches(selected, opened)
+            or binding["uid"] != owner_uid
+            or binding["gid"] != owner_gid
+            or binding["mode"] != _STRICT_LIVE_IPC_WITNESS_DIRECTORY_MODE
+            or namespace_mount_id != parent_mount_id
+            or binding["device"] != parent_metadata.st_dev
+            or (
+                expected_binding is not None
+                and binding != dict(expected_binding)
+            )
+        ):
+            raise AssertionError(
+                "strict live IPC witness namespace access policy is unsafe"
+            )
+        result_fd = namespace_fd
+        namespace_fd = None
+        return result_fd, binding
+    except OSError as error:
+        raise AssertionError(
+            "strict live IPC witness namespace is unavailable"
+        ) from error
+    finally:
+        if namespace_fd is not None:
+            os.close(namespace_fd)
+
+
+def _strict_live_ipc_witness_record(
+    document: Mapping[str, object],
+    *,
+    phase: str,
+    sequence: int,
+    previous_sha256: str | None,
+    root_binding: Mapping[str, object] | None,
+    delete_nonce: str | None,
+    deletion_receipt: Mapping[str, object] | None,
+) -> dict[str, object]:
+    direct_binding = _direct_opt_root_document(document)
+    witness = direct_binding["witness"]
+    assert isinstance(witness, dict)
+    return {
+        "schema_version": 1,
+        "sequence": sequence,
+        "previous_sha256": previous_sha256,
+        "phase": phase,
+        "token": document["token"],
+        "session_id": document["session_id"],
+        "publication_nonce": document["publication_nonce"],
+        "intent_sha256": _strict_live_ipc_witness_intent_sha256(document),
+        "witness_nonce": witness["nonce"],
+        "witness_basename": witness["basename"],
+        "parent_device": direct_binding["parent"]["device"],
+        "parent_inode": direct_binding["parent"]["inode"],
+        "root_name": direct_binding["name"],
+        "runner_uid": document["registry_owner_uid"],
+        "target_gid": direct_binding["target_gid"],
+        "mode": direct_binding["mode"],
+        "root": None if root_binding is None else dict(root_binding),
+        "delete_nonce": delete_nonce,
+        "deleted": (
+            None if deletion_receipt is None else dict(deletion_receipt)
+        ),
+    }
+
+
+def _encode_strict_live_ipc_witness_frame(
+    record: Mapping[str, object],
+) -> tuple[bytes, str]:
+    payload = json.dumps(
+        dict(record), sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    if not payload or len(payload) > _STRICT_LIVE_IPC_WITNESS_RECORD_LIMIT_BYTES:
+        raise AssertionError("strict live IPC witness record is excessive")
+    digest = hashlib.sha256(payload).hexdigest()
+    return (
+        f"{len(payload):08x}:".encode("ascii")
+        + payload
+        + b":"
+        + digest.encode("ascii")
+        + b"\n",
+        digest,
+    )
+
+
+def _validate_strict_live_ipc_witness_records(
+    records: Sequence[Mapping[str, object]],
+    document: Mapping[str, object],
+) -> None:
+    if not records or len(records) > len(_STRICT_LIVE_IPC_WITNESS_PHASES):
+        raise AssertionError("strict live IPC witness record chain is incomplete")
+    direct_binding = _direct_opt_root_document(document)
+    expected_common = {
+        "schema_version": 1,
+        "token": document["token"],
+        "session_id": document["session_id"],
+        "publication_nonce": document["publication_nonce"],
+        "intent_sha256": _strict_live_ipc_witness_intent_sha256(document),
+        "witness_nonce": direct_binding["witness"]["nonce"],
+        "witness_basename": direct_binding["witness"]["basename"],
+        "parent_device": direct_binding["parent"]["device"],
+        "parent_inode": direct_binding["parent"]["inode"],
+        "root_name": direct_binding["name"],
+        "runner_uid": document["registry_owner_uid"],
+        "target_gid": direct_binding["target_gid"],
+        "mode": direct_binding["mode"],
+    }
+    prior_digest: str | None = None
+    prior_phase: str | None = None
+    prior_root: object = None
+    prior_delete_nonce: object = None
+    allowed = {
+        None: ("intended",),
+        "intended": ("root-bound", "deleting"),
+        "root-bound": ("deleting",),
+        "deleting": ("deleted",),
+        "deleted": (),
+    }
+    for index, record in enumerate(records):
+        if type(record) is not dict or set(record) != {
+            *expected_common,
+            "sequence",
+            "previous_sha256",
+            "phase",
+            "root",
+            "delete_nonce",
+            "deleted",
+        }:
+            raise AssertionError("strict live IPC witness record fields are inexact")
+        if any(
+            type(record.get(key)) is not type(value)
+            or record.get(key) != value
+            for key, value in expected_common.items()
+        ):
+            raise AssertionError("strict live IPC witness authority changed")
+        phase = record.get("phase")
+        sequence = record.get("sequence")
+        previous_sha256 = record.get("previous_sha256")
+        root_binding = record.get("root")
+        delete_nonce = record.get("delete_nonce")
+        deletion_receipt = record.get("deleted")
+        if (
+            type(sequence) is not int
+            or sequence != index
+            or (
+                prior_digest is None
+                and previous_sha256 is not None
+            )
+            or (
+                prior_digest is not None
+                and (
+                    type(previous_sha256) is not str
+                    or previous_sha256 != prior_digest
+                )
+            )
+            or type(phase) is not str
+            or phase not in allowed[prior_phase]
+            or (
+                root_binding is not None
+                and not _direct_opt_root_binding_is_exact(
+                    root_binding, include_mount=False
+                )
+            )
+        ):
+            raise AssertionError("strict live IPC witness record chain is invalid")
+        if phase == "intended" and (
+            root_binding is not None
+            or delete_nonce is not None
+            or deletion_receipt is not None
+        ):
+            raise AssertionError("strict live IPC witness intended phase is invalid")
+        if (
+            phase != "intended"
+            and direct_binding.get("root") is not None
+            and root_binding != direct_binding.get("root")
+        ):
+            raise AssertionError("strict live IPC witness root identity changed")
+        if phase == "root-bound" and (
+            root_binding is None
+            or delete_nonce is not None
+            or deletion_receipt is not None
+        ):
+            raise AssertionError("strict live IPC witness root phase is invalid")
+        if phase in ("deleting", "deleted") and (
+            type(document.get("execution_root_delete_nonce")) is not str
+            or delete_nonce != document.get("execution_root_delete_nonce")
+        ):
+            raise AssertionError("strict live IPC witness delete nonce changed")
+        if phase == "deleting" and (
+            type(delete_nonce) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", delete_nonce) is None
+            or deletion_receipt is not None
+            or root_binding != prior_root
+        ):
+            raise AssertionError("strict live IPC witness deleting phase is invalid")
+        expected_deletion_receipt = {
+            "kind": "direct-empty-rmdir-v1",
+            "parent_device": direct_binding["parent"]["device"],
+            "parent_inode": direct_binding["parent"]["inode"],
+            "device": None if root_binding is None else root_binding["device"],
+            "inode": None if root_binding is None else root_binding["inode"],
+            "name": direct_binding["name"],
+        }
+        if phase == "deleted" and (
+            root_binding != prior_root
+            or delete_nonce != prior_delete_nonce
+            or type(deletion_receipt) is not dict
+            or set(deletion_receipt) != set(expected_deletion_receipt)
+            or any(
+                type(deletion_receipt.get(key)) is not type(value)
+                or deletion_receipt.get(key) != value
+                for key, value in expected_deletion_receipt.items()
+            )
+        ):
+            raise AssertionError("strict live IPC witness deleted phase is invalid")
+        payload = json.dumps(
+            dict(record), sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+        prior_digest = hashlib.sha256(payload).hexdigest()
+        prior_phase = str(phase)
+        prior_root = root_binding
+        prior_delete_nonce = delete_nonce
+
+
+def _write_validated_strict_live_ipc_witness_record(
+    descriptor: int,
+    document: Mapping[str, object],
+    records: Sequence[Mapping[str, object]],
+    digests: Sequence[str],
+    *,
+    leading_bytes: bytes,
+    durable_prefix: bytes,
+    phase: str,
+    root_binding: Mapping[str, object] | None,
+    delete_nonce: str | None,
+    deletion_receipt: Mapping[str, object] | None,
+) -> tuple[dict[str, object], bytes, str] | None:
+    if len(records) != len(digests):
+        raise AssertionError("strict live IPC witness digest chain is inexact")
+    record = _strict_live_ipc_witness_record(
+        document,
+        phase=phase,
+        sequence=len(records),
+        previous_sha256=None if not digests else digests[-1],
+        root_binding=root_binding,
+        delete_nonce=delete_nonce,
+        deletion_receipt=deletion_receipt,
+    )
+    _validate_strict_live_ipc_witness_records([*records, record], document)
+    frame, digest = _encode_strict_live_ipc_witness_frame(record)
+    publication = leading_bytes + frame
+    if len(publication) > _STRICT_LIVE_IPC_WITNESS_LIMIT_BYTES:
+        raise AssertionError("strict live IPC witness log is excessive")
+    if not publication.startswith(durable_prefix):
+        return None
+    try:
+        os.lseek(descriptor, len(durable_prefix), os.SEEK_SET)
+        view = memoryview(publication)[len(durable_prefix) :]
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise AssertionError("strict live IPC witness write stalled")
+            view = view[written:]
+        os.fsync(descriptor)
+    except OSError as error:
+        raise AssertionError("strict live IPC witness cannot be written") from error
+    return record, publication, digest
+
+
+def _strict_live_ipc_recovery_root_binding(
+    document: Mapping[str, object],
+) -> dict[str, object] | None:
+    direct_binding = _direct_opt_root_document(document)
+    root_path = _STRICT_LIVE_IPC_PARENT / str(direct_binding["name"])
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(
+                root_path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        except FileNotFoundError:
+            return None
+        binding = _directory_policy_binding(
+            root_path,
+            descriptor,
+            description="strict live IPC recovery root",
+        )
+    except OSError as error:
+        raise AssertionError(
+            "strict live IPC recovery root is unreadable"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        binding["uid"] != document.get("registry_owner_uid")
+        or binding["gid"] != direct_binding["target_gid"]
+        or binding["mode"] != _STRICT_LIVE_IPC_ROOT_MODE
+    ):
+        raise AssertionError("strict live IPC recovery root policy is unsafe")
+    return binding
+
+
+def _strict_live_ipc_witness_partial_tail_is_exact(
+    tail: bytes,
+    records: Sequence[Mapping[str, object]],
+    document: Mapping[str, object],
+) -> bool:
+    direct_binding = _direct_opt_root_document(document)
+    candidates: list[dict[str, object]] = []
+    if not records:
+        candidates.append(
+            _strict_live_ipc_witness_record(
+                document,
+                phase="intended",
+                sequence=0,
+                previous_sha256=None,
+                root_binding=None,
+                delete_nonce=None,
+                deletion_receipt=None,
+            )
+        )
+    else:
+        prior = records[-1]
+        prior_phase = prior.get("phase")
+        prior_root = prior.get("root")
+        next_sequence = len(records)
+        previous_sha256 = hashlib.sha256(
+            json.dumps(
+                dict(prior), sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+        ).hexdigest()
+        delete_nonce = document.get("execution_root_delete_nonce")
+        if prior_phase == "intended":
+            recovered_root = _strict_live_ipc_recovery_root_binding(document)
+            if recovered_root is not None:
+                candidates.append(
+                    _strict_live_ipc_witness_record(
+                        document,
+                        phase="root-bound",
+                        sequence=next_sequence,
+                        previous_sha256=previous_sha256,
+                        root_binding=recovered_root,
+                        delete_nonce=None,
+                        deletion_receipt=None,
+                    )
+                )
+            if type(delete_nonce) is str:
+                candidates.append(
+                    _strict_live_ipc_witness_record(
+                        document,
+                        phase="deleting",
+                        sequence=next_sequence,
+                        previous_sha256=previous_sha256,
+                        root_binding=recovered_root,
+                        delete_nonce=delete_nonce,
+                        deletion_receipt=None,
+                    )
+                )
+        elif prior_phase == "root-bound" and type(delete_nonce) is str:
+            candidates.append(
+                _strict_live_ipc_witness_record(
+                    document,
+                    phase="deleting",
+                    sequence=next_sequence,
+                    previous_sha256=previous_sha256,
+                    root_binding=prior_root,
+                    delete_nonce=delete_nonce,
+                    deletion_receipt=None,
+                )
+            )
+        elif prior_phase == "deleting" and type(delete_nonce) is str:
+            root_path = _STRICT_LIVE_IPC_PARENT / str(direct_binding["name"])
+            try:
+                root_path.lstat()
+            except FileNotFoundError:
+                deletion_receipt = {
+                    "kind": "direct-empty-rmdir-v1",
+                    "parent_device": direct_binding["parent"]["device"],
+                    "parent_inode": direct_binding["parent"]["inode"],
+                    "device": (
+                        None if prior_root is None else prior_root["device"]
+                    ),
+                    "inode": None if prior_root is None else prior_root["inode"],
+                    "name": direct_binding["name"],
+                }
+                candidates.append(
+                    _strict_live_ipc_witness_record(
+                        document,
+                        phase="deleted",
+                        sequence=next_sequence,
+                        previous_sha256=previous_sha256,
+                        root_binding=prior_root,
+                        delete_nonce=delete_nonce,
+                        deletion_receipt=deletion_receipt,
+                    )
+                )
+            except OSError as error:
+                raise AssertionError(
+                    "strict live IPC recovery root is unreadable"
+                ) from error
+    valid_candidates: list[dict[str, object]] = []
+    for candidate in candidates:
+        try:
+            _validate_strict_live_ipc_witness_records(
+                [*records, candidate], document
+            )
+        except AssertionError:
+            continue
+        valid_candidates.append(candidate)
+    return any(
+        _encode_strict_live_ipc_witness_frame(value)[0].startswith(tail)
+        for value in valid_candidates
+    )
+
+
+def _read_strict_live_ipc_witness_log(
+    descriptor: int,
+    namespace_fd: int,
+    document: Mapping[str, object],
+    *,
+    repair_partial_tail: bool,
+) -> tuple[list[dict[str, object]], bytes, list[str]]:
+    try:
+        metadata = os.fstat(descriptor)
+        data = os.pread(
+            descriptor, _STRICT_LIVE_IPC_WITNESS_LIMIT_BYTES + 1, 0
+        )
+    except OSError as error:
+        raise AssertionError("strict live IPC witness is unreadable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != _STRICT_LIVE_IPC_WITNESS_OWNER_UID
+        or metadata.st_gid != _STRICT_LIVE_IPC_WITNESS_OWNER_GID
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode)
+        != _STRICT_LIVE_IPC_WITNESS_FILE_MODE
+        or metadata.st_size != len(data)
+        or len(data) > _STRICT_LIVE_IPC_WITNESS_LIMIT_BYTES
+    ):
+        raise AssertionError("strict live IPC witness access policy is unsafe")
+    _descriptor_acl_is_absent(descriptor, "strict live IPC witness")
+    direct_binding = _direct_opt_root_document(document)
+    witness = direct_binding["witness"]
+    if repair_partial_tail and witness.get("file") is None:
+        resumed = _write_validated_strict_live_ipc_witness_record(
+            descriptor,
+            document,
+            (),
+            (),
+            leading_bytes=_STRICT_LIVE_IPC_WITNESS_MAGIC,
+            durable_prefix=data,
+            phase="intended",
+            root_binding=None,
+            delete_nonce=None,
+            deletion_receipt=None,
+        )
+        if resumed is not None:
+            _intended_record, initial_publication, _intended_digest = resumed
+            # The exact, high-entropy basename is predeclared by the held
+            # registry intent and lives in a root-only namespace.  An O_EXCL
+            # creator killed before its first durable frame therefore owns
+            # only this exact initial-publication prefix; never truncate or
+            # overwrite a divergent collision.
+            try:
+                os.fsync(namespace_fd)
+                completed_metadata = os.fstat(descriptor)
+                completed_data = os.pread(
+                    descriptor,
+                    _STRICT_LIVE_IPC_WITNESS_LIMIT_BYTES + 1,
+                    0,
+                )
+            except OSError as error:
+                raise AssertionError(
+                    "strict live IPC witness publication cannot be resumed"
+                ) from error
+            if (
+                completed_metadata.st_size != len(initial_publication)
+                or completed_data != initial_publication
+            ):
+                raise AssertionError(
+                    "strict live IPC witness publication changed"
+                )
+            data = completed_data
+    if not data.startswith(_STRICT_LIVE_IPC_WITNESS_MAGIC):
+        raise AssertionError("strict live IPC witness access policy is unsafe")
+    offset = len(_STRICT_LIVE_IPC_WITNESS_MAGIC)
+    valid_offset = offset
+    records: list[dict[str, object]] = []
+    digests: list[str] = []
+    while offset < len(data):
+        remaining = data[offset:]
+        if len(remaining) < 9:
+            break
+        length_value = remaining[:8]
+        if remaining[8:9] != b":" or re.fullmatch(
+            rb"[0-9a-f]{8}", length_value
+        ) is None:
+            raise AssertionError("strict live IPC witness frame header is malformed")
+        payload_length = int(length_value, 16)
+        frame_length = 9 + payload_length + 1 + 64 + 1
+        if (
+            payload_length <= 0
+            or payload_length > _STRICT_LIVE_IPC_WITNESS_RECORD_LIMIT_BYTES
+        ):
+            raise AssertionError("strict live IPC witness frame length is invalid")
+        if len(remaining) < frame_length:
+            break
+        payload = remaining[9 : 9 + payload_length]
+        digest_offset = 9 + payload_length
+        digest_bytes = remaining[digest_offset + 1 : digest_offset + 65]
+        if (
+            remaining[digest_offset : digest_offset + 1] != b":"
+            or remaining[digest_offset + 65 : frame_length] != b"\n"
+            or re.fullmatch(rb"[0-9a-f]{64}", digest_bytes) is None
+            or hashlib.sha256(payload).hexdigest().encode("ascii")
+            != digest_bytes
+        ):
+            raise AssertionError("strict live IPC witness frame digest is invalid")
+        try:
+            record = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise AssertionError("strict live IPC witness frame is malformed") from error
+        if (
+            type(record) is not dict
+            or json.dumps(record, sort_keys=True, separators=(",", ":")).encode(
+                "ascii"
+            )
+            != payload
+        ):
+            raise AssertionError("strict live IPC witness frame is noncanonical")
+        records.append(record)
+        digests.append(digest_bytes.decode("ascii"))
+        offset += frame_length
+        valid_offset = offset
+    if records:
+        _validate_strict_live_ipc_witness_records(records, document)
+    if valid_offset != len(data):
+        tail = data[valid_offset:]
+        if (
+            not repair_partial_tail
+            or not tail
+            or not _strict_live_ipc_witness_partial_tail_is_exact(
+                tail, records, document
+            )
+        ):
+            raise AssertionError("strict live IPC witness tail is incomplete")
+        try:
+            os.ftruncate(descriptor, valid_offset)
+            os.fsync(descriptor)
+            os.fsync(namespace_fd)
+            data = data[:valid_offset]
+        except OSError as error:
+            raise AssertionError(
+                "strict live IPC witness tail cannot be repaired"
+            ) from error
+    if not records and not repair_partial_tail:
+        raise AssertionError("strict live IPC witness record chain is incomplete")
+    return records, data, digests
+
+
+def _strict_live_ipc_witness_file_binding(
+    descriptor: int,
+    document: Mapping[str, object],
+    records: Sequence[Mapping[str, object]],
+    data: bytes,
+    digests: Sequence[str],
+) -> dict[str, object]:
+    metadata = os.fstat(descriptor)
+    direct_binding = _direct_opt_root_document(document)
+    witness = direct_binding["witness"]
+    return {
+        "path": str(
+            _strict_live_ipc_witness_namespace_path()
+            / str(witness["basename"])
+        ),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "nlink": metadata.st_nlink,
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "last_record_sha256": digests[-1],
+        "phase": records[-1]["phase"],
+    }
+
+
+def _append_strict_live_ipc_witness_record(
+    descriptor: int,
+    namespace_fd: int,
+    document: Mapping[str, object],
+    records: list[dict[str, object]],
+    data: bytes,
+    digests: list[str],
+    *,
+    phase: str,
+    root_binding: Mapping[str, object] | None,
+    delete_nonce: str | None,
+    deletion_receipt: Mapping[str, object] | None,
+) -> tuple[list[dict[str, object]], bytes, list[str]]:
+    written = _write_validated_strict_live_ipc_witness_record(
+        descriptor,
+        document,
+        records,
+        digests,
+        leading_bytes=data,
+        durable_prefix=data,
+        phase=phase,
+        root_binding=root_binding,
+        delete_nonce=delete_nonce,
+        deletion_receipt=deletion_receipt,
+    )
+    if written is None:
+        raise AssertionError("strict live IPC witness append prefix changed")
+    record, expected_data, digest = written
+    selected_records, selected_data, selected_digests = (
+        _read_strict_live_ipc_witness_log(
+            descriptor,
+            namespace_fd,
+            document,
+            repair_partial_tail=False,
+        )
+    )
+    if (
+        selected_records != [*records, record]
+        or selected_data != expected_data
+        or selected_digests != [*digests, digest]
+    ):
+        raise AssertionError("strict live IPC witness append changed")
+    return selected_records, selected_data, selected_digests
+
+
+def _root_open_or_create_strict_live_ipc_witness(
+    namespace_fd: int,
+    document: Mapping[str, object],
+) -> tuple[int, list[dict[str, object]], bytes, list[str]]:
+    direct_binding = _direct_opt_root_document(document)
+    witness = direct_binding["witness"]
+    basename = str(witness["basename"])
+    expected_file = witness.get("file")
+    descriptor: int | None = None
+    created = False
+    publication_durable = False
+    try:
+        try:
+            descriptor = os.open(
+                basename,
+                os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=namespace_fd,
+            )
+        except FileNotFoundError:
+            if expected_file is not None:
+                raise AssertionError("strict live IPC witness identity changed")
+            try:
+                descriptor = os.open(
+                    basename,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    _STRICT_LIVE_IPC_WITNESS_FILE_MODE,
+                    dir_fd=namespace_fd,
+                )
+                created = True
+            except FileExistsError:
+                descriptor = os.open(
+                    basename,
+                    os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=namespace_fd,
+                )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if expected_file is not None:
+            try:
+                opened_before_repair = os.fstat(descriptor)
+                selected_before_repair = os.stat(
+                    basename,
+                    dir_fd=namespace_fd,
+                    follow_symlinks=False,
+                )
+                bytes_before_repair = os.pread(
+                    descriptor,
+                    _STRICT_LIVE_IPC_WITNESS_LIMIT_BYTES + 1,
+                    0,
+                )
+            except OSError as error:
+                raise AssertionError(
+                    "strict live IPC witness identity is unreadable"
+                ) from error
+            expected_size = int(expected_file["size"])
+            expected_path = str(
+                _strict_live_ipc_witness_namespace_path() / basename
+            )
+            if (
+                not _strict_registry_entry_metadata_matches(
+                    selected_before_repair, opened_before_repair
+                )
+                or expected_file.get("path") != expected_path
+                or any(
+                    expected_file.get(field)
+                    != getattr(opened_before_repair, attribute)
+                    for field, attribute in (
+                        ("device", "st_dev"),
+                        ("inode", "st_ino"),
+                        ("uid", "st_uid"),
+                        ("gid", "st_gid"),
+                        ("nlink", "st_nlink"),
+                    )
+                )
+                or expected_file.get("mode")
+                != stat.S_IMODE(opened_before_repair.st_mode)
+                or opened_before_repair.st_size != len(bytes_before_repair)
+                or len(bytes_before_repair)
+                > _STRICT_LIVE_IPC_WITNESS_LIMIT_BYTES
+                or expected_size > len(bytes_before_repair)
+                or hashlib.sha256(
+                    bytes_before_repair[:expected_size]
+                ).hexdigest()
+                != expected_file.get("sha256")
+            ):
+                raise AssertionError("strict live IPC witness identity changed")
+        if created:
+            os.fchown(
+                descriptor,
+                _STRICT_LIVE_IPC_WITNESS_OWNER_UID,
+                _STRICT_LIVE_IPC_WITNESS_OWNER_GID,
+            )
+            os.fchmod(descriptor, _STRICT_LIVE_IPC_WITNESS_FILE_MODE)
+            published = _write_validated_strict_live_ipc_witness_record(
+                descriptor,
+                document,
+                (),
+                (),
+                leading_bytes=_STRICT_LIVE_IPC_WITNESS_MAGIC,
+                durable_prefix=b"",
+                phase="intended",
+                root_binding=None,
+                delete_nonce=None,
+                deletion_receipt=None,
+            )
+            if published is None:
+                raise AssertionError(
+                    "strict live IPC witness publication prefix changed"
+                )
+            publication_durable = True
+            os.fsync(namespace_fd)
+        records, data, digests = _read_strict_live_ipc_witness_log(
+            descriptor,
+            namespace_fd,
+            document,
+            repair_partial_tail=True,
+        )
+        if not records:
+            records, data, digests = _append_strict_live_ipc_witness_record(
+                descriptor,
+                namespace_fd,
+                document,
+                records,
+                data,
+                digests,
+                phase="intended",
+                root_binding=None,
+                delete_nonce=None,
+                deletion_receipt=None,
+            )
+        current_binding = _strict_live_ipc_witness_file_binding(
+            descriptor, document, records, data, digests
+        )
+        selected = os.stat(
+            basename, dir_fd=namespace_fd, follow_symlinks=False
+        )
+        opened = os.fstat(descriptor)
+        if not _strict_registry_entry_metadata_matches(selected, opened):
+            raise AssertionError("strict live IPC witness directory entry changed")
+        if expected_file is not None:
+            expected_size = int(expected_file["size"])
+            if (
+                any(
+                    current_binding.get(field) != expected_file.get(field)
+                    for field in (
+                        "path",
+                        "device",
+                        "inode",
+                        "uid",
+                        "gid",
+                        "mode",
+                        "nlink",
+                    )
+                )
+                or expected_size > len(data)
+                or hashlib.sha256(data[:expected_size]).hexdigest()
+                != expected_file["sha256"]
+                or _STRICT_LIVE_IPC_WITNESS_PHASES.index(
+                    str(current_binding["phase"])
+                )
+                < _STRICT_LIVE_IPC_WITNESS_PHASES.index(
+                    str(expected_file["phase"])
+                )
+            ):
+                raise AssertionError("strict live IPC witness identity changed")
+        result_fd = descriptor
+        descriptor = None
+        return result_fd, records, data, digests
+    except BaseException as error:
+        if created and not publication_durable and descriptor is not None:
+            try:
+                # Never delete through a mutable basename after validation
+                # fails.  Persist the exact empty O_EXCL residue instead; a
+                # same-document retry can bind its descriptor and complete the
+                # authorized initial record without destructive cleanup.
+                os.fsync(namespace_fd)
+            except OSError as cleanup_error:
+                raise AssertionError(
+                    "strict live IPC failed publication cannot be retained"
+                ) from cleanup_error
+        if isinstance(error, OSError):
+            raise AssertionError(
+                "strict live IPC witness cannot be opened"
+            ) from error
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _root_registered_opt_ipc_witness_operation(
+    operation: str,
+    document: Mapping[str, object],
+) -> dict[str, object]:
+    if operation not in ("create", "cleanup", "finalize"):
+        raise AssertionError("strict live IPC witness operation is invalid")
+    direct_binding = _direct_opt_root_document(document)
+    witness = direct_binding["witness"]
+    assert isinstance(witness, dict)
+    parent_fd, recaptured_parent = _open_strict_live_ipc_parent(
+        direct_binding["parent"]
+    )
+    namespace_fd: int | None = None
+    witness_fd: int | None = None
+    try:
+        namespace_fd, namespace_binding = (
+            _root_open_strict_live_ipc_witness_namespace(
+                parent_fd, witness.get("namespace")
+            )
+        )
+        basename = str(witness["basename"])
+        if operation == "finalize":
+            expected_file = witness.get("file")
+            if (
+                expected_file is None
+                or expected_file.get("phase") != "deleted"
+                or type(document.get("execution_root_deleted")) is not dict
+            ):
+                raise AssertionError(
+                    "strict live IPC witness retirement identity is unavailable"
+                )
+            try:
+                witness_fd = os.open(
+                    basename,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=namespace_fd,
+                )
+            except FileNotFoundError as error:
+                raise AssertionError(
+                    "strict live IPC witness retirement identity is unavailable"
+                ) from error
+            fcntl.flock(witness_fd, fcntl.LOCK_EX)
+            records, data, digests = _read_strict_live_ipc_witness_log(
+                witness_fd,
+                namespace_fd,
+                document,
+                repair_partial_tail=False,
+            )
+            file_binding = _strict_live_ipc_witness_file_binding(
+                witness_fd, document, records, data, digests
+            )
+            selected_file = os.stat(
+                basename, dir_fd=namespace_fd, follow_symlinks=False
+            )
+            opened_file = os.fstat(witness_fd)
+            if (
+                file_binding != expected_file
+                or not _strict_registry_entry_metadata_matches(
+                    selected_file, opened_file
+                )
+                or records[-1].get("phase") != "deleted"
+                or records[-1].get("deleted")
+                != document.get("execution_root_deleted")
+            ):
+                raise AssertionError(
+                    "strict live IPC witness retirement binding changed"
+                )
+            try:
+                os.stat(
+                    str(direct_binding["name"]),
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                os.fsync(parent_fd)
+            else:
+                raise AssertionError(
+                    "strict live IPC root reappeared before witness retirement"
+                )
+
+            # Retirement is deliberately non-destructive.  Revalidate both
+            # the selected directory entry and the already-open descriptor
+            # after proving that the execution root remains absent, then
+            # re-read the complete terminal log from that same descriptor.
+            # This binds object identity, access policy, and content without a
+            # basename unlink race against an unrelated replacement object.
+            selected_file = os.stat(
+                basename, dir_fd=namespace_fd, follow_symlinks=False
+            )
+            opened_file = os.fstat(witness_fd)
+            if (
+                not _strict_registry_entry_metadata_matches(
+                    selected_file, opened_file
+                )
+                or (opened_file.st_dev, opened_file.st_ino)
+                != (file_binding["device"], file_binding["inode"])
+            ):
+                raise AssertionError(
+                    "strict live IPC witness retirement binding changed"
+                )
+            final_records, final_data, final_digests = (
+                _read_strict_live_ipc_witness_log(
+                    witness_fd,
+                    namespace_fd,
+                    document,
+                    repair_partial_tail=False,
+                )
+            )
+            final_file_binding = _strict_live_ipc_witness_file_binding(
+                witness_fd,
+                document,
+                final_records,
+                final_data,
+                final_digests,
+            )
+            final_selected_file = os.stat(
+                basename, dir_fd=namespace_fd, follow_symlinks=False
+            )
+            final_opened_file = os.fstat(witness_fd)
+            if (
+                final_records != records
+                or final_data != data
+                or final_digests != digests
+                or final_file_binding != file_binding
+                or not _strict_registry_entry_metadata_matches(
+                    final_selected_file, final_opened_file
+                )
+                or not _strict_registry_entry_metadata_matches(
+                    opened_file, final_opened_file
+                )
+            ):
+                raise AssertionError(
+                    "strict live IPC witness retirement binding changed"
+                )
+            retired_binding = {**file_binding, "absent": False}
+            return {
+                "status": "complete",
+                "operation": "finalize",
+                "parent": recaptured_parent,
+                "root": direct_binding["root"],
+                "deleted": document.get("execution_root_deleted"),
+                "witness": {
+                    **dict(witness),
+                    "namespace": namespace_binding,
+                    "file": file_binding,
+                    "retired": retired_binding,
+                },
+                "origin_absent": True,
+            }
+
+        witness_fd, records, data, digests = (
+            _root_open_or_create_strict_live_ipc_witness(
+                namespace_fd, document
+            )
+        )
+        fcntl.flock(witness_fd, fcntl.LOCK_EX)
+        records, data, digests = _read_strict_live_ipc_witness_log(
+            witness_fd,
+            namespace_fd,
+            document,
+            repair_partial_tail=True,
+        )
+        phase = str(records[-1]["phase"])
+        root_binding = records[-1].get("root")
+        expected_root = direct_binding.get("root")
+        if expected_root is not None and root_binding != expected_root:
+            raise AssertionError("strict live IPC witness root identity changed")
+        root_selected = None
+        try:
+            root_selected = os.stat(
+                str(direct_binding["name"]),
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        if operation == "create":
+            if phase == "intended":
+                if root_selected is None:
+                    root_receipt = _root_registered_opt_ipc_root_operation(
+                        "create",
+                        direct_binding["parent"],
+                        str(direct_binding["name"]),
+                        int(document["registry_owner_uid"]),
+                        int(direct_binding["target_gid"]),
+                        None,
+                    )
+                else:
+                    root_receipt = _root_registered_opt_ipc_root_operation(
+                        "adopt",
+                        direct_binding["parent"],
+                        str(direct_binding["name"]),
+                        int(document["registry_owner_uid"]),
+                        int(direct_binding["target_gid"]),
+                        None,
+                        allow_controller_created_adoption=True,
+                    )
+                root_binding = root_receipt.get("root")
+                if not _direct_opt_root_binding_is_exact(
+                    root_binding, include_mount=False
+                ):
+                    raise AssertionError(
+                        "strict live IPC witness root result is invalid"
+                    )
+                records, data, digests = (
+                    _append_strict_live_ipc_witness_record(
+                        witness_fd,
+                        namespace_fd,
+                        document,
+                        records,
+                        data,
+                        digests,
+                        phase="root-bound",
+                        root_binding=root_binding,
+                        delete_nonce=None,
+                        deletion_receipt=None,
+                    )
+                )
+            elif phase == "root-bound":
+                _root_registered_opt_ipc_root_operation(
+                    "verify",
+                    direct_binding["parent"],
+                    str(direct_binding["name"]),
+                    int(document["registry_owner_uid"]),
+                    int(direct_binding["target_gid"]),
+                    root_binding,
+                )
+            else:
+                raise AssertionError(
+                    "strict live IPC witness create phase is invalid"
+                )
+            deletion_receipt = None
+        else:
+            delete_nonce = document.get("execution_root_delete_nonce")
+            if type(delete_nonce) is not str:
+                raise AssertionError(
+                    "strict live IPC witness delete nonce is missing"
+                )
+            if phase == "intended" and root_selected is not None:
+                adopted = _root_registered_opt_ipc_root_operation(
+                    "adopt",
+                    direct_binding["parent"],
+                    str(direct_binding["name"]),
+                    int(document["registry_owner_uid"]),
+                    int(direct_binding["target_gid"]),
+                    None,
+                    allow_controller_created_adoption=True,
+                )
+                root_binding = adopted.get("root")
+                records, data, digests = (
+                    _append_strict_live_ipc_witness_record(
+                        witness_fd,
+                        namespace_fd,
+                        document,
+                        records,
+                        data,
+                        digests,
+                        phase="root-bound",
+                        root_binding=root_binding,
+                        delete_nonce=None,
+                        deletion_receipt=None,
+                    )
+                )
+                phase = "root-bound"
+            if phase in ("intended", "root-bound"):
+                records, data, digests = (
+                    _append_strict_live_ipc_witness_record(
+                        witness_fd,
+                        namespace_fd,
+                        document,
+                        records,
+                        data,
+                        digests,
+                        phase="deleting",
+                        root_binding=root_binding,
+                        delete_nonce=delete_nonce,
+                        deletion_receipt=None,
+                    )
+                )
+                phase = "deleting"
+            if phase == "deleting":
+                cleaned = _root_registered_opt_ipc_root_operation(
+                    "cleanup",
+                    direct_binding["parent"],
+                    str(direct_binding["name"]),
+                    int(document["registry_owner_uid"]),
+                    int(direct_binding["target_gid"]),
+                    root_binding,
+                )
+                root_binding = cleaned.get("root")
+                deletion_receipt = {
+                    "kind": "direct-empty-rmdir-v1",
+                    "parent_device": direct_binding["parent"]["device"],
+                    "parent_inode": direct_binding["parent"]["inode"],
+                    "device": (
+                        None
+                        if root_binding is None
+                        else root_binding["device"]
+                    ),
+                    "inode": (
+                        None
+                        if root_binding is None
+                        else root_binding["inode"]
+                    ),
+                    "name": direct_binding["name"],
+                }
+                records, data, digests = (
+                    _append_strict_live_ipc_witness_record(
+                        witness_fd,
+                        namespace_fd,
+                        document,
+                        records,
+                        data,
+                        digests,
+                        phase="deleted",
+                        root_binding=root_binding,
+                        delete_nonce=delete_nonce,
+                        deletion_receipt=deletion_receipt,
+                    )
+                )
+            elif phase == "deleted":
+                deletion_receipt = records[-1].get("deleted")
+                root_binding = records[-1].get("root")
+                _root_registered_opt_ipc_root_operation(
+                    "cleanup",
+                    direct_binding["parent"],
+                    str(direct_binding["name"]),
+                    int(document["registry_owner_uid"]),
+                    int(direct_binding["target_gid"]),
+                    root_binding,
+                )
+            else:
+                raise AssertionError(
+                    "strict live IPC witness cleanup phase is invalid"
+                )
+        file_binding = _strict_live_ipc_witness_file_binding(
+            witness_fd, document, records, data, digests
+        )
+        selected_witness = os.stat(
+            basename, dir_fd=namespace_fd, follow_symlinks=False
+        )
+        opened_witness = os.fstat(witness_fd)
+        if not _strict_registry_entry_metadata_matches(
+            selected_witness, opened_witness
+        ):
+            raise AssertionError("strict live IPC witness directory entry changed")
+        return {
+            "status": "complete",
+            "operation": operation,
+            "parent": recaptured_parent,
+            "root": root_binding,
+            "deleted": deletion_receipt,
+            "witness": {
+                **dict(witness),
+                "namespace": namespace_binding,
+                "file": file_binding,
+            },
+            "origin_absent": operation == "cleanup",
+        }
+    finally:
+        if witness_fd is not None:
+            try:
+                fcntl.flock(witness_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(witness_fd)
+        if namespace_fd is not None:
+            os.close(namespace_fd)
+        os.close(parent_fd)
+
+
+def _root_registered_opt_ipc_root_main(arguments: Sequence[str]) -> int:
+    registry_fd: int | None = None
+    lock_fd: int | None = None
+    entry_fd: int | None = None
+    try:
+        if os.getuid() != 0 or os.geteuid() != 0:
+            raise AssertionError("strict live IPC root broker did not start as root")
+        _bind_root_controller_parent()
+        if len(arguments) != 11:
+            raise AssertionError("strict live IPC root broker arguments are malformed")
+        (
+            operation,
+            entry_value,
+            registry_value,
+            parent_value,
+            name,
+            runner_uid_value,
+            target_gid_value,
+            root_value,
+            token,
+            session_id,
+            delete_nonce,
+        ) = arguments
+        entry_path = Path(entry_value)
+        if (
+            not entry_path.is_absolute()
+            or _CHAIN_ENTRY_NAME_PATTERN.fullmatch(entry_path.name) is None
+            or not runner_uid_value.isdecimal()
+            or not target_gid_value.isdecimal()
+            or re.fullmatch(r"[0-9a-f]{32}", token) is None
+            or re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+            or operation not in ("create", "cleanup", "finalize")
+            or (
+                operation in ("cleanup", "finalize")
+                and re.fullmatch(r"[0-9a-f]{32}", delete_nonce) is None
+            )
+            or (operation == "create" and delete_nonce != "-")
+            or name != _direct_opt_root_name(session_id)
+        ):
+            raise AssertionError("strict live IPC root broker binding is malformed")
+        runner_uid = int(runner_uid_value)
+        target_gid = int(target_gid_value)
+        registry_binding = json.loads(registry_value)
+        parent_binding = json.loads(parent_value)
+        expected_root = None if root_value == "-" else json.loads(root_value)
+        if (
+            entry_path.parent != Path(str(registry_binding.get("path")))
+            or entry_path.name != f"chain-{session_id}.json"
+        ):
+            raise AssertionError(
+                "strict live IPC root durable intent selector is invalid"
+            )
+        registry_fd, recaptured_registry = _open_strict_live_registry_entries(
+            registry_binding, runner_uid
+        )
+        lock_name = f".{entry_path.name}.lock"
+        try:
+            lock_fd = os.open(
+                lock_name,
+                os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=registry_fd,
+            )
+            lock_metadata = os.fstat(lock_fd)
+            if (
+                not stat.S_ISREG(lock_metadata.st_mode)
+                or lock_metadata.st_uid != runner_uid
+                or lock_metadata.st_nlink != 1
+                or stat.S_IMODE(lock_metadata.st_mode) != 0o600
+            ):
+                raise AssertionError(
+                    "strict live IPC root durable intent lock is unsafe"
+                )
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise AssertionError(
+                        "strict live IPC root durable intent lock is unreadable"
+                    ) from error
+            else:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                raise AssertionError(
+                    "strict live IPC root durable intent lock is not held"
+                )
+            entry_fd = os.open(
+                entry_path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=registry_fd,
+            )
+            entry_metadata = os.fstat(entry_fd)
+            chunks: list[bytes] = []
+            remaining = 4097
+            while remaining:
+                chunk = os.read(entry_fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            entry_bytes = b"".join(chunks)
+            revalidated_entry = os.fstat(entry_fd)
+            selected_entry = os.stat(
+                entry_path.name,
+                dir_fd=registry_fd,
+                follow_symlinks=False,
+            )
+            entry_document = json.loads(entry_bytes)
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise AssertionError(
+                "strict live IPC root durable intent is unreadable"
+            ) from error
+        if (
+            not stat.S_ISREG(entry_metadata.st_mode)
+            or entry_metadata.st_uid != runner_uid
+            or entry_metadata.st_nlink != 1
+            or stat.S_IMODE(entry_metadata.st_mode) != 0o600
+            or entry_metadata.st_size > 4096
+            or len(entry_bytes) != entry_metadata.st_size
+            or any(
+                getattr(entry_metadata, field)
+                != getattr(revalidated_entry, field)
+                for field in (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_uid",
+                    "st_gid",
+                    "st_nlink",
+                    "st_size",
+                )
+            )
+            or any(
+                getattr(selected_entry, field)
+                != getattr(entry_metadata, field)
+                for field in (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_uid",
+                    "st_gid",
+                    "st_nlink",
+                    "st_size",
+                )
+            )
+            or type(entry_document) is not dict
+        ):
+            raise AssertionError("strict live IPC root durable intent is invalid")
+        loaded_document = _load_chain_registry_entry(
+            entry_path,
+            expected_token=token,
+            expected_target_uid=target_gid,
+            expected_recovery_controller=_TRUSTED_SUPPORT_PATH,
+            bound_descriptor=entry_fd,
+        )
+        entry_direct_binding = _direct_opt_root_document(entry_document)
+        expected_state = {
+            "create": "prepared",
+            "cleanup": "deleting",
+            "finalize": "closed",
+        }[operation]
+        if (
+            loaded_document != entry_document
+            or entry_document.get("controller_path")
+            != str(_TRUSTED_SUPPORT_PATH)
+            or entry_document.get("registry_owner_uid") != runner_uid
+            or entry_direct_binding.get("registry") != recaptured_registry
+            or entry_direct_binding.get("parent") != parent_binding
+            or entry_direct_binding.get("name") != name
+            or entry_direct_binding.get("target_gid") != target_gid
+            or entry_direct_binding.get("mode")
+            != _STRICT_LIVE_IPC_ROOT_MODE
+            or entry_direct_binding.get("root") != expected_root
+            or entry_document.get("state") != expected_state
+            or entry_document.get("execution_root_delete_nonce")
+            != (None if operation == "create" else delete_nonce)
+        ):
+            raise AssertionError("strict live IPC root durable intent is invalid")
+        current_entry = os.stat(
+            entry_path.name,
+            dir_fd=registry_fd,
+            follow_symlinks=False,
+        )
+        if not _strict_registry_entry_metadata_matches(
+            current_entry, entry_metadata
+        ):
+            raise AssertionError(
+                "strict live IPC root durable intent identity changed"
+            )
+        receipt = _root_registered_opt_ipc_witness_operation(
+            operation, entry_document
+        )
+        root_binding = receipt.get("root")
+        if root_binding is not None and not _direct_opt_root_binding_is_exact(
+            root_binding, include_mount=False
+        ):
+            raise AssertionError(
+                "strict live IPC root broker result binding is invalid"
+            )
+        after_descriptor = os.fstat(entry_fd)
+        after_selected = os.stat(
+            entry_path.name, dir_fd=registry_fd, follow_symlinks=False
+        )
+        after_bytes = os.pread(entry_fd, 4097, 0)
+        if (
+            not _strict_registry_entry_metadata_matches(
+                after_descriptor, entry_metadata
+            )
+            or not _strict_registry_entry_metadata_matches(
+                after_selected, entry_metadata
+            )
+            or after_bytes != entry_bytes
+        ):
+            raise AssertionError(
+                "strict live IPC root durable intent changed during broker use"
+            )
+        receipt.update(
+            {
+                "schema_version": 1,
+                "kind": _STRICT_LIVE_IPC_CLEANUP_KIND,
+                "token": token,
+                "session_id": session_id,
+                "delete_nonce": None if delete_nonce == "-" else delete_nonce,
+            }
+        )
+    except BaseException as error:
+        receipt = {
+            "status": "incomplete",
+            "error": f"{type(error).__name__}: {error}",
+        }
+    finally:
+        for descriptor in (entry_fd, lock_fd, registry_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+    print(
+        _ROOT_TREE_RECEIPT_PREFIX
+        + json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    )
+    return 0
 
 
 def _root_seal_execution_root_main(arguments: Sequence[str]) -> int:
@@ -7486,6 +9598,355 @@ def _invoke_registered_resource_seal(
         )
 
 
+def _direct_opt_root_document(
+    document: Mapping[str, object],
+) -> dict[str, object]:
+    binding = document.get("direct_opt_root")
+    witness = binding.get("witness") if type(binding) is dict else None
+    session_id = document.get("session_id")
+    root_binding = binding.get("root") if type(binding) is dict else None
+    if (
+        document.get("cleanup_execution_root") is not True
+        or document.get("cleanup_kind") != _STRICT_LIVE_IPC_CLEANUP_KIND
+        or type(binding) is not dict
+        or set(binding)
+        != {
+            "registry",
+            "parent",
+            "name",
+            "target_gid",
+            "mode",
+            "root",
+            "witness",
+        }
+        or not _direct_opt_root_binding_is_exact(
+            binding.get("registry"), include_mount=False
+        )
+        or not _direct_opt_root_binding_is_exact(
+            binding.get("parent"), include_mount=True
+        )
+        or binding["parent"].get("path") != str(_STRICT_LIVE_IPC_PARENT)
+        or binding["registry"].get("uid")
+        != document.get("registry_owner_uid")
+        or binding["registry"].get("mode") != 0o700
+        or type(binding.get("name")) is not str
+        or binding.get("name")
+        != _direct_opt_root_name(str(document.get("session_id")))
+        or type(binding.get("target_gid")) is not int
+        or binding.get("target_gid") != document.get("target_uid")
+        or binding.get("mode") != _STRICT_LIVE_IPC_ROOT_MODE
+        or not _strict_live_ipc_witness_binding_is_exact(witness)
+        or witness.get("basename")
+        != _strict_live_ipc_witness_basename(
+            str(session_id), str(witness.get("nonce"))
+        )
+        or (
+            root_binding is not None
+            and not _direct_opt_root_binding_is_exact(
+                root_binding, include_mount=False
+            )
+        )
+        or (
+            root_binding is not None
+            and (
+                root_binding.get("path")
+                != str(_STRICT_LIVE_IPC_PARENT / str(binding.get("name")))
+                or root_binding.get("uid") != document.get("registry_owner_uid")
+                or root_binding.get("gid") != binding.get("target_gid")
+                or root_binding.get("mode") != _STRICT_LIVE_IPC_ROOT_MODE
+            )
+        )
+    ):
+        raise AssertionError("strict registered live IPC root binding is malformed")
+    namespace_binding = witness.get("namespace")
+    file_binding = witness.get("file")
+    retired_binding = witness.get("retired")
+    if (
+        namespace_binding is not None
+        and (
+            namespace_binding.get("path")
+            != str(_strict_live_ipc_witness_namespace_path())
+            or namespace_binding.get("uid")
+            != _STRICT_LIVE_IPC_WITNESS_OWNER_UID
+            or namespace_binding.get("gid")
+            != _STRICT_LIVE_IPC_WITNESS_OWNER_GID
+            or namespace_binding.get("mode")
+            != _STRICT_LIVE_IPC_WITNESS_DIRECTORY_MODE
+            or namespace_binding.get("device") != binding["parent"].get("device")
+        )
+    ):
+        raise AssertionError("strict registered live IPC witness namespace is malformed")
+    if (
+        file_binding is not None
+        and (
+            namespace_binding is None
+            or file_binding.get("path")
+            != str(
+                _strict_live_ipc_witness_namespace_path()
+                / str(witness.get("basename"))
+            )
+            or file_binding.get("uid") != _STRICT_LIVE_IPC_WITNESS_OWNER_UID
+            or file_binding.get("gid") != _STRICT_LIVE_IPC_WITNESS_OWNER_GID
+            or file_binding.get("phase") not in ("root-bound", "deleted")
+        )
+    ):
+        raise AssertionError("strict registered live IPC witness file is malformed")
+    if root_binding is not None and file_binding is None:
+        raise AssertionError(
+            "strict registered live IPC witness root proof is malformed"
+        )
+    if file_binding is not None and file_binding.get("phase") == "root-bound" and (
+        root_binding is None
+        or document.get("execution_root_deleted") is not None
+        or retired_binding is not None
+    ):
+        raise AssertionError("strict registered live IPC witness root proof is malformed")
+    if file_binding is not None and file_binding.get("phase") == "deleted" and (
+        type(document.get("execution_root_delete_nonce")) is not str
+        or type(document.get("execution_root_deleted")) is not dict
+    ):
+        raise AssertionError(
+            "strict registered live IPC witness deletion proof is malformed"
+        )
+    if retired_binding is not None and document.get("state") != "closed":
+        raise AssertionError("strict registered live IPC witness retired too early")
+    return dict(binding)
+
+
+def _invoke_registered_opt_ipc_root(
+    controller_path: Path,
+    entry_path: Path,
+    document: Mapping[str, object],
+    operation: str,
+) -> dict[str, object]:
+    if operation not in ("create", "cleanup", "finalize"):
+        raise AssertionError("strict registered live IPC root operation is invalid")
+    binding = _direct_opt_root_document(document)
+    root_binding = binding["root"]
+    delete_nonce = document.get("execution_root_delete_nonce")
+    expected_state = {
+        "create": "prepared",
+        "cleanup": "deleting",
+        "finalize": "closed",
+    }[operation]
+    if document.get("state") != expected_state:
+        raise AssertionError("strict registered live IPC root state is invalid")
+    if operation in ("cleanup", "finalize"):
+        if type(delete_nonce) is not str:
+            raise AssertionError(
+                "strict registered live IPC root delete nonce is missing"
+            )
+        selected_delete_nonce = delete_nonce
+    else:
+        if delete_nonce is not None or root_binding is not None:
+            raise AssertionError(
+                "strict registered live IPC root create phase is invalid"
+            )
+        selected_delete_nonce = "-"
+    with _chain_registry_lock(entry_path):
+        selected_document = _load_chain_registry_entry(entry_path)
+        if selected_document != dict(document):
+            raise AssertionError(
+                "strict registered live IPC root durable intent changed"
+            )
+        output = _run_registered_sudo(
+            [
+                str(_STRICT_PRIMITIVES["python"]),
+                *_ROOT_PYTHON_ARGUMENTS,
+                str(controller_path),
+                "--isolation-opt-ipc-root",
+                operation,
+                str(entry_path),
+                json.dumps(
+                    binding["registry"], sort_keys=True, separators=(",", ":")
+                ),
+                json.dumps(
+                    binding["parent"], sort_keys=True, separators=(",", ":")
+                ),
+                str(binding["name"]),
+                str(document["registry_owner_uid"]),
+                str(binding["target_gid"]),
+                (
+                    "-"
+                    if root_binding is None
+                    else json.dumps(
+                        root_binding, sort_keys=True, separators=(",", ":")
+                    )
+                ),
+                str(document["token"]),
+                str(document["session_id"]),
+                selected_delete_nonce,
+            ],
+            execution_root=_STRICT_LIVE_IPC_PARENT,
+            diagnostic_phase="registered-command",
+        )
+        expected_prefix = _ROOT_TREE_RECEIPT_PREFIX.encode("ascii")
+        if not output.startswith(expected_prefix) or output.count(b"\n") != 1:
+            raise AssertionError("strict live IPC root broker receipt is malformed")
+        try:
+            receipt = json.loads(output[len(expected_prefix) :])
+        except json.JSONDecodeError as error:
+            raise AssertionError(
+                "strict live IPC root broker receipt is malformed"
+            ) from error
+        trusted_finalize_witness: dict[str, object] | None = None
+        if (
+            operation == "finalize"
+            and type(receipt) is dict
+            and type(receipt.get("witness")) is dict
+        ):
+            prior_witness = binding["witness"]
+            selected_witness = receipt["witness"]
+            prior_file = prior_witness.get("file")
+            selected_file = selected_witness.get("file")
+            if prior_file is None or selected_file != prior_file:
+                raise AssertionError(
+                    "strict live IPC witness file content changed"
+                )
+            expected_retired = {**prior_file, "absent": False}
+            if selected_witness.get("retired") != expected_retired:
+                raise AssertionError(
+                    "strict live IPC witness retirement proof changed"
+                )
+            trusted_finalize_witness = dict(prior_witness)
+            trusted_finalize_witness["retired"] = expected_retired
+        if (
+            type(receipt) is not dict
+            or set(receipt)
+            != {
+                "status",
+                "schema_version",
+                "kind",
+                "operation",
+                "token",
+                "session_id",
+                "delete_nonce",
+                "parent",
+                "root",
+                "deleted",
+                "witness",
+                "origin_absent",
+            }
+            or receipt.get("status") != "complete"
+            or receipt.get("schema_version") != 1
+            or receipt.get("kind") != _STRICT_LIVE_IPC_CLEANUP_KIND
+            or receipt.get("operation") != operation
+            or receipt.get("token") != document.get("token")
+            or receipt.get("session_id") != document.get("session_id")
+            or receipt.get("delete_nonce")
+            != (None if selected_delete_nonce == "-" else selected_delete_nonce)
+            or receipt.get("parent") != binding["parent"]
+            or receipt.get("origin_absent")
+            is not (operation in ("cleanup", "finalize"))
+            or not _strict_live_ipc_witness_binding_is_exact(
+                receipt.get("witness")
+            )
+            or receipt["witness"].get("basename")
+            != binding["witness"].get("basename")
+            or receipt["witness"].get("nonce")
+            != binding["witness"].get("nonce")
+        ):
+            raise AssertionError(
+                "strict live IPC root broker did not complete: "
+                f"{receipt.get('error') if isinstance(receipt, dict) else 'invalid'}"
+            )
+        receipt_root = receipt.get("root")
+        if (
+            receipt_root is not None
+            and not _direct_opt_root_binding_is_exact(
+                receipt_root, include_mount=False
+            )
+        ):
+            raise AssertionError("strict live IPC root broker root is malformed")
+        if root_binding is not None and receipt_root != root_binding:
+            raise AssertionError("strict live IPC root broker identity changed")
+        receipt_deleted = receipt.get("deleted")
+        if operation == "create":
+            if receipt_root is None or receipt_deleted is not None:
+                raise AssertionError("strict live IPC root create proof is malformed")
+        elif (
+            type(receipt_deleted) is not dict
+            or receipt_deleted.get("kind") != "direct-empty-rmdir-v1"
+            or receipt_deleted.get("parent_device") != binding["parent"]["device"]
+            or receipt_deleted.get("parent_inode") != binding["parent"]["inode"]
+            or receipt_deleted.get("name") != binding["name"]
+            or receipt_deleted.get("device")
+            != (None if receipt_root is None else receipt_root["device"])
+            or receipt_deleted.get("inode")
+            != (None if receipt_root is None else receipt_root["inode"])
+            or (
+                operation == "finalize"
+                and receipt_deleted != document.get("execution_root_deleted")
+            )
+        ):
+            raise AssertionError("strict live IPC root deletion proof is malformed")
+        prior_witness = binding["witness"]
+        selected_witness = receipt["witness"]
+        for field in ("namespace",):
+            if prior_witness.get(field) is not None and (
+                selected_witness.get(field) != prior_witness.get(field)
+            ):
+                raise AssertionError(
+                    "strict live IPC witness namespace identity changed"
+                )
+        prior_file = prior_witness.get("file")
+        selected_file = selected_witness.get("file")
+        if operation == "finalize":
+            if trusted_finalize_witness is None:
+                raise AssertionError(
+                    "strict live IPC witness retirement proof is missing"
+                )
+            trusted_witness = trusted_finalize_witness
+        elif prior_file is not None and (
+            selected_file is None
+            or any(
+                selected_file.get(field) != prior_file.get(field)
+                for field in (
+                    "path",
+                    "device",
+                    "inode",
+                    "uid",
+                    "gid",
+                    "mode",
+                    "nlink",
+                )
+            )
+        ):
+            raise AssertionError("strict live IPC witness file identity changed")
+        else:
+            if selected_witness.get("retired") is not None:
+                raise AssertionError("strict live IPC witness retired too early")
+            trusted_witness = dict(selected_witness)
+        reloaded_document = _load_chain_registry_entry(entry_path)
+        if reloaded_document != dict(document):
+            raise AssertionError(
+                "strict registered live IPC root durable intent changed"
+            )
+        updated_document = dict(document)
+        updated_binding = dict(binding)
+        updated_binding["root"] = (
+            None if receipt_root is None else dict(receipt_root)
+        )
+        updated_binding["witness"] = trusted_witness
+        updated_document["direct_opt_root"] = updated_binding
+        if receipt_root is not None:
+            updated_document["execution_root"] = {
+                field: receipt_root[field]
+                for field in ("path", "device", "inode")
+            }
+        if operation in ("cleanup", "finalize"):
+            updated_document["execution_root_deleted"] = dict(receipt_deleted)
+        _direct_opt_root_document(updated_document)
+        _write_chain_registry_entry(entry_path, updated_document, create=False)
+        persisted = _load_chain_registry_entry(entry_path)
+        if persisted != updated_document:
+            raise AssertionError("strict live IPC root proof import changed")
+        if operation == "finalize":
+            receipt = dict(receipt)
+            receipt["witness"] = trusted_witness
+        return receipt
+
+
 def _invoke_root_tree_operation(
     controller_path: Path,
     operation: str,
@@ -7751,6 +10212,7 @@ def _load_chain_registry_entry(
     expected_token: str | None = None,
     expected_target_uid: int | None = None,
     expected_recovery_controller: Path | None = None,
+    bound_descriptor: int | None = None,
 ) -> dict[str, object]:
     if (
         expected_token is None
@@ -7771,8 +10233,32 @@ def _load_chain_registry_entry(
         expected_target_uid = target_uid_value
         expected_recovery_controller = controller_value
     try:
-        metadata = path.lstat()
-        data = path.read_bytes()
+        if bound_descriptor is None:
+            metadata = path.lstat()
+            data = path.read_bytes()
+        else:
+            if type(bound_descriptor) is not int:
+                raise AssertionError(
+                    "strict chain registry descriptor is malformed"
+                )
+            metadata = os.fstat(bound_descriptor)
+            data = os.pread(bound_descriptor, 4097, 0)
+            revalidated = os.fstat(bound_descriptor)
+            if any(
+                getattr(metadata, field) != getattr(revalidated, field)
+                for field in (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_uid",
+                    "st_gid",
+                    "st_nlink",
+                    "st_size",
+                )
+            ) or metadata.st_size != len(data):
+                raise AssertionError(
+                    "strict chain registry descriptor changed while reading"
+                )
     except OSError as error:
         raise AssertionError("strict chain registry entry is unreadable") from error
     if (
@@ -7789,6 +10275,29 @@ def _load_chain_registry_entry(
         raise AssertionError("strict chain registry entry is malformed") from error
     if (
         type(document) is not dict
+        or set(document)
+        != {
+            "schema_version",
+            "token",
+            "registry_owner_uid",
+            "state",
+            "session_id",
+            "publication_nonce",
+            "target_uid",
+            "controller_path",
+            "recovery_controller_path",
+            "handshake_path",
+            "execution_root",
+            "cleanup_execution_root",
+            "cleanup_kind",
+            "direct_opt_root",
+            "execution_root_deleted",
+            "execution_root_delete_nonce",
+            "launcher_parent",
+            "outer_marker",
+            "outer",
+        }
+        or type(document.get("schema_version")) is not int
         or document.get("schema_version") != 2
         or document.get("state") not in _CHAIN_STATES
         or type(document.get("registry_owner_uid")) is not int
@@ -7840,6 +10349,50 @@ def _load_chain_registry_entry(
         raise AssertionError(
             "strict chain registry entry active session binding is invalid"
         )
+    cleanup_kind = document.get("cleanup_kind")
+    direct_opt_root = document.get("direct_opt_root")
+    if (
+        (
+            document.get("cleanup_execution_root") is False
+            and (cleanup_kind is not None or direct_opt_root is not None)
+        )
+        or (
+            document.get("cleanup_execution_root") is True
+            and cleanup_kind == "sealed-resource-v1"
+            and direct_opt_root is not None
+        )
+        or (
+            document.get("cleanup_execution_root") is True
+            and cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND
+            and type(direct_opt_root) is not dict
+        )
+        or (
+            document.get("cleanup_execution_root") is True
+            and cleanup_kind
+            not in ("sealed-resource-v1", _STRICT_LIVE_IPC_CLEANUP_KIND)
+        )
+        or cleanup_kind
+        not in (None, "sealed-resource-v1", _STRICT_LIVE_IPC_CLEANUP_KIND)
+    ):
+        raise AssertionError("strict chain registry cleanup binding is invalid")
+    if cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND:
+        binding = _direct_opt_root_document(document)
+        root_binding = binding.get("root")
+        expected_execution_root = (
+            {
+                key: binding["parent"][key]
+                for key in ("path", "device", "inode")
+            }
+            if root_binding is None
+            else {
+                key: root_binding[key]
+                for key in ("path", "device", "inode")
+            }
+        )
+        if document.get("execution_root") != expected_execution_root:
+            raise AssertionError(
+                "strict registered live IPC execution root binding is invalid"
+            )
     deletion_receipt = document.get("execution_root_deleted")
     deletion_nonce = document.get("execution_root_delete_nonce")
     if deletion_nonce is not None and (
@@ -7849,33 +10402,78 @@ def _load_chain_registry_entry(
         or document.get("state") not in ("deleting", "closed")
     ):
         raise AssertionError("strict chain registry deletion nonce is invalid")
-    if deletion_receipt is not None and (
-        type(deletion_receipt) is not dict
-        or set(deletion_receipt)
-        != {
-            "kind",
-            "device",
-            "inode",
-            "vault_device",
-            "vault_inode",
-            "tombstone_name",
-        }
-        or deletion_receipt.get("kind") != "sealed-empty-tombstone"
-        or deletion_receipt.get("device")
-        != document["execution_root"].get("device")
-        or deletion_receipt.get("inode")
-        != document["execution_root"].get("inode")
-        or type(deletion_receipt.get("vault_device")) is not int
-        or type(deletion_receipt.get("vault_inode")) is not int
-        or deletion_receipt.get("tombstone_name")
-        != _sealed_tombstone_name(
-            str(document.get("session_id")), str(deletion_nonce)
-        )
-        or document.get("cleanup_execution_root") is not True
-        or deletion_nonce is None
-        or document.get("state") not in ("deleting", "closed")
-    ):
-        raise AssertionError("strict chain registry deletion receipt is invalid")
+    if deletion_receipt is not None:
+        if cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND:
+            direct_binding = _direct_opt_root_document(document)
+            direct_root = direct_binding.get("root")
+            invalid_deletion_receipt = (
+                type(deletion_receipt) is not dict
+                or set(deletion_receipt)
+                != {
+                    "kind",
+                    "parent_device",
+                    "parent_inode",
+                    "device",
+                    "inode",
+                    "name",
+                }
+                or deletion_receipt.get("kind")
+                != "direct-empty-rmdir-v1"
+                or deletion_receipt.get("parent_device")
+                != direct_binding["parent"]["device"]
+                or deletion_receipt.get("parent_inode")
+                != direct_binding["parent"]["inode"]
+                or deletion_receipt.get("name") != direct_binding["name"]
+                or (
+                    direct_root is None
+                    and (
+                        deletion_receipt.get("device") is not None
+                        or deletion_receipt.get("inode") is not None
+                    )
+                )
+                or (
+                    direct_root is not None
+                    and (
+                        deletion_receipt.get("device")
+                        != direct_root["device"]
+                        or deletion_receipt.get("inode")
+                        != direct_root["inode"]
+                    )
+                )
+            )
+        else:
+            invalid_deletion_receipt = (
+                type(deletion_receipt) is not dict
+                or set(deletion_receipt)
+                != {
+                    "kind",
+                    "device",
+                    "inode",
+                    "vault_device",
+                    "vault_inode",
+                    "tombstone_name",
+                }
+                or deletion_receipt.get("kind") != "sealed-empty-tombstone"
+                or deletion_receipt.get("device")
+                != document["execution_root"].get("device")
+                or deletion_receipt.get("inode")
+                != document["execution_root"].get("inode")
+                or type(deletion_receipt.get("vault_device")) is not int
+                or type(deletion_receipt.get("vault_inode")) is not int
+                or deletion_receipt.get("tombstone_name")
+                != _sealed_tombstone_name(
+                    str(document.get("session_id")), str(deletion_nonce)
+                )
+            )
+        if (
+            invalid_deletion_receipt
+            or document.get("cleanup_execution_root") is not True
+            or deletion_nonce is None
+            or document.get("state") not in ("deleting", "closed")
+        ):
+            raise AssertionError(
+                "strict chain registry deletion receipt is invalid"
+            )
     if (
         document.get("cleanup_execution_root") is True
         and document.get("state") in ("deleting", "closed")
@@ -8431,6 +11029,8 @@ def _register_trusted_root_chain(
     *,
     execution_root: Path,
     cleanup_execution_root: bool = False,
+    cleanup_kind: str | None = None,
+    direct_opt_root: Mapping[str, object] | None = None,
     session_id: str | None = None,
     publication_nonce: str | None = None,
     published_callback: Callable[[], None] | None = None,
@@ -8449,6 +11049,25 @@ def _register_trusted_root_chain(
         or (handshake_path is not None and not handshake_path.is_absolute())
     ):
         raise AssertionError("strict active isolation registry is malformed")
+    selected_cleanup_kind = (
+        "sealed-resource-v1"
+        if cleanup_execution_root and cleanup_kind is None
+        else cleanup_kind
+    )
+    if (
+        (not cleanup_execution_root and selected_cleanup_kind is not None)
+        or (
+            selected_cleanup_kind == "sealed-resource-v1"
+            and direct_opt_root is not None
+        )
+        or (
+            selected_cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND
+            and type(direct_opt_root) is not dict
+        )
+        or selected_cleanup_kind
+        not in (None, "sealed-resource-v1", _STRICT_LIVE_IPC_CLEANUP_KIND)
+    ):
+        raise AssertionError("strict registered cleanup binding is malformed")
     selected_session_id = uuid.uuid4().hex if session_id is None else session_id
     selected_publication_nonce = (
         uuid.uuid4().hex if publication_nonce is None else publication_nonce
@@ -8471,12 +11090,18 @@ def _register_trusted_root_chain(
         "handshake_path": None if handshake_path is None else str(handshake_path),
         "execution_root": _execution_root_binding(execution_root),
         "cleanup_execution_root": cleanup_execution_root,
+        "cleanup_kind": selected_cleanup_kind,
+        "direct_opt_root": (
+            None if direct_opt_root is None else dict(direct_opt_root)
+        ),
         "execution_root_deleted": None,
         "execution_root_delete_nonce": None,
         "launcher_parent": None,
         "outer_marker": None,
         "outer": None,
     }
+    if selected_cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND:
+        _direct_opt_root_document(document)
     with _chain_registry_lock(entry_path, create=True):
         _write_chain_registry_entry(
             entry_path,
@@ -8494,10 +11119,17 @@ def _registered_entry_matches_publication_attempt(
     publication_nonce: str,
     execution_root_binding: Mapping[str, object],
     cleanup_execution_root: bool,
+    cleanup_kind: str | None = None,
+    direct_opt_root: Mapping[str, object] | None = None,
 ) -> bool:
     token = session.get("token")
     target_uid = session.get("target_uid")
     controller_path = session.get("controller_path")
+    selected_cleanup_kind = (
+        "sealed-resource-v1"
+        if cleanup_execution_root and cleanup_kind is None
+        else cleanup_kind
+    )
     if (
         type(publication_nonce) is not str
         or re.fullmatch(r"[0-9a-f]{32}", publication_nonce) is None
@@ -8505,6 +11137,16 @@ def _registered_entry_matches_publication_attempt(
         or type(target_uid) is not int
         or not isinstance(controller_path, Path)
         or type(cleanup_execution_root) is not bool
+        or selected_cleanup_kind
+        not in (None, "sealed-resource-v1", _STRICT_LIVE_IPC_CLEANUP_KIND)
+        or (
+            selected_cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND
+            and type(direct_opt_root) is not dict
+        )
+        or (
+            selected_cleanup_kind != _STRICT_LIVE_IPC_CLEANUP_KIND
+            and direct_opt_root is not None
+        )
         or set(execution_root_binding) != {"path", "device", "inode"}
         or type(execution_root_binding.get("path")) is not str
         or type(execution_root_binding.get("device")) is not int
@@ -8524,6 +11166,9 @@ def _registered_entry_matches_publication_attempt(
             and document.get("execution_root") == dict(execution_root_binding)
             and document.get("cleanup_execution_root")
             is cleanup_execution_root
+            and document.get("cleanup_kind") == selected_cleanup_kind
+            and document.get("direct_opt_root")
+            == (None if direct_opt_root is None else dict(direct_opt_root))
             and document.get("launcher_parent") is None
             and document.get("outer_marker") is None
             and document.get("outer") is None
@@ -8614,6 +11259,168 @@ def _registered_entry_matches_publication_attempt(
                 "strict registered publication staging changed during recovery"
             )
         return True
+
+
+def _revalidate_registered_live_ipc_root(
+    value: Mapping[str, object],
+) -> Path:
+    if (
+        type(value) is not dict
+        or set(value) != {"entry_path", "parent", "root"}
+        or type(value.get("entry_path")) is not str
+        or not Path(str(value.get("entry_path"))).is_absolute()
+        or not _direct_opt_root_binding_is_exact(
+            value.get("parent"), include_mount=True
+        )
+        or not _direct_opt_root_binding_is_exact(
+            value.get("root"), include_mount=False
+        )
+    ):
+        raise AssertionError("strict live IPC root receipt is malformed")
+    entry_path = Path(str(value["entry_path"]))
+    document = _load_chain_registry_entry(entry_path)
+    direct_binding = _direct_opt_root_document(document)
+    if (
+        direct_binding["parent"] != value["parent"]
+        or direct_binding["root"] != value["root"]
+        or document.get("state") != "prepared"
+    ):
+        raise AssertionError("strict live IPC root registry binding changed")
+    parent_fd, _parent = _open_strict_live_ipc_parent(value["parent"])
+    root_fd: int | None = None
+    try:
+        root_fd = _open_bound_directory_entry(
+            parent_fd,
+            str(direct_binding["name"]),
+            int(value["root"]["device"]),
+            int(value["root"]["inode"]),
+        )
+        recaptured = _directory_policy_binding(
+            Path(str(value["root"]["path"])),
+            root_fd,
+            description="strict live IPC root",
+        )
+        if recaptured != value["root"]:
+            raise AssertionError("strict live IPC root access policy changed")
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
+    return Path(str(value["root"]["path"]))
+
+
+@contextmanager
+def _registered_live_host_ipc_root() -> Iterator[dict[str, object]]:
+    session = _active_strict_session()
+    controller_path = session.get("controller_path")
+    target_uid = session.get("target_uid")
+    realm = _strict_realm()
+    if (
+        not isinstance(controller_path, Path)
+        or type(target_uid) is not int
+        or type(realm.get("uid")) is not int
+        or type(realm.get("gid")) is not int
+        or realm["uid"] != target_uid
+        or realm["gid"] != target_uid
+        or (
+            realm.get("lock") is None
+            and type(realm.get("inherited_lock_fd")) is not int
+        )
+    ):
+        raise AssertionError("strict live IPC root realm binding is malformed")
+    parent_binding = _strict_live_ipc_parent_binding()
+    session_id = uuid.uuid4().hex
+    publication_nonce = uuid.uuid4().hex
+    witness_nonce = uuid.uuid4().hex
+    name = _direct_opt_root_name(session_id)
+    direct_binding = {
+        "parent": parent_binding,
+        "name": name,
+        "target_gid": int(realm["gid"]),
+        "mode": _STRICT_LIVE_IPC_ROOT_MODE,
+        "root": None,
+        "witness": {
+            "basename": _strict_live_ipc_witness_basename(
+                session_id, witness_nonce
+            ),
+            "nonce": witness_nonce,
+            "namespace": None,
+            "file": None,
+            "retired": None,
+        },
+    }
+    execution_root_binding = {
+        key: parent_binding[key] for key in ("path", "device", "inode")
+    }
+    entries = session.get("entries")
+    if not isinstance(entries, Path):
+        raise AssertionError("strict live IPC registry path is malformed")
+    registry_binding = _strict_live_registry_entries_binding(entries)
+    direct_binding["registry"] = registry_binding
+    entry_path = entries / f"chain-{session_id}.json"
+    entry_owned = False
+
+    def mark_entry_owned() -> None:
+        nonlocal entry_owned
+        entry_owned = True
+
+    with _registry_session_gate(exclusive=False):
+        try:
+            try:
+                registered_path = _register_trusted_root_chain(
+                    controller_path,
+                    None,
+                    target_uid,
+                    execution_root=_STRICT_LIVE_IPC_PARENT,
+                    cleanup_execution_root=True,
+                    cleanup_kind=_STRICT_LIVE_IPC_CLEANUP_KIND,
+                    direct_opt_root=direct_binding,
+                    session_id=session_id,
+                    publication_nonce=publication_nonce,
+                    published_callback=mark_entry_owned,
+                )
+                if registered_path != entry_path:
+                    raise AssertionError(
+                        "strict live IPC registry path is inconsistent"
+                    )
+                entry_owned = True
+            except BaseException:
+                if not entry_owned:
+                    entry_owned = _registered_entry_matches_publication_attempt(
+                        entry_path,
+                        session=session,
+                        publication_nonce=publication_nonce,
+                        execution_root_binding=execution_root_binding,
+                        cleanup_execution_root=True,
+                        cleanup_kind=_STRICT_LIVE_IPC_CLEANUP_KIND,
+                        direct_opt_root=direct_binding,
+                    )
+                raise
+            document = _load_chain_registry_entry(entry_path)
+            receipt = _invoke_registered_opt_ipc_root(
+                controller_path, entry_path, document, "create"
+            )
+            document = _load_chain_registry_entry(entry_path)
+            imported_direct_binding = _direct_opt_root_document(document)
+            root_binding = imported_direct_binding.get("root")
+            if not _direct_opt_root_binding_is_exact(
+                root_binding, include_mount=False
+            ):
+                raise AssertionError("strict live IPC create receipt is malformed")
+            if receipt.get("witness") != imported_direct_binding.get("witness"):
+                raise AssertionError("strict live IPC witness import changed")
+            selected = {
+                "entry_path": str(entry_path),
+                "parent": parent_binding,
+                "root": dict(root_binding),
+            }
+            _revalidate_registered_live_ipc_root(selected)
+            yield selected
+        finally:
+            if entry_owned:
+                _recover_registered_entry(
+                    entry_path, allow_recovery_broker=True
+                )
 
 
 def _transition_trusted_root_chain(
@@ -8775,10 +11582,60 @@ def _exact_durable_deletion_receipt(
     return receipt
 
 
+def _cleanup_registered_direct_opt_root(
+    entry_path: Path, document: Mapping[str, object]
+) -> None:
+    recovery_controller = document.get("recovery_controller_path")
+    if type(recovery_controller) is not str:
+        raise AssertionError("strict live IPC recovery controller is malformed")
+    if document.get("state") == "closing":
+        document = _transition_trusted_root_chain(
+            entry_path,
+            ("closing",),
+            "deleting",
+            execution_root_delete_nonce=uuid.uuid4().hex,
+        )
+    if document.get("state") != "deleting":
+        raise AssertionError("strict registered live IPC root is not deleting")
+    receipt = _invoke_registered_opt_ipc_root(
+        Path(recovery_controller), entry_path, document, "cleanup"
+    )
+    imported = _load_chain_registry_entry(entry_path)
+    binding = _direct_opt_root_document(imported)
+    if (
+        imported.get("state") != "deleting"
+        or receipt.get("root") != binding.get("root")
+        or receipt.get("deleted") != imported.get("execution_root_deleted")
+        or receipt.get("witness") != binding.get("witness")
+        or binding["witness"]["file"].get("phase") != "deleted"
+    ):
+        raise AssertionError("strict live IPC cleanup proof import is inconsistent")
+    parent_fd, _parent = _open_strict_live_ipc_parent(binding["parent"])
+    try:
+        try:
+            os.stat(
+                str(binding["name"]),
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise AssertionError(
+                "strict live IPC root absence cannot be revalidated"
+            ) from error
+    finally:
+        os.close(parent_fd)
+    raise AssertionError("strict live IPC root still exists after cleanup")
+
+
 def _cleanup_registered_execution_root(
     entry_path: Path, document: Mapping[str, object]
 ) -> None:
     if document.get("cleanup_execution_root") is not True:
+        return
+    if document.get("cleanup_kind") == _STRICT_LIVE_IPC_CLEANUP_KIND:
+        _cleanup_registered_direct_opt_root(entry_path, document)
         return
     session = _active_strict_session()
     session_root = session.get("root")
@@ -8831,11 +11688,27 @@ def _cleanup_registered_execution_root(
     raise AssertionError("strict sealed execution root origin still exists")
 
 
-def _mark_trusted_root_chain_closed(entry_path: Path) -> None:
+def _mark_trusted_root_chain_closed(entry_path: Path) -> dict[str, object]:
     with _chain_registry_lock(entry_path):
         document = _load_chain_registry_entry(entry_path)
         if document.get("state") == "closed":
-            return
+            if document.get("cleanup_kind") != _STRICT_LIVE_IPC_CLEANUP_KIND:
+                return document
+            direct_binding = _direct_opt_root_document(document)
+            if direct_binding["witness"].get("retired") is None:
+                recovery_controller = document.get("recovery_controller_path")
+                if type(recovery_controller) is not str:
+                    raise AssertionError(
+                        "strict live IPC recovery controller is malformed"
+                    )
+                _invoke_registered_opt_ipc_root(
+                    Path(recovery_controller), entry_path, document, "finalize"
+                )
+                document = _load_chain_registry_entry(entry_path)
+                direct_binding = _direct_opt_root_document(document)
+            if direct_binding["witness"].get("retired") is None:
+                raise AssertionError("strict live IPC witness was not retired")
+            return document
         if document.get("state") not in ("closing", "deleting"):
             raise AssertionError("strict chain registry cannot close before recovery")
         outer_value = document.get("outer")
@@ -8850,9 +11723,27 @@ def _mark_trusted_root_chain_closed(entry_path: Path) -> None:
             if final_document.get("cleanup_execution_root") is True
             else "closing"
         )
-        _transition_trusted_root_chain(
+        closed_document = _transition_trusted_root_chain(
             entry_path, (expected_state,), "closed"
         )
+        if closed_document.get("cleanup_kind") == _STRICT_LIVE_IPC_CLEANUP_KIND:
+            recovery_controller = closed_document.get("recovery_controller_path")
+            if type(recovery_controller) is not str:
+                raise AssertionError(
+                    "strict live IPC recovery controller is malformed"
+                )
+            _invoke_registered_opt_ipc_root(
+                Path(recovery_controller), entry_path, closed_document, "finalize"
+            )
+            closed_document = _load_chain_registry_entry(entry_path)
+            if (
+                _direct_opt_root_document(closed_document)["witness"].get(
+                    "retired"
+                )
+                is None
+            ):
+                raise AssertionError("strict live IPC witness was not retired")
+        return closed_document
 
 
 def _discover_prepared_outer(
@@ -8906,11 +11797,11 @@ def _discover_prepared_outer(
 
 def _recover_registered_entry(
     entry_path: Path, *, allow_recovery_broker: bool
-) -> None:
+) -> dict[str, object]:
     with _chain_registry_lock(entry_path):
         document = _load_chain_registry_entry(entry_path)
         if document.get("state") == "closed":
-            return
+            return _mark_trusted_root_chain_closed(entry_path)
         if document.get("state") == "prepared" and document.get("outer") is None:
             discovered_outer = _discover_prepared_outer(document)
             if discovered_outer is not None:
@@ -8945,7 +11836,7 @@ def _recover_registered_entry(
                 _invoke_registered_session_cleanup(
                     recovery_controller, entry_path, int(document["target_uid"])
                 )
-        _mark_trusted_root_chain_closed(entry_path)
+        return _mark_trusted_root_chain_closed(entry_path)
 
 
 def _registered_sudo_command(arguments: Sequence[str]) -> list[str]:
@@ -10799,7 +13690,7 @@ def _watchdog_close_runner_clients(
 def _registry_watchdog_replay(
     parent_identity: tuple[int, int, int, int],
     session: dict[str, object] | None,
-) -> None:
+) -> tuple[dict[str, object], ...]:
     observed_parent = _process_identity(
         Path("/proc") / str(parent_identity[0])
     )
@@ -10824,18 +13715,17 @@ def _registry_watchdog_replay(
         Path(str(environment[_ISOLATION_REGISTRY_ENV])),
         str(environment[_ISOLATION_REGISTRY_TOKEN_ENV]),
     )
-    close_trusted_isolation_chains(selected_session)
+    return close_trusted_isolation_chains(selected_session)
 
 
 def _registry_watchdog_replay_until_complete(
     parent_identity: tuple[int, int, int, int],
     session: dict[str, object] | None,
-) -> None:
+) -> tuple[dict[str, object], ...]:
     delay = _STRICT_WATCHDOG_REPLAY_BACKOFF_INITIAL_SECONDS
     while True:
         try:
-            _registry_watchdog_replay(parent_identity, session)
-            return
+            return _registry_watchdog_replay(parent_identity, session)
         except BaseException:
             time.sleep(delay)
             delay = min(
@@ -10844,11 +13734,76 @@ def _registry_watchdog_replay_until_complete(
             )
 
 
+def _watchdog_recovery_summary(
+    documents: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    summaries: list[dict[str, object]] = []
+    for document in documents:
+        if document.get("cleanup_kind") != _STRICT_LIVE_IPC_CLEANUP_KIND:
+            continue
+        binding = _direct_opt_root_document(document)
+        root_binding = binding.get("root")
+        witness_binding = binding.get("witness")
+        witness_file = witness_binding.get("file")
+        witness_retired = witness_binding.get("retired")
+        deletion_receipt = document.get("execution_root_deleted")
+        if (
+            document.get("state") != "closed"
+            or type(document.get("session_id")) is not str
+            or type(document.get("token")) is not str
+            or type(document.get("execution_root_delete_nonce")) is not str
+            or (
+                root_binding is not None
+                and not _direct_opt_root_binding_is_exact(
+                    root_binding, include_mount=False
+                )
+            )
+            or type(deletion_receipt) is not dict
+            or type(witness_file) is not dict
+            or witness_file.get("phase") != "deleted"
+            or type(witness_retired) is not dict
+        ):
+            raise AssertionError(
+                "strict watchdog recovery summary is incomplete"
+            )
+        summaries.append(
+            {
+                "session_id": document["session_id"],
+                "token": document["token"],
+                "delete_nonce": document["execution_root_delete_nonce"],
+                "parent_device": binding["parent"]["device"],
+                "parent_inode": binding["parent"]["inode"],
+                "root_device": (
+                    None if root_binding is None else root_binding["device"]
+                ),
+                "root_inode": (
+                    None if root_binding is None else root_binding["inode"]
+                ),
+                "deleted": dict(deletion_receipt),
+                "witness_nonce": witness_binding["nonce"],
+                "witness_last_record_sha256": witness_file[
+                    "last_record_sha256"
+                ],
+                "witness_retired": dict(witness_retired),
+            }
+        )
+    summaries.sort(key=lambda value: str(value["session_id"]))
+    canonical = json.dumps(
+        summaries, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    return {
+        "direct_opt_root_count": len(summaries),
+        "direct_opt_root_sha256": hashlib.sha256(canonical).hexdigest(),
+        "direct_opt_root": summaries[0] if len(summaries) == 1 else None,
+    }
+
+
 def _registry_watchdog_main(arguments: Sequence[str]) -> int:
     token = "unknown"
     result: dict[str, object]
     recovery_responsibility = len(arguments) == 5
     recovery_completed = False
+    recovered_documents: tuple[dict[str, object], ...] = ()
     session: dict[str, object] | None = None
     parent_identity: tuple[int, int, int, int] | None = None
     try:
@@ -10905,22 +13860,31 @@ def _registry_watchdog_main(arguments: Sequence[str]) -> int:
         if session.get("watchdog_authorized") is not True:
             raise AssertionError("strict registry watchdog is unauthorized")
         print(f"{_WATCHDOG_READY_PREFIX}{token}", flush=True)
+        watch_started_ns = time.monotonic_ns()
         deadline = time.monotonic() + _STRICT_WATCHDOG_TIMEOUT_SECONDS
         buffer = b""
         drain_requested = False
         owner_lost = False
+        terminal_reason: str | None = None
+        terminal_observed_ns: int | None = None
         while not drain_requested and not owner_lost:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 owner_lost = True
+                terminal_reason = "heartbeat-timeout"
+                terminal_observed_ns = time.monotonic_ns()
                 break
             readable, _, _ = select.select([sys.stdin.fileno()], [], [], remaining)
             if not readable:
                 owner_lost = True
+                terminal_reason = "heartbeat-timeout"
+                terminal_observed_ns = time.monotonic_ns()
                 break
             data = os.read(sys.stdin.fileno(), 64)
             if not data:
                 owner_lost = True
+                terminal_reason = "owner-eof"
+                terminal_observed_ns = time.monotonic_ns()
                 break
             buffer += data
             if len(buffer) > 64:
@@ -10931,6 +13895,8 @@ def _registry_watchdog_main(arguments: Sequence[str]) -> int:
                     deadline = time.monotonic() + _STRICT_WATCHDOG_TIMEOUT_SECONDS
                 elif frame == b"D":
                     drain_requested = True
+                    terminal_reason = "drain-request"
+                    terminal_observed_ns = time.monotonic_ns()
                     break
                 else:
                     raise AssertionError(
@@ -10941,13 +13907,28 @@ def _registry_watchdog_main(arguments: Sequence[str]) -> int:
                 raise AssertionError(
                     "strict registry watchdog parent binding is unavailable"
                 )
-            _registry_watchdog_replay_until_complete(
+            recovered_documents = _registry_watchdog_replay_until_complete(
                 parent_identity, session
             )
             recovery_completed = True
         else:
-            close_trusted_isolation_chains(session)
-        result = {"status": "complete", "token": token}
+            recovered_documents = close_trusted_isolation_chains(session)
+        result = {
+            "status": "complete",
+            "token": token,
+            "recovery": _watchdog_recovery_summary(recovered_documents),
+            "terminal": {
+                "reason": terminal_reason,
+                "elapsed_ns": (
+                    terminal_observed_ns - watch_started_ns
+                    if terminal_observed_ns is not None
+                    else None
+                ),
+                "heartbeat_timeout_ns": int(
+                    _STRICT_WATCHDOG_TIMEOUT_SECONDS * 1_000_000_000
+                ),
+            },
+        }
     except BaseException as error:
         recovery_error: BaseException | None = None
         if (
@@ -10956,7 +13937,7 @@ def _registry_watchdog_main(arguments: Sequence[str]) -> int:
             and parent_identity is not None
         ):
             try:
-                _registry_watchdog_replay_until_complete(
+                recovered_documents = _registry_watchdog_replay_until_complete(
                     parent_identity, session
                 )
                 recovery_completed = True
@@ -11673,10 +14654,12 @@ def _close_registry_through_watchdog(
     _STRICT_SESSION = None
 
 
-def close_trusted_isolation_chains(registry: Mapping[str, object]) -> None:
+def close_trusted_isolation_chains(
+    registry: Mapping[str, object],
+) -> tuple[dict[str, object], ...]:
     root = registry.get("root")
     if root is None:
-        return
+        return ()
     session = _current_strict_session_unchecked()
     inherited = session.get("inherited")
     if inherited not in (True, False):
@@ -11691,13 +14674,13 @@ def close_trusted_isolation_chains(registry: Mapping[str, object]) -> None:
                 "strict owner registry watchdog is unavailable"
             )
         _close_registry_through_watchdog(session)
-        return
+        return ()
     if (
         inherited is True and session.get("watchdog_authorized") is not True
     ):
         raise AssertionError("strict inherited child cannot close parent registry")
     with _registry_session_gate(exclusive=True, session=session):
-        _close_trusted_isolation_chains_under_gate(registry)
+        return _close_trusted_isolation_chains_under_gate(registry)
 
 
 def _cleanup_orphan_resource_roots(
@@ -11758,7 +14741,7 @@ def _cleanup_orphan_resource_roots(
 
 def _close_trusted_isolation_chains_under_gate(
     registry: Mapping[str, object],
-) -> None:
+) -> tuple[dict[str, object], ...]:
     global _STRICT_BACKEND_VALIDATED, _STRICT_SESSION
     root = registry.get("root")
     session = _current_strict_session_unchecked()
@@ -11778,6 +14761,24 @@ def _close_trusted_isolation_chains_under_gate(
     previous_signature: tuple[tuple[object, ...], ...] | None = None
     stalled_rounds = 0
     rounds = 0
+
+    def witness_status(
+        document: Mapping[str, object],
+    ) -> tuple[object, object, bool]:
+        if document.get("cleanup_kind") != _STRICT_LIVE_IPC_CLEANUP_KIND:
+            return (None, None, True)
+        witness = _direct_opt_root_document(document)["witness"]
+        file_binding = witness.get("file")
+        return (
+            None if file_binding is None else file_binding.get("phase"),
+            (
+                None
+                if file_binding is None
+                else file_binding.get("last_record_sha256")
+            ),
+            witness.get("retired") is not None,
+        )
+
     while rounds < _STRICT_REGISTRY_ENTRY_LIMIT * 3:
         rounds += 1
         round_failures: list[str] = []
@@ -11843,6 +14844,7 @@ def _close_trusted_isolation_chains_under_gate(
                     document.get("outer") is not None,
                     document.get("execution_root_delete_nonce"),
                     document.get("execution_root_deleted") is not None,
+                    *witness_status(document),
                 )
                 for entry_path, document in zip(
                     current_entries, current_documents, strict=True
@@ -11850,6 +14852,7 @@ def _close_trusted_isolation_chains_under_gate(
             )
             all_closed = all(
                 document.get("state") == "closed"
+                and witness_status(document)[2]
                 for document in current_documents
             )
         except BaseException as error:
@@ -11899,6 +14902,7 @@ def _close_trusted_isolation_chains_under_gate(
     session["closed"] = True
     _STRICT_BACKEND_VALIDATED = False
     _STRICT_SESSION = None
+    return tuple(dict(document) for document in final_documents)
 
 
 def _acl_is_absent(path: Path, description: str) -> None:
@@ -14815,6 +17819,8 @@ if __name__ == "__main__":
         raise SystemExit(_root_tree_main(sys.argv[2:]))
     if len(sys.argv) == 17 and sys.argv[1] == "--isolation-seal":
         raise SystemExit(_root_seal_execution_root_main(sys.argv[2:]))
+    if len(sys.argv) == 13 and sys.argv[1] == "--isolation-opt-ipc-root":
+        raise SystemExit(_root_registered_opt_ipc_root_main(sys.argv[2:]))
     if len(sys.argv) == 4 and sys.argv[1] == "--hook-fault-probe":
         raise SystemExit(_hook_fault_probe_main(sys.argv[2], sys.argv[3]))
     raise SystemExit("required_ci_candidate.py is a trusted support module")
