@@ -561,6 +561,200 @@ def _trusted_distribution_context() -> tuple[Path, Path, Path, str]:
     )
 
 
+def _trusted_support_file_binding(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+    )
+
+
+def _read_stable_trusted_support(
+    path: Path,
+) -> tuple[bytes, tuple[int, int, int, int, int, int, int, int]]:
+    if not path.is_absolute() or path.is_symlink():
+        raise AssertionError("trusted candidate support path is unsafe")
+    try:
+        resolved = path.resolve(strict=True)
+        parent_metadata = path.parent.lstat()
+    except OSError as error:
+        raise AssertionError(
+            "trusted candidate support path is unreadable"
+        ) from error
+    if resolved != path or not stat.S_ISDIR(parent_metadata.st_mode):
+        raise AssertionError("trusted candidate support path is unsafe")
+    directory_descriptor: int | None = None
+    descriptor: int | None = None
+    try:
+        directory_descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        opened_parent = os.fstat(directory_descriptor)
+        parent_binding = (
+            opened_parent.st_dev,
+            opened_parent.st_ino,
+            stat.S_IFMT(opened_parent.st_mode),
+            stat.S_IMODE(opened_parent.st_mode),
+            opened_parent.st_uid,
+            opened_parent.st_gid,
+        )
+        expected_parent_binding = (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+            stat.S_IFMT(parent_metadata.st_mode),
+            stat.S_IMODE(parent_metadata.st_mode),
+            parent_metadata.st_uid,
+            parent_metadata.st_gid,
+        )
+        if parent_binding != expected_parent_binding:
+            raise AssertionError(
+                "trusted candidate support parent binding changed"
+            )
+        selected = os.stat(
+            path.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        selected_binding = _trusted_support_file_binding(selected)
+        if (
+            selected_binding[2] != stat.S_IFREG
+            or selected_binding[6] != 1
+            or selected_binding[7] < 0
+            or selected_binding[7] > CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES
+        ):
+            raise AssertionError("trusted candidate support file is unsafe")
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | os.O_NOCTTY
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            dir_fd=directory_descriptor,
+        )
+        opened_binding = _trusted_support_file_binding(os.fstat(descriptor))
+        if opened_binding[:2] != selected_binding[:2]:
+            raise AssertionError(
+                "trusted candidate support object changed while being opened"
+            )
+        if opened_binding[2:7] != selected_binding[2:7]:
+            raise AssertionError(
+                "trusted candidate support access policy changed while being opened"
+            )
+        if opened_binding[7] != selected_binding[7]:
+            raise AssertionError(
+                "trusted candidate support content stability changed while being opened"
+            )
+
+        def read_once() -> bytes:
+            chunks: list[bytes] = []
+            offset = 0
+            remaining = opened_binding[7] + 1
+            while remaining > 0:
+                chunk = os.pread(
+                    descriptor,
+                    min(remaining, 64 * 1024),
+                    offset,
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                offset += len(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+
+        first = read_once()
+        second = read_once()
+        final_parent = os.fstat(directory_descriptor)
+        final_parent_path = path.parent.lstat()
+        final_parent_binding = (
+            final_parent.st_dev,
+            final_parent.st_ino,
+            stat.S_IFMT(final_parent.st_mode),
+            stat.S_IMODE(final_parent.st_mode),
+            final_parent.st_uid,
+            final_parent.st_gid,
+        )
+        final_parent_path_binding = (
+            final_parent_path.st_dev,
+            final_parent_path.st_ino,
+            stat.S_IFMT(final_parent_path.st_mode),
+            stat.S_IMODE(final_parent_path.st_mode),
+            final_parent_path.st_uid,
+            final_parent_path.st_gid,
+        )
+        if (
+            final_parent_binding != parent_binding
+            or final_parent_path_binding != parent_binding
+        ):
+            raise AssertionError(
+                "trusted candidate support parent binding changed while being read"
+            )
+        final_opened_binding = _trusted_support_file_binding(
+            os.fstat(descriptor)
+        )
+        final_path_binding = _trusted_support_file_binding(
+            os.stat(
+                path.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if (
+            final_opened_binding[:2] != opened_binding[:2]
+            or final_path_binding[:2] != opened_binding[:2]
+        ):
+            raise AssertionError(
+                "trusted candidate support object changed while being read"
+            )
+        if (
+            final_opened_binding[2:7] != opened_binding[2:7]
+            or final_path_binding[2:7] != opened_binding[2:7]
+        ):
+            raise AssertionError(
+                "trusted candidate support access policy changed while being read"
+            )
+        if (
+            first != second
+            or len(first) != opened_binding[7]
+            or final_opened_binding[7] != opened_binding[7]
+            or final_path_binding[7] != opened_binding[7]
+        ):
+            raise AssertionError(
+                "trusted candidate support content stability changed while being read"
+            )
+        return first, opened_binding
+    except OSError as error:
+        raise AssertionError(
+            "trusted candidate support source cannot be read"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+
+
+def _read_selected_trusted_support(
+    path: Path,
+    selected_metadata: os.stat_result,
+    description: str,
+) -> bytes:
+    selected_binding = _trusted_support_file_binding(selected_metadata)
+    source, opened_binding = _read_stable_trusted_support(path)
+    if opened_binding != selected_binding:
+        raise AssertionError(f"{description} selected object binding changed")
+    return source
+
+
 (
     _TRUSTED_CHECKOUT_ROOT,
     _TRUSTED_CONTENT_ROOT,
@@ -571,10 +765,38 @@ def _trusted_distribution_context() -> tuple[Path, Path, Path, str]:
 # making its value unambiguously identify the Git checkout root.
 _TRUSTED_REPO_ROOT = _TRUSTED_CHECKOUT_ROOT
 _TRUSTED_SUPPORT_PATH = Path(__file__).resolve(strict=True)
-try:
-    _TRUSTED_SUPPORT_SOURCE = _TRUSTED_SUPPORT_PATH.read_bytes()
-except OSError as error:
-    raise AssertionError("trusted candidate support source cannot be read") from error
+_TRUSTED_SUPPORT_PRELOAD_BYTES = globals().pop(
+    "_TRUSTED_SUPPORT_PRELOAD_BYTES",
+    None,
+)
+_TRUSTED_SUPPORT_PRELOAD_BINDING = globals().pop(
+    "_TRUSTED_SUPPORT_PRELOAD_BINDING",
+    None,
+)
+if _TRUSTED_SUPPORT_PRELOAD_BYTES is None:
+    if _TRUSTED_SUPPORT_PRELOAD_BINDING is not None:
+        raise AssertionError("trusted candidate support preload is malformed")
+    (
+        _TRUSTED_SUPPORT_SOURCE,
+        _TRUSTED_SUPPORT_BINDING,
+    ) = _read_stable_trusted_support(_TRUSTED_SUPPORT_PATH)
+elif (
+    type(_TRUSTED_SUPPORT_PRELOAD_BYTES) is bytes
+    and isinstance(_TRUSTED_SUPPORT_PRELOAD_BINDING, tuple)
+    and len(_TRUSTED_SUPPORT_PRELOAD_BINDING) == 8
+    and all(
+        type(value) is int for value in _TRUSTED_SUPPORT_PRELOAD_BINDING
+    )
+    and _TRUSTED_SUPPORT_PRELOAD_BINDING[2] == stat.S_IFREG
+    and _TRUSTED_SUPPORT_PRELOAD_BINDING[6] == 1
+    and _TRUSTED_SUPPORT_PRELOAD_BINDING[7]
+    == len(_TRUSTED_SUPPORT_PRELOAD_BYTES)
+):
+    _TRUSTED_SUPPORT_SOURCE = _TRUSTED_SUPPORT_PRELOAD_BYTES
+    _TRUSTED_SUPPORT_BINDING = _TRUSTED_SUPPORT_PRELOAD_BINDING
+else:
+    raise AssertionError("trusted candidate support preload is malformed")
+del _TRUSTED_SUPPORT_PRELOAD_BYTES, _TRUSTED_SUPPORT_PRELOAD_BINDING
 _TRUSTED_SUPPORT_SHA256 = hashlib.sha256(_TRUSTED_SUPPORT_SOURCE).hexdigest()
 _STRICT_REALM: dict[str, object] | None = None
 _STRICT_SESSION: dict[str, object] | None = None
@@ -14530,6 +14752,11 @@ def _session_from_environment() -> dict[str, object] | None:
         ):
             raise AssertionError("strict inherited isolation registry is unsafe")
     controller_metadata = controller_path.lstat()
+    controller_source = _read_selected_trusted_support(
+        controller_path,
+        controller_metadata,
+        "strict inherited recovery controller",
+    )
     session_lock_metadata = session_lock.lstat()
     watchdog_token_metadata = watchdog_token_path.lstat()
     watchdog_token = watchdog_token_path.read_text(encoding="ascii")
@@ -14539,7 +14766,7 @@ def _session_from_environment() -> dict[str, object] | None:
         or controller_metadata.st_uid != os.getuid()
         or controller_metadata.st_nlink != 1
         or stat.S_IMODE(controller_metadata.st_mode) != 0o400
-        or hashlib.sha256(controller_path.read_bytes()).hexdigest()
+        or hashlib.sha256(controller_source).hexdigest()
         != _TRUSTED_SUPPORT_SHA256
         or not stat.S_ISREG(session_lock_metadata.st_mode)
         or session_lock_metadata.st_uid != os.getuid()
@@ -18844,17 +19071,22 @@ def _protect_strict_checkout_boundaries() -> None:
             or path.resolve(strict=True) != path
         ):
             raise AssertionError(f"strict {description} boundary is not runner-owned")
-        path.chmod(0o700)
-        final_metadata = path.lstat()
-        if stat.S_IMODE(final_metadata.st_mode) != 0o700:
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
             raise AssertionError(f"strict {description} boundary is not owner-only")
         _acl_is_absent(path, f"strict {description} boundary")
     support_metadata = _TRUSTED_SUPPORT_PATH.lstat()
+    support_source = _read_selected_trusted_support(
+        _TRUSTED_SUPPORT_PATH,
+        support_metadata,
+        "trusted support source",
+    )
     if (
         not stat.S_ISREG(support_metadata.st_mode)
         or support_metadata.st_nlink != 1
         or _TRUSTED_SUPPORT_PATH.resolve(strict=True) != _TRUSTED_SUPPORT_PATH
-        or hashlib.sha256(_TRUSTED_SUPPORT_PATH.read_bytes()).hexdigest()
+        or _trusted_support_file_binding(support_metadata)
+        != _TRUSTED_SUPPORT_BINDING
+        or hashlib.sha256(support_source).hexdigest()
         != _TRUSTED_SUPPORT_SHA256
     ):
         raise AssertionError("trusted support source identity is not stable")

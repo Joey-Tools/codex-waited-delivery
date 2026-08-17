@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import ast
 import base64
+import binascii
 import contextlib
 import ctypes
 import errno
 import fcntl
 import hashlib
 import io
+import importlib.abc
 import importlib.util
 import inspect
 from pathlib import Path
 import json
+import linecache
 import math
 import os
 import re
@@ -26,33 +29,1633 @@ import textwrap
 import threading
 import time
 import traceback
+import types
 import unittest
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from unittest import mock
 
 
+TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES = 2 * 1024 * 1024
+TRUSTED_TEST_CONTROL_PLANE_ENTRY_LIMIT = 256
+TRUSTED_TEST_CONTROL_PLANE_DEPTH_LIMIT = 8
+TRUSTED_TEST_CONTROL_PLANE_TOTAL_SOURCE_LIMIT_BYTES = 16 * 1024 * 1024
+TRUSTED_STRUCTURE_VALIDATOR_FLAG = "--validate-required-ci-structure"
+TRUSTED_TEST_SUPERVISOR_FLAG = "--run-trusted-tests"
+TRUSTED_TEST_CHILD_FLAG = "--run-trusted-test-suite"
+CI_STRICT_RUNTIME_LIVE_FLAG = "--run-strict-runtime-live-test"
+TRUSTED_TEST_SUITE_BUNDLE_LIMIT_BYTES = 16 * 1024 * 1024
+TRUSTED_TEST_CHILD_BOOTSTRAP_CODE = (
+    "import fcntl, hashlib, importlib.util, linecache, os, stat, sys\n"
+    "if len(sys.argv) != 10:\n"
+    "    raise AssertionError('trusted child bootstrap arguments are malformed')\n"
+    "(_supervisor_fd_text, _supervisor_length_text, _supervisor_sha, "
+    "_bundle_fd_text, _bundle_length_text, _bundle_sha, _logical_path, "
+    "_child_flag, _trusted_root) = sys.argv[1:10]\n"
+    "if (not os.path.isabs(_logical_path) "
+    "or _child_flag != '--run-trusted-test-suite' "
+    "or not os.path.isabs(_trusted_root) "
+    "or os.path.normpath(_trusted_root) != _trusted_root "
+    "or os.path.basename(_trusted_root) != '.required-ci'):\n"
+    "    raise AssertionError('trusted child bootstrap arguments are malformed')\n"
+    "def _read_payload(_fd_text, _length_text, _expected_sha, _limit):\n"
+    "    _fd = int(_fd_text)\n"
+    "    _length = int(_length_text)\n"
+    "    if (str(_fd) != _fd_text or _fd < 3 "
+    "or str(_length) != _length_text or _length <= 0 or _length > _limit "
+    "or len(_expected_sha) != 64 or any(_character not in "
+    "'0123456789abcdef' for _character in _expected_sha)):\n"
+    "        raise AssertionError('trusted child bootstrap arguments are malformed')\n"
+    "    _opened = os.fstat(_fd)\n"
+    "    _binding = (_opened.st_dev, _opened.st_ino, "
+    "stat.S_IFMT(_opened.st_mode), stat.S_IMODE(_opened.st_mode), "
+    "_opened.st_uid, _opened.st_gid, _opened.st_nlink, _opened.st_size)\n"
+    "    _flags = fcntl.fcntl(_fd, fcntl.F_GETFL)\n"
+    "    if (_binding[2] != stat.S_IFREG or _binding[3] != 0o400 "
+    "or _binding[4] != os.geteuid() or _binding[6] != 0 "
+    "or _binding[7] != _length or (_flags & os.O_ACCMODE) != os.O_RDONLY "
+    "or not (_flags & os.O_NONBLOCK)):\n"
+    "        raise AssertionError('trusted child bootstrap descriptor is unsafe')\n"
+    "    def _read_once():\n"
+    "        _chunks = []\n"
+    "        _offset = 0\n"
+    "        _remaining = _length + 1\n"
+    "        while _remaining > 0:\n"
+    "            _chunk = os.pread(_fd, min(_remaining, 64 * 1024), _offset)\n"
+    "            if not _chunk:\n"
+    "                break\n"
+    "            _chunks.append(_chunk)\n"
+    "            _offset += len(_chunk)\n"
+    "            _remaining -= len(_chunk)\n"
+    "        return b''.join(_chunks)\n"
+    "    _captured = _read_once()\n"
+    "    _captured_again = _read_once()\n"
+    "    _opened_after = os.fstat(_fd)\n"
+    "    _binding_after = (_opened_after.st_dev, _opened_after.st_ino, "
+    "stat.S_IFMT(_opened_after.st_mode), stat.S_IMODE(_opened_after.st_mode), "
+    "_opened_after.st_uid, _opened_after.st_gid, _opened_after.st_nlink, "
+    "_opened_after.st_size)\n"
+    "    if (_binding_after != _binding or _captured_again != _captured "
+    "or len(_captured) != _length "
+    "or hashlib.sha256(_captured).hexdigest() != _expected_sha):\n"
+    "        raise AssertionError('trusted child bootstrap payload changed')\n"
+    "    return _captured\n"
+    "if _supervisor_fd_text == _bundle_fd_text:\n"
+    "    raise AssertionError('trusted child bootstrap descriptors overlap')\n"
+    "_captured = _read_payload(_supervisor_fd_text, "
+    "_supervisor_length_text, _supervisor_sha, 2 * 1024 * 1024)\n"
+    "_suite_bundle = _read_payload(_bundle_fd_text, _bundle_length_text, "
+    "_bundle_sha, 16 * 1024 * 1024)\n"
+    "for _payload_fd_text in {_supervisor_fd_text, _bundle_fd_text}:\n"
+    "    os.close(int(_payload_fd_text))\n"
+    "sys.argv = [_logical_path, _child_flag, _trusted_root]\n"
+    "globals()['__file__'] = _logical_path\n"
+    "globals()['__cached__'] = None\n"
+    "globals()['__loader__'] = None\n"
+    "globals()['__package__'] = None\n"
+    "globals()['__spec__'] = None\n"
+    "globals()['_TRUSTED_TEST_SUITE_BUNDLE_PRELOAD_BYTES'] = _suite_bundle\n"
+    "globals()['_TRUSTED_TEST_SUPERVISOR_SEED_BYTES'] = _captured\n"
+    "_captured_text = importlib.util.decode_source(_captured)\n"
+    "linecache.cache[_logical_path] = (len(_captured), None, "
+    "_captured_text.splitlines(keepends=True), _logical_path)\n"
+    "_code = compile(_captured, _logical_path, 'exec', dont_inherit=True)\n"
+    "del _captured, _captured_text, _suite_bundle\n"
+    "exec(_code, globals())\n"
+)
+TRUSTED_TEST_LAUNCH_COMMITMENT_ENV = (
+    "REQUIRED_CI_TRUSTED_LAUNCH_CONTROL_PLANE_SHA256"
+)
+TRUSTED_TEST_SUITE_COMMITMENT_ENV = (
+    "REQUIRED_CI_TRUSTED_SUITE_CONTROL_PLANE_SHA256"
+)
+_TRUSTED_TEST_SUITE_BUNDLE_BYTES = globals().pop(
+    "_TRUSTED_TEST_SUITE_BUNDLE_PRELOAD_BYTES",
+    None,
+)
+if _TRUSTED_TEST_SUITE_BUNDLE_BYTES is not None and (
+    type(_TRUSTED_TEST_SUITE_BUNDLE_BYTES) is not bytes
+    or not _TRUSTED_TEST_SUITE_BUNDLE_BYTES
+    or len(_TRUSTED_TEST_SUITE_BUNDLE_BYTES)
+    > TRUSTED_TEST_SUITE_BUNDLE_LIMIT_BYTES
+):
+    raise AssertionError("trusted child suite bundle is malformed")
+
+
+def _test_control_plane_directory_binding(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _test_control_plane_file_binding(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+    )
+
+
+def _read_test_control_plane_file(
+    parent_descriptor: int,
+    name: str,
+    selected: os.stat_result,
+    description: str,
+) -> tuple[bytes, tuple[int, int, int, int, int, int, int, int]]:
+    selected_binding = _test_control_plane_file_binding(selected)
+    if (
+        selected_binding[2] != stat.S_IFREG
+        or selected_binding[6] != 1
+        or selected_binding[7] < 0
+        or selected_binding[7] > TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES
+    ):
+        raise AssertionError(
+            f"{description} active test control-plane file is unsafe"
+        )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | os.O_NOCTTY
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        opened_binding = _test_control_plane_file_binding(opened)
+        if (
+            opened_binding[:2] != selected_binding[:2]
+            or opened_binding[2] != stat.S_IFREG
+        ):
+            raise AssertionError(
+                f"{description} active test control-plane object changed or "
+                "was replaced while being opened"
+            )
+        if opened_binding[3:7] != selected_binding[3:7]:
+            raise AssertionError(
+                f"{description} active test control-plane access policy changed "
+                "while being opened"
+            )
+        if opened_binding[7] != selected_binding[7]:
+            raise AssertionError(
+                f"{description} active test control-plane content stability "
+                "changed while being opened"
+            )
+
+        def read_once() -> bytes:
+            chunks: list[bytes] = []
+            offset = 0
+            remaining = opened_binding[7] + 1
+            while remaining > 0:
+                chunk = os.pread(
+                    descriptor,
+                    min(remaining, 64 * 1024),
+                    offset,
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                offset += len(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+
+        first = read_once()
+        second = read_once()
+        opened_after = os.fstat(descriptor)
+        selected_after = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        opened_after_binding = _test_control_plane_file_binding(opened_after)
+        selected_after_binding = _test_control_plane_file_binding(selected_after)
+        if (
+            opened_after_binding[:2] != opened_binding[:2]
+            or selected_after_binding[:2] != opened_binding[:2]
+            or opened_after_binding[2] != stat.S_IFREG
+            or selected_after_binding[2] != stat.S_IFREG
+        ):
+            raise AssertionError(
+                f"{description} active test control-plane object changed or "
+                "was replaced while being read"
+            )
+        if (
+            opened_after_binding[3:7] != opened_binding[3:7]
+            or selected_after_binding[3:7] != opened_binding[3:7]
+        ):
+            raise AssertionError(
+                f"{description} active test control-plane access policy changed "
+                "while being read"
+            )
+        if (
+            first != second
+            or len(first) != opened_binding[7]
+            or opened_after_binding[7] != opened_binding[7]
+            or selected_after_binding[7] != opened_binding[7]
+        ):
+            raise AssertionError(
+                f"{description} active test control-plane content stability "
+                "changed while being read"
+            )
+        return first, opened_binding
+    except OSError as error:
+        raise AssertionError(
+            f"{description} active test control-plane file is unreadable"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_stable_test_control_plane_path(
+    path: Path,
+    description: str,
+) -> tuple[
+    bytes,
+    tuple[int, int, int, int, int, int, int, int],
+]:
+    if not path.is_absolute() or path.is_symlink():
+        raise AssertionError(f"{description} path is unsafe")
+    try:
+        resolved_parent = path.parent.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(f"{description} parent is unreadable") from error
+    if resolved_parent != path.parent or not resolved_parent.is_dir():
+        raise AssertionError(f"{description} parent is unsafe")
+    parent_descriptor: int | None = None
+    try:
+        parent_descriptor = os.open(
+            resolved_parent,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+        )
+        parent_binding = _test_control_plane_directory_binding(
+            os.fstat(parent_descriptor)
+        )
+        if (
+            parent_binding[2] != stat.S_IFDIR
+            or parent_binding
+            != _test_control_plane_directory_binding(
+                resolved_parent.lstat()
+            )
+        ):
+            raise AssertionError(f"{description} parent changed")
+        selected = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        source, binding = _read_test_control_plane_file(
+            parent_descriptor,
+            path.name,
+            selected,
+            description,
+        )
+        if (
+            _test_control_plane_directory_binding(
+                os.fstat(parent_descriptor)
+            )
+            != parent_binding
+            or _test_control_plane_directory_binding(
+                resolved_parent.lstat()
+            )
+            != parent_binding
+        ):
+            raise AssertionError(f"{description} parent changed")
+        return source, binding
+    except OSError as error:
+        raise AssertionError(f"{description} is unreadable") from error
+    finally:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+
+
+def _test_control_plane_namespace_capture(
+    tests_root: Path,
+    description: str,
+    *,
+    capture_names: frozenset[str] | None = frozenset(),
+    root_descriptor: int | None = None,
+    ignored_root_directories: frozenset[str] = frozenset(),
+) -> tuple[
+    dict[str, tuple[int, int, int, int, int, int]],
+    dict[str, bytes],
+    dict[str, tuple[int, int, int, int, int, int, int, int]],
+    tuple[int, int, int, int, int, int],
+]:
+    if not tests_root.is_absolute() or tests_root.is_symlink():
+        raise AssertionError(
+            f"{description} active test control-plane namespace is unsafe"
+        )
+    try:
+        resolved_tests_root = tests_root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            f"{description} active test control-plane namespace is unreadable"
+        ) from error
+    if resolved_tests_root != tests_root or not resolved_tests_root.is_dir():
+        raise AssertionError(
+            f"{description} active test control-plane namespace is unsafe"
+        )
+
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    owned_root_descriptor = root_descriptor is None
+    entries: dict[str, tuple[int, int, int, int, int, int]] = {}
+    captured: dict[str, bytes] = {}
+    captured_bindings: dict[
+        str, tuple[int, int, int, int, int, int, int, int]
+    ] = {}
+    entry_count = 0
+    captured_source_bytes = 0
+
+    def bounded_names(descriptor: int, *, charge: bool) -> list[str]:
+        nonlocal entry_count
+        names: list[str] = []
+        with os.scandir(descriptor) as iterator:
+            for entry in iterator:
+                if len(names) >= TRUSTED_TEST_CONTROL_PLANE_ENTRY_LIMIT:
+                    raise AssertionError(
+                        f"{description} active test control-plane namespace "
+                        "exceeds the per-enumeration entry limit"
+                    )
+                name = entry.name
+                if (
+                    type(name) is not str
+                    or name in ("", ".", "..")
+                    or os.path.sep in name
+                ):
+                    raise AssertionError(
+                        f"{description} active test control-plane namespace "
+                        "contains an invalid entry"
+                    )
+                if charge:
+                    entry_count += 1
+                    if entry_count > TRUSTED_TEST_CONTROL_PLANE_ENTRY_LIMIT:
+                        raise AssertionError(
+                            f"{description} active test control-plane namespace "
+                            "exceeds the entry limit"
+                        )
+                names.append(name)
+        if len(names) != len(set(names)):
+            raise AssertionError(
+                f"{description} active test control-plane namespace "
+                "contains duplicate entries"
+            )
+        return sorted(names)
+
+    def scan_directory(
+        descriptor: int,
+        prefix: tuple[str, ...],
+        depth: int,
+    ) -> None:
+        nonlocal captured_source_bytes
+        def visible_names(
+            *,
+            charge: bool,
+        ) -> tuple[
+            list[str],
+            dict[str, tuple[int, int, int, int, int, int]],
+        ]:
+            names: list[str] = []
+            ignored: dict[
+                str, tuple[int, int, int, int, int, int]
+            ] = {}
+            for selected_name in bounded_names(descriptor, charge=charge):
+                if not prefix and selected_name in ignored_root_directories:
+                    ignored_binding = _test_control_plane_directory_binding(
+                        os.stat(
+                            selected_name,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                    )
+                    if ignored_binding[2] != stat.S_IFDIR:
+                        raise AssertionError(
+                            f"{description} ignored import cache is unsafe"
+                        )
+                    ignored[selected_name] = ignored_binding
+                else:
+                    names.append(selected_name)
+            return names, ignored
+
+        names, ignored = visible_names(charge=True)
+        for name in names:
+            relative_parts = (*prefix, name)
+            relative = Path(*relative_parts).as_posix()
+            try:
+                selected = os.stat(
+                    name, dir_fd=descriptor, follow_symlinks=False
+                )
+            except OSError as error:
+                raise AssertionError(
+                    f"{description} active test control-plane namespace "
+                    f"entry {relative!r} is unreadable"
+                ) from error
+            binding = _test_control_plane_directory_binding(selected)
+            if relative in entries:
+                raise AssertionError(
+                    f"{description} active test control-plane namespace "
+                    "contains duplicate paths"
+                )
+            entries[relative] = binding
+            if binding[2] == stat.S_IFDIR:
+                if depth >= TRUSTED_TEST_CONTROL_PLANE_DEPTH_LIMIT:
+                    raise AssertionError(
+                        f"{description} active test control-plane namespace "
+                        "exceeds the depth limit"
+                    )
+                child_descriptor: int | None = None
+                try:
+                    child_descriptor = os.open(
+                        name,
+                        directory_flags,
+                        dir_fd=descriptor,
+                    )
+                    if (
+                        _test_control_plane_directory_binding(
+                            os.fstat(child_descriptor)
+                        )
+                        != binding
+                    ):
+                        raise AssertionError(
+                            f"{description} active test control-plane namespace "
+                            f"directory {relative!r} changed while being opened"
+                        )
+                    scan_directory(
+                        child_descriptor, relative_parts, depth + 1
+                    )
+                    if (
+                        _test_control_plane_directory_binding(
+                            os.fstat(child_descriptor)
+                        )
+                        != binding
+                        or _test_control_plane_directory_binding(
+                            os.stat(
+                                name,
+                                dir_fd=descriptor,
+                                follow_symlinks=False,
+                            )
+                        )
+                        != binding
+                    ):
+                        raise AssertionError(
+                            f"{description} active test control-plane namespace "
+                            f"directory {relative!r} changed while being read"
+                        )
+                except OSError as error:
+                    raise AssertionError(
+                        f"{description} active test control-plane namespace "
+                        f"directory {relative!r} is unreadable"
+                    ) from error
+                finally:
+                    if child_descriptor is not None:
+                        os.close(child_descriptor)
+            else:
+                try:
+                    if capture_names is None or relative in capture_names:
+                        source, file_binding = _read_test_control_plane_file(
+                            descriptor,
+                            name,
+                            selected,
+                            f"{description} {relative!r}",
+                        )
+                        if tuple(file_binding[:6]) != binding:
+                            raise AssertionError(
+                                f"{description} active test control-plane "
+                                f"entry {relative!r} changed between namespace "
+                                "and content capture"
+                            )
+                        captured_source_bytes += len(source)
+                        if (
+                            captured_source_bytes
+                            > TRUSTED_TEST_CONTROL_PLANE_TOTAL_SOURCE_LIMIT_BYTES
+                        ):
+                            raise AssertionError(
+                                f"{description} active test control-plane sources "
+                                "exceed the total byte limit"
+                            )
+                        captured[relative] = source
+                        captured_bindings[relative] = file_binding
+                    selected_after = os.stat(
+                        name,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise AssertionError(
+                        f"{description} active test control-plane namespace "
+                        f"entry {relative!r} became unreadable"
+                    ) from error
+                if (
+                    _test_control_plane_directory_binding(selected_after)
+                    != binding
+                ):
+                    raise AssertionError(
+                        f"{description} active test control-plane namespace "
+                        f"entry {relative!r} changed while being read"
+                    )
+        final_names, final_ignored = visible_names(charge=False)
+        if final_names != names or final_ignored != ignored:
+            raise AssertionError(
+                f"{description} active test control-plane namespace "
+                "changed while being enumerated"
+            )
+
+    try:
+        if root_descriptor is None:
+            root_descriptor = os.open(resolved_tests_root, directory_flags)
+        root_binding = _test_control_plane_directory_binding(
+            os.fstat(root_descriptor)
+        )
+        if (
+            root_binding
+            != _test_control_plane_directory_binding(
+                resolved_tests_root.lstat()
+            )
+            or root_binding[2] != stat.S_IFDIR
+        ):
+            raise AssertionError(
+                f"{description} active test control-plane namespace changed"
+            )
+        scan_directory(root_descriptor, (), 0)
+        if (
+            _test_control_plane_directory_binding(os.fstat(root_descriptor))
+            != root_binding
+            or _test_control_plane_directory_binding(
+                resolved_tests_root.lstat()
+            )
+            != root_binding
+        ):
+            raise AssertionError(
+                f"{description} active test control-plane namespace changed"
+            )
+        missing_captures = (
+            []
+            if capture_names is None
+            else sorted(capture_names - captured.keys())
+        )
+        if missing_captures:
+            raise AssertionError(
+                f"{description} active test control-plane manifest namespace "
+                "capture is incomplete: "
+                f"{missing_captures!r}"
+            )
+        return entries, captured, captured_bindings, root_binding
+    except OSError as error:
+        raise AssertionError(
+            f"{description} active test control-plane namespace is unreadable"
+        ) from error
+    finally:
+        if owned_root_descriptor and root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def _test_control_plane_namespace_tree(
+    tests_root: Path,
+    description: str,
+) -> dict[str, tuple[int, int, int, int, int, int]]:
+    entries, _captured, _captured_bindings, _root_binding = (
+        _test_control_plane_namespace_capture(
+        tests_root,
+        description,
+        )
+    )
+    return entries
+
+
+def _active_test_control_plane_names(
+    entries: Mapping[str, tuple[int, int, int, int, int, int]],
+    description: str,
+) -> list[str]:
+    names = sorted(
+        entry
+        for entry in entries
+        if "/" not in entry
+        and (
+            entry == "required_ci_candidate.py"
+            or (entry.startswith("test_") and entry.endswith(".py"))
+        )
+    )
+    if (
+        "required_ci_candidate.py" not in names
+        or not any(name.startswith("test_") for name in names)
+        or len(names) != len(set(names))
+    ):
+        raise AssertionError(
+            f"{description} active test control-plane manifest is incomplete "
+            "or duplicated"
+        )
+    unexpected = sorted(set(entries) - set(names))
+    if unexpected:
+        raise AssertionError(
+            f"{description} active test control-plane namespace contains "
+            f"unexpected entries: {unexpected[:8]!r}"
+        )
+    for name in names:
+        binding = entries.get(name)
+        if (
+            not isinstance(binding, tuple)
+            or len(binding) != 6
+            or binding[2] != stat.S_IFREG
+        ):
+            raise AssertionError(
+                f"{description} active test control-plane manifest "
+                f"entry {name!r} is not an ordinary file"
+            )
+    return names
+
+
+def _test_control_plane_commitment(
+    repo_root: Path,
+    repo_binding: tuple[int, int, int, int, int, int],
+    tests_root: Path,
+    tests_binding: tuple[int, int, int, int, int, int],
+    namespace_tree: Mapping[
+        str, tuple[int, int, int, int, int, int]
+    ],
+    sources: Mapping[str, bytes],
+    file_bindings: Mapping[
+        str, tuple[int, int, int, int, int, int, int, int]
+    ],
+) -> str:
+    names = sorted(namespace_tree)
+    if (
+        not repo_root.is_absolute()
+        or not tests_root.is_absolute()
+        or repo_root not in tests_root.parents
+        or len(repo_binding) != 6
+        or len(tests_binding) != 6
+        or any(type(value) is not int for value in repo_binding)
+        or any(type(value) is not int for value in tests_binding)
+        or repo_binding[2] != stat.S_IFDIR
+        or tests_binding[2] != stat.S_IFDIR
+        or sorted(sources) != names
+        or sorted(file_bindings) != names
+    ):
+        raise AssertionError(
+            "trusted active test control-plane commitment is malformed"
+        )
+    rows: list[list[object]] = []
+    for name in names:
+        namespace_binding = namespace_tree[name]
+        file_binding = file_bindings[name]
+        source = sources[name]
+        if (
+            type(name) is not str
+            or "/" in name
+            or len(namespace_binding) != 6
+            or len(file_binding) != 8
+            or tuple(file_binding[:6]) != tuple(namespace_binding)
+            or type(source) is not bytes
+            or file_binding[6] != 1
+            or file_binding[7] != len(source)
+        ):
+            raise AssertionError(
+                "trusted active test control-plane commitment is malformed"
+            )
+        rows.append(
+            [
+                name,
+                list(namespace_binding),
+                list(file_binding),
+                len(source),
+                hashlib.sha256(source).hexdigest(),
+            ]
+        )
+    payload = {
+        "schema_version": 1,
+        "repo_root": str(repo_root),
+        "repo_binding": list(repo_binding),
+        "tests_root": str(tests_root),
+        "tests_binding": list(tests_binding),
+        "files": rows,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _formal_test_control_plane_entry_requested() -> bool:
+    arguments = sys.argv[1:]
+    formal_shape = (
+        arguments == [TRUSTED_STRUCTURE_VALIDATOR_FLAG]
+        or arguments == [TRUSTED_TEST_SUPERVISOR_FLAG]
+        or arguments == [CI_STRICT_RUNTIME_LIVE_FLAG]
+        or (
+            len(arguments) == 2
+            and arguments[0] == TRUSTED_TEST_CHILD_FLAG
+            and type(arguments[1]) is str
+        )
+    )
+    if __name__ != "__main__" or not formal_shape:
+        return False
+    if type(sys.argv[0]) is not str:
+        raise AssertionError(
+            "formal Required CI test control-plane entry is malformed"
+        )
+    try:
+        invoked_path = Path(sys.argv[0]).resolve(strict=True)
+        loaded_path = Path(__file__).resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            "formal Required CI test control-plane entry is unreadable"
+        ) from error
+    if invoked_path != loaded_path:
+        raise AssertionError(
+            "formal Required CI test control-plane entry is not bound"
+        )
+    return True
+
+
+def _assert_formal_checkout_boundary_acl_absent(
+    path: Path,
+    description: str,
+) -> None:
+    listxattr = getattr(os, "listxattr", None)
+    if listxattr is not None:
+        try:
+            attributes = listxattr(path, follow_symlinks=False)
+        except OSError as error:
+            raise AssertionError(
+                f"formal {description} boundary ACL state cannot be read"
+            ) from error
+        if {
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+        }.intersection(attributes):
+            raise AssertionError(f"formal {description} boundary has an ACL")
+        return
+    if sys.platform != "darwin":
+        raise AssertionError(
+            f"formal {description} boundary ACL state cannot be read"
+        )
+    try:
+        completed = subprocess.run(
+            ["/bin/ls", "-ld", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AssertionError(
+            f"formal {description} boundary ACL state cannot be read"
+        ) from error
+    if (
+        completed.returncode != 0
+        or len(completed.stdout) > 8192
+        or len(completed.stderr) > 8192
+    ):
+        raise AssertionError(
+            f"formal {description} boundary ACL state cannot be read"
+        )
+    fields = completed.stdout.split(None, 1)
+    if not fields or len(fields[0]) not in (10, 11):
+        raise AssertionError(
+            f"formal {description} boundary ACL state is malformed"
+        )
+    if fields[0].endswith("+"):
+        raise AssertionError(f"formal {description} boundary has an ACL")
+
+
+def _prepare_formal_checkout_boundary(
+    path: Path,
+    description: str,
+) -> tuple[int, tuple[int, int, int, int, int, int]]:
+    if not path.is_absolute() or path.is_symlink():
+        raise AssertionError(f"formal {description} boundary is unsafe")
+    try:
+        resolved = path.resolve(strict=True)
+        selected = path.lstat()
+    except OSError as error:
+        raise AssertionError(
+            f"formal {description} boundary is unreadable"
+        ) from error
+    if (
+        resolved != path
+        or not stat.S_ISDIR(selected.st_mode)
+        or selected.st_uid != os.geteuid()
+    ):
+        raise AssertionError(f"formal {description} boundary is unsafe")
+    _assert_formal_checkout_boundary_acl_absent(path, description)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        opened = os.fstat(descriptor)
+        selected_identity = (
+            selected.st_dev,
+            selected.st_ino,
+            stat.S_IFMT(selected.st_mode),
+            selected.st_uid,
+            selected.st_gid,
+        )
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            stat.S_IFMT(opened.st_mode),
+            opened.st_uid,
+            opened.st_gid,
+        )
+        if opened_identity != selected_identity:
+            raise AssertionError(
+                f"formal {description} boundary changed while being opened"
+            )
+        if stat.S_IMODE(opened.st_mode) != 0o700:
+            os.fchmod(descriptor, 0o700)
+        _assert_formal_checkout_boundary_acl_absent(path, description)
+        final_opened = os.fstat(descriptor)
+        final_path = path.lstat()
+        final_opened_identity = (
+            final_opened.st_dev,
+            final_opened.st_ino,
+            stat.S_IFMT(final_opened.st_mode),
+            final_opened.st_uid,
+            final_opened.st_gid,
+        )
+        final_path_identity = (
+            final_path.st_dev,
+            final_path.st_ino,
+            stat.S_IFMT(final_path.st_mode),
+            final_path.st_uid,
+            final_path.st_gid,
+        )
+        if (
+            final_opened_identity != selected_identity
+            or final_path_identity != selected_identity
+        ):
+            raise AssertionError(
+                f"formal {description} boundary changed while being prepared"
+            )
+        if (
+            stat.S_IMODE(final_opened.st_mode) != 0o700
+            or stat.S_IMODE(final_path.st_mode) != 0o700
+        ):
+            raise AssertionError(
+                f"formal {description} boundary is not owner-only"
+            )
+        prepared_binding = _test_control_plane_directory_binding(
+            final_opened
+        )
+        retained_descriptor = descriptor
+        descriptor = None
+        return retained_descriptor, prepared_binding
+    except OSError as error:
+        raise AssertionError(
+            f"formal {description} boundary cannot be prepared"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _capture_formal_test_control_plane_from_prepared_root(
+    repo_root: Path,
+    tests_root: Path,
+    candidate_root: Path,
+    *,
+    prepare_boundaries: bool,
+) -> tuple[
+    tuple[int, int, int, int, int, int],
+    dict[str, tuple[int, int, int, int, int, int]],
+    dict[str, bytes],
+    dict[str, tuple[int, int, int, int, int, int, int, int]],
+    tuple[int, int, int, int, int, int],
+]:
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    repo_descriptor: int | None = None
+    candidate_descriptor: int | None = None
+    candidate_binding: tuple[int, int, int, int, int, int] | None = None
+    path_descriptors: list[
+        tuple[
+            int,
+            str,
+            int,
+            tuple[int, int, int, int, int, int],
+        ]
+    ] = []
+    try:
+        if prepare_boundaries:
+            repo_descriptor, repo_binding = (
+                _prepare_formal_checkout_boundary(
+                    repo_root,
+                    "trusted checkout",
+                )
+            )
+            if candidate_root != repo_root:
+                candidate_descriptor, candidate_binding = (
+                    _prepare_formal_checkout_boundary(
+                        candidate_root,
+                        "candidate checkout",
+                    )
+                )
+        else:
+            repo_descriptor = os.open(repo_root, directory_flags)
+            repo_binding = _test_control_plane_directory_binding(
+                os.fstat(repo_descriptor)
+            )
+        if (
+            repo_binding[2] != stat.S_IFDIR
+            or _test_control_plane_directory_binding(repo_root.lstat())
+            != repo_binding
+        ):
+            raise AssertionError(
+                "formal Required CI repository root changed between "
+                "preparation and capture"
+            )
+        try:
+            tests_relative = tests_root.relative_to(repo_root)
+        except ValueError as error:
+            raise AssertionError(
+                "formal Required CI test control-plane path is unsafe"
+            ) from error
+        if not tests_relative.parts or ".." in tests_relative.parts:
+            raise AssertionError(
+                "formal Required CI test control-plane path is unsafe"
+            )
+        parent_descriptor = repo_descriptor
+        for component in tests_relative.parts:
+            selected = _test_control_plane_directory_binding(
+                os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            component_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            opened = _test_control_plane_directory_binding(
+                os.fstat(component_descriptor)
+            )
+            if opened != selected or opened[2] != stat.S_IFDIR:
+                os.close(component_descriptor)
+                raise AssertionError(
+                    "formal Required CI test control-plane path changed "
+                    "while being opened"
+                )
+            path_descriptors.append(
+                (
+                    parent_descriptor,
+                    component,
+                    component_descriptor,
+                    opened,
+                )
+            )
+            parent_descriptor = component_descriptor
+        tests_descriptor = parent_descriptor
+        (
+            namespace,
+            sources,
+            bindings,
+            tests_binding,
+        ) = _test_control_plane_namespace_capture(
+            tests_root,
+            "trusted",
+            capture_names=None,
+            root_descriptor=tests_descriptor,
+        )
+        if prepare_boundaries:
+            _assert_formal_checkout_boundary_acl_absent(
+                repo_root,
+                "trusted checkout",
+            )
+            if candidate_root != repo_root:
+                _assert_formal_checkout_boundary_acl_absent(
+                    candidate_root,
+                    "candidate checkout",
+                )
+        if (
+            _test_control_plane_directory_binding(
+                os.fstat(repo_descriptor)
+            )
+            != repo_binding
+            or _test_control_plane_directory_binding(repo_root.lstat())
+            != repo_binding
+            or any(
+                _test_control_plane_directory_binding(
+                    os.fstat(component_descriptor)
+                )
+                != component_binding
+                or _test_control_plane_directory_binding(
+                    os.stat(
+                        component,
+                        dir_fd=component_parent,
+                        follow_symlinks=False,
+                    )
+                )
+                != component_binding
+                for (
+                    component_parent,
+                    component,
+                    component_descriptor,
+                    component_binding,
+                ) in path_descriptors
+            )
+        ):
+            raise AssertionError(
+                "formal Required CI repository root changed between "
+                "preparation and capture"
+            )
+        if candidate_descriptor is not None and (
+            candidate_binding is None
+            or _test_control_plane_directory_binding(
+                os.fstat(candidate_descriptor)
+            )
+            != candidate_binding
+            or _test_control_plane_directory_binding(candidate_root.lstat())
+            != candidate_binding
+        ):
+            raise AssertionError(
+                "formal Required CI candidate root changed between "
+                "preparation and capture"
+            )
+        return repo_binding, namespace, sources, bindings, tests_binding
+    except OSError as error:
+        raise AssertionError(
+            "formal Required CI test control-plane cannot be captured"
+        ) from error
+    finally:
+        for (
+            _component_parent,
+            _component,
+            component_descriptor,
+            _component_binding,
+        ) in reversed(path_descriptors):
+            os.close(component_descriptor)
+        if candidate_descriptor is not None:
+            os.close(candidate_descriptor)
+        if repo_descriptor is not None:
+            os.close(repo_descriptor)
+
+
+_TRUSTED_TEST_NAMESPACE_PRELOAD: (
+    dict[str, tuple[int, int, int, int, int, int]] | None
+) = None
+_TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT: Path | None = None
+_TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT_BINDING: (
+    tuple[int, int, int, int, int, int] | None
+) = None
+_TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT: Path | None = None
+_TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_BINDING: (
+    tuple[int, int, int, int, int, int] | None
+) = None
+_TRUSTED_TEST_NAMESPACE_PRELOAD_SNAPSHOT: dict[str, object] | None = None
+_TRUSTED_TEST_NAMESPACE_PRELOAD_SOURCES: dict[str, bytes] = {}
+_TRUSTED_TEST_NAMESPACE_PRELOAD_BINDINGS: dict[
+    str, tuple[int, int, int, int, int, int, int, int]
+] = {}
+_TRUSTED_TEST_NAMESPACE_PRELOAD_COMMITMENT: str | None = None
+_TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BYTES: bytes | None = globals().pop(
+    "_TRUSTED_CANDIDATE_SUPPORT_SEED_BYTES",
+    None,
+)
+_TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BINDING: (
+    tuple[int, int, int, int, int, int, int, int] | None
+) = globals().pop(
+    "_TRUSTED_CANDIDATE_SUPPORT_SEED_BINDING",
+    None,
+)
+_TRUSTED_TEST_SUPERVISOR_SEED_BYTES: bytes | None = globals().pop(
+    "_TRUSTED_TEST_SUPERVISOR_SEED_BYTES",
+    None,
+)
+_TRUSTED_TEST_SUPERVISOR_SEED_BINDING: (
+    tuple[int, int, int, int, int, int, int, int] | None
+) = globals().pop(
+    "_TRUSTED_TEST_SUPERVISOR_SEED_BINDING",
+    None,
+)
+_FORMAL_TEST_CONTROL_PLANE_ENTRY = _formal_test_control_plane_entry_requested()
+for _trusted_seed_description, _trusted_seed, _trusted_seed_binding in (
+    (
+        "candidate support",
+        _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BYTES,
+        _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BINDING,
+    ),
+    (
+        "test supervisor",
+        _TRUSTED_TEST_SUPERVISOR_SEED_BYTES,
+        _TRUSTED_TEST_SUPERVISOR_SEED_BINDING,
+    ),
+):
+    if (
+        _trusted_seed is not None
+        and (
+            type(_trusted_seed) is not bytes
+            or not _trusted_seed
+            or len(_trusted_seed) > TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES
+        )
+    ) or (
+        _trusted_seed_binding is not None
+        and (
+            not isinstance(_trusted_seed_binding, tuple)
+            or len(_trusted_seed_binding) != 8
+            or any(type(value) is not int for value in _trusted_seed_binding)
+            or _trusted_seed_binding[2] != stat.S_IFREG
+            or _trusted_seed_binding[6] != 1
+            or _trusted_seed is None
+            or _trusted_seed_binding[7] != len(_trusted_seed)
+        )
+    ) or (
+        _trusted_seed is not None
+        and _trusted_seed_binding is None
+        and not _FORMAL_TEST_CONTROL_PLANE_ENTRY
+    ):
+        raise AssertionError(
+            f"trusted {_trusted_seed_description} seed is malformed"
+        )
+if _FORMAL_TEST_CONTROL_PLANE_ENTRY:
+    _TRUSTED_TEST_NAMESPACE_ROOT = Path(__file__).resolve(strict=True).parent
+    if _TRUSTED_TEST_NAMESPACE_ROOT.parts[-4:] == (
+        "personal_codex",
+        "skills",
+        "waited-delivery",
+        "tests",
+    ):
+        _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT = (
+            _TRUSTED_TEST_NAMESPACE_ROOT.parents[3]
+        )
+    elif _TRUSTED_TEST_NAMESPACE_ROOT.parts[-3:] == (
+        "skills",
+        "waited-delivery",
+        "tests",
+    ):
+        _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT = (
+            _TRUSTED_TEST_NAMESPACE_ROOT.parents[2]
+        )
+    else:
+        raise AssertionError(
+            "formal Required CI test control-plane layout is unsupported"
+        )
+    _formal_candidate_root_value = os.environ.get(
+        "REQUIRED_CI_CANDIDATE_ROOT"
+    )
+    if _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT.name == ".required-ci":
+        _expected_formal_candidate_root = (
+            _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT.parent / ".candidate"
+        )
+        if (
+            type(_formal_candidate_root_value) is not str
+            or Path(_formal_candidate_root_value)
+            != _expected_formal_candidate_root
+        ):
+            raise AssertionError(
+                "formal Required CI candidate checkout boundary is malformed"
+            )
+        _formal_candidate_root = _expected_formal_candidate_root
+        _prepare_formal_boundaries = True
+    elif sys.argv[1:] == [CI_STRICT_RUNTIME_LIVE_FLAG]:
+        if _formal_candidate_root_value is not None:
+            raise AssertionError(
+                "formal strict live candidate checkout boundary is malformed"
+            )
+        _formal_candidate_root = _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT
+        _prepare_formal_boundaries = True
+    else:
+        _formal_candidate_root = _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT
+        _prepare_formal_boundaries = False
+    (
+        _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_BINDING,
+        _TRUSTED_TEST_NAMESPACE_PRELOAD,
+        _TRUSTED_TEST_NAMESPACE_PRELOAD_SOURCES,
+        _TRUSTED_TEST_NAMESPACE_PRELOAD_BINDINGS,
+        _TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT_BINDING,
+    ) = _capture_formal_test_control_plane_from_prepared_root(
+        _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT,
+        _TRUSTED_TEST_NAMESPACE_ROOT,
+        _formal_candidate_root,
+        prepare_boundaries=_prepare_formal_boundaries,
+    )
+    _active_test_control_plane_names(
+        _TRUSTED_TEST_NAMESPACE_PRELOAD,
+        "trusted",
+    )
+    _TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT = _TRUSTED_TEST_NAMESPACE_ROOT
+    if (
+        _TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT_BINDING[2] != stat.S_IFDIR
+        or _test_control_plane_directory_binding(
+            _TRUSTED_TEST_NAMESPACE_ROOT.lstat()
+        )
+        != _TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT_BINDING
+        or _test_control_plane_directory_binding(
+            _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT.lstat()
+        )
+        != _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_BINDING
+    ):
+        raise AssertionError(
+            "formal Required CI test control-plane root changed during capture"
+        )
+    _captured_support_source = _TRUSTED_TEST_NAMESPACE_PRELOAD_SOURCES[
+        "required_ci_candidate.py"
+    ]
+    _captured_support_binding = _TRUSTED_TEST_NAMESPACE_PRELOAD_BINDINGS[
+        "required_ci_candidate.py"
+    ]
+    _captured_supervisor_source = _TRUSTED_TEST_NAMESPACE_PRELOAD_SOURCES[
+        Path(__file__).name
+    ]
+    _captured_supervisor_binding = _TRUSTED_TEST_NAMESPACE_PRELOAD_BINDINGS[
+        Path(__file__).name
+    ]
+    if (
+        _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BYTES is not None
+        and _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BYTES
+        != _captured_support_source
+    ):
+        raise AssertionError(
+            "trusted candidate support seed differs from the launch namespace"
+        )
+    if (
+        _TRUSTED_TEST_SUPERVISOR_SEED_BYTES is not None
+        and _TRUSTED_TEST_SUPERVISOR_SEED_BYTES
+        != _captured_supervisor_source
+    ):
+        raise AssertionError(
+            "trusted test supervisor seed differs from the launch namespace"
+        )
+    if (
+        _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BINDING is not None
+        and _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BINDING
+        != _captured_support_binding
+    ):
+        raise AssertionError(
+            "trusted candidate support binding differs from the launch namespace"
+        )
+    if (
+        _TRUSTED_TEST_SUPERVISOR_SEED_BINDING is not None
+        and _TRUSTED_TEST_SUPERVISOR_SEED_BINDING
+        != _captured_supervisor_binding
+    ):
+        raise AssertionError(
+            "trusted test supervisor binding differs from the launch namespace"
+        )
+    _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BYTES = _captured_support_source
+    _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BINDING = _captured_support_binding
+    _TRUSTED_TEST_SUPERVISOR_SEED_BYTES = _captured_supervisor_source
+    _TRUSTED_TEST_SUPERVISOR_SEED_BINDING = _captured_supervisor_binding
+    _TRUSTED_TEST_NAMESPACE_PRELOAD_COMMITMENT = (
+        _test_control_plane_commitment(
+            _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT,
+            _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_BINDING,
+            _TRUSTED_TEST_NAMESPACE_ROOT,
+            _TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT_BINDING,
+            _TRUSTED_TEST_NAMESPACE_PRELOAD,
+            _TRUSTED_TEST_NAMESPACE_PRELOAD_SOURCES,
+            _TRUSTED_TEST_NAMESPACE_PRELOAD_BINDINGS,
+        )
+    )
+    if (
+        len(sys.argv) == 3
+        and sys.argv[1] == TRUSTED_TEST_CHILD_FLAG
+    ):
+        expected_commitment = os.environ.get(
+            TRUSTED_TEST_LAUNCH_COMMITMENT_ENV
+        )
+        if (
+            type(expected_commitment) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_commitment) is None
+            or expected_commitment
+            != _TRUSTED_TEST_NAMESPACE_PRELOAD_COMMITMENT
+        ):
+            raise AssertionError(
+                "trusted child control-plane commitment changed before support load"
+            )
+TRUSTED_TEST_SUPERVISOR_PATH = Path(__file__).resolve(strict=True)
+if _TRUSTED_TEST_SUPERVISOR_SEED_BYTES is None:
+    (
+        TRUSTED_TEST_SUPERVISOR_BYTES,
+        TRUSTED_TEST_SUPERVISOR_BINDING,
+    ) = _read_stable_test_control_plane_path(
+        TRUSTED_TEST_SUPERVISOR_PATH,
+        "trusted test supervisor",
+    )
+else:
+    TRUSTED_TEST_SUPERVISOR_BYTES = _TRUSTED_TEST_SUPERVISOR_SEED_BYTES
+    if _TRUSTED_TEST_SUPERVISOR_SEED_BINDING is None:
+        raise AssertionError("trusted test supervisor seed binding is missing")
+    TRUSTED_TEST_SUPERVISOR_BINDING = (
+        _TRUSTED_TEST_SUPERVISOR_SEED_BINDING
+    )
+TRUSTED_TEST_SUPERVISOR_SHA256 = hashlib.sha256(
+    TRUSTED_TEST_SUPERVISOR_BYTES
+).hexdigest()
 TRUSTED_CANDIDATE_SUPPORT_PATH = Path(__file__).resolve(strict=True).with_name(
     "required_ci_candidate.py"
 )
-try:
-    TRUSTED_CANDIDATE_SUPPORT_SOURCE = TRUSTED_CANDIDATE_SUPPORT_PATH.read_bytes()
-except OSError as error:
-    raise AssertionError("trusted candidate support cannot be read") from error
+if _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BYTES is None:
+    (
+        TRUSTED_CANDIDATE_SUPPORT_SOURCE,
+        TRUSTED_CANDIDATE_SUPPORT_BINDING,
+    ) = _read_stable_test_control_plane_path(
+        TRUSTED_CANDIDATE_SUPPORT_PATH,
+        "trusted candidate support",
+    )
+else:
+    TRUSTED_CANDIDATE_SUPPORT_SOURCE = (
+        _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BYTES
+    )
+    if _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BINDING is None:
+        raise AssertionError("trusted candidate support seed binding is missing")
+    TRUSTED_CANDIDATE_SUPPORT_BINDING = (
+        _TRUSTED_CANDIDATE_SUPPORT_PRELOAD_BINDING
+    )
 TRUSTED_CANDIDATE_SUPPORT_SHA256 = hashlib.sha256(
     TRUSTED_CANDIDATE_SUPPORT_SOURCE
 ).hexdigest()
+def _trusted_test_control_plane_source_rows(
+    seed_rows: object,
+) -> tuple[tuple[str, bytes], ...]:
+    if seed_rows is None:
+        if _TRUSTED_TEST_NAMESPACE_PRELOAD_SOURCES:
+            sources = dict(_TRUSTED_TEST_NAMESPACE_PRELOAD_SOURCES)
+        else:
+            tests_root = Path(__file__).resolve(strict=True).parent
+            (
+                namespace_tree,
+                sources,
+                _source_bindings,
+                root_binding,
+            ) = _test_control_plane_namespace_capture(
+                tests_root,
+                "trusted ordinary discovery",
+                capture_names=None,
+                ignored_root_directories=frozenset({"__pycache__"}),
+            )
+            _active_test_control_plane_names(
+                namespace_tree,
+                "trusted ordinary discovery",
+            )
+            if (
+                root_binding
+                != _test_control_plane_directory_binding(tests_root.lstat())
+            ):
+                raise AssertionError(
+                    "trusted ordinary discovery root changed during capture"
+                )
+    else:
+        if not isinstance(seed_rows, tuple):
+            raise AssertionError(
+                "trusted captured test source seed is malformed"
+            )
+        sources = {}
+        for row in seed_rows:
+            if (
+                not isinstance(row, tuple)
+                or len(row) != 2
+                or type(row[0]) is not str
+                or type(row[1]) is not bytes
+                or row[0] in sources
+            ):
+                raise AssertionError(
+                    "trusted captured test source seed is malformed"
+                )
+            sources[row[0]] = row[1]
+    names = sorted(sources)
+    if (
+        "required_ci_candidate.py" not in names
+        or Path(__file__).name not in names
+        or not any(name.startswith("test_") for name in names)
+        or any(
+            "/" in name
+            or (
+                name != "required_ci_candidate.py"
+                and not (name.startswith("test_") and name.endswith(".py"))
+            )
+            for name in names
+        )
+        or any(not source for source in sources.values())
+        or sources["required_ci_candidate.py"]
+        != TRUSTED_CANDIDATE_SUPPORT_SOURCE
+        or sources[Path(__file__).name] != TRUSTED_TEST_SUPERVISOR_BYTES
+    ):
+        raise AssertionError("trusted captured test source seed is malformed")
+    return tuple((name, sources[name]) for name in names)
+
+
+TRUSTED_TEST_CONTROL_PLANE_SOURCE_ROWS = (
+    _trusted_test_control_plane_source_rows(
+        globals().pop(
+            "_TRUSTED_TEST_CONTROL_PLANE_SOURCE_SEED_ROWS",
+            None,
+        )
+    )
+)
+
+
+def _trusted_test_control_plane_source(name: str) -> bytes:
+    matches = [
+        source
+        for source_name, source in TRUSTED_TEST_CONTROL_PLANE_SOURCE_ROWS
+        if source_name == name
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"trusted captured test source {name!r} is missing")
+    return matches[0]
+
+
+@contextlib.contextmanager
+def _owner_private_captured_support_path() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(
+        prefix="waited-captured-support-",
+    ) as temporary_directory:
+        root = Path(temporary_directory).resolve(strict=True)
+        root_metadata = root.lstat()
+        if (
+            root_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise AssertionError(
+                "captured support staging root is not owner-private"
+            )
+        path = root / "required_ci_candidate.py"
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                0o600,
+            )
+            offset = 0
+            while offset < len(TRUSTED_CANDIDATE_SUPPORT_SOURCE):
+                written = os.write(
+                    descriptor,
+                    TRUSTED_CANDIDATE_SUPPORT_SOURCE[offset:],
+                )
+                if written <= 0:
+                    raise AssertionError(
+                        "captured support staging write made no progress"
+                    )
+                offset += written
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o400)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        staged_source, staged_binding = _read_stable_test_control_plane_path(
+            path,
+            "captured staged candidate support",
+        )
+        if (
+            staged_source != TRUSTED_CANDIDATE_SUPPORT_SOURCE
+            or staged_binding[3] != 0o400
+            or staged_binding[4] != os.geteuid()
+        ):
+            raise AssertionError("captured support staging is malformed")
+        try:
+            yield path
+        finally:
+            final_source, final_binding = _read_stable_test_control_plane_path(
+                path,
+                "captured staged candidate support",
+            )
+            if final_source != staged_source or final_binding != staged_binding:
+                raise AssertionError(
+                    "captured support staging changed during execution"
+                )
+
+
+class _CapturedSourceLoader(importlib.abc.InspectLoader):
+    def __init__(self, module_name: str, logical_path: Path, source: bytes):
+        if (
+            type(module_name) is not str
+            or not module_name
+            or not logical_path.is_absolute()
+            or type(source) is not bytes
+            or not source
+        ):
+            raise AssertionError("captured source loader input is malformed")
+        self._module_name = module_name
+        self._logical_path = str(logical_path)
+        self._source = source
+        try:
+            self._source_text = importlib.util.decode_source(source)
+        except UnicodeError as error:
+            raise AssertionError("captured source is not valid Python text") from error
+
+    def get_filename(self, fullname: str) -> str:
+        self._require_name(fullname)
+        return self._logical_path
+
+    def get_source(self, fullname: str) -> str:
+        self._require_name(fullname)
+        return self._source_text
+
+    def get_code(self, fullname: str):
+        self._require_name(fullname)
+        return compile(
+            self._source,
+            self._logical_path,
+            "exec",
+            dont_inherit=True,
+        )
+
+    def is_package(self, fullname: str) -> bool:
+        self._require_name(fullname)
+        return False
+
+    def linecache_entry(self) -> tuple[int, None, list[str], str]:
+        return (
+            len(self._source),
+            None,
+            self._source_text.splitlines(keepends=True),
+            self._logical_path,
+        )
+
+    def _require_name(self, fullname: str) -> None:
+        if fullname != self._module_name:
+            raise ImportError("captured source loader module name changed")
 
 
 def _load_trusted_candidate_support():
+    loader = _CapturedSourceLoader(
+        "required_ci_candidate",
+        TRUSTED_CANDIDATE_SUPPORT_PATH,
+        TRUSTED_CANDIDATE_SUPPORT_SOURCE,
+    )
     spec = importlib.util.spec_from_file_location(
-        "required_ci_candidate", TRUSTED_CANDIDATE_SUPPORT_PATH
+        "required_ci_candidate",
+        TRUSTED_CANDIDATE_SUPPORT_PATH,
+        loader=loader,
     )
     if spec is None or spec.loader is None:
         raise AssertionError("trusted candidate support cannot be loaded")
     module = importlib.util.module_from_spec(spec)
+    previous_module = sys.modules.get(spec.name)
+    had_previous_module = spec.name in sys.modules
+    module.__dict__["_TRUSTED_SUPPORT_PRELOAD_BYTES"] = (
+        TRUSTED_CANDIDATE_SUPPORT_SOURCE
+    )
+    module.__dict__["_TRUSTED_SUPPORT_PRELOAD_BINDING"] = (
+        TRUSTED_CANDIDATE_SUPPORT_BINDING
+    )
+    logical_path = str(TRUSTED_CANDIDATE_SUPPORT_PATH)
+    missing_cache = object()
+    previous_cache = linecache.cache.get(logical_path, missing_cache)
+    linecache.cache[logical_path] = loader.linecache_entry()
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    try:
+        code = loader.get_code(spec.name)
+        exec(code, module.__dict__)
+        if (
+            getattr(module, "_TRUSTED_SUPPORT_PATH", None)
+            != TRUSTED_CANDIDATE_SUPPORT_PATH
+            or getattr(module, "_TRUSTED_SUPPORT_SOURCE", None)
+            != TRUSTED_CANDIDATE_SUPPORT_SOURCE
+            or getattr(module, "_TRUSTED_SUPPORT_SHA256", None)
+            != TRUSTED_CANDIDATE_SUPPORT_SHA256
+            or getattr(module, "_TRUSTED_SUPPORT_BINDING", None)
+            != TRUSTED_CANDIDATE_SUPPORT_BINDING
+            or "_TRUSTED_SUPPORT_PRELOAD_BYTES" in module.__dict__
+            or "_TRUSTED_SUPPORT_PRELOAD_BINDING" in module.__dict__
+        ):
+            raise AssertionError(
+                "trusted candidate support did not consume the captured bytes"
+            )
+    except BaseException:
+        if had_previous_module:
+            sys.modules[spec.name] = previous_module
+        else:
+            sys.modules.pop(spec.name, None)
+        if previous_cache is missing_cache:
+            linecache.cache.pop(logical_path, None)
+        else:
+            linecache.cache[logical_path] = previous_cache
+        raise
     return module
 
 
@@ -127,16 +1730,11 @@ TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS = 3 * 60
 TRUSTED_JOB_RUNNER_MARGIN_MINUTES = 5
 TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS = 1
 TRUSTED_TEST_CHILD_REAP_TIMEOUT_SECONDS = 5
-TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES = 2 * 1024 * 1024
 TRUSTED_WORKFLOW_INVENTORY_LIMIT = 256
 TRUSTED_WORKFLOW_TOTAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024
 TRUSTED_TEST_CHILD_SUCCESS_EXIT = 73
 TRUSTED_TEST_RECEIPT_SCHEMA_VERSION = 3
 TRUSTED_TEST_RECEIPT_SENTINEL = "REQUIRED_CI_TRUSTED_TESTS_COMPLETED:"
-TRUSTED_STRUCTURE_VALIDATOR_FLAG = "--validate-required-ci-structure"
-TRUSTED_TEST_SUPERVISOR_FLAG = "--run-trusted-tests"
-TRUSTED_TEST_CHILD_FLAG = "--run-trusted-test-suite"
-CI_STRICT_RUNTIME_LIVE_FLAG = "--run-strict-runtime-live-test"
 CI_STRICT_RUNTIME_LIVE_TEST_METHOD = (
     "test_strict_runtime_live_end_to_end"
 )
@@ -238,6 +1836,66 @@ CI_STRICT_RUNTIME_LIVE_FORBIDDEN_ENV = (
     *LOCAL_SUPERVISOR_ISOLATION_ENV[1:],
     "REQUIRED_CI_INTERNAL_ISOLATION_WATCHDOG_TOKEN",
 )
+_LOCAL_FORMAL_LAUNCH_CONTROL_PLANE: dict[str, object] | None = None
+
+
+@contextlib.contextmanager
+def _local_formal_test_control_plane_copy() -> Iterator[None]:
+    supervisor_path = Path(__file__).resolve(strict=True)
+    support_path = TRUSTED_CANDIDATE_SUPPORT_PATH.resolve(strict=True)
+    try:
+        supervisor_relative = supervisor_path.relative_to(TRUSTED_REPO_ROOT)
+        support_relative = support_path.relative_to(TRUSTED_REPO_ROOT)
+    except ValueError as error:
+        raise AssertionError(
+            "local formal test control-plane source is outside the trusted root"
+        ) from error
+    supervisor_source = TRUSTED_TEST_SUPERVISOR_BYTES
+    support_source = TRUSTED_CANDIDATE_SUPPORT_SOURCE
+    if _LOCAL_FORMAL_LAUNCH_CONTROL_PLANE is not None:
+        raise AssertionError("local formal launch authority is already active")
+    with tempfile.TemporaryDirectory(
+        prefix="waited-formal-control-plane-",
+    ) as temporary_directory:
+        copy_root = Path(temporary_directory).resolve(strict=True)
+        copied_supervisor = copy_root / supervisor_relative
+        copied_support = copy_root / support_relative
+        if copied_supervisor.parent != copied_support.parent:
+            raise AssertionError(
+                "local formal test control-plane layout is inconsistent"
+            )
+        copied_supervisor.parent.mkdir(parents=True)
+        copied_supervisor.write_bytes(supervisor_source)
+        copied_support.write_bytes(support_source)
+        launch_control_plane = _active_test_control_plane_snapshot(
+            copy_root,
+            "local formal launch authority",
+        )
+        launch_files = launch_control_plane.get("files")
+        if (
+            not isinstance(launch_files, dict)
+            or not isinstance(launch_files.get(supervisor_relative.as_posix()), dict)
+            or not isinstance(launch_files.get(support_relative.as_posix()), dict)
+            or launch_files[supervisor_relative.as_posix()].get("source")
+            != supervisor_source
+            or launch_files[support_relative.as_posix()].get("source")
+            != support_source
+        ):
+            raise AssertionError("local formal launch authority is malformed")
+        with mock.patch.object(
+            sys.modules[__name__],
+            "__file__",
+            str(copied_supervisor),
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_LOCAL_FORMAL_LAUNCH_CONTROL_PLANE",
+            launch_control_plane,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_TRUSTED_TEST_NAMESPACE_PRELOAD_SNAPSHOT",
+            None,
+        ):
+            yield
 
 
 @contextlib.contextmanager
@@ -247,14 +1905,15 @@ def _local_nonstrict_supervisor_environment() -> Iterator[None]:
         for key in LOCAL_SUPERVISOR_ISOLATION_ENV
         if key in os.environ
     }
-    try:
-        for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
-            os.environ.pop(key, None)
-        yield
-    finally:
-        for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
-            os.environ.pop(key, None)
-        os.environ.update(previous)
+    with _local_formal_test_control_plane_copy():
+        try:
+            for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+                os.environ.pop(key, None)
+            yield
+        finally:
+            for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+                os.environ.pop(key, None)
+            os.environ.update(previous)
 
 
 def _snapshot_permission_probe_is_meaningful() -> bool:
@@ -327,7 +1986,17 @@ README_COMPILE_COMMAND = (
     "'"
 )
 README_DISCOVERY_COMMAND = (
-    "python3 -I -m unittest discover -s skills/waited-delivery/tests"
+    "python3 -I -B -c 'import os,stat,subprocess,sys,tempfile; "
+    "from pathlib import Path; checkout=Path.cwd().resolve(); "
+    "cache=tempfile.TemporaryDirectory(prefix=\"codex-waited-delivery-pycache-\"); "
+    "cache_root=Path(cache.name).resolve(); metadata=cache_root.stat(); "
+    "safe=(cache_root.is_absolute() and cache_root != checkout and "
+    "checkout not in cache_root.parents and metadata.st_uid==os.geteuid() and "
+    "stat.S_IMODE(metadata.st_mode)==0o700); "
+    "completed=(subprocess.run([sys.executable,\"-I\",\"-B\",\"-X\","
+    "\"pycache_prefix=\"+str(cache_root),\"-m\",\"unittest\",\"discover\","
+    "\"-s\",\"skills/waited-delivery/tests\"],check=False) if safe else None); "
+    "cache.cleanup(); sys.exit(125 if completed is None else completed.returncode)'"
 )
 STRICT_RUNTIME_HARDENING_COMMAND = (
     'if [[ ! "$pythonLocation" =~ '
@@ -653,11 +2322,25 @@ def _static_test_ids(module_path: Path, description: str) -> list[str]:
         raise AssertionError(
             f"{description} test module {module_path.name!r} cannot be read as UTF-8"
         ) from error
+    return _static_test_ids_from_source(
+        source,
+        module_path.name,
+        str(module_path),
+        description,
+    )
+
+
+def _static_test_ids_from_source(
+    source: str,
+    module_name: str,
+    logical_path: str,
+    description: str,
+) -> list[str]:
     try:
-        tree = ast.parse(source, filename=str(module_path))
+        tree = ast.parse(source, filename=logical_path)
     except SyntaxError as error:
         raise AssertionError(
-            f"{description} test module {module_path.name!r} is not valid Python"
+            f"{description} test module {module_name!r} is not valid Python"
         ) from error
 
     test_ids: list[str] = []
@@ -665,12 +2348,12 @@ def _static_test_ids(module_path: Path, description: str) -> list[str]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name == "load_tests":
                 raise AssertionError(
-                    f"{description} test module {module_path.name!r} uses an "
+                    f"{description} test module {module_name!r} uses an "
                     "unsupported load_tests hook"
                 )
             if node.name.startswith("test_"):
                 raise AssertionError(
-                    f"{description} test module {module_path.name!r} uses an "
+                    f"{description} test module {module_name!r} uses an "
                     "unsupported module-level test"
                 )
         if not isinstance(node, ast.ClassDef):
@@ -693,12 +2376,12 @@ def _static_test_ids(module_path: Path, description: str) -> list[str]:
         )
         if not direct_test_case:
             raise AssertionError(
-                f"{description} test class {node.name!r} in {module_path.name!r} "
+                f"{description} test class {node.name!r} in {module_name!r} "
                 "must directly extend unittest.TestCase"
             )
         if node.decorator_list:
             raise AssertionError(
-                f"{description} test class {node.name!r} in {module_path.name!r} "
+                f"{description} test class {node.name!r} in {module_name!r} "
                 "must not use decorators"
             )
         for method in test_methods:
@@ -715,11 +2398,11 @@ def _static_test_ids(module_path: Path, description: str) -> list[str]:
 
     if not test_ids:
         raise AssertionError(
-            f"{description} test module {module_path.name!r} has no static tests"
+            f"{description} test module {module_name!r} has no static tests"
         )
     if len(test_ids) != len(set(test_ids)):
         raise AssertionError(
-            f"{description} test module {module_path.name!r} has duplicate test IDs"
+            f"{description} test module {module_name!r} has duplicate test IDs"
         )
     return sorted(test_ids)
 
@@ -735,29 +2418,6 @@ def _inventory_lookup(inventory: list[dict[str, object]]) -> dict[str, list[str]
             raise AssertionError("test inventory entry is duplicated or malformed")
         lookup[module] = test_ids
     return lookup
-
-
-def _require_expected_test_inventory(
-    expected_inventory: list[dict[str, object]],
-    candidate_inventory: list[dict[str, object]],
-) -> None:
-    expected = _inventory_lookup(expected_inventory)
-    candidate = _inventory_lookup(candidate_inventory)
-    missing: list[str] = []
-    for module, expected_test_ids in expected.items():
-        candidate_test_ids = candidate.get(module)
-        if candidate_test_ids is None:
-            missing.append(module)
-            continue
-        missing.extend(
-            f"{module}::{test_id}"
-            for test_id in expected_test_ids
-            if test_id not in candidate_test_ids
-        )
-    if missing:
-        raise AssertionError(
-            "candidate expected test inventory is incomplete: " + ", ".join(missing)
-        )
 
 
 def _inventory_test_ids(inventory: list[dict[str, object]]) -> list[str]:
@@ -804,45 +2464,990 @@ def _assert_candidate_absent_from_sys_path(candidate_root: Path) -> None:
             raise AssertionError("candidate checkout must not appear on trusted sys.path")
 
 
-def _trusted_test_source_manifest(repo_root: Path) -> dict[str, str]:
-    resolved_repo_root = repo_root.resolve(strict=True)
+def _active_test_control_plane_snapshot(
+    repo_root: Path,
+    description: str,
+    *,
+    expected_cross_root: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if not repo_root.is_absolute() or repo_root.is_symlink():
+        raise AssertionError(
+            f"{description} active test control-plane manifest root is unsafe"
+        )
+    try:
+        resolved_repo_root = repo_root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            f"{description} active test control-plane manifest root is unreadable"
+        ) from error
+    if resolved_repo_root != repo_root or not resolved_repo_root.is_dir():
+        raise AssertionError(
+            f"{description} active test control-plane manifest root is unsafe"
+        )
     tests_root = distribution_tests_root(resolved_repo_root)
-    support_path = tests_root / "required_ci_candidate.py"
-    paths = sorted(tests_root.glob("test_*.py")) + [support_path]
+    if tests_root.is_symlink():
+        raise AssertionError(
+            f"{description} active test control-plane manifest path is unsafe"
+        )
+    try:
+        resolved_tests_root = tests_root.resolve(strict=True)
+    except OSError as error:
+        raise AssertionError(
+            f"{description} active test control-plane manifest is unreadable"
+        ) from error
+    if resolved_tests_root != tests_root or not resolved_tests_root.is_dir():
+        raise AssertionError(
+            f"{description} active test control-plane manifest path is unsafe"
+        )
+    expected_files: dict[str, dict[str, object]] | None = None
+    expected_capture_names: frozenset[str] | None = None
+    if expected_cross_root is not None:
+        selected_expected_files = expected_cross_root.get("files")
+        if not isinstance(selected_expected_files, dict) or any(
+            type(path) is not str or not isinstance(entry, dict)
+            for path, entry in selected_expected_files.items()
+        ):
+            raise AssertionError(
+                "trusted active test control-plane manifest is malformed"
+            )
+        tests_relative = resolved_tests_root.relative_to(resolved_repo_root)
+        capture_names: set[str] = set()
+        for expected_relative in selected_expected_files:
+            relative_path = Path(expected_relative)
+            try:
+                capture_relative = relative_path.relative_to(tests_relative)
+            except ValueError as error:
+                raise AssertionError(
+                    "trusted active test control-plane manifest path is malformed"
+                ) from error
+            if (
+                relative_path.is_absolute()
+                or relative_path.as_posix() != expected_relative
+                or ".." in relative_path.parts
+                or len(capture_relative.parts) != 1
+                or capture_relative.name in capture_names
+            ):
+                raise AssertionError(
+                    "trusted active test control-plane manifest path is malformed"
+                )
+            capture_names.add(capture_relative.name)
+        expected_files = selected_expected_files
+        expected_capture_names = frozenset(capture_names)
+
+    repo_fd: int | None = None
+    tests_fd: int | None = None
+    tests_path_descriptors: list[
+        tuple[
+            int,
+            str,
+            int,
+            tuple[int, int, int, int, int, int],
+        ]
+    ] = []
+    try:
+        repo_fd = os.open(
+            resolved_repo_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        repo_binding = _test_control_plane_directory_binding(
+            os.fstat(repo_fd)
+        )
+        tests_relative = resolved_tests_root.relative_to(resolved_repo_root)
+        if not tests_relative.parts:
+            raise AssertionError(
+                f"{description} active test control-plane manifest path is unsafe"
+            )
+        parent_descriptor = repo_fd
+        directory_flags = (
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        for component in tests_relative.parts:
+            selected_component = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            selected_binding = _test_control_plane_directory_binding(
+                selected_component
+            )
+            component_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            opened_binding = _test_control_plane_directory_binding(
+                os.fstat(component_descriptor)
+            )
+            if (
+                opened_binding != selected_binding
+                or opened_binding[2] != stat.S_IFDIR
+            ):
+                os.close(component_descriptor)
+                raise AssertionError(
+                    f"{description} active test control-plane manifest path changed"
+                )
+            tests_path_descriptors.append(
+                (
+                    parent_descriptor,
+                    component,
+                    component_descriptor,
+                    opened_binding,
+                )
+            )
+            parent_descriptor = component_descriptor
+        tests_fd = parent_descriptor
+        tests_binding = _test_control_plane_directory_binding(
+            os.fstat(tests_fd)
+        )
+        if (
+            repo_binding
+            != _test_control_plane_directory_binding(
+                resolved_repo_root.lstat()
+            )
+            or tests_binding
+            != _test_control_plane_directory_binding(
+                resolved_tests_root.lstat()
+            )
+            or repo_binding[2] != stat.S_IFDIR
+            or tests_binding[2] != stat.S_IFDIR
+        ):
+            raise AssertionError(
+                f"{description} active test control-plane manifest path changed"
+            )
+        (
+            namespace_tree,
+            captured_sources,
+            captured_bindings,
+            captured_root_binding,
+        ) = _test_control_plane_namespace_capture(
+            resolved_tests_root,
+            description,
+            capture_names=expected_capture_names,
+            root_descriptor=tests_fd,
+        )
+        if captured_root_binding != tests_binding:
+            raise AssertionError(
+                f"{description} active test control-plane manifest root changed "
+                "during capture"
+            )
+        names = _active_test_control_plane_names(namespace_tree, description)
+        if expected_files is not None:
+            expected_paths = sorted(expected_files)
+            observed_paths = sorted(
+                (
+                    resolved_tests_root / name
+                ).relative_to(resolved_repo_root).as_posix()
+                for name in names
+            )
+            if observed_paths != expected_paths:
+                raise AssertionError(
+                    f"{description} active test control-plane manifest path set differs"
+                )
+
+        files: dict[str, dict[str, object]] = {}
+        for name in names:
+            relative = (
+                resolved_tests_root / name
+            ).relative_to(resolved_repo_root).as_posix()
+            source = captured_sources[name]
+            binding = captured_bindings[name]
+            if expected_files is not None:
+                expected_entry = expected_files[relative]
+                expected_binding = expected_entry.get("binding")
+                if (
+                    not isinstance(expected_binding, tuple)
+                    or len(expected_binding) != 8
+                    or (
+                        binding[2],
+                        binding[3],
+                        binding[7],
+                    )
+                    != (
+                        expected_binding[2],
+                        expected_binding[3],
+                        expected_binding[7],
+                    )
+                ):
+                    raise AssertionError(
+                        f"{description} active test control-plane manifest "
+                        f"metadata differs for {relative!r}"
+                    )
+            digest = hashlib.sha256(source).hexdigest()
+            if expected_files is not None:
+                expected_entry = expected_files[relative]
+                if (
+                    source != expected_entry.get("source")
+                    or digest != expected_entry.get("sha256")
+                ):
+                    raise AssertionError(
+                        f"{description} active test control-plane manifest "
+                        f"content differs for {relative!r}"
+                    )
+            files[relative] = {
+                "binding": binding,
+                "source": source,
+                "sha256": digest,
+            }
+        (
+            final_namespace_tree,
+            final_sources,
+            final_bindings,
+            final_root_binding,
+        ) = _test_control_plane_namespace_capture(
+            resolved_tests_root,
+            description,
+            capture_names=expected_capture_names,
+            root_descriptor=tests_fd,
+        )
+        if (
+            final_namespace_tree != namespace_tree
+            or final_sources != captured_sources
+            or final_bindings != captured_bindings
+            or final_root_binding != tests_binding
+            or _test_control_plane_directory_binding(os.fstat(repo_fd))
+            != repo_binding
+            or _test_control_plane_directory_binding(
+                resolved_repo_root.lstat()
+            )
+            != repo_binding
+            or _test_control_plane_directory_binding(os.fstat(tests_fd))
+            != tests_binding
+            or _test_control_plane_directory_binding(
+                resolved_tests_root.lstat()
+            )
+            != tests_binding
+            or any(
+                _test_control_plane_directory_binding(
+                    os.fstat(component_descriptor)
+                )
+                != component_binding
+                or _test_control_plane_directory_binding(
+                    os.stat(
+                        component,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+                != component_binding
+                for (
+                    parent_descriptor,
+                    component,
+                    component_descriptor,
+                    component_binding,
+                ) in tests_path_descriptors
+            )
+        ):
+            raise AssertionError(
+                f"{description} active test control-plane manifest changed "
+                "while being captured"
+            )
+        return {
+            "repo_root": str(resolved_repo_root),
+            "repo_binding": repo_binding,
+            "tests_root": str(resolved_tests_root),
+            "tests_binding": tests_binding,
+            "namespace_tree": namespace_tree,
+            "files": files,
+        }
+    except OSError as error:
+        raise AssertionError(
+            f"{description} active test control-plane manifest is unreadable"
+        ) from error
+    finally:
+        for (
+            _parent_descriptor,
+            _component,
+            component_descriptor,
+            _component_binding,
+        ) in reversed(tests_path_descriptors):
+            os.close(component_descriptor)
+        if repo_fd is not None:
+            os.close(repo_fd)
+
+
+def _trusted_test_source_manifest_from_snapshot(
+    snapshot: dict[str, object],
+) -> dict[str, str]:
+    files = snapshot.get("files")
+    if not isinstance(files, dict):
+        raise AssertionError("trusted active test control-plane manifest is malformed")
     manifest: dict[str, str] = {}
-    for path in paths:
-        try:
-            path.lstat()
-            resolved = path.resolve(strict=True)
-            source = path.read_bytes()
-        except OSError as error:
-            raise AssertionError("trusted test source cannot be read") from error
-        if not path.is_file() or path.is_symlink() or resolved != path:
-            raise AssertionError("trusted test source must be an ordinary file")
-        relative = path.relative_to(resolved_repo_root).as_posix()
-        manifest[relative] = hashlib.sha256(source).hexdigest()
-    if len(manifest) != len(paths):
-        raise AssertionError("trusted test source inventory is duplicated")
+    for relative, entry in files.items():
+        if (
+            type(relative) is not str
+            or not isinstance(entry, dict)
+            or type(entry.get("sha256")) is not str
+        ):
+            raise AssertionError(
+                "trusted active test control-plane manifest is malformed"
+            )
+        manifest[relative] = entry["sha256"]
     support_relative = (
         TRUSTED_CONTENT_RELATIVE_ROOT
         / CANDIDATE_TESTS_RELATIVE_PATH
         / "required_ci_candidate.py"
     ).as_posix()
-    if manifest[support_relative] != TRUSTED_CANDIDATE_SUPPORT_SHA256:
+    if manifest.get(support_relative) != TRUSTED_CANDIDATE_SUPPORT_SHA256:
         raise AssertionError("trusted candidate support does not match loaded bytes")
     return manifest
 
 
+def _test_control_plane_commitment_from_snapshot(
+    snapshot: dict[str, object],
+) -> str:
+    repo_root_value = snapshot.get("repo_root")
+    repo_binding = snapshot.get("repo_binding")
+    tests_root_value = snapshot.get("tests_root")
+    tests_binding = snapshot.get("tests_binding")
+    namespace_tree = snapshot.get("namespace_tree")
+    files = snapshot.get("files")
+    if (
+        type(repo_root_value) is not str
+        or not isinstance(repo_binding, tuple)
+        or len(repo_binding) != 6
+        or type(tests_root_value) is not str
+        or not isinstance(tests_binding, tuple)
+        or len(tests_binding) != 6
+        or not isinstance(namespace_tree, dict)
+        or not isinstance(files, dict)
+    ):
+        raise AssertionError(
+            "trusted active test control-plane snapshot is malformed"
+        )
+    sources: dict[str, bytes] = {}
+    file_bindings: dict[
+        str, tuple[int, int, int, int, int, int, int, int]
+    ] = {}
+    tests_root = Path(tests_root_value)
+    for relative, entry in files.items():
+        if type(relative) is not str or not isinstance(entry, dict):
+            raise AssertionError(
+                "trusted active test control-plane snapshot is malformed"
+            )
+        name = Path(relative).name
+        source = entry.get("source")
+        binding = entry.get("binding")
+        if (
+            name in sources
+            or type(source) is not bytes
+            or not isinstance(binding, tuple)
+            or len(binding) != 8
+        ):
+            raise AssertionError(
+                "trusted active test control-plane snapshot is malformed"
+            )
+        sources[name] = source
+        file_bindings[name] = binding
+    return _test_control_plane_commitment(
+        Path(repo_root_value),
+        repo_binding,
+        tests_root,
+        tests_binding,
+        namespace_tree,
+        sources,
+        file_bindings,
+    )
+
+
+def _formal_test_control_plane_preload_snapshot(
+) -> dict[str, object] | None:
+    if _TRUSTED_TEST_NAMESPACE_PRELOAD_SNAPSHOT is not None:
+        return _TRUSTED_TEST_NAMESPACE_PRELOAD_SNAPSHOT
+    if _TRUSTED_TEST_NAMESPACE_PRELOAD is None:
+        return None
+    if (
+        _TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT is None
+        or _TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT_BINDING is None
+        or _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT is None
+        or _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_BINDING is None
+    ):
+        raise AssertionError(
+            "formal Required CI test control-plane preload is incomplete"
+        )
+    names = _active_test_control_plane_names(
+        _TRUSTED_TEST_NAMESPACE_PRELOAD,
+        "trusted formal preload",
+    )
+    if (
+        sorted(_TRUSTED_TEST_NAMESPACE_PRELOAD_SOURCES) != names
+        or sorted(_TRUSTED_TEST_NAMESPACE_PRELOAD_BINDINGS) != names
+    ):
+        raise AssertionError(
+            "formal Required CI test control-plane preload is malformed"
+        )
+    files: dict[str, dict[str, object]] = {}
+    for name in names:
+        relative = (
+            _TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT / name
+        ).relative_to(
+            _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT
+        ).as_posix()
+        source = _TRUSTED_TEST_NAMESPACE_PRELOAD_SOURCES[name]
+        binding = _TRUSTED_TEST_NAMESPACE_PRELOAD_BINDINGS[name]
+        files[relative] = {
+            "binding": binding,
+            "source": source,
+            "sha256": hashlib.sha256(source).hexdigest(),
+        }
+    snapshot: dict[str, object] = {
+        "repo_root": str(_TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_ROOT),
+        "repo_binding": _TRUSTED_TEST_NAMESPACE_PRELOAD_REPO_BINDING,
+        "tests_root": str(_TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT),
+        "tests_binding": _TRUSTED_TEST_NAMESPACE_PRELOAD_ROOT_BINDING,
+        "namespace_tree": dict(_TRUSTED_TEST_NAMESPACE_PRELOAD),
+        "files": files,
+    }
+    preload_commitment = globals().get(
+        "_TRUSTED_TEST_NAMESPACE_PRELOAD_COMMITMENT"
+    )
+    if (
+        type(preload_commitment) is not str
+        or _test_control_plane_commitment_from_snapshot(snapshot)
+        != preload_commitment
+    ):
+        raise AssertionError(
+            "formal Required CI test control-plane preload commitment is malformed"
+        )
+    return snapshot
+
+
+def _trusted_test_control_plane_authority(
+    repo_root: Path,
+    description: str,
+) -> dict[str, object]:
+    preload = _formal_test_control_plane_preload_snapshot()
+    if preload is None:
+        return _active_test_control_plane_snapshot(repo_root, description)
+    if (
+        preload.get("repo_root") != str(repo_root)
+        or preload.get("tests_root") != str(distribution_tests_root(repo_root))
+    ):
+        raise AssertionError(
+            "trusted formal preload authority is foreign to the selected root"
+        )
+    observed = _active_test_control_plane_snapshot(repo_root, description)
+    if observed != preload:
+        raise AssertionError(
+            f"{description} active test control-plane changed after the formal preload"
+        )
+    return preload
+
+
+def _trusted_test_sources_from_snapshot(
+    snapshot: dict[str, object],
+) -> dict[str, bytes]:
+    namespace_tree = snapshot.get("namespace_tree")
+    files = snapshot.get("files")
+    if not isinstance(namespace_tree, dict) or not isinstance(files, dict):
+        raise AssertionError(
+            "trusted active test control-plane snapshot is malformed"
+        )
+    sources: dict[str, bytes] = {}
+    for relative, entry in files.items():
+        if type(relative) is not str or not isinstance(entry, dict):
+            raise AssertionError(
+                "trusted active test control-plane snapshot is malformed"
+            )
+        relative_path = Path(relative)
+        source = entry.get("source")
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.name in sources
+            or type(source) is not bytes
+        ):
+            raise AssertionError(
+                "trusted active test control-plane snapshot is malformed"
+            )
+        sources[relative_path.name] = source
+    if sorted(sources) != sorted(namespace_tree):
+        raise AssertionError(
+            "trusted active test control-plane snapshot is malformed"
+        )
+    _test_control_plane_commitment_from_snapshot(snapshot)
+    return dict(sorted(sources.items()))
+
+
+def _trusted_test_inventory_from_snapshot(
+    snapshot: dict[str, object],
+) -> list[dict[str, object]]:
+    tests_root_value = snapshot.get("tests_root")
+    if type(tests_root_value) is not str:
+        raise AssertionError(
+            "trusted active test control-plane snapshot is malformed"
+        )
+    tests_root = Path(tests_root_value)
+    sources = _trusted_test_sources_from_snapshot(snapshot)
+    modules = [
+        name
+        for name in sources
+        if name.startswith("test_") and name.endswith(".py")
+    ]
+    if not modules:
+        raise AssertionError("trusted expected test inventory must not be empty")
+    inventory: list[dict[str, object]] = []
+    for name in modules:
+        try:
+            source_text = sources[name].decode("utf-8")
+        except UnicodeError as error:
+            raise AssertionError(
+                f"trusted test module {name!r} cannot be read as UTF-8"
+            ) from error
+        inventory.append(
+            {
+                "module": name,
+                "test_ids": _static_test_ids_from_source(
+                    source_text,
+                    name,
+                    str(tests_root / name),
+                    "trusted captured",
+                ),
+            }
+        )
+    return inventory
+
+
+def _trusted_test_suite_bundle(snapshot: dict[str, object]) -> bytes:
+    repo_root = snapshot.get("repo_root")
+    repo_binding = snapshot.get("repo_binding")
+    tests_root = snapshot.get("tests_root")
+    tests_binding = snapshot.get("tests_binding")
+    namespace_tree = snapshot.get("namespace_tree")
+    files = snapshot.get("files")
+    if (
+        type(repo_root) is not str
+        or not isinstance(repo_binding, tuple)
+        or len(repo_binding) != 6
+        or type(tests_root) is not str
+        or not isinstance(tests_binding, tuple)
+        or len(tests_binding) != 6
+        or not isinstance(namespace_tree, dict)
+        or not isinstance(files, dict)
+    ):
+        raise AssertionError("trusted test suite bundle source is malformed")
+    _trusted_test_sources_from_snapshot(snapshot)
+    file_rows: list[dict[str, object]] = []
+    for relative in sorted(files):
+        entry = files[relative]
+        if not isinstance(entry, dict):
+            raise AssertionError("trusted test suite bundle source is malformed")
+        binding = entry.get("binding")
+        source = entry.get("source")
+        digest = entry.get("sha256")
+        if (
+            not isinstance(binding, tuple)
+            or len(binding) != 8
+            or type(source) is not bytes
+            or type(digest) is not str
+            or hashlib.sha256(source).hexdigest() != digest
+        ):
+            raise AssertionError("trusted test suite bundle source is malformed")
+        file_rows.append(
+            {
+                "binding": list(binding),
+                "path": relative,
+                "sha256": digest,
+                "source_base64": base64.b64encode(source).decode("ascii"),
+            }
+        )
+    payload = {
+        "files": file_rows,
+        "namespace": [
+            [name, list(namespace_tree[name])]
+            for name in sorted(namespace_tree)
+        ],
+        "repo_binding": list(repo_binding),
+        "repo_root": repo_root,
+        "schema_version": 1,
+        "tests_binding": list(tests_binding),
+        "tests_root": tests_root,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if not encoded or len(encoded) > TRUSTED_TEST_SUITE_BUNDLE_LIMIT_BYTES:
+        raise AssertionError("trusted test suite bundle exceeds its fixed bound")
+    return encoded
+
+
+def _trusted_test_suite_snapshot_from_bundle(
+    bundle: bytes,
+    expected_repo_root: Path,
+) -> dict[str, object]:
+    if (
+        type(bundle) is not bytes
+        or not bundle
+        or len(bundle) > TRUSTED_TEST_SUITE_BUNDLE_LIMIT_BYTES
+        or not expected_repo_root.is_absolute()
+    ):
+        raise AssertionError("trusted child suite bundle is malformed")
+    try:
+        payload = json.loads(bundle.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise AssertionError("trusted child suite bundle is malformed") from error
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "files",
+            "namespace",
+            "repo_binding",
+            "repo_root",
+            "schema_version",
+            "tests_binding",
+            "tests_root",
+        }
+        or type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
+        or json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        != bundle
+        or payload.get("repo_root") != str(expected_repo_root)
+        or payload.get("tests_root")
+        != str(distribution_tests_root(expected_repo_root))
+    ):
+        raise AssertionError("trusted child suite bundle is malformed")
+    repo_binding_value = payload.get("repo_binding")
+    tests_binding_value = payload.get("tests_binding")
+    namespace_value = payload.get("namespace")
+    files_value = payload.get("files")
+    if (
+        not isinstance(repo_binding_value, list)
+        or len(repo_binding_value) != 6
+        or any(type(value) is not int for value in repo_binding_value)
+        or not isinstance(tests_binding_value, list)
+        or len(tests_binding_value) != 6
+        or any(type(value) is not int for value in tests_binding_value)
+        or not isinstance(namespace_value, list)
+        or not isinstance(files_value, list)
+    ):
+        raise AssertionError("trusted child suite bundle is malformed")
+    namespace_tree: dict[str, tuple[int, int, int, int, int, int]] = {}
+    for row in namespace_value:
+        if (
+            not isinstance(row, list)
+            or len(row) != 2
+            or type(row[0]) is not str
+            or row[0] in namespace_tree
+            or not isinstance(row[1], list)
+            or len(row[1]) != 6
+            or any(type(value) is not int for value in row[1])
+        ):
+            raise AssertionError("trusted child suite bundle is malformed")
+        namespace_tree[row[0]] = tuple(row[1])
+    files: dict[str, dict[str, object]] = {}
+    for row in files_value:
+        if not isinstance(row, dict) or set(row) != {
+            "binding",
+            "path",
+            "sha256",
+            "source_base64",
+        }:
+            raise AssertionError("trusted child suite bundle is malformed")
+        relative = row.get("path")
+        binding_value = row.get("binding")
+        digest = row.get("sha256")
+        encoded_source = row.get("source_base64")
+        if (
+            type(relative) is not str
+            or relative in files
+            or not isinstance(binding_value, list)
+            or len(binding_value) != 8
+            or any(type(value) is not int for value in binding_value)
+            or type(digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or type(encoded_source) is not str
+        ):
+            raise AssertionError("trusted child suite bundle is malformed")
+        try:
+            source = base64.b64decode(encoded_source, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise AssertionError("trusted child suite bundle is malformed") from error
+        if (
+            not source
+            or len(source) > TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES
+            or hashlib.sha256(source).hexdigest() != digest
+        ):
+            raise AssertionError("trusted child suite bundle is malformed")
+        files[relative] = {
+            "binding": tuple(binding_value),
+            "source": source,
+            "sha256": digest,
+        }
+    snapshot = {
+        "repo_root": str(expected_repo_root),
+        "repo_binding": tuple(repo_binding_value),
+        "tests_root": str(distribution_tests_root(expected_repo_root)),
+        "tests_binding": tuple(tests_binding_value),
+        "namespace_tree": namespace_tree,
+        "files": files,
+    }
+    try:
+        _trusted_test_sources_from_snapshot(snapshot)
+    except AssertionError as error:
+        raise AssertionError(
+            "trusted child suite bundle is malformed"
+        ) from error
+    return snapshot
+
+
+@contextlib.contextmanager
+def _trusted_test_suite_from_snapshot(
+    snapshot: dict[str, object],
+) -> Iterator[tuple[unittest.TestSuite, unittest.TestLoader]]:
+    tests_root_value = snapshot.get("tests_root")
+    if type(tests_root_value) is not str:
+        raise AssertionError(
+            "trusted active test control-plane snapshot is malformed"
+        )
+    tests_root = Path(tests_root_value)
+    sources = _trusted_test_sources_from_snapshot(snapshot)
+    files = snapshot.get("files")
+    if not isinstance(files, dict):
+        raise AssertionError(
+            "trusted active test control-plane snapshot is malformed"
+        )
+    source_bindings: dict[
+        str, tuple[int, int, int, int, int, int, int, int]
+    ] = {}
+    for relative, entry in files.items():
+        if type(relative) is not str or not isinstance(entry, dict):
+            raise AssertionError(
+                "trusted active test control-plane snapshot is malformed"
+            )
+        name = Path(relative).name
+        binding = entry.get("binding")
+        if (
+            name in source_bindings
+            or name not in sources
+            or not isinstance(binding, tuple)
+            or len(binding) != 8
+        ):
+            raise AssertionError(
+                "trusted active test control-plane snapshot is malformed"
+            )
+        source_bindings[name] = binding
+    if sorted(source_bindings) != sorted(sources):
+        raise AssertionError(
+            "trusted active test control-plane snapshot is malformed"
+        )
+    support_source = sources.get("required_ci_candidate.py")
+    support_binding = source_bindings.get("required_ci_candidate.py")
+    if type(support_source) is not bytes or support_binding is None:
+        raise AssertionError("trusted captured candidate support is missing")
+    module_names = [
+        Path(name).stem
+        for name in sources
+        if name.startswith("test_") and name.endswith(".py")
+    ]
+    if not module_names or len(module_names) != len(set(module_names)):
+        raise AssertionError("trusted captured test module set is malformed")
+    missing = object()
+    previous_modules: dict[str, object] = {
+        name: sys.modules.get(name, missing)
+        for name in (*module_names, "required_ci_candidate")
+    }
+    source_loaders = {
+        name: _CapturedSourceLoader(
+            Path(name).stem,
+            tests_root / name,
+            source,
+        )
+        for name, source in sources.items()
+    }
+    previous_linecache = {
+        str(tests_root / name): linecache.cache.get(
+            str(tests_root / name),
+            missing,
+        )
+        for name in sources
+    }
+    for name, source_loader in source_loaders.items():
+        linecache.cache[str(tests_root / name)] = (
+            source_loader.linecache_entry()
+        )
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    try:
+        for module_name in module_names:
+            filename = f"{module_name}.py"
+            logical_path = tests_root / filename
+            source_loader = source_loaders[filename]
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                logical_path,
+                loader=source_loader,
+            )
+            if spec is None:
+                raise AssertionError(
+                    "trusted captured test module spec is malformed"
+                )
+            module = importlib.util.module_from_spec(spec)
+            module.__cached__ = None
+            module.__package__ = ""
+            if filename == Path(__file__).name:
+                module.__dict__["_TRUSTED_TEST_CONTROL_PLANE_SOURCE_SEED_ROWS"] = (
+                    tuple(
+                        (name, sources[name])
+                        for name in sorted(sources)
+                    )
+                )
+                module.__dict__["_TRUSTED_CANDIDATE_SUPPORT_SEED_BYTES"] = (
+                    support_source
+                )
+                module.__dict__["_TRUSTED_CANDIDATE_SUPPORT_SEED_BINDING"] = (
+                    support_binding
+                )
+                module.__dict__["_TRUSTED_TEST_SUPERVISOR_SEED_BYTES"] = (
+                    sources[filename]
+                )
+                module.__dict__["_TRUSTED_TEST_SUPERVISOR_SEED_BINDING"] = (
+                    source_bindings[filename]
+                )
+            sys.modules[module_name] = module
+            code = source_loader.get_code(module_name)
+            exec(code, module.__dict__)
+            suite.addTests(loader.loadTestsFromModule(module))
+        if loader.errors:
+            raise AssertionError("trusted captured test loader reported errors")
+        yield suite, loader
+    finally:
+        for name, previous in previous_modules.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+        for logical_path, previous in previous_linecache.items():
+            if previous is missing:
+                linecache.cache.pop(logical_path, None)
+            else:
+                linecache.cache[logical_path] = previous
+
+
+def _trusted_test_source_manifest(repo_root: Path) -> dict[str, str]:
+    return _trusted_test_source_manifest_from_snapshot(
+        _active_test_control_plane_snapshot(repo_root, "trusted")
+    )
+
+
+_bounded_failure_text = _CANDIDATE_SUPPORT._bounded_failure_text
+_TerminalFailure = tuple[str, str, BaseException]
+
+
+class _RequiredCITerminalFailures(AssertionError):
+    def __init__(
+        self,
+        context: str,
+        failures: Sequence[_TerminalFailure],
+    ) -> None:
+        self.failures = tuple(failures)
+        order = ",".join(
+            f"{role}[{phase}]" for role, phase, _error in self.failures
+        )
+        details: list[str] = []
+        for role, phase, error in self.failures:
+            detail = _bounded_failure_text(
+                f"{type(error).__name__}: {error}",
+                limit=240,
+            )
+            details.append(f"{role}[{phase}]={detail}")
+        super().__init__(
+            f"{context}: order={order}; details=" + "; ".join(details)
+        )
+
+
+def _capture_terminal_failure(
+    failures: list[_TerminalFailure],
+    role: str,
+    phase: str,
+    callback: Callable[[], object],
+) -> object | None:
+    try:
+        return callback()
+    except BaseException as error:
+        failures.append((role, phase, error))
+        return None
+
+
+def _raise_terminal_failures(
+    context: str,
+    failures: Sequence[_TerminalFailure],
+) -> None:
+    ordered_failures = tuple(
+        failure for failure in failures if failure[0] == "primary"
+    ) + tuple(
+        failure for failure in failures if failure[0] != "primary"
+    )
+    if not ordered_failures:
+        return
+    if len(ordered_failures) == 1:
+        raise ordered_failures[0][2]
+    primary = next(
+        (
+            error
+            for role, _phase, error in ordered_failures
+            if role == "primary"
+        ),
+        ordered_failures[0][2],
+    )
+    raise _RequiredCITerminalFailures(
+        context,
+        ordered_failures,
+    ) from primary
+
+
+def _require_exact_terminal_value(
+    actual: object,
+    expected: object,
+    message: str,
+) -> None:
+    if actual != expected:
+        raise AssertionError(message)
+
+
 def _trusted_test_suite_receipt(
-    trusted_repo_root: Path, candidate_root: Path
+    trusted_repo_root: Path,
+    candidate_root: Path,
+    trusted_control_plane_seed: dict[str, object] | None = None,
 ) -> dict[str, object]:
     _CANDIDATE_SUPPORT.strict_isolation_platform_preflight()
-    trusted_inventory = _direct_test_inventory(trusted_repo_root, "trusted")
-    trusted_source_sha256 = _trusted_test_source_manifest(trusted_repo_root)
-    expected_test_ids = _inventory_test_ids(trusted_inventory)
-    trusted_tests_root = (
-        distribution_tests_root(trusted_repo_root.resolve(strict=True))
+    observed_control_plane = _active_test_control_plane_snapshot(
+        trusted_repo_root, "trusted"
     )
+    if trusted_control_plane_seed is None:
+        trusted_control_plane = observed_control_plane
+    else:
+        trusted_control_plane = trusted_control_plane_seed
+        if observed_control_plane != trusted_control_plane:
+            raise AssertionError(
+                "trusted child control-plane changed before captured execution"
+            )
+    trusted_inventory = _trusted_test_inventory_from_snapshot(
+        trusted_control_plane
+    )
+    trusted_source_sha256 = _trusted_test_source_manifest_from_snapshot(
+        trusted_control_plane
+    )
+    expected_control_plane_commitment = os.environ.get(
+        TRUSTED_TEST_SUITE_COMMITMENT_ENV
+    )
+    if expected_control_plane_commitment is not None and (
+        re.fullmatch(
+            r"[0-9a-f]{64}", expected_control_plane_commitment
+        )
+        is None
+        or _test_control_plane_commitment_from_snapshot(
+            trusted_control_plane
+        )
+        != expected_control_plane_commitment
+    ):
+        raise AssertionError(
+            "trusted child control-plane commitment changed before discovery"
+        )
+    expected_test_ids = _inventory_test_ids(trusted_inventory)
     _assert_candidate_absent_from_sys_path(candidate_root)
     candidate_sha, require_clean = _CANDIDATE_SUPPORT.expected_candidate_sha(
         candidate_root
@@ -853,60 +3458,117 @@ def _trusted_test_suite_receipt(
         require_clean=require_clean,
     )
 
-    loader = unittest.TestLoader()
     captured_stdout = io.StringIO()
     captured_stderr = io.StringIO()
     runner_output = io.StringIO()
-    with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(
-        captured_stderr
-    ):
-        suite = loader.discover(
-            start_dir=str(trusted_tests_root),
-            pattern="test_*.py",
-            top_level_dir=str(trusted_tests_root),
-        )
-        if loader.errors:
-            raise AssertionError("trusted test loader reported errors")
-        _assert_candidate_absent_from_sys_path(candidate_root)
-        loaded_test_ids = _suite_test_ids(suite)
-        if loaded_test_ids != expected_test_ids:
-            raise AssertionError(
-                "loaded trusted test inventory does not match static inventory"
-            )
-        result = unittest.TextTestRunner(
-            stream=runner_output, verbosity=0
-        ).run(suite)
-    _assert_candidate_absent_from_sys_path(candidate_root)
-
-    result_counts = {
-        "failures": len(result.failures),
-        "errors": len(result.errors),
-        "skipped": len(result.skipped),
-        "expected_failures": len(result.expectedFailures),
-        "unexpected_successes": len(result.unexpectedSuccesses),
-    }
-    if (
-        result.testsRun != len(expected_test_ids)
-        or not result.wasSuccessful()
-        or any(result_counts.values())
-    ):
-        details = _bounded_failure_text(
-            runner_output.getvalue()
-            + captured_stdout.getvalue()
-            + captured_stderr.getvalue()
-        )
-        raise AssertionError(f"trusted test suite did not complete exactly: {details}")
-    if _direct_test_inventory(trusted_repo_root, "trusted") != trusted_inventory:
-        raise AssertionError("trusted expected test inventory changed during execution")
-    if _trusted_test_source_manifest(trusted_repo_root) != trusted_source_sha256:
-        raise AssertionError("trusted test source changed during execution")
-    final_candidate_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
-        candidate_root,
-        candidate_sha,
-        require_clean=require_clean,
+    trusted_runner = unittest.TextTestRunner(
+        stream=runner_output,
+        verbosity=0,
     )
-    if final_candidate_binding != candidate_binding:
-        raise AssertionError("candidate checkout binding changed during trusted tests")
+    trusted_run = trusted_runner.run
+    execution_state: dict[str, object] = {}
+    terminal_failures: list[_TerminalFailure] = []
+
+    def execute_captured_suite() -> None:
+        with contextlib.redirect_stdout(
+            captured_stdout
+        ), contextlib.redirect_stderr(captured_stderr):
+            with _trusted_test_suite_from_snapshot(
+                trusted_control_plane
+            ) as captured_suite:
+                suite, _loader = captured_suite
+                _assert_candidate_absent_from_sys_path(candidate_root)
+                loaded_test_ids = _suite_test_ids(suite)
+                if loaded_test_ids != expected_test_ids:
+                    raise AssertionError(
+                        "loaded trusted test inventory does not match static inventory"
+                    )
+                result = trusted_run(suite)
+        _assert_candidate_absent_from_sys_path(candidate_root)
+        result_counts = {
+            "failures": len(result.failures),
+            "errors": len(result.errors),
+            "skipped": len(result.skipped),
+            "expected_failures": len(result.expectedFailures),
+            "unexpected_successes": len(result.unexpectedSuccesses),
+        }
+        execution_state["result"] = result
+        execution_state["result_counts"] = result_counts
+        if (
+            result.testsRun != len(expected_test_ids)
+            or not result.wasSuccessful()
+            or any(result_counts.values())
+        ):
+            details = _bounded_failure_text(
+                runner_output.getvalue()
+                + captured_stdout.getvalue()
+                + captured_stderr.getvalue()
+            )
+            raise AssertionError(
+                f"trusted test suite did not complete exactly: {details}"
+            )
+
+    _capture_terminal_failure(
+        terminal_failures,
+        "primary",
+        "suite-execution",
+        execute_captured_suite,
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-import-path",
+        lambda: _assert_candidate_absent_from_sys_path(candidate_root),
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-inventory",
+        lambda: _require_exact_terminal_value(
+            _trusted_test_inventory_from_snapshot(
+                _active_test_control_plane_snapshot(
+                    trusted_repo_root,
+                    "trusted inventory",
+                )
+            ),
+            trusted_inventory,
+            "trusted expected test inventory changed during execution",
+        ),
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-trusted-control-plane",
+        lambda: _require_exact_terminal_value(
+            _active_test_control_plane_snapshot(trusted_repo_root, "trusted"),
+            trusted_control_plane,
+            "trusted active test control-plane manifest changed during execution",
+        ),
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-candidate-binding",
+        lambda: _require_exact_terminal_value(
+            _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                candidate_root,
+                candidate_sha,
+                require_clean=require_clean,
+            ),
+            candidate_binding,
+            "candidate checkout binding changed during trusted tests",
+        ),
+    )
+    _raise_terminal_failures(
+        "trusted test suite execution and integrity failures",
+        terminal_failures,
+    )
+    result = execution_state.get("result")
+    result_counts = execution_state.get("result_counts")
+    if not isinstance(result, unittest.TestResult) or not isinstance(
+        result_counts, dict
+    ):
+        raise AssertionError("trusted test suite result is missing")
     return {
         "schema_version": TRUSTED_TEST_RECEIPT_SCHEMA_VERSION,
         "status": "completed",
@@ -917,9 +3579,6 @@ def _trusted_test_suite_receipt(
         "executed_test_count": result.testsRun,
         **result_counts,
     }
-
-
-_bounded_failure_text = _CANDIDATE_SUPPORT._bounded_failure_text
 
 
 def _validated_trusted_child_receipt(
@@ -1100,6 +3759,201 @@ def _terminate_trusted_test_child(process: subprocess.Popen[str]) -> None:
         )
 
 
+@contextlib.contextmanager
+def _trusted_test_child_source_descriptor(
+    source: bytes,
+    *,
+    size_limit: int = TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES,
+    description: str = "bootstrap source",
+) -> Iterator[int]:
+    if (
+        type(source) is not bytes
+        or not source
+        or type(size_limit) is not int
+        or size_limit <= 0
+        or len(source) > size_limit
+    ):
+        raise AssertionError(f"trusted child {description} is malformed")
+    directory_descriptor: int | None = None
+    source_descriptor: int | None = None
+    source_name = "captured-payload.bin"
+    with tempfile.TemporaryDirectory(
+        prefix="required-ci-trusted-child-source-"
+    ) as temporary_directory:
+        directory_path = Path(temporary_directory).resolve(strict=True)
+        directory_metadata = directory_path.lstat()
+        directory_binding = _test_control_plane_directory_binding(
+            directory_metadata
+        )
+        if (
+            directory_binding[2] != stat.S_IFDIR
+            or directory_binding[3] != 0o700
+            or directory_binding[4] != os.geteuid()
+        ):
+            raise AssertionError(
+                "trusted child bootstrap directory is unsafe"
+            )
+        try:
+            directory_descriptor = os.open(
+                directory_path,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+            )
+            if (
+                _test_control_plane_directory_binding(
+                    os.fstat(directory_descriptor)
+                )
+                != directory_binding
+            ):
+                raise AssertionError(
+                    "trusted child bootstrap directory changed"
+                )
+            writer = os.open(
+                source_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            try:
+                offset = 0
+                while offset < len(source):
+                    written = os.write(writer, source[offset:])
+                    if written <= 0:
+                        raise AssertionError(
+                            "trusted child bootstrap source could not be staged"
+                        )
+                    offset += written
+                os.fsync(writer)
+                os.fchmod(writer, 0o400)
+                written_binding = _test_control_plane_file_binding(
+                    os.fstat(writer)
+                )
+            finally:
+                os.close(writer)
+            selected_binding = _test_control_plane_file_binding(
+                os.stat(
+                    source_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            if (
+                selected_binding != written_binding
+                or selected_binding[2] != stat.S_IFREG
+                or selected_binding[3] != 0o400
+                or selected_binding[4] != os.geteuid()
+                or selected_binding[6] != 1
+                or selected_binding[7] != len(source)
+            ):
+                raise AssertionError(
+                    "trusted child bootstrap source staging is unsafe"
+                )
+            source_descriptor = os.open(
+                source_name,
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | os.O_NOCTTY
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                dir_fd=directory_descriptor,
+            )
+            opened_binding = _test_control_plane_file_binding(
+                os.fstat(source_descriptor)
+            )
+            if opened_binding != selected_binding:
+                raise AssertionError(
+                    "trusted child bootstrap source changed while being opened"
+                )
+            os.unlink(source_name, dir_fd=directory_descriptor)
+            unlinked_binding = _test_control_plane_file_binding(
+                os.fstat(source_descriptor)
+            )
+            expected_unlinked_binding = (
+                *opened_binding[:6],
+                0,
+                opened_binding[7],
+            )
+            if unlinked_binding != expected_unlinked_binding:
+                raise AssertionError(
+                    "trusted child bootstrap source could not be made private"
+                )
+
+            def read_once() -> bytes:
+                chunks: list[bytes] = []
+                offset = 0
+                remaining = len(source) + 1
+                while remaining > 0:
+                    chunk = os.pread(
+                        source_descriptor,
+                        min(remaining, 64 * 1024),
+                        offset,
+                    )
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    offset += len(chunk)
+                    remaining -= len(chunk)
+                return b"".join(chunks)
+
+            first = read_once()
+            second = read_once()
+            if (
+                first != source
+                or second != source
+                or _test_control_plane_file_binding(
+                    os.fstat(source_descriptor)
+                )
+                != unlinked_binding
+            ):
+                raise AssertionError(
+                    "trusted child bootstrap source changed while being staged"
+                )
+            try:
+                yield source_descriptor
+            except BaseException as child_error:
+                if (
+                    read_once() != source
+                    or _test_control_plane_file_binding(
+                        os.fstat(source_descriptor)
+                    )
+                    != unlinked_binding
+                ):
+                    details = _bounded_failure_text(
+                        f"{type(child_error).__name__}: {child_error}"
+                    )
+                    raise AssertionError(
+                        "trusted child bootstrap source changed during failed "
+                        f"execution; child failure was: {details}"
+                    ) from child_error
+                raise
+            else:
+                if (
+                    read_once() != source
+                    or _test_control_plane_file_binding(
+                        os.fstat(source_descriptor)
+                    )
+                    != unlinked_binding
+                ):
+                    raise AssertionError(
+                        "trusted child bootstrap source changed during execution"
+                    )
+        except OSError as error:
+            raise AssertionError(
+                "trusted child bootstrap source is unreadable"
+            ) from error
+        finally:
+            if source_descriptor is not None:
+                os.close(source_descriptor)
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
+
+
 def _run_trusted_test_child(
     command: list[str],
     *,
@@ -1123,19 +3977,35 @@ def _run_trusted_test_child(
         )
     except OSError as error:
         raise AssertionError("trusted Required CI child could not be started") from error
+
+    def raise_with_reap(primary: BaseException, phase: str) -> None:
+        terminal_failures: list[_TerminalFailure] = [
+            ("primary", phase, primary)
+        ]
+        _capture_terminal_failure(
+            terminal_failures,
+            "integrity",
+            "child-reap",
+            lambda: _terminate_trusted_test_child(process),
+        )
+        _raise_terminal_failures(
+            "trusted Required CI child failed",
+            terminal_failures,
+        )
+
     try:
         child_timeout = _remaining_trusted_test_child_timeout(supervisor_deadline)
-    except BaseException:
-        _terminate_trusted_test_child(process)
-        raise
+    except BaseException as error:
+        raise_with_reap(error, "child-timeout-budget")
+        raise AssertionError("unreachable")
     try:
         stdout, stderr = process.communicate(timeout=child_timeout)
-    except subprocess.TimeoutExpired:
-        _terminate_trusted_test_child(process)
-        raise
-    except BaseException:
-        _terminate_trusted_test_child(process)
-        raise
+    except subprocess.TimeoutExpired as error:
+        raise_with_reap(error, "child-timeout")
+        raise AssertionError("unreachable")
+    except BaseException as error:
+        raise_with_reap(error, "child-communicate")
+        raise AssertionError("unreachable")
     return subprocess.CompletedProcess(
         command,
         process.returncode,
@@ -1178,10 +4048,109 @@ def supervise_trusted_required_ci_tests(
         )
     split_workspace_root = canonical_trusted_root.parent
     _assert_candidate_absent_from_sys_path(candidate_root)
-    trusted_inventory = _direct_test_inventory(trusted_repo_root, "trusted")
-    trusted_source_sha256 = _trusted_test_source_manifest(trusted_repo_root)
-    candidate_static_inventory = _direct_test_inventory(candidate_root, "candidate")
-    _require_expected_test_inventory(trusted_inventory, candidate_static_inventory)
+    trusted_control_plane = _trusted_test_control_plane_authority(
+        trusted_repo_root, "trusted"
+    )
+    trusted_inventory = _trusted_test_inventory_from_snapshot(
+        trusted_control_plane
+    )
+    trusted_source_sha256 = _trusted_test_source_manifest_from_snapshot(
+        trusted_control_plane
+    )
+    trusted_control_plane_commitment = (
+        _test_control_plane_commitment_from_snapshot(
+            trusted_control_plane
+        )
+    )
+    trusted_suite_bundle = _trusted_test_suite_bundle(trusted_control_plane)
+    trusted_supervisor = Path(__file__).resolve(strict=True)
+    try:
+        launch_skill_root = trusted_supervisor.parents[1]
+        launch_repo_root, _content_root, _relative_root, _profile = (
+            distribution_contract_context(launch_skill_root)
+        )
+        launch_relative = trusted_supervisor.relative_to(
+            launch_repo_root
+        ).as_posix()
+        launch_support_relative = trusted_supervisor.with_name(
+            "required_ci_candidate.py"
+        ).relative_to(launch_repo_root).as_posix()
+    except (IndexError, OSError, ValueError) as error:
+        raise AssertionError(
+            "trusted candidate test supervisor cannot be bound"
+        ) from error
+    if launch_repo_root == canonical_trusted_root:
+        launch_control_plane = trusted_control_plane
+    else:
+        launch_control_plane = _LOCAL_FORMAL_LAUNCH_CONTROL_PLANE
+        if (
+            not isinstance(launch_control_plane, dict)
+            or launch_control_plane.get("repo_root") != str(launch_repo_root)
+            or launch_control_plane.get("tests_root")
+            != str(distribution_tests_root(launch_repo_root))
+        ):
+            raise AssertionError(
+                "trusted local launch authority is missing or foreign"
+            )
+    launch_files = launch_control_plane.get("files")
+    if not isinstance(launch_files, dict):
+        raise AssertionError("trusted launch control-plane snapshot is malformed")
+    launch_entry = launch_files.get(launch_relative)
+    launch_support_entry = launch_files.get(launch_support_relative)
+    if (
+        not isinstance(launch_entry, dict)
+        or not isinstance(launch_support_entry, dict)
+    ):
+        raise AssertionError(
+            "trusted launch supervisor or support is missing from its authority"
+        )
+    trusted_supervisor_source = launch_entry.get("source")
+    launch_support_source = launch_support_entry.get("source")
+    trusted_supervisor_binding = launch_entry.get("binding")
+    launch_support_binding = launch_support_entry.get("binding")
+    if (
+        type(trusted_supervisor_source) is not bytes
+        or trusted_supervisor_source != TRUSTED_TEST_SUPERVISOR_BYTES
+        or hashlib.sha256(trusted_supervisor_source).hexdigest()
+        != TRUSTED_TEST_SUPERVISOR_SHA256
+        or type(launch_support_source) is not bytes
+        or launch_support_source != TRUSTED_CANDIDATE_SUPPORT_SOURCE
+        or hashlib.sha256(launch_support_source).hexdigest()
+        != TRUSTED_CANDIDATE_SUPPORT_SHA256
+        or not isinstance(trusted_supervisor_binding, tuple)
+        or len(trusted_supervisor_binding) != 8
+        or not isinstance(launch_support_binding, tuple)
+        or len(launch_support_binding) != 8
+        or (
+            launch_repo_root == canonical_trusted_root
+            and (
+                trusted_supervisor_binding
+                != TRUSTED_TEST_SUPERVISOR_BINDING
+                or launch_support_binding
+                != TRUSTED_CANDIDATE_SUPPORT_BINDING
+            )
+        )
+        or (
+            launch_repo_root != canonical_trusted_root
+            and (
+                trusted_supervisor_binding[2:]
+                != TRUSTED_TEST_SUPERVISOR_BINDING[2:]
+                or launch_support_binding[2:]
+                != TRUSTED_CANDIDATE_SUPPORT_BINDING[2:]
+            )
+        )
+    ):
+        raise AssertionError(
+            "trusted launch authority differs from the parent-loaded sources"
+        )
+    launch_control_plane_commitment = (
+        _test_control_plane_commitment_from_snapshot(launch_control_plane)
+    )
+    candidate_control_plane = _active_test_control_plane_snapshot(
+        candidate_root,
+        "candidate",
+        expected_cross_root=trusted_control_plane,
+    )
     candidate_sha, require_clean = _CANDIDATE_SUPPORT.expected_candidate_sha(
         candidate_root
     )
@@ -1195,6 +4164,12 @@ def supervise_trusted_required_ci_tests(
     child_environment.pop("PYTHONHOME", None)
     child_environment.pop("PYTHONPATH", None)
     child_environment.pop(TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV, None)
+    child_environment[TRUSTED_TEST_SUITE_COMMITMENT_ENV] = (
+        trusted_control_plane_commitment
+    )
+    child_environment[TRUSTED_TEST_LAUNCH_COMMITMENT_ENV] = (
+        launch_control_plane_commitment
+    )
     child_environment[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(
         candidate_root.resolve(strict=True)
     )
@@ -1204,10 +4179,14 @@ def supervise_trusted_required_ci_tests(
     _require_trusted_test_cleanup_reserve(
         supervisor_deadline, "before isolation registry acquisition"
     )
-    isolation_chain_registry = (
-        _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
-    )
+    isolation_chain_registry: Mapping[str, object] | None = None
+    completed: subprocess.CompletedProcess[str] | None = None
+    receipt: dict[str, object] | None = None
+    terminal_failures: list[_TerminalFailure] = []
     try:
+        isolation_chain_registry = (
+            _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
+        )
         registry_environment = isolation_chain_registry["environment"]
         if not isinstance(registry_environment, dict):
             raise AssertionError("trusted isolation chain registry is malformed")
@@ -1216,69 +4195,161 @@ def supervise_trusted_required_ci_tests(
             _CANDIDATE_SUPPORT.trusted_isolation_child_environment()
         )
         child_environment.pop(TRUSTED_TEST_SUPERVISOR_DEADLINE_ENV, None)
+        child_environment[TRUSTED_TEST_SUITE_COMMITMENT_ENV] = (
+            trusted_control_plane_commitment
+        )
+        child_environment[TRUSTED_TEST_LAUNCH_COMMITMENT_ENV] = (
+            launch_control_plane_commitment
+        )
         isolation_pass_fds = (
             _CANDIDATE_SUPPORT.trusted_isolation_child_pass_fds()
         )
-        trusted_supervisor = Path(__file__).resolve(strict=True)
-        try:
-            trusted_supervisor_source = trusted_supervisor.read_bytes()
-        except OSError as error:
-            raise AssertionError(
-                "trusted candidate test supervisor cannot be read"
-            ) from error
-        try:
-            completed = _run_trusted_test_child(
-                [
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    "-S",
-                    str(trusted_supervisor),
-                    TRUSTED_TEST_CHILD_FLAG,
-                    str(trusted_repo_root.resolve(strict=True)),
-                ],
-                cwd=trusted_repo_root.resolve(strict=True),
-                environment=child_environment,
-                pass_fds=isolation_pass_fds,
-                supervisor_deadline=supervisor_deadline,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise AssertionError(
+        with _trusted_test_child_source_descriptor(
+            trusted_supervisor_source
+        ) as source_descriptor, _trusted_test_child_source_descriptor(
+            trusted_suite_bundle,
+            size_limit=TRUSTED_TEST_SUITE_BUNDLE_LIMIT_BYTES,
+            description="suite bundle",
+        ) as suite_bundle_descriptor:
+                completed = _run_trusted_test_child(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-S",
+                        "-c",
+                        TRUSTED_TEST_CHILD_BOOTSTRAP_CODE,
+                        str(source_descriptor),
+                        str(len(trusted_supervisor_source)),
+                        hashlib.sha256(
+                            trusted_supervisor_source
+                        ).hexdigest(),
+                        str(suite_bundle_descriptor),
+                        str(len(trusted_suite_bundle)),
+                        hashlib.sha256(trusted_suite_bundle).hexdigest(),
+                        str(trusted_supervisor),
+                        TRUSTED_TEST_CHILD_FLAG,
+                        str(trusted_repo_root.resolve(strict=True)),
+                    ],
+                    cwd=trusted_repo_root.resolve(strict=True),
+                    environment=child_environment,
+                    pass_fds=(
+                        *isolation_pass_fds,
+                        source_descriptor,
+                        suite_bundle_descriptor,
+                    ),
+                    supervisor_deadline=supervisor_deadline,
+                )
+    except subprocess.TimeoutExpired as error:
+        translated = AssertionError(
                 "trusted Required CI tests did not complete before the fixed timeout"
-            ) from error
+        )
+        translated.__cause__ = error
+        terminal_failures.append(("primary", "child-timeout", translated))
+    except BaseException as error:
+        terminal_failures.append(("primary", "child-run", error))
     finally:
-        _close_and_verify_trusted_isolation(isolation_chain_registry)
-    receipt = _validated_trusted_child_receipt(
-        completed,
-        trusted_inventory,
-        trusted_source_sha256,
-        candidate_binding,
+        if isolation_chain_registry is not None:
+            _capture_terminal_failure(
+                terminal_failures,
+                "integrity",
+                "isolation-cleanup",
+                lambda: _close_and_verify_trusted_isolation(
+                    isolation_chain_registry
+                ),
+            )
+    if completed is not None:
+        validated_receipt = _capture_terminal_failure(
+            terminal_failures,
+            "primary",
+            "child-receipt",
+            lambda: _validated_trusted_child_receipt(
+                completed,
+                trusted_inventory,
+                trusted_source_sha256,
+                candidate_binding,
+            ),
+        )
+        if isinstance(validated_receipt, dict):
+            receipt = validated_receipt
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-import-path",
+        lambda: _assert_candidate_absent_from_sys_path(candidate_root),
     )
-
-    try:
-        final_supervisor_source = trusted_supervisor.read_bytes()
-    except OSError as error:
-        raise AssertionError(
-            "trusted candidate test supervisor became unreadable"
-        ) from error
-    if final_supervisor_source != trusted_supervisor_source:
-        raise AssertionError("trusted candidate test supervisor changed")
-    if _direct_test_inventory(trusted_repo_root, "trusted") != trusted_inventory:
-        raise AssertionError("trusted expected test inventory changed during execution")
-    if _trusted_test_source_manifest(trusted_repo_root) != trusted_source_sha256:
-        raise AssertionError("trusted test source changed during execution")
-    if (
-        _direct_test_inventory(candidate_root, "candidate")
-        != candidate_static_inventory
-    ):
-        raise AssertionError("candidate static test inventory changed during execution")
-    final_candidate_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
-        candidate_root,
-        candidate_sha,
-        require_clean=require_clean,
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-launch",
+        lambda: _require_exact_terminal_value(
+            _active_test_control_plane_snapshot(
+                launch_repo_root,
+                "trusted launch",
+            ),
+            launch_control_plane,
+            "trusted launch control-plane changed during supervision",
+        ),
     )
-    if final_candidate_binding != candidate_binding:
-        raise AssertionError("candidate checkout binding changed during supervision")
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-inventory",
+        lambda: _require_exact_terminal_value(
+            _trusted_test_inventory_from_snapshot(
+                _active_test_control_plane_snapshot(
+                    trusted_repo_root,
+                    "trusted inventory",
+                )
+            ),
+            trusted_inventory,
+            "trusted expected test inventory changed during execution",
+        ),
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-trusted-control-plane",
+        lambda: _require_exact_terminal_value(
+            _active_test_control_plane_snapshot(trusted_repo_root, "trusted"),
+            trusted_control_plane,
+            "trusted active test control-plane manifest changed during execution",
+        ),
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-candidate-control-plane",
+        lambda: _require_exact_terminal_value(
+            _active_test_control_plane_snapshot(
+                candidate_root,
+                "candidate",
+                expected_cross_root=trusted_control_plane,
+            ),
+            candidate_control_plane,
+            "candidate active test control-plane manifest changed during execution",
+        ),
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-candidate-binding",
+        lambda: _require_exact_terminal_value(
+            _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                candidate_root,
+                candidate_sha,
+                require_clean=require_clean,
+            ),
+            candidate_binding,
+            "candidate checkout binding changed during supervision",
+        ),
+    )
+    _raise_terminal_failures(
+        "trusted supervisor execution and integrity failures",
+        terminal_failures,
+    )
+    if receipt is None:
+        raise AssertionError("trusted child completion receipt is missing")
     return receipt
 
 
@@ -1650,9 +4721,33 @@ def _trusted_test_child_main(trusted_repo_root_value: str) -> int:
             raise AssertionError("trusted test root is unreadable") from error
         if canonical_trusted_root != trusted_repo_root:
             raise AssertionError("trusted test root must be canonical")
+        if _TRUSTED_TEST_SUITE_BUNDLE_BYTES is None:
+            raise AssertionError("trusted child suite bundle is missing")
+        trusted_control_plane_seed = (
+            _trusted_test_suite_snapshot_from_bundle(
+                _TRUSTED_TEST_SUITE_BUNDLE_BYTES,
+                canonical_trusted_root,
+            )
+        )
+        expected_commitment = os.environ.get(
+            TRUSTED_TEST_SUITE_COMMITMENT_ENV
+        )
+        if (
+            type(expected_commitment) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_commitment) is None
+            or _test_control_plane_commitment_from_snapshot(
+                trusted_control_plane_seed
+            )
+            != expected_commitment
+        ):
+            raise AssertionError(
+                "trusted child suite bundle commitment is malformed"
+            )
         candidate_root = required_ci_repository_root(canonical_trusted_root)
         receipt = _trusted_test_suite_receipt(
-            canonical_trusted_root, candidate_root
+            canonical_trusted_root,
+            candidate_root,
+            trusted_control_plane_seed,
         )
     except BaseException as error:
         message = _bounded_failure_text(f"{type(error).__name__}: {error}")
@@ -3176,14 +6271,71 @@ def _trusted_structure_validator_main() -> int:
     before = _CANDIDATE_SUPPORT.candidate_checkout_binding(
         REPO_ROOT, candidate_sha, require_clean=True
     )
-    validate_required_ci_repository(REPO_ROOT, candidate_sha=candidate_sha)
-    after = _CANDIDATE_SUPPORT.candidate_checkout_binding(
-        REPO_ROOT, candidate_sha, require_clean=True
+    trusted_control_plane = _trusted_test_control_plane_authority(
+        TRUSTED_REPO_ROOT, "trusted"
     )
-    if after != before:
-        raise AssertionError(
-            "candidate checkout binding changed during structure validation"
-        )
+    candidate_control_plane = _active_test_control_plane_snapshot(
+        REPO_ROOT,
+        "candidate",
+        expected_cross_root=trusted_control_plane,
+    )
+    terminal_failures: list[_TerminalFailure] = []
+    _capture_terminal_failure(
+        terminal_failures,
+        "primary",
+        "structure-validation",
+        lambda: validate_required_ci_repository(
+            REPO_ROOT,
+            candidate_sha=candidate_sha,
+        ),
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-trusted-control-plane",
+        lambda: _require_exact_terminal_value(
+            _active_test_control_plane_snapshot(
+                TRUSTED_REPO_ROOT,
+                "trusted",
+            ),
+            trusted_control_plane,
+            "trusted active test control-plane manifest changed during "
+            "structure validation",
+        ),
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-candidate-control-plane",
+        lambda: _require_exact_terminal_value(
+            _active_test_control_plane_snapshot(
+                REPO_ROOT,
+                "candidate",
+                expected_cross_root=trusted_control_plane,
+            ),
+            candidate_control_plane,
+            "candidate active test control-plane manifest changed during "
+            "structure validation",
+        ),
+    )
+    _capture_terminal_failure(
+        terminal_failures,
+        "integrity",
+        "final-candidate-binding",
+        lambda: _require_exact_terminal_value(
+            _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                REPO_ROOT,
+                candidate_sha,
+                require_clean=True,
+            ),
+            before,
+            "candidate checkout binding changed during structure validation",
+        ),
+    )
+    _raise_terminal_failures(
+        "trusted structure validation and integrity failures",
+        terminal_failures,
+    )
     return 0
 
 
@@ -3356,6 +6508,27 @@ class CheckoutStepParsingTests(unittest.TestCase):
 
 
 class WorkflowHardeningRegressionTests(unittest.TestCase):
+    def test_ordinary_ci_uses_the_exact_isolated_discovery_command(self) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "repository-only CI workflow is not packaged in the private "
+                "skill-only distribution"
+            )
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        expected_step = (
+            "      - name: Run tests\n"
+            "        run: |\n"
+            f"          {README_DISCOVERY_COMMAND}\n"
+        )
+
+        self.assertEqual(workflow.count(expected_step), 1)
+        self.assertNotIn(
+            "python3 -I -m unittest discover -s skills/waited-delivery/tests",
+            workflow,
+        )
+
     def test_ordinary_ci_has_exact_strict_runtime_live_job(self) -> None:
         if DISTRIBUTION_PROFILE == "private":
             self.skipTest(
@@ -4193,10 +7366,9 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                         "test_required_ci_workflow.py"
                     )
                     candidate_validator.parent.mkdir(parents=True)
-                    shutil.copyfile(
-                        TRUSTED_CANDIDATE_SUPPORT_PATH,
-                        candidate_validator.parent / "required_ci_candidate.py",
-                    )
+                    (
+                        candidate_validator.parent / "required_ci_candidate.py"
+                    ).write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
                     if state == "replaced":
                         candidate_validator.write_text(
                             "raise SystemExit(0)\n", encoding="utf-8"
@@ -4272,7 +7444,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                         / "skills/waited-delivery/tests/required_ci_candidate.py"
                     )
                     support_path.parent.mkdir(parents=True)
-                    shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, support_path)
+                    support_path.write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
 
                     with self.assertRaisesRegex(
                         AssertionError, "required-ci.yml path binding"
@@ -6085,7 +9257,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         trusted_support = distribution_tests_root(trusted_root) / (
             "required_ci_candidate.py"
         )
-        shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, trusted_support)
+        trusted_support.write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
+        (
+            distribution_tests_root(candidate_root)
+            / "required_ci_candidate.py"
+        ).write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
         scripts_root = (
             distribution_content_root(candidate_root)
             / "skills/waited-delivery/scripts"
@@ -6105,12 +9281,20 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             distribution_tests_root(trusted_root)
             / "test_required_ci_workflow.py"
         )
-        shutil.copyfile(Path(__file__).resolve(strict=True), trusted_test_path)
+        trusted_test_path.write_bytes(TRUSTED_TEST_SUPERVISOR_BYTES)
+        (
+            distribution_tests_root(candidate_root)
+            / "test_required_ci_workflow.py"
+        ).write_bytes(TRUSTED_TEST_SUPERVISOR_BYTES)
+        shutil.copyfile(
+            distribution_tests_root(trusted_root) / "test_required.py",
+            distribution_tests_root(candidate_root) / "test_required.py",
+        )
         candidate_support_path = (
             distribution_tests_root(candidate_root)
             / "required_ci_candidate.py"
         )
-        shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, candidate_support_path)
+        candidate_support_path.write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
         workflow_path = candidate_root / ".github/workflows/required-ci.yml"
         workflow_path.parent.mkdir(parents=True)
         workflow_path.write_text(
@@ -6140,7 +9324,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             / "skills/waited-delivery/tests/required_ci_candidate.py"
         )
         support_path.parent.mkdir(parents=True)
-        shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, support_path)
+        support_path.write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
         for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS:
             script_path = content_root / relative_path
             script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -9636,26 +12820,2155 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
         self.assertIn("--validate-required-ci-structure", structure_step)
         self.assertNotIn(TRUSTED_TEST_SUPERVISOR_FLAG, structure_step)
-        with mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "expected_candidate_sha",
-            return_value=("a" * 40, True),
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "candidate_checkout_binding",
-            return_value={"binding": "exact"},
-        ) as binding, mock.patch.object(
-            sys.modules[__name__],
-            "validate_required_ci_repository",
-            return_value=[],
-        ) as validate_repository, mock.patch.object(unittest, "main") as unittest_main:
-            self.assertEqual(_trusted_structure_validator_main(), 0)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root, candidate_sha = (
+                self.prepare_structure_cli_split(temporary_directory)
+            )
+            with mock.patch.object(
+                sys.modules[__name__], "TRUSTED_REPO_ROOT", trusted_root
+            ), mock.patch.object(
+                sys.modules[__name__], "REPO_ROOT", candidate_root
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "expected_candidate_sha",
+                return_value=(candidate_sha, True),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_checkout_binding",
+                return_value={"binding": "exact"},
+            ) as binding, mock.patch.object(
+                sys.modules[__name__],
+                "validate_required_ci_repository",
+                return_value=[],
+            ) as validate_repository, mock.patch.object(
+                unittest, "main"
+            ) as unittest_main:
+                self.assertEqual(_trusted_structure_validator_main(), 0)
 
         self.assertEqual(binding.call_count, 2)
         validate_repository.assert_called_once_with(
-            REPO_ROOT, candidate_sha="a" * 40
+            candidate_root, candidate_sha=candidate_sha
         )
         unittest_main.assert_not_called()
+
+    def test_structure_validator_rejects_candidate_control_plane_before_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root, _ = self.prepare_structure_cli_split(
+                temporary_directory
+            )
+            canary = Path(temporary_directory) / "structure-poison.executed"
+            self.write_test_module(
+                candidate_root,
+                "test_poison.py",
+                "from pathlib import Path\n"
+                f"Path({str(canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "import unittest\n\n"
+                "class PoisonTests(unittest.TestCase):\n"
+                "    def test_poison(self):\n"
+                "        pass\n",
+            )
+            for command in (
+                [
+                    _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                    "-C",
+                    str(candidate_root),
+                    "add",
+                    "--all",
+                ],
+                [
+                    _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                    "-C",
+                    str(candidate_root),
+                    "-c",
+                    "user.name=Required CI Test",
+                    "-c",
+                    "user.email=required-ci@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "candidate control-plane poison",
+                ],
+            ):
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            candidate_sha = _CANDIDATE_SUPPORT._run_candidate_git(
+                candidate_root, "rev-parse", "--verify", "HEAD^{commit}"
+            ).decode("ascii").strip()
+
+            with mock.patch.object(
+                sys.modules[__name__], "TRUSTED_REPO_ROOT", trusted_root
+            ), mock.patch.object(
+                sys.modules[__name__], "REPO_ROOT", candidate_root
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "expected_candidate_sha",
+                return_value=(candidate_sha, True),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_checkout_binding",
+                return_value={"binding": "exact"},
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "validate_required_ci_repository",
+                side_effect=AssertionError(
+                    "candidate repository validation was reached"
+                ),
+            ) as validate_repository:
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "candidate active test control-plane manifest path set differs",
+                ):
+                    _trusted_structure_validator_main()
+
+            validate_repository.assert_not_called()
+            self.assertFalse(canary.exists())
+
+    def test_structure_validator_revalidates_both_control_planes_after_validation(
+        self,
+    ) -> None:
+        for side in ("trusted", "candidate"):
+            with self.subTest(side=side):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root, candidate_sha = (
+                        self.prepare_structure_cli_split(temporary_directory)
+                    )
+                    selected_root = (
+                        trusted_root if side == "trusted" else candidate_root
+                    )
+                    selected_path = (
+                        distribution_tests_root(selected_root)
+                        / "test_required.py"
+                    )
+                    original_source = selected_path.read_bytes()
+                    original_metadata = selected_path.stat()
+                    original_binding = _test_control_plane_file_binding(
+                        original_metadata
+                    )
+                    held_path = (
+                        Path(temporary_directory)
+                        / f"structure-{side}-test_required.py.held"
+                    )
+                    validation_reached = False
+
+                    def mutate_during_validation(
+                        _repo_root: Path, *, candidate_sha: str
+                    ) -> list[dict[str, str]]:
+                        nonlocal validation_reached
+                        self.assertEqual(_repo_root, candidate_root)
+                        self.assertEqual(
+                            candidate_sha,
+                            _CANDIDATE_SUPPORT._run_candidate_git(
+                                candidate_root,
+                                "rev-parse",
+                                "--verify",
+                                "HEAD^{commit}",
+                            ).decode("ascii").strip(),
+                        )
+                        validation_reached = True
+                        if side == "trusted":
+                            selected_path.rename(held_path)
+                            selected_path.write_bytes(original_source)
+                            selected_path.chmod(
+                                stat.S_IMODE(original_metadata.st_mode)
+                            )
+                            self.assertNotEqual(
+                                selected_path.stat().st_ino,
+                                held_path.stat().st_ino,
+                            )
+                        else:
+                            changed_source = original_source.replace(
+                                b"        pass\n", b"        pAss\n", 1
+                            )
+                            self.assertEqual(
+                                len(changed_source), len(original_source)
+                            )
+                            selected_path.write_bytes(changed_source)
+                        return []
+
+                    with mock.patch.object(
+                        sys.modules[__name__], "TRUSTED_REPO_ROOT", trusted_root
+                    ), mock.patch.object(
+                        sys.modules[__name__], "REPO_ROOT", candidate_root
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "expected_candidate_sha",
+                        return_value=(candidate_sha, True),
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "candidate_checkout_binding",
+                        return_value={"binding": "exact"},
+                    ), mock.patch.object(
+                        sys.modules[__name__],
+                        "validate_required_ci_repository",
+                        side_effect=mutate_during_validation,
+                    ):
+                        expected_error = (
+                            "active test control-plane manifest changed "
+                            "during structure validation"
+                            if side == "trusted"
+                            else "candidate active test control-plane manifest"
+                        )
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            expected_error,
+                        ):
+                            _trusted_structure_validator_main()
+
+                    self.assertTrue(validation_reached)
+                    if side == "trusted":
+                        changed_binding = _test_control_plane_file_binding(
+                            selected_path.stat()
+                        )
+                        self.assertEqual(
+                            selected_path.read_bytes(), original_source
+                        )
+                        self.assertEqual(
+                            changed_binding[2:], original_binding[2:]
+                        )
+                        self.assertNotEqual(
+                            (changed_binding[0], changed_binding[1]),
+                            (original_binding[0], original_binding[1]),
+                        )
+                        self.assertEqual(
+                            _test_control_plane_file_binding(held_path.stat()),
+                            original_binding,
+                        )
+
+    def test_formal_preload_snapshot_cannot_be_rebased_by_structure_validator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root, candidate_sha = (
+                self.prepare_structure_cli_split(temporary_directory)
+            )
+            early_snapshot = _active_test_control_plane_snapshot(
+                trusted_root,
+                "trusted",
+            )
+            poison = self.required_module(
+                body="        self.assertTrue(True)\n"
+            )
+            self.write_test_module(trusted_root, "test_required.py", poison)
+            self.write_test_module(candidate_root, "test_required.py", poison)
+
+            with mock.patch.object(
+                sys.modules[__name__],
+                "TRUSTED_REPO_ROOT",
+                trusted_root,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "REPO_ROOT",
+                candidate_root,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_TRUSTED_TEST_NAMESPACE_PRELOAD_SNAPSHOT",
+                early_snapshot,
+                create=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "expected_candidate_sha",
+                return_value=(candidate_sha, True),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_checkout_binding",
+                return_value={"binding": "exact"},
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "validate_required_ci_repository",
+                return_value=[],
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "changed after the formal preload",
+                ):
+                    _trusted_structure_validator_main()
+
+    def test_structure_failure_runs_every_terminal_revalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root, candidate_sha = (
+                self.prepare_structure_cli_split(temporary_directory)
+            )
+            actual_snapshot = _active_test_control_plane_snapshot
+            snapshot_counts = {"trusted": 0, "candidate": 0}
+            binding_calls = 0
+            primary_error = AssertionError("structure primary sentinel")
+
+            def terminal_snapshot_failures(
+                repo_root: Path,
+                description: str,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                if description in snapshot_counts:
+                    snapshot_counts[description] += 1
+                    if snapshot_counts[description] == 2:
+                        raise AssertionError(f"final {description} sentinel")
+                return actual_snapshot(repo_root, description, **kwargs)
+
+            def terminal_binding_failure(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal binding_calls
+                binding_calls += 1
+                if binding_calls == 2:
+                    raise AssertionError("final binding sentinel")
+                return {"binding": "exact"}
+
+            with mock.patch.object(
+                sys.modules[__name__],
+                "TRUSTED_REPO_ROOT",
+                trusted_root,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "REPO_ROOT",
+                candidate_root,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "expected_candidate_sha",
+                return_value=(candidate_sha, True),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_checkout_binding",
+                side_effect=terminal_binding_failure,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_active_test_control_plane_snapshot",
+                side_effect=terminal_snapshot_failures,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "validate_required_ci_repository",
+                side_effect=primary_error,
+            ):
+                with self.assertRaises(
+                    _RequiredCITerminalFailures
+                ) as raised:
+                    _trusted_structure_validator_main()
+
+            self.assertEqual(
+                [
+                    (role, phase)
+                    for role, phase, _error in raised.exception.failures
+                ],
+                [
+                    ("primary", "structure-validation"),
+                    ("integrity", "final-trusted-control-plane"),
+                    ("integrity", "final-candidate-control-plane"),
+                    ("integrity", "final-candidate-binding"),
+                ],
+            )
+            self.assertIs(raised.exception.__cause__, primary_error)
+
+    def test_control_plane_leaf_reader_never_blocks_on_fifo_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            tests_root = distribution_tests_root(trusted_root)
+            target = tests_root / "test_required.py"
+            detached = tests_root / "test_required.py.detached"
+            original_open = os.open
+            replacement_done = False
+            leaf_flags: int | None = None
+            guard_descriptor: int | None = None
+            captured_error: BaseException | None = None
+
+            def replace_with_fifo(
+                selected: object,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                nonlocal replacement_done, leaf_flags
+                if (
+                    not replacement_done
+                    and Path(selected) == Path(target.name)
+                    and "dir_fd" in kwargs
+                    and not flags & os.O_DIRECTORY
+                ):
+                    target.rename(detached)
+                    os.mkfifo(target)
+                    replacement_done = True
+                    leaf_flags = flags
+                return original_open(selected, flags, *args, **kwargs)
+
+            def capture() -> None:
+                nonlocal captured_error
+                try:
+                    _active_test_control_plane_snapshot(trusted_root, "trusted")
+                except BaseException as error:
+                    captured_error = error
+
+            try:
+                with mock.patch.object(
+                    os,
+                    "open",
+                    side_effect=replace_with_fifo,
+                ):
+                    worker = threading.Thread(target=capture)
+                    worker.start()
+                    worker.join(timeout=0.25)
+                    completed_without_writer = not worker.is_alive()
+                    if worker.is_alive():
+                        guard_descriptor = original_open(
+                            target,
+                            os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY,
+                        )
+                        worker.join(timeout=2)
+                    self.assertFalse(
+                        worker.is_alive(),
+                        "the FIFO fixture worker must be recoverable",
+                    )
+            finally:
+                if guard_descriptor is not None:
+                    os.close(guard_descriptor)
+
+            self.assertTrue(
+                replacement_done, "the FIFO replacement fixture must execute"
+            )
+            self.assertTrue(
+                completed_without_writer,
+                "the control-plane leaf reader must not wait for a FIFO writer",
+            )
+            self.assertIsInstance(captured_error, AssertionError)
+            self.assertIsNotNone(leaf_flags)
+            assert leaf_flags is not None
+            self.assertTrue(leaf_flags & os.O_NONBLOCK)
+            self.assertTrue(leaf_flags & os.O_NOCTTY)
+            self.assertTrue(leaf_flags & os.O_NOFOLLOW)
+            self.assertTrue(detached.is_file())
+            self.assertTrue(stat.S_ISFIFO(target.lstat().st_mode))
+
+    def test_control_plane_leaf_reader_rejects_hardlinks_and_torn_reads(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            target = distribution_tests_root(trusted_root) / "test_required.py"
+            hardlink = Path(temporary_directory) / "test_required.py.link"
+            os.link(target, hardlink)
+            with self.assertRaisesRegex(
+                AssertionError,
+                "control-plane file is unsafe",
+            ):
+                _active_test_control_plane_snapshot(trusted_root, "trusted")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            target = distribution_tests_root(trusted_root) / "test_required.py"
+            original_source = target.read_bytes()
+            changed_source = original_source.replace(b"        pass\n", b"        pAss\n", 1)
+            self.assertEqual(len(changed_source), len(original_source))
+            target_identity = (target.stat().st_dev, target.stat().st_ino)
+            original_pread = os.pread
+            mutated = False
+
+            def mutate_after_first_read(
+                descriptor: int, length: int, offset: int
+            ) -> bytes:
+                nonlocal mutated
+                chunk = original_pread(descriptor, length, offset)
+                metadata = os.fstat(descriptor)
+                if (
+                    not mutated
+                    and (metadata.st_dev, metadata.st_ino) == target_identity
+                ):
+                    target.write_bytes(changed_source)
+                    mutated = True
+                return chunk
+
+            try:
+                with mock.patch.object(
+                    os,
+                    "pread",
+                    side_effect=mutate_after_first_read,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "content stability changed while being read",
+                    ):
+                        _active_test_control_plane_snapshot(
+                            trusted_root, "trusted"
+                        )
+            finally:
+                target.write_bytes(original_source)
+
+            self.assertTrue(mutated, "the torn-read fixture must execute")
+
+    def test_control_plane_leaf_reader_rejects_equal_length_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            tests_root = distribution_tests_root(trusted_root)
+            target = tests_root / "test_required.py"
+            held = tests_root / "test_required.py.held"
+            source = target.read_bytes()
+            original_mode = stat.S_IMODE(target.stat().st_mode)
+            parent_descriptor = os.open(
+                tests_root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            selected = os.stat(
+                target.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            original_open = os.open
+            replaced = False
+
+            def replace_before_leaf_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                if path == target.name and dir_fd == parent_descriptor and not replaced:
+                    target.rename(held)
+                    target.write_bytes(source)
+                    target.chmod(original_mode)
+                    replaced = True
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            try:
+                with mock.patch.object(
+                    os,
+                    "open",
+                    side_effect=replace_before_leaf_open,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "object changed or was replaced while being opened",
+                    ):
+                        _read_test_control_plane_file(
+                            parent_descriptor,
+                            target.name,
+                            selected,
+                            "trusted replacement fixture",
+                        )
+            finally:
+                os.close(parent_descriptor)
+                if held.exists():
+                    target.unlink()
+                    held.rename(target)
+
+            self.assertTrue(replaced)
+
+    def test_cross_root_source_and_digest_checks_are_independently_causal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            trusted_snapshot = _active_test_control_plane_snapshot(
+                trusted_root, "trusted"
+            )
+            trusted_files = trusted_snapshot["files"]
+            self.assertIsInstance(trusted_files, dict)
+            assert isinstance(trusted_files, dict)
+            selected_relative = (
+                distribution_tests_root(trusted_root) / "test_required.py"
+            ).relative_to(trusted_root).as_posix()
+            selected_entry = trusted_files[selected_relative]
+            self.assertIsInstance(selected_entry, dict)
+            assert isinstance(selected_entry, dict)
+            source = selected_entry["source"]
+            digest = selected_entry["sha256"]
+            self.assertIsInstance(source, bytes)
+            self.assertIsInstance(digest, str)
+            assert isinstance(source, bytes)
+            assert isinstance(digest, str)
+            candidate_path = (
+                distribution_tests_root(candidate_root) / "test_required.py"
+            )
+            changed_source = source.replace(
+                b"        pass\n",
+                b"        pAss\n",
+                1,
+            )
+            self.assertEqual(len(changed_source), len(source))
+            actual_sha256 = hashlib.sha256
+            wrong_digest = "0" * 64 if digest != "0" * 64 else "1" * 64
+
+            for name, observed_source, observed_digest in (
+                ("source-only", changed_source, digest),
+                ("digest-only", source, wrong_digest),
+            ):
+                with self.subTest(name=name):
+                    candidate_path.write_bytes(observed_source)
+
+                    def spoof_selected_digest(data: bytes = b"") -> object:
+                        if data == observed_source:
+                            return types.SimpleNamespace(
+                                hexdigest=lambda: observed_digest
+                            )
+                        return actual_sha256(data)
+
+                    with mock.patch.object(
+                        hashlib,
+                        "sha256",
+                        side_effect=spoof_selected_digest,
+                    ):
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            "content differs",
+                        ):
+                            _active_test_control_plane_snapshot(
+                                candidate_root,
+                                "candidate",
+                                expected_cross_root=trusted_snapshot,
+                            )
+
+    def test_namespace_final_enumeration_has_an_independent_hard_bound(
+        self,
+    ) -> None:
+        class OversizedEnumeration:
+            def __enter__(self) -> Iterator[object]:
+                return iter(
+                    types.SimpleNamespace(name=f"transient-{index}.py")
+                    for index in range(
+                        TRUSTED_TEST_CONTROL_PLANE_ENTRY_LIMIT + 1
+                    )
+                )
+
+            def __exit__(
+                self,
+                _exc_type: object,
+                _exc_value: object,
+                _traceback: object,
+            ) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            actual_scandir = os.scandir
+            scans = 0
+
+            def oversized_only_on_final_scan(
+                descriptor: int,
+            ) -> object:
+                nonlocal scans
+                scans += 1
+                if scans == 2:
+                    return OversizedEnumeration()
+                return actual_scandir(descriptor)
+
+            with mock.patch.object(
+                os,
+                "scandir",
+                side_effect=oversized_only_on_final_scan,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "per-enumeration entry limit",
+                ):
+                    _active_test_control_plane_snapshot(
+                        trusted_root,
+                        "trusted",
+                    )
+
+            self.assertEqual(scans, 2)
+
+    def test_namespace_capture_enforces_total_source_byte_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            tests_root = distribution_tests_root(trusted_root)
+            source_sizes = [
+                path.stat().st_size
+                for path in sorted(tests_root.glob("*.py"))
+            ]
+            self.assertGreaterEqual(len(source_sizes), 2)
+            total_limit = max(source_sizes)
+            self.assertTrue(
+                all(size <= total_limit for size in source_sizes)
+            )
+            self.assertGreater(sum(source_sizes), total_limit)
+            with mock.patch.object(
+                sys.modules[__name__],
+                "TRUSTED_TEST_CONTROL_PLANE_TOTAL_SOURCE_LIMIT_BYTES",
+                total_limit,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "total byte limit",
+                ):
+                    _active_test_control_plane_snapshot(
+                        trusted_root,
+                        "trusted",
+                    )
+
+    def test_namespace_capture_enforces_nine_level_depth_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tests_root = Path(temporary_directory).resolve(strict=True)
+            current = tests_root
+            for depth in range(TRUSTED_TEST_CONTROL_PLANE_DEPTH_LIMIT + 1):
+                current = current / f"level-{depth}"
+                current.mkdir()
+
+            with self.assertRaisesRegex(
+                AssertionError,
+                "exceeds the depth limit",
+            ):
+                _test_control_plane_namespace_capture(
+                    tests_root,
+                    "trusted",
+                )
+
+    def test_namespace_capture_enforces_individual_source_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tests_root = Path(temporary_directory).resolve(strict=True)
+            oversized = tests_root / "test_oversized.py"
+            oversized.write_bytes(
+                b"x" * (TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES + 1)
+            )
+
+            with self.assertRaisesRegex(
+                AssertionError,
+                "active test control-plane file is unsafe",
+            ):
+                _test_control_plane_namespace_capture(
+                    tests_root,
+                    "trusted",
+                    capture_names=None,
+                )
+
+    def test_namespace_capture_enforces_cross_directory_entry_limit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tests_root = Path(temporary_directory).resolve(strict=True)
+            per_directory = TRUSTED_TEST_CONTROL_PLANE_ENTRY_LIMIT // 2
+            for directory_name in ("left", "right"):
+                directory = tests_root / directory_name
+                directory.mkdir()
+                for index in range(per_directory):
+                    (directory / f"entry-{index:03d}").touch()
+
+            self.assertLessEqual(per_directory, TRUSTED_TEST_CONTROL_PLANE_ENTRY_LIMIT)
+            self.assertGreater(
+                2 + (2 * per_directory),
+                TRUSTED_TEST_CONTROL_PLANE_ENTRY_LIMIT,
+            )
+            with self.assertRaisesRegex(
+                AssertionError,
+                "exceeds the entry limit",
+            ):
+                _test_control_plane_namespace_capture(
+                    tests_root,
+                    "trusted",
+                )
+
+    def test_cross_root_capture_never_reads_an_unexpected_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            trusted_snapshot = _active_test_control_plane_snapshot(
+                trusted_root,
+                "trusted",
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            unexpected = distribution_tests_root(candidate_root) / "extra.py"
+            unexpected.write_bytes(b"raise AssertionError('must not read')\n")
+            actual_reader = _read_test_control_plane_file
+
+            def reject_unexpected_read(
+                parent_descriptor: int,
+                name: str,
+                selected: os.stat_result,
+                description: str,
+            ) -> tuple[
+                bytes,
+                tuple[int, int, int, int, int, int, int, int],
+            ]:
+                if name == unexpected.name:
+                    raise AssertionError("unexpected leaf was read")
+                return actual_reader(
+                    parent_descriptor,
+                    name,
+                    selected,
+                    description,
+                )
+
+            with mock.patch.object(
+                sys.modules[__name__],
+                "_read_test_control_plane_file",
+                side_effect=reject_unexpected_read,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "namespace contains unexpected entries",
+                ):
+                    _active_test_control_plane_snapshot(
+                        candidate_root,
+                        "candidate",
+                        expected_cross_root=trusted_snapshot,
+                    )
+
+    def test_final_full_capture_rejects_restored_same_inode_content(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            target = (
+                distribution_tests_root(trusted_root) / "test_required.py"
+            )
+            original_source = target.read_bytes()
+            changed_source = original_source.replace(
+                b"        pass\n",
+                b"        pAss\n",
+                1,
+            )
+            self.assertEqual(len(changed_source), len(original_source))
+            target_identity = (target.stat().st_dev, target.stat().st_ino)
+            original_reader = _read_test_control_plane_file
+            original_capture = _test_control_plane_namespace_capture
+            capture_count = 0
+            mutated = False
+            restored = False
+
+            def mutate_before_stable_leaf_read(
+                parent_descriptor: int,
+                name: str,
+                selected: os.stat_result,
+                description: str,
+            ) -> tuple[
+                bytes,
+                tuple[int, int, int, int, int, int, int, int],
+            ]:
+                nonlocal mutated
+                if (
+                    not mutated
+                    and (selected.st_dev, selected.st_ino) == target_identity
+                ):
+                    target.write_bytes(changed_source)
+                    mutated = True
+                return original_reader(
+                    parent_descriptor,
+                    name,
+                    selected,
+                    description,
+                )
+
+            def restore_before_final_capture(
+                tests_root: Path,
+                description: str,
+                **kwargs: object,
+            ) -> tuple[
+                dict[str, tuple[int, int, int, int, int, int]],
+                dict[str, bytes],
+                dict[
+                    str,
+                    tuple[int, int, int, int, int, int, int, int],
+                ],
+            ]:
+                nonlocal capture_count, restored
+                capture_count += 1
+                if capture_count == 2:
+                    target.write_bytes(original_source)
+                    restored = True
+                return original_capture(
+                    tests_root,
+                    description,
+                    **kwargs,
+                )
+
+            try:
+                with mock.patch.object(
+                    sys.modules[__name__],
+                    "_read_test_control_plane_file",
+                    side_effect=mutate_before_stable_leaf_read,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "_test_control_plane_namespace_capture",
+                    side_effect=restore_before_final_capture,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "changed while being captured",
+                    ):
+                        _active_test_control_plane_snapshot(
+                            trusted_root,
+                            "trusted",
+                        )
+            finally:
+                target.write_bytes(original_source)
+
+            self.assertTrue(mutated)
+            self.assertTrue(restored)
+            self.assertEqual(capture_count, 2)
+
+    def test_tests_root_identity_is_independent_from_file_bindings(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            tests_root = distribution_tests_root(trusted_root)
+            before = _active_test_control_plane_snapshot(
+                trusted_root, "trusted"
+            )
+            original_mode = stat.S_IMODE(tests_root.stat().st_mode)
+            held_root = tests_root.with_name("tests-held-outside-namespace")
+            tests_root.rename(held_root)
+            tests_root.mkdir(mode=original_mode)
+            for held_entry in sorted(held_root.iterdir()):
+                held_entry.rename(tests_root / held_entry.name)
+
+            after = _active_test_control_plane_snapshot(
+                trusted_root, "trusted"
+            )
+
+            self.assertEqual(before["repo_binding"], after["repo_binding"])
+            self.assertEqual(before["namespace_tree"], after["namespace_tree"])
+            self.assertEqual(before["files"], after["files"])
+            self.assertEqual(before["tests_root"], after["tests_root"])
+            self.assertNotEqual(
+                before["tests_binding"],
+                after["tests_binding"],
+                "the tests-root directory identity must remain independently bound",
+            )
+            self.assertNotEqual(before, after)
+
+    def test_held_tests_root_rejects_transient_path_decoy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            tests_root = distribution_tests_root(trusted_root)
+            held_root = Path(temporary_directory) / "held-tests-root"
+            decoy_root = Path(temporary_directory) / "decoy-tests-root"
+            returned_decoy = Path(temporary_directory) / "returned-decoy-root"
+            shutil.copytree(tests_root, decoy_root)
+            original_capture = _test_control_plane_namespace_capture
+            decoy_installed = False
+
+            def capture_while_path_names_decoy(
+                selected_root: Path,
+                description: str,
+                **kwargs: object,
+            ) -> tuple[
+                dict[str, tuple[int, int, int, int, int, int]],
+                dict[str, bytes],
+                dict[
+                    str,
+                    tuple[int, int, int, int, int, int, int, int],
+                ],
+            ]:
+                nonlocal decoy_installed
+                root_descriptor = kwargs.get("root_descriptor")
+                if root_descriptor is None or decoy_installed:
+                    return original_capture(
+                        selected_root,
+                        description,
+                        **kwargs,
+                    )
+                tests_root.rename(held_root)
+                decoy_root.rename(tests_root)
+                decoy_installed = True
+                try:
+                    return original_capture(
+                        selected_root,
+                        description,
+                        **kwargs,
+                    )
+                finally:
+                    tests_root.rename(returned_decoy)
+                    held_root.rename(tests_root)
+
+            with mock.patch.object(
+                sys.modules[__name__],
+                "_test_control_plane_namespace_capture",
+                side_effect=capture_while_path_names_decoy,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "active test control-plane namespace changed",
+                ):
+                    _active_test_control_plane_snapshot(
+                        trusted_root,
+                        "trusted",
+                    )
+
+            self.assertTrue(decoy_installed)
+            self.assertTrue(tests_root.is_dir())
+            self.assertTrue(returned_decoy.is_dir())
+
+    def test_final_tests_root_path_revalidation_rejects_decoy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            tests_root = distribution_tests_root(trusted_root)
+            held_root = Path(temporary_directory) / "held-tests-root"
+            decoy_root = Path(temporary_directory) / "decoy-tests-root"
+            shutil.copytree(tests_root, decoy_root)
+            actual_lstat = Path.lstat
+            actual_capture = _test_control_plane_namespace_capture
+            completed_captures = 0
+            decoy_observed = False
+
+            def count_completed_capture(
+                selected_root: Path,
+                description: str,
+                **kwargs: object,
+            ) -> tuple[
+                dict[str, tuple[int, int, int, int, int, int]],
+                dict[str, bytes],
+                dict[
+                    str,
+                    tuple[int, int, int, int, int, int, int, int],
+                ],
+            ]:
+                nonlocal completed_captures
+                result = actual_capture(
+                    selected_root,
+                    description,
+                    **kwargs,
+                )
+                completed_captures += 1
+                return result
+
+            def decoy_only_for_final_path_revalidation(
+                selected: Path,
+            ) -> os.stat_result:
+                nonlocal decoy_observed
+                if (
+                    selected == tests_root
+                    and completed_captures == 2
+                    and not decoy_observed
+                ):
+                    tests_root.rename(held_root)
+                    decoy_root.rename(tests_root)
+                    try:
+                        decoy_observed = True
+                        return actual_lstat(selected)
+                    finally:
+                        tests_root.rename(decoy_root)
+                        held_root.rename(tests_root)
+                return actual_lstat(selected)
+
+            with mock.patch.object(
+                Path,
+                "lstat",
+                autospec=True,
+                side_effect=decoy_only_for_final_path_revalidation,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_test_control_plane_namespace_capture",
+                side_effect=count_completed_capture,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "manifest changed while being captured",
+                ):
+                    _active_test_control_plane_snapshot(
+                        trusted_root,
+                        "trusted",
+                    )
+
+            self.assertTrue(decoy_observed)
+            self.assertEqual(completed_captures, 2)
+            self.assertTrue(tests_root.is_dir())
+            self.assertTrue(decoy_root.is_dir())
+
+    def test_tests_root_binding_is_committed_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            snapshot = _active_test_control_plane_snapshot(
+                trusted_root,
+                "trusted",
+            )
+            changed = dict(snapshot)
+            tests_binding = snapshot["tests_binding"]
+            self.assertIsInstance(tests_binding, tuple)
+            assert isinstance(tests_binding, tuple)
+            changed["tests_binding"] = (
+                tests_binding[0],
+                tests_binding[1] + 1,
+                *tests_binding[2:],
+            )
+
+            self.assertNotEqual(
+                _test_control_plane_commitment_from_snapshot(snapshot),
+                _test_control_plane_commitment_from_snapshot(changed),
+            )
+
+    def test_child_receipt_revalidates_during_its_own_execution_window(
+        self,
+    ) -> None:
+        for mutation in ("content", "mode", "replacement"):
+            with self.subTest(mutation=mutation):
+                missing_module = object()
+                previous_test_module = sys.modules.pop(
+                    "test_required", missing_module
+                )
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root = self.prepare_roots(
+                        temporary_directory
+                    )
+                    self.write_test_module(
+                        candidate_root,
+                        "test_required.py",
+                        self.required_module(),
+                    )
+                    candidate_sha = self.initialize_candidate_checkout(
+                        candidate_root
+                    )
+                    target = (
+                        distribution_tests_root(trusted_root)
+                        / "test_required.py"
+                    )
+                    original_source = target.read_bytes()
+                    original_mode = stat.S_IMODE(target.stat().st_mode)
+                    held = Path(temporary_directory) / "trusted-test.held"
+                    actual_run = unittest.TextTestRunner.run
+                    mutation_executed = False
+
+                    def mutate_before_child_revalidation(
+                        runner: unittest.TextTestRunner,
+                        suite: unittest.TestSuite,
+                    ) -> unittest.TestResult:
+                        nonlocal mutation_executed
+                        result = actual_run(runner, suite)
+                        if mutation == "content":
+                            changed = original_source.replace(
+                                b"        pass\n",
+                                b"        pAss\n",
+                                1,
+                            )
+                            self.assertEqual(len(changed), len(original_source))
+                            target.write_bytes(changed)
+                        elif mutation == "mode":
+                            target.chmod(original_mode ^ 0o100)
+                        else:
+                            target.rename(held)
+                            target.write_bytes(original_source)
+                            target.chmod(original_mode)
+                        mutation_executed = True
+                        return result
+
+                    try:
+                        with mock.patch.dict(
+                            os.environ,
+                            {
+                                REQUIRED_CI_CANDIDATE_ROOT_ENV: str(
+                                    candidate_root
+                                ),
+                                REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                            },
+                            clear=False,
+                        ), mock.patch.object(
+                            unittest.TextTestRunner,
+                            "run",
+                            new=mutate_before_child_revalidation,
+                        ):
+                            for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+                                os.environ.pop(key, None)
+                            with self.assertRaisesRegex(
+                                AssertionError,
+                                "trusted active test control-plane manifest",
+                            ):
+                                _trusted_test_suite_receipt(
+                                    trusted_root,
+                                    candidate_root,
+                                )
+                    finally:
+                        if mutation == "replacement":
+                            if target.exists():
+                                target.unlink()
+                            if held.exists():
+                                held.rename(target)
+                        else:
+                            target.write_bytes(original_source)
+                            target.chmod(original_mode)
+                        sys.modules.pop("test_required", None)
+                        if previous_test_module is not missing_module:
+                            sys.modules["test_required"] = previous_test_module
+
+                    self.assertTrue(
+                        mutation_executed,
+                        "the child-window mutation fixture must execute",
+                    )
+
+    def test_trusted_entry_rejects_import_namespace_poison_before_execution(
+        self,
+    ) -> None:
+        for poison_kind in ("unchecked-support-pyc", "shlex-shadow"):
+            with self.subTest(poison_kind=poison_kind):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root, candidate_sha = (
+                        self.prepare_structure_cli_split(temporary_directory)
+                    )
+                    trusted_tests_root = distribution_tests_root(trusted_root)
+                    trusted_test_path = (
+                        trusted_tests_root / "test_required_ci_workflow.py"
+                    )
+                    canary = (
+                        Path(temporary_directory)
+                        / f"trusted-{poison_kind}.executed"
+                    )
+                    poison_source = (
+                        "from pathlib import Path\n"
+                        f"Path({str(canary)!r}).write_text("
+                        "'executed', encoding='utf-8')\n"
+                    )
+                    (
+                        trusted_tests_root / "required_ci_candidate.py"
+                    ).write_text(
+                        poison_source
+                        + "raise AssertionError("
+                        "'trusted support executed before namespace guard')\n",
+                        encoding="utf-8",
+                    )
+                    if poison_kind == "unchecked-support-pyc":
+                        import py_compile
+
+                        pycache_root = trusted_tests_root / "__pycache__"
+                        pycache_root.mkdir()
+                        poison_source_path = (
+                            Path(temporary_directory) / "poison_support.py"
+                        )
+                        poison_source_path.write_text(
+                            poison_source, encoding="utf-8"
+                        )
+                        py_compile.compile(
+                            str(poison_source_path),
+                            cfile=str(
+                                pycache_root
+                                / (
+                                    "required_ci_candidate."
+                                    f"{sys.implementation.cache_tag}.pyc"
+                                )
+                            ),
+                            doraise=True,
+                            invalidation_mode=(
+                                py_compile.PycInvalidationMode.UNCHECKED_HASH
+                            ),
+                        )
+                    else:
+                        (trusted_tests_root / "shlex.py").write_text(
+                            poison_source, encoding="utf-8"
+                        )
+
+                    environment = os.environ.copy()
+                    environment["GITHUB_WORKSPACE"] = str(trusted_root.parent)
+                    environment["GITHUB_SHA"] = candidate_sha
+                    environment[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(
+                        candidate_root
+                    )
+                    environment[REQUIRED_CI_CANDIDATE_SHA_ENV] = candidate_sha
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-B",
+                            str(trusted_test_path),
+                            TRUSTED_STRUCTURE_VALIDATOR_FLAG,
+                        ],
+                        cwd=trusted_root,
+                        env=environment,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(
+                        "trusted active test control-plane namespace contains "
+                        "unexpected entries",
+                        completed.stderr,
+                    )
+                    self.assertFalse(canary.exists())
+
+    def test_ordinary_discovery_tolerates_benign_bytecode_cache_without_weakening_formal_entry(
+        self,
+    ) -> None:
+        import py_compile
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkout_root = Path(temporary_directory).resolve(strict=True)
+            tests_root = (
+                checkout_root / "skills/waited-delivery/tests"
+            )
+            tests_root.mkdir(parents=True)
+            workflow_test_path = tests_root / "test_required_ci_workflow.py"
+            support_path = tests_root / "required_ci_candidate.py"
+            workflow_test_path.write_bytes(TRUSTED_TEST_SUPERVISOR_BYTES)
+            support_path.write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
+            discovery_command = [
+                sys.executable,
+                "-I",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                str(tests_root),
+                "-p",
+                workflow_test_path.name,
+                "-k",
+                "test_block_mapping_separator_requires_whitespace_or_line_end",
+            ]
+
+            clean_discovery = subprocess.run(
+                discovery_command,
+                cwd=checkout_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                clean_discovery.returncode,
+                0,
+                clean_discovery.stderr,
+            )
+            pycache_root = tests_root / "__pycache__"
+            self.assertTrue(any(pycache_root.glob("*.pyc")))
+            py_compile.compile(
+                str(support_path),
+                cfile=str(
+                    pycache_root
+                    / (
+                        "required_ci_candidate."
+                        f"{sys.implementation.cache_tag}.pyc"
+                    )
+                ),
+                doraise=True,
+            )
+
+            cached_discovery = subprocess.run(
+                discovery_command,
+                cwd=checkout_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                cached_discovery.returncode,
+                0,
+                cached_discovery.stderr,
+            )
+
+            support_canary = checkout_root / "formal-support.executed"
+            support_path.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(support_canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "raise AssertionError('formal support executed before guard')\n",
+                encoding="utf-8",
+            )
+            formal_entry = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(workflow_test_path),
+                    TRUSTED_STRUCTURE_VALIDATOR_FLAG,
+                ],
+                cwd=checkout_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertNotEqual(formal_entry.returncode, 0)
+            self.assertIn(
+                "trusted active test control-plane namespace contains "
+                "unexpected entries",
+                formal_entry.stderr,
+            )
+            self.assertFalse(support_canary.exists())
+
+    def test_local_formal_copy_never_relocates_shared_import_cache(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkout_root = Path(temporary_directory).resolve(strict=True)
+            tests_root = checkout_root / "skills/waited-delivery/tests"
+            tests_root.mkdir(parents=True)
+            supervisor_path = tests_root / "test_required_ci_workflow.py"
+            support_path = tests_root / "required_ci_candidate.py"
+            supervisor_path.write_bytes(TRUSTED_TEST_SUPERVISOR_BYTES)
+            support_path.write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
+            shared_cache = tests_root / "__pycache__"
+            shared_cache.mkdir()
+            sentinel = shared_cache / "sentinel.pyc"
+            sentinel.write_bytes(b"trusted-cache-sentinel\x00")
+            cache_binding = _test_control_plane_directory_binding(
+                shared_cache.stat()
+            )
+            sentinel_binding = _test_control_plane_file_binding(
+                sentinel.stat()
+            )
+            sentinel_source = sentinel.read_bytes()
+            inventory = sorted(path.name for path in shared_cache.iterdir())
+
+            def forbidden_relocation(*_args: object, **_kwargs: object) -> None:
+                raise AssertionError(
+                    "the local formal copy must not relocate shared cache state"
+                )
+
+            for body_error in (False, True):
+                with self.subTest(body_error=body_error), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_REPO_ROOT",
+                    checkout_root,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_PATH",
+                    support_path,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "__file__",
+                    str(supervisor_path),
+                ), mock.patch.object(
+                    Path,
+                    "rename",
+                    side_effect=forbidden_relocation,
+                ), mock.patch.object(
+                    os,
+                    "rename",
+                    side_effect=forbidden_relocation,
+                ), mock.patch.object(
+                    os,
+                    "replace",
+                    side_effect=forbidden_relocation,
+                ), mock.patch.object(
+                    shutil,
+                    "move",
+                    side_effect=forbidden_relocation,
+                ):
+                    if body_error:
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "formal copy body failed",
+                        ):
+                            with _local_formal_test_control_plane_copy():
+                                copied_tests_root = Path(__file__).parent
+                                (copied_tests_root / "__pycache__").mkdir()
+                                raise RuntimeError("formal copy body failed")
+                    else:
+                        with _local_formal_test_control_plane_copy():
+                            copied_supervisor = Path(__file__)
+                            self.assertNotEqual(
+                                copied_supervisor,
+                                supervisor_path,
+                            )
+                            copied_cache = (
+                                copied_supervisor.parent / "__pycache__"
+                            )
+                            copied_cache.mkdir()
+                            (copied_cache / "generated.pyc").write_bytes(
+                                b"private-copy-only"
+                            )
+
+                self.assertEqual(
+                    _test_control_plane_directory_binding(
+                        shared_cache.stat()
+                    ),
+                    cache_binding,
+                )
+                self.assertEqual(
+                    _test_control_plane_file_binding(sentinel.stat()),
+                    sentinel_binding,
+                )
+                self.assertEqual(sentinel.read_bytes(), sentinel_source)
+                self.assertEqual(
+                    sorted(path.name for path in shared_cache.iterdir()),
+                    inventory,
+                )
+
+    def test_import_namespace_guard_matches_only_exact_formal_direct_entries(
+        self,
+    ) -> None:
+        module = sys.modules[__name__]
+        script = str(Path(__file__).resolve(strict=True))
+        formal_arguments = (
+            [TRUSTED_STRUCTURE_VALIDATOR_FLAG],
+            [TRUSTED_TEST_SUPERVISOR_FLAG],
+            [TRUSTED_TEST_CHILD_FLAG, "/tmp/.required-ci"],
+            [CI_STRICT_RUNTIME_LIVE_FLAG],
+        )
+        for arguments in formal_arguments:
+            with self.subTest(formal=arguments):
+                with mock.patch.object(
+                    module, "__name__", "__main__"
+                ), mock.patch.object(sys, "argv", [script, *arguments]):
+                    self.assertTrue(
+                        _formal_test_control_plane_entry_requested()
+                    )
+
+        with mock.patch.object(
+            module, "__name__", "test_required_ci_workflow"
+        ), mock.patch.object(
+            sys,
+            "argv",
+            [script, TRUSTED_STRUCTURE_VALIDATOR_FLAG],
+        ):
+            self.assertFalse(_formal_test_control_plane_entry_requested())
+
+        ordinary_or_malformed_arguments = (
+            [],
+            ["discover", "-s", "skills/waited-delivery/tests"],
+            ["MappingPairParsingTests.test_block_mapping"],
+            [TRUSTED_STRUCTURE_VALIDATOR_FLAG, "unexpected"],
+            [TRUSTED_TEST_CHILD_FLAG],
+            [TRUSTED_TEST_CHILD_FLAG, "/tmp/.required-ci", "unexpected"],
+            [TRUSTED_TEST_CHILD_FLAG, Path("/tmp/.required-ci")],
+        )
+        for arguments in ordinary_or_malformed_arguments:
+            with self.subTest(ordinary_or_malformed=arguments):
+                with mock.patch.object(
+                    module, "__name__", "__main__"
+                ), mock.patch.object(sys, "argv", [script, *arguments]):
+                    self.assertFalse(
+                        _formal_test_control_plane_entry_requested()
+                    )
+
+        with mock.patch.object(
+            module, "__name__", "__main__"
+        ), mock.patch.object(
+            sys,
+            "argv",
+            [
+                str(TRUSTED_CANDIDATE_SUPPORT_PATH),
+                TRUSTED_STRUCTURE_VALIDATOR_FLAG,
+            ],
+        ):
+            with self.assertRaisesRegex(AssertionError, "is not bound"):
+                _formal_test_control_plane_entry_requested()
+
+    def test_support_loader_executes_captured_source_instead_of_unchecked_bytecode(
+        self,
+    ) -> None:
+        import py_compile
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory).resolve(strict=True)
+            support_path = temporary_root / "required_ci_candidate.py"
+            source_canary = temporary_root / "source.executed"
+            path_canary = temporary_root / "path.executed"
+            bytecode_canary = temporary_root / "bytecode.executed"
+            source = (
+                "import hashlib\n"
+                "from pathlib import Path\n"
+                "_TRUSTED_SUPPORT_PATH = Path(__file__).resolve(strict=True)\n"
+                "_TRUSTED_SUPPORT_SOURCE = globals().pop("
+                "'_TRUSTED_SUPPORT_PRELOAD_BYTES')\n"
+                "_TRUSTED_SUPPORT_BINDING = globals().pop("
+                "'_TRUSTED_SUPPORT_PRELOAD_BINDING')\n"
+                "_TRUSTED_SUPPORT_SHA256 = hashlib.sha256("
+                "_TRUSTED_SUPPORT_SOURCE).hexdigest()\n"
+                f"Path({str(source_canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "SUPPORT_ORIGIN = 'captured-source'\n"
+            ).encode("utf-8")
+            support_path.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(path_canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "SUPPORT_ORIGIN = 'path-source'\n",
+                encoding="utf-8",
+            )
+            poison_source_path = temporary_root / "poison_support.py"
+            poison_source_path.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(bytecode_canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "SUPPORT_ORIGIN = 'unchecked-bytecode'\n",
+                encoding="utf-8",
+            )
+            cache_path = Path(importlib.util.cache_from_source(str(support_path)))
+            cache_path.parent.mkdir(parents=True)
+            py_compile.compile(
+                str(poison_source_path),
+                cfile=str(cache_path),
+                doraise=True,
+                invalidation_mode=(
+                    py_compile.PycInvalidationMode.UNCHECKED_HASH
+                ),
+            )
+            previous_support_module = sys.modules.get(
+                "required_ci_candidate"
+            )
+            support_was_loaded = "required_ci_candidate" in sys.modules
+            support_binding = (
+                1,
+                2,
+                stat.S_IFREG,
+                0o400,
+                os.geteuid(),
+                os.getegid(),
+                1,
+                len(source),
+            )
+            try:
+                with mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_PATH",
+                    support_path,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_SOURCE",
+                    source,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_SHA256",
+                    hashlib.sha256(source).hexdigest(),
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_BINDING",
+                    support_binding,
+                ):
+                    loaded = _load_trusted_candidate_support()
+            finally:
+                if support_was_loaded:
+                    sys.modules[
+                        "required_ci_candidate"
+                    ] = previous_support_module
+                else:
+                    sys.modules.pop("required_ci_candidate", None)
+
+            self.assertEqual(loaded.SUPPORT_ORIGIN, "captured-source")
+            self.assertTrue(source_canary.exists())
+            self.assertFalse(path_canary.exists())
+            self.assertFalse(bytecode_canary.exists())
+
+    def test_support_loader_never_reopens_path_after_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkout_root = Path(temporary_directory).resolve(strict=True)
+            support_path = (
+                checkout_root
+                / "skills/waited-delivery/tests/required_ci_candidate.py"
+            )
+            support_path.parent.mkdir(parents=True)
+            captured_source = TRUSTED_CANDIDATE_SUPPORT_SOURCE
+            support_path.write_bytes(captured_source)
+            poison_source = b"#" + b"x" * (len(captured_source) - 1)
+            self.assertEqual(len(poison_source), len(captured_source))
+            support_path.write_bytes(poison_source)
+            original_open = os.open
+            path_reopened = False
+
+            def reject_support_reopen(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal path_reopened
+                if Path(path) == support_path.parent or (
+                    path == support_path.name and dir_fd is not None
+                ):
+                    path_reopened = True
+                    raise AssertionError(
+                        "captured support was reopened through its path"
+                    )
+                return original_open(
+                    path,
+                    flags,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+
+            previous_support_module = sys.modules.get(
+                "required_ci_candidate"
+            )
+            support_was_loaded = "required_ci_candidate" in sys.modules
+            try:
+                with mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_PATH",
+                    support_path,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_SOURCE",
+                    captured_source,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_SHA256",
+                    hashlib.sha256(captured_source).hexdigest(),
+                ), mock.patch.object(
+                    os,
+                    "open",
+                    side_effect=reject_support_reopen,
+                ):
+                    loaded = _load_trusted_candidate_support()
+            finally:
+                if support_was_loaded:
+                    sys.modules[
+                        "required_ci_candidate"
+                    ] = previous_support_module
+                else:
+                    sys.modules.pop("required_ci_candidate", None)
+
+            self.assertFalse(path_reopened)
+            self.assertEqual(
+                loaded._TRUSTED_SUPPORT_SOURCE,
+                captured_source,
+            )
+            self.assertEqual(
+                loaded._TRUSTED_SUPPORT_SHA256,
+                hashlib.sha256(captured_source).hexdigest(),
+            )
+            self.assertIn(
+                "def _bounded_failure_text",
+                inspect.getsource(loaded._bounded_failure_text),
+            )
+
+    def test_formal_support_preload_survives_scan_to_exec_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            support_path = (
+                root
+                / "skills/waited-delivery/tests/required_ci_candidate.py"
+            )
+            support_path.parent.mkdir(parents=True)
+            held = support_path.with_name("support.held")
+            support_path.write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
+            captured_source, captured_binding = (
+                _read_stable_test_control_plane_path(
+                    support_path,
+                    "formal support fixture",
+                )
+            )
+            poison = b"#" + b"x" * (len(captured_source) - 1)
+            self.assertEqual(len(poison), len(captured_source))
+            original_mode = stat.S_IMODE(support_path.stat().st_mode)
+            function = _load_trusted_candidate_support
+            source_lines, source_start = inspect.getsourcelines(function)
+            exec_line = source_start + next(
+                index
+                for index, line in enumerate(source_lines)
+                if "exec(code, module.__dict__)" in line
+            )
+            replacement_installed = False
+
+            def replace_after_capture_before_exec(
+                frame: types.FrameType,
+                event: str,
+                _argument: object,
+            ) -> Callable[..., object]:
+                nonlocal replacement_installed
+                if (
+                    frame.f_code is function.__code__
+                    and event == "line"
+                    and frame.f_lineno == exec_line
+                    and not replacement_installed
+                ):
+                    support_path.rename(held)
+                    support_path.write_bytes(poison)
+                    support_path.chmod(original_mode)
+                    replacement_installed = True
+                return replace_after_capture_before_exec
+
+            previous_support_module = sys.modules.get(
+                "required_ci_candidate"
+            )
+            support_was_loaded = "required_ci_candidate" in sys.modules
+            try:
+                with mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_PATH",
+                    support_path,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_SOURCE",
+                    captured_source,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_BINDING",
+                    captured_binding,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "TRUSTED_CANDIDATE_SUPPORT_SHA256",
+                    hashlib.sha256(captured_source).hexdigest(),
+                ):
+                    sys.settrace(replace_after_capture_before_exec)
+                    try:
+                        loaded = function()
+                    finally:
+                        sys.settrace(None)
+            finally:
+                if replacement_installed:
+                    support_path.unlink()
+                    held.rename(support_path)
+                if support_was_loaded:
+                    sys.modules[
+                        "required_ci_candidate"
+                    ] = previous_support_module
+                else:
+                    sys.modules.pop("required_ci_candidate", None)
+
+            self.assertTrue(replacement_installed)
+            self.assertEqual(loaded._TRUSTED_SUPPORT_SOURCE, captured_source)
+            self.assertEqual(loaded._TRUSTED_SUPPORT_BINDING, captured_binding)
+
+    def test_stable_support_reader_rejects_special_and_linked_objects(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            fifo = root / "support.fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(AssertionError, "file is unsafe"):
+                _CANDIDATE_SUPPORT._read_stable_trusted_support(fifo)
+
+            support = root / "required_ci_candidate.py"
+            alias = root / "support.alias"
+            support.write_bytes(b"support = True\n")
+            os.link(support, alias)
+            with self.assertRaisesRegex(AssertionError, "file is unsafe"):
+                _CANDIDATE_SUPPORT._read_stable_trusted_support(support)
+
+    def test_stable_support_reader_rejects_torn_same_inode_content(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            support = (
+                Path(temporary_directory).resolve(strict=True)
+                / "required_ci_candidate.py"
+            )
+            first_source = b"support = 'first'\n"
+            second_source = b"support = 'other'\n"
+            self.assertEqual(len(first_source), len(second_source))
+            support.write_bytes(first_source)
+            original_pread = os.pread
+            calls = 0
+
+            def mutate_after_first_chunk(
+                descriptor: int,
+                length: int,
+                offset: int,
+            ) -> bytes:
+                nonlocal calls
+                data = original_pread(descriptor, length, offset)
+                calls += 1
+                if calls == 1:
+                    support.write_bytes(second_source)
+                return data
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "pread",
+                side_effect=mutate_after_first_chunk,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "content stability changed while being read",
+                ):
+                    _CANDIDATE_SUPPORT._read_stable_trusted_support(support)
+
+            self.assertGreaterEqual(calls, 2)
+
+    def test_stable_support_reader_rejects_equal_length_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            support = root / "required_ci_candidate.py"
+            held = root / "support.held"
+            source = b"support = True\n"
+            support.write_bytes(source)
+            original_mode = stat.S_IMODE(support.stat().st_mode)
+            original_open = os.open
+            replaced = False
+
+            def replace_between_selection_and_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                if path == support.name and dir_fd is not None and not replaced:
+                    support.rename(held)
+                    support.write_bytes(source)
+                    support.chmod(original_mode)
+                    replaced = True
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT.os,
+                    "open",
+                    side_effect=replace_between_selection_and_open,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "object changed while being opened",
+                    ):
+                        _CANDIDATE_SUPPORT._read_stable_trusted_support(
+                            support
+                        )
+            finally:
+                if held.exists():
+                    support.unlink()
+                    held.rename(support)
+
+            self.assertTrue(replaced)
+
+    def test_stable_support_reader_binds_special_race_open_flags(self) -> None:
+        import pty
+
+        for scenario in ("fifo", "symlink", "tty"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory).resolve(strict=True)
+                support = root / "required_ci_candidate.py"
+                held = root / "support.held"
+                support.write_bytes(b"support = True\n")
+                original_open = os.open
+                observed_flags: list[int] = []
+                pty_descriptors: tuple[int, int] | None = None
+                replaced = False
+
+                def replace_between_selection_and_open(
+                    selected_path: str
+                    | bytes
+                    | os.PathLike[str]
+                    | os.PathLike[bytes],
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal pty_descriptors, replaced
+                    if (
+                        selected_path == support.name
+                        and dir_fd is not None
+                        and not replaced
+                    ):
+                        observed_flags.append(flags)
+                        required_flags = (
+                            os.O_NONBLOCK | os.O_NOCTTY | os.O_NOFOLLOW
+                        )
+                        if flags & required_flags != required_flags:
+                            raise AssertionError(
+                                "trusted support open omitted required descriptor flags"
+                            )
+                        support.rename(held)
+                        if scenario == "fifo":
+                            os.mkfifo(support)
+                        elif scenario == "symlink":
+                            support.symlink_to(held.name)
+                        else:
+                            pty_descriptors = pty.openpty()
+                            support.symlink_to(os.ttyname(pty_descriptors[1]))
+                        replaced = True
+                    return original_open(
+                        selected_path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+
+                try:
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT.os,
+                        "open",
+                        side_effect=replace_between_selection_and_open,
+                    ):
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            "object changed while being opened|source cannot be read",
+                        ):
+                            _CANDIDATE_SUPPORT._read_stable_trusted_support(
+                                support
+                            )
+                finally:
+                    if pty_descriptors is not None:
+                        os.close(pty_descriptors[0])
+                        os.close(pty_descriptors[1])
+
+                self.assertTrue(replaced)
+                self.assertEqual(len(observed_flags), 1)
+
+    def test_stable_support_reader_rejects_open_policy_changes(self) -> None:
+        for scenario in ("mode", "link-count"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory).resolve(strict=True)
+                support = root / "required_ci_candidate.py"
+                alias = root / "support.alias"
+                support.write_bytes(b"support = True\n")
+                selected = support.lstat()
+                original_open = os.open
+                changed = False
+
+                def change_policy_before_open(
+                    selected_path: str
+                    | bytes
+                    | os.PathLike[str]
+                    | os.PathLike[bytes],
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal changed
+                    if (
+                        selected_path == support.name
+                        and dir_fd is not None
+                        and not changed
+                    ):
+                        if scenario == "mode":
+                            changed_mode = (
+                                0o600
+                                if stat.S_IMODE(selected.st_mode) != 0o600
+                                else 0o640
+                            )
+                            support.chmod(changed_mode)
+                        else:
+                            os.link(support, alias)
+                        changed = True
+                    return original_open(
+                        selected_path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT.os,
+                    "open",
+                    side_effect=change_policy_before_open,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "access policy changed while being opened",
+                    ):
+                        _CANDIDATE_SUPPORT._read_stable_trusted_support(
+                            support
+                        )
+
+                self.assertTrue(changed)
+
+    def test_stable_support_reader_rejects_group_change_during_open(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            support = root / "required_ci_candidate.py"
+            support.write_bytes(b"support = True\n")
+            selected = support.lstat()
+            alternate_groups = sorted(
+                group
+                for group in set((*os.getgroups(), os.getegid()))
+                if group != selected.st_gid
+            )
+            if not alternate_groups:
+                self.skipTest("no alternate supplementary group is available")
+            original_open = os.open
+            changed = False
+
+            def change_group_before_open(
+                selected_path: str
+                | bytes
+                | os.PathLike[str]
+                | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal changed
+                if (
+                    selected_path == support.name
+                    and dir_fd is not None
+                    and not changed
+                ):
+                    os.chown(support, -1, alternate_groups[0])
+                    changed = True
+                return original_open(
+                    selected_path,
+                    flags,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "open",
+                side_effect=change_group_before_open,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "access policy changed while being opened",
+                ):
+                    _CANDIDATE_SUPPORT._read_stable_trusted_support(support)
+
+            self.assertTrue(changed)
+
+    def test_selected_support_reader_rejects_same_content_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            support = root / "required_ci_candidate.py"
+            held = root / "support.held"
+            source = b"support = True\n"
+            support.write_bytes(source)
+            selected = support.lstat()
+            original_mode = stat.S_IMODE(selected.st_mode)
+            support.rename(held)
+            support.write_bytes(source)
+            support.chmod(original_mode)
+            try:
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "selected object binding changed",
+                ):
+                    _CANDIDATE_SUPPORT._read_selected_trusted_support(
+                        support,
+                        selected,
+                        "controller",
+                    )
+            finally:
+                support.unlink()
+                held.rename(support)
 
     def test_structure_validator_cli_does_not_enter_unittest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -9699,10 +15012,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             moved_tests_root = distribution_tests_root(moved_trusted_root)
             moved_tests_root.mkdir(parents=True)
             moved_test_path = moved_tests_root / "test_required_ci_workflow.py"
-            shutil.copyfile(Path(__file__).resolve(strict=True), moved_test_path)
-            shutil.copyfile(
-                TRUSTED_CANDIDATE_SUPPORT_PATH,
-                moved_tests_root / "required_ci_candidate.py",
+            moved_test_path.write_bytes(TRUSTED_TEST_SUPERVISOR_BYTES)
+            (moved_tests_root / "required_ci_candidate.py").write_bytes(
+                TRUSTED_CANDIDATE_SUPPORT_SOURCE
             )
             environment = os.environ.copy()
             environment["GITHUB_WORKSPACE"] = str(workspace)
@@ -10529,13 +15841,28 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self,
     ) -> None:
         source = inspect.getsource(supervise_trusted_required_ci_tests)
-        post_acquire = source.split(
-            "trusted_isolation_chain_registry()", 1
+        cleanup_scope = source.split(
+            "terminal_failures: list[_TerminalFailure] = []", 1
         )[1]
+        acquire_index = cleanup_scope.index(
+            "trusted_isolation_chain_registry()"
+        )
+        registry_use_index = cleanup_scope.index(
+            'registry_environment ='
+        )
+        finally_index = cleanup_scope.index("finally:")
+        cleanup_index = cleanup_scope.index(
+            '"isolation-cleanup"',
+            finally_index,
+        )
 
-        self.assertLess(
-            post_acquire.index("try:"),
-            post_acquire.index('registry_environment ='),
+        self.assertTrue(cleanup_scope.lstrip().startswith("try:"))
+        self.assertLess(acquire_index, registry_use_index)
+        self.assertLess(registry_use_index, finally_index)
+        self.assertLess(finally_index, cleanup_index)
+        self.assertIn(
+            "_close_and_verify_trusted_isolation(",
+            cleanup_scope[cleanup_index:],
         )
 
     def test_execution_snapshot_registers_cleanup_before_first_mutation(
@@ -10726,8 +16053,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertFalse(final_path.exists())
 
     def test_all_privileged_launches_use_the_registered_outer_gate(self) -> None:
-        support_source = TRUSTED_CANDIDATE_SUPPORT_PATH.read_text(
-            encoding="utf-8"
+        support_source = importlib.util.decode_source(
+            TRUSTED_CANDIDATE_SUPPORT_SOURCE
         )
         command_source = inspect.getsource(
             _CANDIDATE_SUPPORT._registered_sudo_command
@@ -10749,7 +16076,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     def test_privileged_tree_changes_are_fd_anchored_and_never_recursive_by_path(
         self,
     ) -> None:
-        support_source = TRUSTED_CANDIDATE_SUPPORT_PATH.read_text(encoding="utf-8")
+        support_source = importlib.util.decode_source(
+            TRUSTED_CANDIDATE_SUPPORT_SOURCE
+        )
 
         self.assertNotIn('"-hR"', support_source)
         self.assertTrue(
@@ -19344,6 +24673,33 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ),
             )
 
+    def assert_candidate_control_plane_rejected_before_child(
+        self,
+        trusted_root: Path,
+        candidate_root: Path,
+        *,
+        canary: Path | None = None,
+    ) -> None:
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "trusted_isolation_chain_registry",
+            side_effect=AssertionError(
+                "candidate manifest gate was bypassed"
+            ),
+        ) as registry, mock.patch.object(
+            sys.modules[__name__], "_run_trusted_test_child"
+        ) as run_child:
+            with self.assertRaisesRegex(
+                AssertionError,
+                "candidate active test control-plane manifest",
+            ):
+                self.supervise(trusted_root, candidate_root)
+
+        registry.assert_not_called()
+        run_child.assert_not_called()
+        if canary is not None:
+            self.assertFalse(canary.exists())
+
     def test_local_supervisor_harness_clears_inherited_strict_registry(
         self,
     ) -> None:
@@ -19397,18 +24753,21 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         root = Path(temporary_directory).resolve(strict=True)
         trusted_root = root / ".required-ci"
         candidate_root = root / ".candidate"
-        source_tests_root = TRUSTED_CONTENT_ROOT / CANDIDATE_TESTS_RELATIVE_PATH
         for repository_root in (trusted_root, candidate_root):
             tests_root = distribution_tests_root(repository_root)
             tests_root.mkdir(parents=True)
-            shutil.copyfile(
-                source_tests_root / "test_waited_delivery_hook_adapter.py",
-                tests_root / "test_waited_delivery_hook_adapter.py",
+            (
+                tests_root / "test_waited_delivery_hook_adapter.py"
+            ).write_bytes(
+                _trusted_test_control_plane_source(
+                    "test_waited_delivery_hook_adapter.py"
+                )
             )
-        shutil.copyfile(
-            TRUSTED_CANDIDATE_SUPPORT_PATH,
-            distribution_tests_root(trusted_root) / "required_ci_candidate.py",
-        )
+        for repository_root in (trusted_root, candidate_root):
+            (
+                distribution_tests_root(repository_root)
+                / "required_ci_candidate.py"
+            ).write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
         candidate_scripts_root = (
             distribution_content_root(candidate_root)
             / "skills/waited-delivery/scripts"
@@ -19540,6 +24899,100 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.readme_test_commands(REPO_ROOT),
             [README_COMPILE_COMMAND, README_DISCOVERY_COMMAND],
         )
+
+    def test_readme_exact_discovery_uses_a_fresh_external_cache(
+        self,
+    ) -> None:
+        if DISTRIBUTION_PROFILE == "private":
+            self.skipTest(
+                "canonical repository documentation is not shipped in private distribution"
+            )
+        import py_compile
+
+        _compile_command, discovery_command = self.readme_test_commands(
+            REPO_ROOT
+        )
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        assert bash is not None
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            checkout_root = fixture_root / "checkout"
+            tests_root = checkout_root / "skills/waited-delivery/tests"
+            external_cache_parent = fixture_root / "external-cache-parent"
+            tests_root.mkdir(parents=True)
+            external_cache_parent.mkdir()
+            source_path = tests_root / "test_readme_discovery.py"
+            source_path.write_text(
+                "import unittest\n\n"
+                "class ReadmeDiscoveryTests(unittest.TestCase):\n"
+                "    def test_source(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            canary = fixture_root / "unchecked-main-pyc.executed"
+            poison_source = fixture_root / "poison.py"
+            poison_source.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "import unittest\n\n"
+                "class ReadmeDiscoveryTests(unittest.TestCase):\n"
+                "    def test_source(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            shared_cache = tests_root / "__pycache__"
+            shared_cache.mkdir()
+            poison_cache = shared_cache / (
+                f"{source_path.stem}.{sys.implementation.cache_tag}.pyc"
+            )
+            py_compile.compile(
+                str(poison_source),
+                cfile=str(poison_cache),
+                doraise=True,
+                invalidation_mode=(
+                    py_compile.PycInvalidationMode.UNCHECKED_HASH
+                ),
+            )
+            shared_cache_binding = _test_control_plane_directory_binding(
+                shared_cache.stat()
+            )
+            poison_binding = _test_control_plane_file_binding(
+                poison_cache.stat()
+            )
+            poison_bytes = poison_cache.read_bytes()
+            environment = os.environ.copy()
+            environment["TMPDIR"] = str(external_cache_parent)
+            environment.pop("BASH_ENV", None)
+
+            completed = subprocess.run(
+                [bash, "-c", discovery_command],
+                cwd=checkout_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("Ran 1 test", completed.stderr)
+            self.assertFalse(canary.exists())
+            self.assertEqual(
+                _test_control_plane_directory_binding(shared_cache.stat()),
+                shared_cache_binding,
+            )
+            self.assertEqual(
+                _test_control_plane_file_binding(poison_cache.stat()),
+                poison_binding,
+            )
+            self.assertEqual(poison_cache.read_bytes(), poison_bytes)
+            self.assertEqual(
+                sorted(path.name for path in shared_cache.iterdir()),
+                [poison_cache.name],
+            )
+            self.assertEqual(list(external_cache_parent.iterdir()), [])
 
     def test_readme_compile_checks_syntax_without_temp_or_bytecode(self) -> None:
         if DISTRIBUTION_PROFILE == "private":
@@ -19740,10 +25193,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.write_test_module(
                 candidate_root,
                 "test_required.py",
-                self.required_module()
-                + "\nclass AddedTests(unittest.TestCase):\n"
-                "    def test_added(self):\n"
-                "        pass\n",
+                self.required_module(),
             )
 
             receipt = self.supervise(trusted_root, candidate_root)
@@ -19773,6 +25223,1197 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(receipt["expected_test_count"], 2)
         self.assertEqual(receipt["executed_test_count"], 2)
 
+    def test_supervisor_rejects_candidate_test_control_plane_mismatch_before_child(
+        self,
+    ) -> None:
+        scenarios = (
+            "extra-module",
+            "same-id-body",
+            "top-level-poison",
+            "candidate-support-poison",
+            "missing-support",
+            "symlink",
+            "mode",
+            "unchecked-support-pyc",
+            "shlex-shadow",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root = self.prepare_roots(
+                        temporary_directory
+                    )
+                    candidate_tests_root = distribution_tests_root(
+                        candidate_root
+                    )
+                    candidate_test_path = (
+                        candidate_tests_root / "test_required.py"
+                    )
+                    candidate_support_path = (
+                        candidate_tests_root / "required_ci_candidate.py"
+                    )
+                    canary = (
+                        Path(temporary_directory)
+                        / f"candidate-{scenario}.executed"
+                    )
+                    self.write_test_module(
+                        candidate_root,
+                        "test_required.py",
+                        self.required_module(),
+                    )
+                    poison = (
+                        "from pathlib import Path\n"
+                        f"Path({str(canary)!r}).write_text("
+                        "'executed', encoding='utf-8')\n"
+                    )
+                    if scenario == "extra-module":
+                        self.write_test_module(
+                            candidate_root,
+                            "test_extra.py",
+                            poison
+                            + "import unittest\n\n"
+                            "class ExtraTests(unittest.TestCase):\n"
+                            "    def test_extra(self):\n"
+                            "        pass\n",
+                        )
+                    elif scenario == "same-id-body":
+                        self.write_test_module(
+                            candidate_root,
+                            "test_required.py",
+                            self.required_module(body="        pAss\n"),
+                        )
+                        self.assertEqual(
+                            candidate_test_path.stat().st_size,
+                            (
+                                distribution_tests_root(trusted_root)
+                                / "test_required.py"
+                            ).stat().st_size,
+                        )
+                    elif scenario == "top-level-poison":
+                        self.write_test_module(
+                            candidate_root,
+                            "test_required.py",
+                            poison + self.required_module(),
+                        )
+                    elif scenario == "candidate-support-poison":
+                        candidate_support_path.write_text(
+                            poison, encoding="utf-8"
+                        )
+                    elif scenario == "missing-support":
+                        candidate_support_path.unlink()
+                    elif scenario == "symlink":
+                        candidate_test_path.unlink()
+                        candidate_test_path.symlink_to(
+                            distribution_tests_root(trusted_root)
+                            / "test_required.py"
+                        )
+                    elif scenario == "unchecked-support-pyc":
+                        import py_compile
+
+                        pycache_root = candidate_tests_root / "__pycache__"
+                        pycache_root.mkdir()
+                        poison_source_path = (
+                            Path(temporary_directory) / "poison_support.py"
+                        )
+                        poison_source_path.write_text(
+                            poison, encoding="utf-8"
+                        )
+                        py_compile.compile(
+                            str(poison_source_path),
+                            cfile=str(
+                                pycache_root
+                                / (
+                                    "required_ci_candidate."
+                                    f"{sys.implementation.cache_tag}.pyc"
+                                )
+                            ),
+                            doraise=True,
+                            invalidation_mode=(
+                                py_compile.PycInvalidationMode.UNCHECKED_HASH
+                            ),
+                        )
+                    elif scenario == "shlex-shadow":
+                        (candidate_tests_root / "shlex.py").write_text(
+                            poison, encoding="utf-8"
+                        )
+                    else:
+                        candidate_test_path.chmod(0o755)
+
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "trusted_isolation_chain_registry",
+                        side_effect=AssertionError(
+                            "candidate manifest gate was bypassed"
+                        ),
+                    ) as registry, mock.patch.object(
+                        sys.modules[__name__], "_run_trusted_test_child"
+                    ) as run_child:
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            r"candidate .*active test control-plane "
+                            r"(?:manifest|namespace|file)",
+                        ):
+                            self.supervise(trusted_root, candidate_root)
+
+                    registry.assert_not_called()
+                    run_child.assert_not_called()
+                    self.assertFalse(canary.exists())
+
+    def test_child_executes_captured_supervisor_before_path_revalidation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            canary = Path(temporary_directory) / "path-supervisor.executed"
+            held = Path(temporary_directory) / "trusted-supervisor.held"
+            actual_run = _run_trusted_test_child
+            replacement_executed = False
+
+            def replace_supervisor_before_child(
+                command: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                nonlocal replacement_executed
+                flag_index = command.index(TRUSTED_TEST_CHILD_FLAG)
+                supervisor_path = Path(command[flag_index - 1])
+                original_source = supervisor_path.read_bytes()
+                original_mode = stat.S_IMODE(supervisor_path.stat().st_mode)
+                poison_prefix = (
+                    "from pathlib import Path\n"
+                    f"Path({str(canary)!r}).write_text("
+                    "'executed', encoding='utf-8')\n"
+                    "raise AssertionError('replacement supervisor executed')\n"
+                    "#"
+                ).encode("utf-8")
+                self.assertLess(len(poison_prefix), len(original_source))
+                poison_source = poison_prefix + b"x" * (
+                    len(original_source) - len(poison_prefix)
+                )
+                self.assertEqual(len(poison_source), len(original_source))
+                supervisor_path.rename(held)
+                supervisor_path.write_bytes(poison_source)
+                supervisor_path.chmod(original_mode)
+                try:
+                    completed = actual_run(command, **kwargs)
+                    replacement_executed = canary.exists()
+                    return completed
+                finally:
+                    supervisor_path.unlink()
+                    held.rename(supervisor_path)
+
+            with mock.patch.object(
+                sys.modules[__name__],
+                "_run_trusted_test_child",
+                side_effect=replace_supervisor_before_child,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    r"trusted Required CI (?:tests did not complete|child returned)",
+                ):
+                    self.supervise(trusted_root, candidate_root)
+
+            self.assertFalse(
+                replacement_executed,
+                "the child must not execute a path replacement before revalidation",
+            )
+            self.assertFalse(canary.exists())
+
+    def test_late_launch_snapshot_cannot_authorize_replacement_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            canary = Path(temporary_directory) / "late-launch.executed"
+            actual_registry = (
+                _CANDIDATE_SUPPORT.trusted_isolation_chain_registry
+            )
+            actual_run = _run_trusted_test_child
+            replacement_installed = False
+            supervisor_path: Path | None = None
+            held: Path | None = None
+
+            def install_replacement_before_child_authority(
+            ) -> Mapping[str, object]:
+                nonlocal replacement_installed, supervisor_path, held
+                supervisor_path = Path(__file__).resolve(strict=True)
+                held = Path(temporary_directory) / "captured-supervisor.held"
+                original_source = supervisor_path.read_bytes()
+                original_mode = stat.S_IMODE(supervisor_path.stat().st_mode)
+                poison_prefix = (
+                    "from pathlib import Path\n"
+                    f"Path({str(canary)!r}).write_text("
+                    "'executed', encoding='utf-8')\n"
+                    "raise AssertionError('late launch replacement executed')\n"
+                    "#"
+                ).encode("utf-8")
+                self.assertLess(len(poison_prefix), len(original_source))
+                poison_source = poison_prefix + b"x" * (
+                    len(original_source) - len(poison_prefix)
+                )
+                supervisor_path.rename(held)
+                supervisor_path.write_bytes(poison_source)
+                supervisor_path.chmod(original_mode)
+                replacement_installed = True
+                return actual_registry()
+
+            def restore_after_child(
+                command: list[str],
+                **kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                try:
+                    return actual_run(command, **kwargs)
+                finally:
+                    assert supervisor_path is not None
+                    assert held is not None
+                    supervisor_path.unlink()
+                    held.rename(supervisor_path)
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "trusted_isolation_chain_registry",
+                    side_effect=install_replacement_before_child_authority,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "_run_trusted_test_child",
+                    side_effect=restore_after_child,
+                ):
+                    with self.assertRaises(AssertionError):
+                        self.supervise(trusted_root, candidate_root)
+            finally:
+                if supervisor_path is not None and held is not None and held.exists():
+                    if supervisor_path.exists():
+                        supervisor_path.unlink()
+                    held.rename(supervisor_path)
+
+            self.assertTrue(replacement_installed)
+            self.assertFalse(
+                canary.exists(),
+                "a late launch snapshot must not authorize its own source bytes",
+            )
+
+    def test_formal_preload_snapshot_cannot_be_rebased_by_supervisor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            early_snapshot = _active_test_control_plane_snapshot(
+                trusted_root,
+                "trusted",
+            )
+            canary = Path(temporary_directory) / "rebased-suite.executed"
+            poison = (
+                "from pathlib import Path\n"
+                f"Path({str(canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                + self.required_module()
+            )
+            self.write_test_module(
+                trusted_root,
+                "test_required.py",
+                poison,
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                poison,
+            )
+
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            with _local_nonstrict_supervisor_environment(), mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_TRUSTED_TEST_NAMESPACE_PRELOAD_SNAPSHOT",
+                early_snapshot,
+                create=True,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "changed after the formal preload",
+                ):
+                    supervise_trusted_required_ci_tests(
+                        trusted_root,
+                        candidate_root,
+                        supervisor_deadline=(
+                            time.monotonic()
+                            + TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS
+                        ),
+                    )
+
+            self.assertFalse(
+                canary.exists(),
+                "a late suite snapshot must not replace formal preload authority",
+            )
+
+    def test_child_rejects_suite_replacement_before_discovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            target = (
+                distribution_tests_root(trusted_root) / "test_required.py"
+            )
+            original_source = target.read_bytes()
+            original_mode = stat.S_IMODE(target.stat().st_mode)
+            held = Path(temporary_directory) / "trusted-test.held"
+            canary = trusted_root / ".suite-canary"
+            poison_prefix = (
+                f"open({canary.name!r}, 'w').write('executed')\n"
+                "import unittest\n"
+                "class X(unittest.TestCase):\n"
+                " def test_x(self): pass\n"
+                "#"
+            ).encode("utf-8")
+            self.assertLess(len(poison_prefix), len(original_source))
+            poison_source = poison_prefix + b"x" * (
+                len(original_source) - len(poison_prefix)
+            )
+            self.assertEqual(len(poison_source), len(original_source))
+            actual_run = _run_trusted_test_child
+            child_started = False
+
+            def replace_suite_around_child(
+                command: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                nonlocal child_started
+                target.rename(held)
+                target.write_bytes(poison_source)
+                target.chmod(original_mode)
+                try:
+                    child_started = True
+                    return actual_run(command, **kwargs)
+                finally:
+                    target.unlink()
+                    held.rename(target)
+
+            with mock.patch.object(
+                sys.modules[__name__],
+                "_run_trusted_test_child",
+                side_effect=replace_suite_around_child,
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    r"trusted Required CI (?:tests did not complete|child returned)",
+                ):
+                    self.supervise(trusted_root, candidate_root)
+
+            self.assertTrue(child_started)
+            self.assertFalse(
+                canary.exists(),
+                "suite commitment must reject replacement before discovery",
+            )
+
+    def test_child_executes_parent_captured_suite_after_commitment(
+        self,
+    ) -> None:
+        missing_module = object()
+        previous_test_module = sys.modules.pop("test_required", missing_module)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            padded_source = self.required_module() + "#" + "x" * 2048 + "\n"
+            self.write_test_module(
+                trusted_root,
+                "test_required.py",
+                padded_source,
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                padded_source,
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            target = distribution_tests_root(trusted_root) / "test_required.py"
+            original_source = target.read_bytes()
+            canary = Path(temporary_directory) / "discover-window.executed"
+            poison_prefix = (
+                "from pathlib import Path\n"
+                f"Path({str(canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "import unittest\n\n"
+                "class RequiredTests(unittest.TestCase):\n"
+                "    def test_one(self):\n"
+                "        pass\n"
+                "    def test_two(self):\n"
+                "        pass\n"
+                "#"
+            ).encode("utf-8")
+            self.assertLess(len(poison_prefix), len(original_source))
+            poison_source = poison_prefix + b"x" * (
+                len(original_source) - len(poison_prefix)
+            )
+            actual_suite_loader = _trusted_test_suite_from_snapshot
+            discovery_window_opened = False
+
+            @contextlib.contextmanager
+            def replace_only_during_captured_load(
+                snapshot: dict[str, object],
+            ) -> Iterator[tuple[unittest.TestSuite, unittest.TestLoader]]:
+                nonlocal discovery_window_opened
+                target.write_bytes(poison_source)
+                discovery_window_opened = True
+                try:
+                    with actual_suite_loader(snapshot) as captured_suite:
+                        yield captured_suite
+                finally:
+                    target.write_bytes(original_source)
+
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                        REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                    },
+                    clear=False,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "_trusted_test_suite_from_snapshot",
+                    side_effect=replace_only_during_captured_load,
+                ):
+                    for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+                        os.environ.pop(key, None)
+                    receipt = _trusted_test_suite_receipt(
+                        trusted_root,
+                        candidate_root,
+                    )
+            finally:
+                target.write_bytes(original_source)
+                sys.modules.pop("test_required", None)
+                if previous_test_module is not missing_module:
+                    sys.modules["test_required"] = previous_test_module
+
+            self.assertEqual(receipt["status"], "completed")
+            self.assertTrue(discovery_window_opened)
+            self.assertFalse(
+                canary.exists(),
+                "discovery must execute parent-captured bytes, not a path reopen",
+            )
+
+    def test_captured_suite_source_introspection_never_reopens_its_path(
+        self,
+    ) -> None:
+        missing_module = object()
+        previous_test_module = sys.modules.pop("test_required", missing_module)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            canary = Path(temporary_directory) / "introspection-path.executed"
+            source = (
+                "import inspect\n"
+                "from pathlib import Path\n"
+                "import unittest\n\n"
+                "class RequiredTests(unittest.TestCase):\n"
+                "    def test_one(self):\n"
+                "        # SAFE_MARKER\n"
+                "        loader_source = __loader__.get_source(__name__)\n"
+                "        if '# SAFE_MARKER' not in loader_source:\n"
+                f"            Path({str(canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "        source = inspect.getsource(type(self).test_one)\n"
+                "        if any(line.strip() == '# EVIL_MARKER' "
+                "for line in source.splitlines()):\n"
+                f"            Path({str(canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "    def test_two(self):\n"
+                "        pass\n"
+            )
+            decoy = source.replace("SAFE_MARKER", "EVIL_MARKER")
+            self.assertEqual(len(decoy), len(source))
+            self.write_test_module(trusted_root, "test_required.py", source)
+            self.write_test_module(candidate_root, "test_required.py", source)
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            target = distribution_tests_root(trusted_root) / "test_required.py"
+            actual_suite_loader = _trusted_test_suite_from_snapshot
+            actual_get_source = _CapturedSourceLoader.get_source
+            introspection_window_opened = False
+            loader_source_reads = 0
+
+            def record_loader_source(
+                loader: _CapturedSourceLoader,
+                fullname: str,
+            ) -> str:
+                nonlocal loader_source_reads
+                loader_source_reads += 1
+                return actual_get_source(loader, fullname)
+
+            @contextlib.contextmanager
+            def introspect_while_path_is_decoy(
+                snapshot: dict[str, object],
+            ) -> Iterator[tuple[unittest.TestSuite, unittest.TestLoader]]:
+                nonlocal introspection_window_opened
+                target.write_text(decoy, encoding="utf-8")
+                introspection_window_opened = True
+                try:
+                    with actual_suite_loader(snapshot) as captured_suite:
+                        yield captured_suite
+                finally:
+                    target.write_text(source, encoding="utf-8")
+
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                        REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                    },
+                    clear=False,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "_trusted_test_suite_from_snapshot",
+                    side_effect=introspect_while_path_is_decoy,
+                ), mock.patch.object(
+                    _CapturedSourceLoader,
+                    "get_source",
+                    autospec=True,
+                    side_effect=record_loader_source,
+                ):
+                    for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+                        os.environ.pop(key, None)
+                    receipt = _trusted_test_suite_receipt(
+                        trusted_root,
+                        candidate_root,
+                    )
+            finally:
+                target.write_text(source, encoding="utf-8")
+                sys.modules.pop("test_required", None)
+                if previous_test_module is not missing_module:
+                    sys.modules["test_required"] = previous_test_module
+
+            self.assertEqual(receipt["status"], "completed")
+            self.assertTrue(introspection_window_opened)
+            self.assertGreaterEqual(loader_source_reads, 1)
+            self.assertFalse(
+                canary.exists(),
+                "captured source introspection must not consult the original path",
+            )
+
+    def test_child_ignores_unchecked_bytecode_created_after_commitment(
+        self,
+    ) -> None:
+        import py_compile
+
+        missing_module = object()
+        previous_test_module = sys.modules.pop("test_required", missing_module)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            tests_root = distribution_tests_root(trusted_root)
+            canary = Path(temporary_directory) / "captured-pyc.executed"
+            poison_source = Path(temporary_directory) / "poison.py"
+            poison_source.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+                "import unittest\n\n"
+                "class RequiredTests(unittest.TestCase):\n"
+                "    def test_one(self):\n"
+                "        pass\n"
+                "    def test_two(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            pycache_root = tests_root / "__pycache__"
+            poison_cache = pycache_root / (
+                f"test_required.{sys.implementation.cache_tag}.pyc"
+            )
+            actual_suite_loader = _trusted_test_suite_from_snapshot
+            cache_window_opened = False
+
+            @contextlib.contextmanager
+            def load_while_unchecked_cache_exists(
+                snapshot: dict[str, object],
+            ) -> Iterator[tuple[unittest.TestSuite, unittest.TestLoader]]:
+                nonlocal cache_window_opened
+                pycache_root.mkdir()
+                py_compile.compile(
+                    str(poison_source),
+                    cfile=str(poison_cache),
+                    doraise=True,
+                    invalidation_mode=(
+                        py_compile.PycInvalidationMode.UNCHECKED_HASH
+                    ),
+                )
+                cache_window_opened = True
+                try:
+                    with actual_suite_loader(snapshot) as captured_suite:
+                        yield captured_suite
+                finally:
+                    poison_cache.unlink()
+                    pycache_root.rmdir()
+
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                        REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                    },
+                    clear=False,
+                ), mock.patch.object(
+                    sys.modules[__name__],
+                    "_trusted_test_suite_from_snapshot",
+                    side_effect=load_while_unchecked_cache_exists,
+                ):
+                    for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+                        os.environ.pop(key, None)
+                    receipt = _trusted_test_suite_receipt(
+                        trusted_root,
+                        candidate_root,
+                    )
+            finally:
+                if poison_cache.exists():
+                    poison_cache.unlink()
+                if pycache_root.exists():
+                    pycache_root.rmdir()
+                sys.modules.pop("test_required", None)
+                if previous_test_module is not missing_module:
+                    sys.modules["test_required"] = previous_test_module
+
+            self.assertEqual(receipt["status"], "completed")
+            self.assertTrue(cache_window_opened)
+            self.assertFalse(canary.exists())
+
+    def test_child_failure_still_reports_control_plane_drift(self) -> None:
+        missing_module = object()
+        previous_test_module = sys.modules.pop("test_required", missing_module)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            target = distribution_tests_root(trusted_root) / "test_required.py"
+            original_source = target.read_bytes()
+            changed_source = original_source.replace(
+                b"        pass\n",
+                b"        pAss\n",
+                1,
+            )
+            self.assertEqual(len(changed_source), len(original_source))
+            actual_run = unittest.TextTestRunner.run
+
+            def fail_and_drift(
+                runner: unittest.TextTestRunner,
+                suite: unittest.TestSuite,
+            ) -> unittest.TestResult:
+                result = actual_run(runner, suite)
+                result.failures.append((suite, "forced primary failure"))
+                target.write_bytes(changed_source)
+                return result
+
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                        REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                    },
+                    clear=False,
+                ), mock.patch.object(
+                    unittest.TextTestRunner,
+                    "run",
+                    new=fail_and_drift,
+                ):
+                    for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+                        os.environ.pop(key, None)
+                    with self.assertRaises(AssertionError) as raised:
+                        _trusted_test_suite_receipt(
+                            trusted_root,
+                            candidate_root,
+                        )
+            finally:
+                target.write_bytes(original_source)
+                sys.modules.pop("test_required", None)
+                if previous_test_module is not missing_module:
+                    sys.modules["test_required"] = previous_test_module
+
+            message = str(raised.exception)
+            self.assertIn("trusted test suite did not complete", message)
+            self.assertIn("trusted active test control-plane", message)
+
+    def test_child_failure_runs_every_terminal_revalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            actual_snapshot = _active_test_control_plane_snapshot
+            actual_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding
+            actual_inventory = _trusted_test_inventory_from_snapshot
+            import_path_calls = 0
+            trusted_snapshot_calls = 0
+            binding_calls = 0
+            inventory_calls = 0
+            primary_error = AssertionError("suite execution sentinel")
+
+            def terminal_import_path_failure(_candidate_root: Path) -> None:
+                nonlocal import_path_calls
+                import_path_calls += 1
+                if import_path_calls == 2:
+                    raise AssertionError("final import path sentinel")
+
+            def terminal_snapshot_failure(
+                repo_root: Path,
+                description: str,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal trusted_snapshot_calls
+                if description == "trusted":
+                    trusted_snapshot_calls += 1
+                    if trusted_snapshot_calls == 2:
+                        raise AssertionError("final trusted sentinel")
+                return actual_snapshot(repo_root, description, **kwargs)
+
+            def terminal_binding_failure(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal binding_calls
+                binding_calls += 1
+                if binding_calls == 2:
+                    raise AssertionError("final binding sentinel")
+                return actual_binding(*args, **kwargs)
+
+            def terminal_inventory_failure(
+                snapshot: dict[str, object],
+            ) -> list[dict[str, object]]:
+                nonlocal inventory_calls
+                inventory_calls += 1
+                if inventory_calls == 2:
+                    raise AssertionError("final inventory sentinel")
+                return actual_inventory(snapshot)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                },
+                clear=False,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_trusted_test_suite_from_snapshot",
+                side_effect=primary_error,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_assert_candidate_absent_from_sys_path",
+                side_effect=terminal_import_path_failure,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_trusted_test_inventory_from_snapshot",
+                side_effect=terminal_inventory_failure,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_active_test_control_plane_snapshot",
+                side_effect=terminal_snapshot_failure,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_checkout_binding",
+                side_effect=terminal_binding_failure,
+            ):
+                with self.assertRaises(
+                    _RequiredCITerminalFailures
+                ) as raised:
+                    _trusted_test_suite_receipt(
+                        trusted_root,
+                        candidate_root,
+                    )
+
+            self.assertEqual(
+                [
+                    (role, phase)
+                    for role, phase, _error in raised.exception.failures
+                ],
+                [
+                    ("primary", "suite-execution"),
+                    ("integrity", "final-import-path"),
+                    ("integrity", "final-inventory"),
+                    ("integrity", "final-trusted-control-plane"),
+                    ("integrity", "final-candidate-binding"),
+                ],
+            )
+            self.assertIs(raised.exception.failures[0][2], primary_error)
+            self.assertIs(raised.exception.__cause__, primary_error)
+
+    def test_parent_nonzero_child_still_reports_control_plane_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            target = distribution_tests_root(trusted_root) / "test_required.py"
+            original_source = target.read_bytes()
+            changed_source = original_source.replace(
+                b"        pass\n",
+                b"        pAss\n",
+                1,
+            )
+            self.assertEqual(len(changed_source), len(original_source))
+
+            def fail_and_drift_child(
+                command: list[str],
+                **_kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                target.write_bytes(changed_source)
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    "",
+                    "forced child failure",
+                )
+
+            try:
+                with mock.patch.object(
+                    sys.modules[__name__],
+                    "_run_trusted_test_child",
+                    side_effect=fail_and_drift_child,
+                ):
+                    with self.assertRaises(AssertionError) as raised:
+                        self.supervise(trusted_root, candidate_root)
+            finally:
+                target.write_bytes(original_source)
+
+            message = str(raised.exception)
+            self.assertIn("trusted Required CI tests did not complete", message)
+            self.assertIn("trusted active test control-plane", message)
+
+    def test_parent_failure_runs_every_terminal_revalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            actual_snapshot = _active_test_control_plane_snapshot
+            actual_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding
+            actual_cleanup = _close_and_verify_trusted_isolation
+            actual_inventory = _trusted_test_inventory_from_snapshot
+            snapshot_counts = {"trusted": 0, "candidate": 0}
+            binding_calls = 0
+            import_path_calls = 0
+            inventory_calls = 0
+            primary_error = AssertionError("child run sentinel")
+            cleanup_error = AssertionError("cleanup sentinel")
+
+            def terminal_snapshot_failures(
+                repo_root: Path,
+                description: str,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                if description in snapshot_counts:
+                    snapshot_counts[description] += 1
+                    if snapshot_counts[description] == 2:
+                        raise AssertionError(f"final {description} sentinel")
+                if description == "trusted launch":
+                    raise AssertionError("final launch sentinel")
+                return actual_snapshot(repo_root, description, **kwargs)
+
+            def terminal_binding_failure(
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                nonlocal binding_calls
+                binding_calls += 1
+                if binding_calls == 2:
+                    raise AssertionError("final binding sentinel")
+                return actual_binding(*args, **kwargs)
+
+            def cleanup_then_fail(registry: Mapping[str, object]) -> None:
+                actual_cleanup(registry)
+                raise cleanup_error
+
+            def terminal_import_path_failure(_candidate_root: Path) -> None:
+                nonlocal import_path_calls
+                import_path_calls += 1
+                if import_path_calls == 2:
+                    raise AssertionError("final import path sentinel")
+
+            def terminal_inventory_failure(
+                snapshot: dict[str, object],
+            ) -> list[dict[str, object]]:
+                nonlocal inventory_calls
+                inventory_calls += 1
+                if inventory_calls == 2:
+                    raise AssertionError("final inventory sentinel")
+                return actual_inventory(snapshot)
+
+            with mock.patch.object(
+                sys.modules[__name__],
+                "_run_trusted_test_child",
+                side_effect=primary_error,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_close_and_verify_trusted_isolation",
+                side_effect=cleanup_then_fail,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_assert_candidate_absent_from_sys_path",
+                side_effect=terminal_import_path_failure,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_active_test_control_plane_snapshot",
+                side_effect=terminal_snapshot_failures,
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "_trusted_test_inventory_from_snapshot",
+                side_effect=terminal_inventory_failure,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_checkout_binding",
+                side_effect=terminal_binding_failure,
+            ):
+                with self.assertRaises(
+                    _RequiredCITerminalFailures
+                ) as raised:
+                    self.supervise(trusted_root, candidate_root)
+
+            self.assertEqual(
+                [
+                    (role, phase)
+                    for role, phase, _error in raised.exception.failures
+                ],
+                [
+                    ("primary", "child-run"),
+                    ("integrity", "isolation-cleanup"),
+                    ("integrity", "final-import-path"),
+                    ("integrity", "final-launch"),
+                    ("integrity", "final-inventory"),
+                    ("integrity", "final-trusted-control-plane"),
+                    ("integrity", "final-candidate-control-plane"),
+                    ("integrity", "final-candidate-binding"),
+                ],
+            )
+            self.assertIs(raised.exception.failures[0][2], primary_error)
+            self.assertIs(raised.exception.failures[1][2], cleanup_error)
+            self.assertIs(raised.exception.__cause__, primary_error)
+
+    def test_supervisor_revalidates_both_control_planes_after_child(
+        self,
+    ) -> None:
+        scenarios = (
+            ("trusted", "content"),
+            ("trusted", "mode"),
+            ("trusted", "replacement"),
+            ("candidate", "content"),
+            ("candidate", "mode"),
+            ("candidate", "replacement"),
+        )
+        for side, mutation in scenarios:
+            with self.subTest(side=side, mutation=mutation):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root = self.prepare_roots(
+                        temporary_directory
+                    )
+                    self.write_test_module(
+                        candidate_root,
+                        "test_required.py",
+                        self.required_module(),
+                    )
+                    selected_root = (
+                        trusted_root if side == "trusted" else candidate_root
+                    )
+                    selected_path = (
+                        distribution_tests_root(selected_root)
+                        / "test_required.py"
+                    )
+                    original_source = selected_path.read_bytes()
+                    original_metadata = selected_path.stat()
+                    original_binding = _test_control_plane_file_binding(
+                        original_metadata
+                    )
+                    child_completed = False
+                    replacement_path = (
+                        Path(temporary_directory)
+                        / f"supervisor-{side}-test_required.py.held"
+                    )
+                    actual_run = _run_trusted_test_child
+
+                    def mutate_after_child(
+                        command: list[str], **kwargs: object
+                    ) -> subprocess.CompletedProcess[str]:
+                        nonlocal child_completed
+                        completed = actual_run(command, **kwargs)
+                        child_completed = True
+                        if mutation == "content":
+                            changed_source = original_source.replace(
+                                b"        pass\n", b"        pAss\n", 1
+                            )
+                            self.assertEqual(
+                                len(changed_source), len(original_source)
+                            )
+                            selected_path.write_bytes(changed_source)
+                        elif mutation == "mode":
+                            selected_path.chmod(
+                                stat.S_IMODE(original_metadata.st_mode) ^ 0o100
+                            )
+                        else:
+                            selected_path.rename(replacement_path)
+                            selected_path.write_bytes(original_source)
+                            selected_path.chmod(
+                                stat.S_IMODE(original_metadata.st_mode)
+                            )
+                        return completed
+
+                    with mock.patch.object(
+                        sys.modules[__name__],
+                        "_run_trusted_test_child",
+                        side_effect=mutate_after_child,
+                    ):
+                        expected_error = (
+                            rf"{side} active test control-plane manifest "
+                            r"changed during execution"
+                            if mutation == "replacement"
+                            else rf"{side} active test control-plane manifest"
+                        )
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            expected_error,
+                        ):
+                            self.supervise(trusted_root, candidate_root)
+
+                    self.assertTrue(child_completed)
+                    changed_metadata = selected_path.stat()
+                    changed_binding = _test_control_plane_file_binding(
+                        changed_metadata
+                    )
+                    if mutation == "content":
+                        self.assertEqual(changed_binding, original_binding)
+                        self.assertNotEqual(
+                            selected_path.read_bytes(), original_source
+                        )
+                    elif mutation == "mode":
+                        self.assertEqual(
+                            (changed_binding[0], changed_binding[1]),
+                            (original_binding[0], original_binding[1]),
+                        )
+                        self.assertNotEqual(
+                            changed_binding[3], original_binding[3]
+                        )
+                        self.assertEqual(
+                            selected_path.read_bytes(), original_source
+                        )
+                    else:
+                        self.assertEqual(
+                            selected_path.read_bytes(), original_source
+                        )
+                        self.assertEqual(
+                            changed_binding[2:], original_binding[2:]
+                        )
+                        self.assertNotEqual(
+                            (changed_binding[0], changed_binding[1]),
+                            (original_binding[0], original_binding[1]),
+                        )
+                        self.assertEqual(
+                            _test_control_plane_file_binding(
+                                replacement_path.stat()
+                            ),
+                            original_binding,
+                        )
+
+    def test_supervisor_accepts_benign_trusted_test_timestamp_churn(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                self.required_module(),
+            )
+            trusted_test_path = (
+                distribution_tests_root(trusted_root) / "test_required.py"
+            )
+            original_metadata = trusted_test_path.stat()
+            actual_run = _run_trusted_test_child
+
+            def touch_after_child(
+                command: list[str], **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                completed = actual_run(command, **kwargs)
+                os.utime(
+                    trusted_test_path,
+                    ns=(
+                        original_metadata.st_atime_ns,
+                        original_metadata.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+                return completed
+
+            with mock.patch.object(
+                sys.modules[__name__],
+                "_run_trusted_test_child",
+                side_effect=touch_after_child,
+            ):
+                receipt = self.supervise(trusted_root, candidate_root)
+
+            final_metadata = trusted_test_path.stat()
+            self.assertEqual(receipt["status"], "completed")
+            self.assertEqual(
+                _test_control_plane_file_binding(final_metadata),
+                _test_control_plane_file_binding(original_metadata),
+            )
+            self.assertNotEqual(
+                final_metadata.st_mtime_ns, original_metadata.st_mtime_ns
+            )
+
     def test_supervisor_rejects_empty_candidate_runtime_with_preserved_inventory(
         self,
     ) -> None:
@@ -19780,9 +26421,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             root = Path(temporary_directory).resolve(strict=True)
             trusted_root = root / ".required-ci"
             candidate_root = root / ".candidate"
-            source_tests_root = (
-                TRUSTED_CONTENT_ROOT / "skills/waited-delivery/tests"
-            )
             functional_test_modules = (
                 "test_skill_contract.py",
                 "test_waited_delivery_bridge.py",
@@ -19802,15 +26440,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 tests_root = distribution_tests_root(repository_root)
                 tests_root.mkdir(parents=True, exist_ok=True)
                 for module_name in functional_test_modules:
-                    shutil.copyfile(
-                        source_tests_root / module_name,
-                        tests_root / module_name,
+                    (tests_root / module_name).write_bytes(
+                        _trusted_test_control_plane_source(module_name)
                     )
-                if repository_root == trusted_root:
-                    shutil.copyfile(
-                        TRUSTED_CANDIDATE_SUPPORT_PATH,
-                        tests_root / "required_ci_candidate.py",
-                    )
+                (tests_root / "required_ci_candidate.py").write_bytes(
+                    TRUSTED_CANDIDATE_SUPPORT_SOURCE
+                )
 
             trusted_scripts_root = (
                 distribution_content_root(trusted_root)
@@ -19835,6 +26470,357 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             ):
                 self.supervise(trusted_root, candidate_root)
 
+    def test_suite_bundle_decoder_rejects_noncanonical_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            snapshot = _active_test_control_plane_snapshot(
+                trusted_root,
+                "trusted",
+            )
+            valid_bundle = _trusted_test_suite_bundle(snapshot)
+            valid_payload = json.loads(valid_bundle.decode("utf-8"))
+            self.assertIsInstance(valid_payload, dict)
+            assert isinstance(valid_payload, dict)
+
+            malformed_bundles: dict[str, bytes] = {}
+            malformed_bundles["noncanonical-json"] = (
+                json.dumps(valid_payload, sort_keys=True).encode("utf-8")
+            )
+
+            for name in (
+                "duplicate-namespace",
+                "duplicate-file",
+                "missing-support",
+                "wrong-root",
+                "wrong-tests-root",
+                "traversal-path",
+                "wrong-binding-policy",
+                "invalid-base64",
+                "digest-mismatch",
+            ):
+                payload = json.loads(valid_bundle.decode("utf-8"))
+                assert isinstance(payload, dict)
+                files = payload["files"]
+                namespace = payload["namespace"]
+                assert isinstance(files, list)
+                assert isinstance(namespace, list)
+                if name == "duplicate-namespace":
+                    namespace.append(list(namespace[0]))
+                elif name == "duplicate-file":
+                    files.append(dict(files[0]))
+                elif name == "missing-support":
+                    payload["files"] = [
+                        row
+                        for row in files
+                        if not str(row["path"]).endswith(
+                            "required_ci_candidate.py"
+                        )
+                    ]
+                elif name == "wrong-root":
+                    payload["repo_root"] = str(trusted_root.parent)
+                elif name == "wrong-tests-root":
+                    payload["tests_root"] = str(trusted_root)
+                elif name == "traversal-path":
+                    files[0]["path"] = "../required_ci_candidate.py"
+                elif name == "wrong-binding-policy":
+                    files[0]["binding"][6] = 2
+                elif name == "invalid-base64":
+                    files[0]["source_base64"] = "***"
+                else:
+                    files[0]["sha256"] = "0" * 64
+                malformed_bundles[name] = json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+
+            for name, bundle in malformed_bundles.items():
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "trusted child suite bundle is malformed",
+                    ):
+                        _trusted_test_suite_snapshot_from_bundle(
+                            bundle,
+                            trusted_root,
+                        )
+
+    def test_child_bootstrap_rejects_malformed_authority_before_exec(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory).resolve(strict=True)
+            canary = temporary_root / "bootstrap.executed"
+            source = (
+                f"open({str(canary)!r}, 'w').write('executed')\n"
+            ).encode("utf-8")
+            source_sha256 = hashlib.sha256(source).hexdigest()
+            suite_bundle = b"captured-suite-bundle"
+            suite_bundle_sha256 = hashlib.sha256(suite_bundle).hexdigest()
+            logical_path = temporary_root / "test_required_ci_workflow.py"
+            trusted_root = temporary_root / ".required-ci"
+
+            def reset_canary() -> None:
+                canary.unlink(missing_ok=True)
+
+            with _trusted_test_child_source_descriptor(
+                source
+            ) as source_descriptor, _trusted_test_child_source_descriptor(
+                suite_bundle,
+                size_limit=TRUSTED_TEST_SUITE_BUNDLE_LIMIT_BYTES,
+                description="suite bundle",
+            ) as suite_bundle_descriptor:
+                valid_command = [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-S",
+                    "-c",
+                    TRUSTED_TEST_CHILD_BOOTSTRAP_CODE,
+                    str(source_descriptor),
+                    str(len(source)),
+                    source_sha256,
+                    str(suite_bundle_descriptor),
+                    str(len(suite_bundle)),
+                    suite_bundle_sha256,
+                    str(logical_path),
+                    TRUSTED_TEST_CHILD_FLAG,
+                    str(trusted_root),
+                ]
+                mutations: dict[str, tuple[int, str]] = {
+                    "digest": (8, "0" * 64),
+                    "bundle digest": (11, "0" * 64),
+                    "overlapping descriptors": (9, str(source_descriptor)),
+                    "relative logical path": (12, "test_required_ci_workflow.py"),
+                    "wrong flag": (13, "--run-untrusted-test-suite"),
+                    "relative trusted root": (14, ".required-ci"),
+                    "zero length": (7, "0"),
+                    "zero bundle length": (10, "0"),
+                    "oversize": (
+                        7,
+                        str(TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES + 1),
+                    ),
+                }
+                for name, (index, replacement) in mutations.items():
+                    with self.subTest(name=name):
+                        reset_canary()
+                        command = valid_command.copy()
+                        command[index] = replacement
+                        completed = subprocess.run(
+                            command,
+                            cwd=temporary_root,
+                            env=os.environ.copy(),
+                            pass_fds=(
+                                source_descriptor,
+                                suite_bundle_descriptor,
+                            ),
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=30,
+                        )
+                        self.assertNotEqual(completed.returncode, 0)
+                        self.assertFalse(canary.exists())
+
+                reset_canary()
+                extra_argument = subprocess.run(
+                    [*valid_command, "unexpected"],
+                    cwd=temporary_root,
+                    env=os.environ.copy(),
+                    pass_fds=(source_descriptor, suite_bundle_descriptor),
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+                self.assertNotEqual(extra_argument.returncode, 0)
+                self.assertFalse(canary.exists())
+
+                reset_canary()
+                same_descriptor_command = valid_command.copy()
+                same_descriptor_command[9] = str(source_descriptor)
+                same_descriptor_command[10] = str(len(source))
+                same_descriptor_command[11] = source_sha256
+                same_descriptor = subprocess.run(
+                    same_descriptor_command,
+                    cwd=temporary_root,
+                    env=os.environ.copy(),
+                    pass_fds=(source_descriptor,),
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+                self.assertNotEqual(same_descriptor.returncode, 0)
+                self.assertFalse(canary.exists())
+
+                def malformed_descriptor(
+                    name: str,
+                    *,
+                    payload: bytes,
+                    mode: int,
+                    flags: int,
+                    retain_link: bool,
+                ) -> int:
+                    path = temporary_root / f"{name}.payload"
+                    writer = os.open(
+                        path,
+                        os.O_RDWR
+                        | os.O_NONBLOCK
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_CLOEXEC,
+                        0o600,
+                    )
+                    try:
+                        os.write(writer, payload)
+                        os.fchmod(writer, mode)
+                        if flags & os.O_ACCMODE == os.O_RDWR:
+                            descriptor = writer
+                            writer = -1
+                        else:
+                            descriptor = os.open(path, flags | os.O_CLOEXEC)
+                        if not retain_link:
+                            path.unlink()
+                        return descriptor
+                    finally:
+                        if writer >= 0:
+                            os.close(writer)
+
+                malformed_descriptors = {
+                    "linked": malformed_descriptor(
+                        "linked",
+                        payload=source,
+                        mode=0o400,
+                        flags=os.O_RDONLY | os.O_NONBLOCK,
+                        retain_link=True,
+                    ),
+                    "wrong-mode": malformed_descriptor(
+                        "wrong-mode",
+                        payload=source,
+                        mode=0o600,
+                        flags=os.O_RDONLY | os.O_NONBLOCK,
+                        retain_link=False,
+                    ),
+                    "writable": malformed_descriptor(
+                        "writable",
+                        payload=source,
+                        mode=0o400,
+                        flags=os.O_RDWR | os.O_NONBLOCK,
+                        retain_link=False,
+                    ),
+                    "blocking": malformed_descriptor(
+                        "blocking",
+                        payload=source,
+                        mode=0o400,
+                        flags=os.O_RDONLY,
+                        retain_link=False,
+                    ),
+                }
+                try:
+                    for name, malformed_fd in malformed_descriptors.items():
+                        with self.subTest(descriptor_policy=name):
+                            reset_canary()
+                            command = valid_command.copy()
+                            command[6] = str(malformed_fd)
+                            completed = subprocess.run(
+                                command,
+                                cwd=temporary_root,
+                                env=os.environ.copy(),
+                                pass_fds=(
+                                    malformed_fd,
+                                    suite_bundle_descriptor,
+                                ),
+                                stdin=subprocess.DEVNULL,
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                                timeout=30,
+                            )
+                            self.assertNotEqual(completed.returncode, 0)
+                            self.assertFalse(canary.exists())
+                finally:
+                    for malformed_fd in malformed_descriptors.values():
+                        os.close(malformed_fd)
+
+                malformed_bundle_descriptors = {
+                    "linked": malformed_descriptor(
+                        "bundle-linked",
+                        payload=suite_bundle,
+                        mode=0o400,
+                        flags=os.O_RDONLY | os.O_NONBLOCK,
+                        retain_link=True,
+                    ),
+                    "wrong-mode": malformed_descriptor(
+                        "bundle-wrong-mode",
+                        payload=suite_bundle,
+                        mode=0o600,
+                        flags=os.O_RDONLY | os.O_NONBLOCK,
+                        retain_link=False,
+                    ),
+                    "writable": malformed_descriptor(
+                        "bundle-writable",
+                        payload=suite_bundle,
+                        mode=0o400,
+                        flags=os.O_RDWR | os.O_NONBLOCK,
+                        retain_link=False,
+                    ),
+                    "blocking": malformed_descriptor(
+                        "bundle-blocking",
+                        payload=suite_bundle,
+                        mode=0o400,
+                        flags=os.O_RDONLY,
+                        retain_link=False,
+                    ),
+                }
+                try:
+                    for name, malformed_fd in (
+                        malformed_bundle_descriptors.items()
+                    ):
+                        with self.subTest(bundle_descriptor_policy=name):
+                            reset_canary()
+                            command = valid_command.copy()
+                            command[9] = str(malformed_fd)
+                            completed = subprocess.run(
+                                command,
+                                cwd=temporary_root,
+                                env=os.environ.copy(),
+                                pass_fds=(source_descriptor, malformed_fd),
+                                stdin=subprocess.DEVNULL,
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                                timeout=30,
+                            )
+                            self.assertNotEqual(completed.returncode, 0)
+                            self.assertFalse(canary.exists())
+                finally:
+                    for malformed_fd in (
+                        malformed_bundle_descriptors.values()
+                    ):
+                        os.close(malformed_fd)
+
+                reset_canary()
+                completed = subprocess.run(
+                    valid_command,
+                    cwd=temporary_root,
+                    env=os.environ.copy(),
+                    pass_fds=(source_descriptor, suite_bundle_descriptor),
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(canary.exists())
+
     def test_supervisor_child_argv_and_environment_are_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             trusted_root, candidate_root = self.prepare_roots(temporary_directory)
@@ -19843,11 +26829,68 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
             actual_run = _run_trusted_test_child
             captured_calls: list[tuple[list[str], dict[str, object]]] = []
+            captured_sources: list[
+                tuple[
+                    bytes,
+                    bytes,
+                    tuple[int, int, int, int, int, int, int, int],
+                    tuple[int, int, int, int, int, int, int, int],
+                    int,
+                    int,
+                    str,
+                    str,
+                ]
+            ] = []
 
             def recording_run(
                 command: list[str], **kwargs: object
             ) -> subprocess.CompletedProcess[str]:
                 captured_calls.append((command, kwargs.copy()))
+                source_descriptor = int(command[6])
+                source_length = int(command[7])
+                suite_bundle_descriptor = int(command[9])
+                suite_bundle_length = int(command[10])
+                child_environment = kwargs["environment"]
+                assert isinstance(child_environment, dict)
+                logical_path = Path(command[12])
+                launch_root, _content, _relative, _profile = (
+                    distribution_contract_context(logical_path.parents[1])
+                )
+                launch_snapshot = _active_test_control_plane_snapshot(
+                    launch_root,
+                    "recorded launch",
+                )
+                captured_sources.append(
+                    (
+                        os.pread(
+                            source_descriptor,
+                            source_length + 1,
+                            0,
+                        ),
+                        os.pread(
+                            suite_bundle_descriptor,
+                            suite_bundle_length + 1,
+                            0,
+                        ),
+                        _test_control_plane_file_binding(
+                            os.fstat(source_descriptor)
+                        ),
+                        _test_control_plane_file_binding(
+                            os.fstat(suite_bundle_descriptor)
+                        ),
+                        fcntl.fcntl(source_descriptor, fcntl.F_GETFL),
+                        fcntl.fcntl(
+                            suite_bundle_descriptor,
+                            fcntl.F_GETFL,
+                        ),
+                        _test_control_plane_commitment_from_snapshot(
+                            launch_snapshot
+                        ),
+                        child_environment[
+                            TRUSTED_TEST_SUITE_COMMITMENT_ENV
+                        ],
+                    )
+                )
                 return actual_run(command, **kwargs)
 
             candidate_sha = self.initialize_candidate_checkout(candidate_root)
@@ -19881,26 +26924,100 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             if call[0][:2] == [sys.executable, "-I"]
         ]
         self.assertEqual(len(child_calls), 1)
+        self.assertEqual(len(captured_sources), 1)
         command, options = child_calls[0]
+        (
+            captured_source,
+            captured_bundle,
+            source_binding,
+            suite_bundle_binding,
+            source_flags,
+            suite_bundle_flags,
+            expected_launch_commitment,
+            expected_suite_commitment,
+        ) = captured_sources[0]
         self.assertEqual(
-            command,
+            command[:6],
             [
                 sys.executable,
                 "-I",
                 "-B",
                 "-S",
-                str(Path(__file__).resolve(strict=True)),
-                TRUSTED_TEST_CHILD_FLAG,
-                str(trusted_root),
+                "-c",
+                TRUSTED_TEST_CHILD_BOOTSTRAP_CODE,
             ],
         )
+        self.assertEqual(len(command), 15)
+        source_descriptor = int(command[6])
+        source_length = int(command[7])
+        suite_bundle_descriptor = int(command[9])
+        suite_bundle_length = int(command[10])
+        self.assertEqual(command[6], str(source_descriptor))
+        self.assertEqual(command[7], str(source_length))
+        self.assertGreater(source_length, 0)
+        self.assertLessEqual(
+            source_length, TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES
+        )
+        self.assertRegex(command[8], r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(command[9], str(suite_bundle_descriptor))
+        self.assertEqual(command[10], str(suite_bundle_length))
+        self.assertRegex(command[11], r"\A[0-9a-f]{64}\Z")
+        self.assertTrue(Path(command[12]).is_absolute())
+        self.assertEqual(Path(command[12]).name, Path(__file__).name)
+        self.assertEqual(
+            command[13:],
+            [TRUSTED_TEST_CHILD_FLAG, str(trusted_root)],
+        )
+        self.assertEqual(captured_source, TRUSTED_TEST_SUPERVISOR_BYTES)
+        self.assertEqual(source_length, len(captured_source))
+        self.assertEqual(
+            command[8],
+            hashlib.sha256(captured_source).hexdigest(),
+        )
+        self.assertEqual(suite_bundle_length, len(captured_bundle))
+        self.assertEqual(
+            command[11],
+            hashlib.sha256(captured_bundle).hexdigest(),
+        )
+        captured_suite_snapshot = _trusted_test_suite_snapshot_from_bundle(
+            captured_bundle,
+            trusted_root,
+        )
+        self.assertEqual(
+            _test_control_plane_commitment_from_snapshot(
+                captured_suite_snapshot
+            ),
+            expected_suite_commitment,
+        )
+        self.assertEqual(source_binding[2], stat.S_IFREG)
+        self.assertEqual(source_binding[3], 0o400)
+        self.assertEqual(source_binding[4], os.geteuid())
+        self.assertEqual(source_binding[6], 0)
+        self.assertEqual(source_binding[7], source_length)
+        self.assertEqual(source_flags & os.O_ACCMODE, os.O_RDONLY)
+        self.assertTrue(source_flags & os.O_NONBLOCK)
+        self.assertEqual(suite_bundle_binding[2], stat.S_IFREG)
+        self.assertEqual(suite_bundle_binding[3], 0o400)
+        self.assertEqual(suite_bundle_binding[4], os.geteuid())
+        self.assertEqual(suite_bundle_binding[6], 0)
+        self.assertEqual(suite_bundle_binding[7], suite_bundle_length)
+        self.assertEqual(suite_bundle_flags & os.O_ACCMODE, os.O_RDONLY)
+        self.assertTrue(suite_bundle_flags & os.O_NONBLOCK)
+        decoded_source = captured_source.decode("utf-8")
+        self.assertNotIn(decoded_source, "\x00".join(command))
         self.assertEqual(options["cwd"], trusted_root)
         self.assertEqual(
-            options["pass_fds"], (), "local nonstrict harness must not pass a realm fd"
+            options["pass_fds"],
+            (source_descriptor, suite_bundle_descriptor),
+            "local harness must pass only captured source and suite fds",
         )
         self.assertIsInstance(options["supervisor_deadline"], float)
         child_environment = options["environment"]
         self.assertIsInstance(child_environment, dict)
+        self.assertNotIn(
+            decoded_source,
+            "\x00".join(child_environment.values()),
+        )
         self.assertEqual(
             child_environment[REQUIRED_CI_CANDIDATE_ROOT_ENV], str(candidate_root)
         )
@@ -19908,6 +27025,18 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             child_environment[REQUIRED_CI_CANDIDATE_SHA_ENV], candidate_sha
         )
         self.assertEqual(child_environment["GITHUB_SHA"], candidate_sha)
+        self.assertRegex(
+            child_environment[TRUSTED_TEST_LAUNCH_COMMITMENT_ENV],
+            r"\A[0-9a-f]{64}\Z",
+        )
+        self.assertEqual(
+            child_environment[TRUSTED_TEST_LAUNCH_COMMITMENT_ENV],
+            expected_launch_commitment,
+        )
+        self.assertRegex(
+            child_environment[TRUSTED_TEST_SUITE_COMMITMENT_ENV],
+            r"\A[0-9a-f]{64}\Z",
+        )
         self.assertNotIn("PYTHONHOME", child_environment)
         self.assertNotIn("PYTHONPATH", child_environment)
         self.assertNotIn(
@@ -19953,7 +27082,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
                     with self.assertRaisesRegex(
                         AssertionError,
-                        "trusted test source|trusted candidate support",
+                        r"trusted .*control-plane (?:manifest|file)|"
+                        r"trusted candidate support",
                     ):
                         self.supervise(trusted_root, candidate_root)
 
@@ -20009,10 +27139,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         candidate_root, "test_required.py", candidate_module
                     )
 
-                    receipt = self.supervise(trusted_root, candidate_root)
-
-                    self.assertEqual(receipt["status"], "completed")
-                    self.assertFalse(canary.exists())
+                    self.assert_candidate_control_plane_rejected_before_child(
+                        trusted_root,
+                        candidate_root,
+                        canary=canary,
+                    )
 
     def test_supervisor_ignores_a_forged_candidate_completion_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -20054,10 +27185,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 candidate_root, "test_required.py", candidate_module
             )
 
-            receipt = self.supervise(trusted_root, candidate_root)
-
-            self.assertEqual(receipt["status"], "completed")
-            self.assertFalse(canary.exists())
+            self.assert_candidate_control_plane_rejected_before_child(
+                trusted_root,
+                candidate_root,
+                canary=canary,
+            )
 
     def test_supervisor_does_not_import_candidate_os_exit_zero(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -20079,10 +27211,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 candidate_root, "test_required.py", candidate_module
             )
 
-            receipt = self.supervise(trusted_root, candidate_root)
-
-            self.assertEqual(receipt["status"], "completed")
-            self.assertFalse(canary.exists())
+            self.assert_candidate_control_plane_rejected_before_child(
+                trusted_root,
+                candidate_root,
+                canary=canary,
+            )
 
     def test_supervisor_rejects_an_existing_empty_test_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -20093,7 +27226,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
             (tests_root / "README.txt").write_text("no tests\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(AssertionError, "expected test inventory"):
+            with self.assertRaisesRegex(
+                AssertionError,
+                "candidate active test control-plane manifest",
+            ):
                 self.supervise(trusted_root, candidate_root)
 
     def test_supervisor_does_not_import_candidate_system_exit_zero(self) -> None:
@@ -20114,10 +27250,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "        pass\n",
             )
 
-            receipt = self.supervise(trusted_root, candidate_root)
-
-            self.assertEqual(receipt["status"], "completed")
-            self.assertFalse(canary.exists())
+            self.assert_candidate_control_plane_rejected_before_child(
+                trusted_root,
+                candidate_root,
+                canary=canary,
+            )
 
     def test_supervisor_rejects_candidate_load_tests_hook(self) -> None:
         partial_module = self.required_module() + (
@@ -20132,8 +27269,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 partial_module,
             )
 
-            with self.assertRaisesRegex(AssertionError, "load_tests"):
-                self.supervise(trusted_root, candidate_root)
+            self.assert_candidate_control_plane_rejected_before_child(
+                trusted_root, candidate_root
+            )
 
     def test_supervisor_does_not_execute_candidate_test_early_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -20153,10 +27291,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 candidate_root, "test_required.py", candidate_module
             )
 
-            receipt = self.supervise(trusted_root, candidate_root)
-
-            self.assertEqual(receipt["status"], "completed")
-            self.assertFalse(canary.exists())
+            self.assert_candidate_control_plane_rejected_before_child(
+                trusted_root,
+                candidate_root,
+                canary=canary,
+            )
 
     def test_supervisor_rejects_deleted_or_renamed_expected_tests(self) -> None:
         fixtures = {
@@ -20186,10 +27325,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         candidate_module,
                     )
 
-                    with self.assertRaisesRegex(
-                        AssertionError, "expected test inventory"
-                    ):
-                        self.supervise(trusted_root, candidate_root)
+                    self.assert_candidate_control_plane_rejected_before_child(
+                        trusted_root, candidate_root
+                    )
 
     def test_supervisor_rejects_skipped_expected_tests(self) -> None:
         fixtures = {
@@ -20218,8 +27356,86 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         skipped_module,
                     )
 
-                    with self.assertRaisesRegex(AssertionError, "decorators"):
-                        self.supervise(trusted_root, candidate_root)
+                    self.assert_candidate_control_plane_rejected_before_child(
+                        trusted_root, candidate_root
+                    )
+
+    def test_child_rejects_dynamic_skip_and_ignores_runner_replacement(
+        self,
+    ) -> None:
+        dynamic_skip = (
+            self.required_module()
+            + "\nRequiredTests.test_one = unittest.skip("
+            "'dynamic skip')(RequiredTests.test_one)\n"
+        )
+        partial_execution = (
+            self.required_module()
+            + "\ndef _first_test(suite):\n"
+            "    for item in suite:\n"
+            "        if isinstance(item, unittest.TestSuite):\n"
+            "            selected = _first_test(item)\n"
+            "            if selected is not None:\n"
+            "                return selected\n"
+            "        else:\n"
+            "            return item\n"
+            "    return None\n\n"
+            "def _run_only_first(_runner, suite):\n"
+            "    result = unittest.TestResult()\n"
+            "    selected = _first_test(suite)\n"
+            "    if selected is not None:\n"
+            "        selected.run(result)\n"
+            "    return result\n\n"
+            "unittest.TextTestRunner.run = _run_only_first\n"
+        )
+        for name, source in (
+            ("dynamic-skip", dynamic_skip),
+            ("partial-execution", partial_execution),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary_directory:
+                trusted_root, candidate_root = self.prepare_roots(
+                    temporary_directory
+                )
+                self.write_test_module(
+                    trusted_root,
+                    "test_required.py",
+                    source,
+                )
+                self.write_test_module(
+                    candidate_root,
+                    "test_required.py",
+                    source,
+                )
+                actual_run = _run_trusted_test_child
+                child_started = False
+
+                def record_child_start(
+                    command: list[str],
+                    **kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    nonlocal child_started
+                    child_started = True
+                    return actual_run(command, **kwargs)
+
+                with mock.patch.object(
+                    sys.modules[__name__],
+                    "_run_trusted_test_child",
+                    side_effect=record_child_start,
+                ):
+                    if name == "dynamic-skip":
+                        with self.assertRaisesRegex(
+                            AssertionError,
+                            "trusted Required CI tests did not complete",
+                        ):
+                            self.supervise(trusted_root, candidate_root)
+                    else:
+                        receipt = self.supervise(
+                            trusted_root,
+                            candidate_root,
+                        )
+                        self.assertEqual(receipt["executed_test_count"], 2)
+                        self.assertEqual(receipt["skipped"], 0)
+
+                self.assertTrue(child_started)
 
     def test_candidate_cannot_reselect_trusted_git_after_support_load(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -35245,13 +42461,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         owner_environment[_CANDIDATE_SUPPORT.ISOLATION_MODE_ENV] = (
             _CANDIDATE_SUPPORT.STRICT_ISOLATION_MODE
         )
+        captured_support_stack = contextlib.ExitStack()
+        staged_support_path = captured_support_stack.enter_context(
+            _owner_private_captured_support_path()
+        )
         owner = subprocess.Popen(
             [
                 str(_CANDIDATE_SUPPORT._STRICT_PRIMITIVES["python"]),
                 *_CANDIDATE_SUPPORT._ROOT_PYTHON_ARGUMENTS,
                 "-c",
                 owner_source,
-                str(TRUSTED_CANDIDATE_SUPPORT_PATH),
+                str(staged_support_path),
             ],
             cwd=str(TRUSTED_REPO_ROOT),
             env=owner_environment,
@@ -35555,6 +42775,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             for stream in (owner.stdout, owner.stderr):
                 if stream is not None:
                     stream.close()
+            captured_support_stack.close()
 
     def test_strict_runtime_live_end_to_end(self) -> None:
         self._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read()
@@ -37529,10 +44750,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             return
         if sys.platform == "linux":
             realm = _CANDIDATE_SUPPORT._strict_realm()
-            _CANDIDATE_SUPPORT._invoke_root_uid_cleanup(
-                TRUSTED_CANDIDATE_SUPPORT_PATH,
-                int(realm["uid"]),
-            )
+            with _owner_private_captured_support_path() as support_path:
+                _CANDIDATE_SUPPORT._invoke_root_uid_cleanup(
+                    support_path,
+                    int(realm["uid"]),
+                )
         with lock_path.open("a+b") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -37788,6 +45010,813 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                         runner_path
                                     )
 
+    def test_suite_bundle_rejects_boolean_schema_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            snapshot = _active_test_control_plane_snapshot(
+                trusted_root,
+                "trusted",
+            )
+            payload = json.loads(_trusted_test_suite_bundle(snapshot))
+            payload["schema_version"] = True
+            malformed = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+            with self.assertRaisesRegex(
+                AssertionError,
+                "suite bundle is malformed",
+            ):
+                _trusted_test_suite_snapshot_from_bundle(
+                    malformed,
+                    trusted_root,
+                )
+
+    def test_control_plane_commitment_binds_repository_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, _candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            snapshot = _active_test_control_plane_snapshot(
+                trusted_root,
+                "trusted",
+            )
+            expected = _test_control_plane_commitment_from_snapshot(snapshot)
+            repo_binding = snapshot["repo_binding"]
+            self.assertIsInstance(repo_binding, tuple)
+            assert isinstance(repo_binding, tuple)
+
+            changed_binding = dict(snapshot)
+            changed_binding["repo_binding"] = (
+                repo_binding[0],
+                repo_binding[1] + 1,
+                *repo_binding[2:],
+            )
+            changed_root = dict(snapshot)
+            changed_root["repo_root"] = str(
+                trusted_root.with_name("foreign-required-ci")
+            )
+
+            self.assertNotEqual(
+                _test_control_plane_commitment_from_snapshot(changed_binding),
+                expected,
+            )
+            try:
+                changed_root_commitment = (
+                    _test_control_plane_commitment_from_snapshot(changed_root)
+                )
+            except AssertionError:
+                pass
+            else:
+                self.assertNotEqual(changed_root_commitment, expected)
+
+    def test_terminal_failure_details_preserve_the_bounded_tail(self) -> None:
+        tail = "terminal-tail-sentinel"
+        primary = AssertionError("p" * 2200 + tail)
+        integrity = AssertionError("integrity")
+
+        failure = _RequiredCITerminalFailures(
+            "terminal context",
+            (
+                ("primary", "child-receipt", primary),
+                ("integrity", "isolation-cleanup", integrity),
+            ),
+        )
+
+        self.assertIn(tail, str(failure))
+        self.assertLessEqual(len(str(failure)), 1024)
+
+    def test_terminal_failure_order_is_primary_first(self) -> None:
+        cleanup = AssertionError("cleanup")
+        receipt = AssertionError("receipt")
+
+        with self.assertRaises(_RequiredCITerminalFailures) as raised:
+            _raise_terminal_failures(
+                "terminal context",
+                (
+                    ("integrity", "isolation-cleanup", cleanup),
+                    ("primary", "child-receipt", receipt),
+                ),
+            )
+
+        self.assertEqual(
+            [
+                (role, phase)
+                for role, phase, _error in raised.exception.failures
+            ],
+            [
+                ("primary", "child-receipt"),
+                ("integrity", "isolation-cleanup"),
+            ],
+        )
+        self.assertIs(raised.exception.__cause__, receipt)
+
+    def test_child_bootstrap_traceback_uses_captured_source_lines(self) -> None:
+        captured_line = "raise AssertionError('captured bootstrap failure')\n"
+        decoy_line = "DECOY_TRACEBACK_MARKER = 'path source'\n"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            trusted_root = root / ".required-ci"
+            trusted_root.mkdir()
+            logical_path = root / "test_required_ci_workflow.py"
+            logical_path.write_text(decoy_line, encoding="utf-8")
+            with _trusted_test_child_source_descriptor(
+                captured_line.encode("utf-8")
+            ) as supervisor_descriptor, _trusted_test_child_source_descriptor(
+                b"suite-bundle",
+                size_limit=TRUSTED_TEST_SUITE_BUNDLE_LIMIT_BYTES,
+                description="suite bundle",
+            ) as bundle_descriptor:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-S",
+                        "-c",
+                        TRUSTED_TEST_CHILD_BOOTSTRAP_CODE,
+                        str(supervisor_descriptor),
+                        str(len(captured_line.encode("utf-8"))),
+                        hashlib.sha256(
+                            captured_line.encode("utf-8")
+                        ).hexdigest(),
+                        str(bundle_descriptor),
+                        str(len(b"suite-bundle")),
+                        hashlib.sha256(b"suite-bundle").hexdigest(),
+                        str(logical_path),
+                        TRUSTED_TEST_CHILD_FLAG,
+                        str(trusted_root),
+                    ],
+                    cwd=root,
+                    check=False,
+                    pass_fds=(supervisor_descriptor, bundle_descriptor),
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(captured_line.strip(), completed.stderr)
+        self.assertNotIn("DECOY_TRACEBACK_MARKER", completed.stderr)
+
+    def test_child_reap_failure_does_not_mask_the_primary_failure(self) -> None:
+        primary = RuntimeError("child communicate primary")
+        cleanup = RuntimeError("child reap cleanup")
+
+        class FailingProcess:
+            pid = 123456
+            returncode = None
+
+            def communicate(self, *, timeout: float) -> tuple[str, str]:
+                del timeout
+                raise primary
+
+        with mock.patch.object(
+            subprocess,
+            "Popen",
+            return_value=FailingProcess(),
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_remaining_trusted_test_child_timeout",
+            return_value=1.0,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_terminate_trusted_test_child",
+            side_effect=cleanup,
+        ):
+            with self.assertRaises(_RequiredCITerminalFailures) as raised:
+                _run_trusted_test_child(
+                    ["trusted-child"],
+                    cwd=Path.cwd(),
+                    environment={},
+                    pass_fds=(),
+                    supervisor_deadline=time.monotonic() + 10,
+                )
+
+        self.assertEqual(
+            [
+                (role, phase)
+                for role, phase, _error in raised.exception.failures
+            ],
+            [
+                ("primary", "child-communicate"),
+                ("integrity", "child-reap"),
+            ],
+        )
+        self.assertIs(raised.exception.failures[0][2], primary)
+        self.assertIs(raised.exception.failures[1][2], cleanup)
+        self.assertIs(raised.exception.__cause__, primary)
+
+    def test_formal_entry_prepares_checkout_modes_before_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root, candidate_sha = (
+                self.prepare_structure_cli_split(temporary_directory)
+            )
+            trusted_root.chmod(0o755)
+            candidate_root.chmod(0o755)
+            script = distribution_tests_root(trusted_root) / Path(__file__).name
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "GITHUB_WORKSPACE": str(trusted_root.parent),
+                    "GITHUB_SHA": candidate_sha,
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                }
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(script),
+                    TRUSTED_STRUCTURE_VALIDATOR_FLAG,
+                ],
+                cwd=trusted_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(stat.S_IMODE(trusted_root.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(candidate_root.stat().st_mode), 0o700)
+
+    def test_late_boundary_protection_is_verify_only_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            trusted_root = root / ".required-ci"
+            candidate_root = root / ".candidate"
+            trusted_root.mkdir(mode=0o755)
+            candidate_root.mkdir(mode=0o755)
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_TRUSTED_CHECKOUT_ROOT",
+                trusted_root,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "candidate_repository_root",
+                return_value=candidate_root,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_acl_is_absent",
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "boundary is not owner-only",
+                ):
+                    _CANDIDATE_SUPPORT._protect_strict_checkout_boundaries()
+                self.assertEqual(
+                    stat.S_IMODE(trusted_root.stat().st_mode),
+                    0o755,
+                )
+                self.assertEqual(
+                    stat.S_IMODE(candidate_root.stat().st_mode),
+                    0o755,
+                )
+
+                trusted_root.chmod(0o700)
+                candidate_root.chmod(0o700)
+                _CANDIDATE_SUPPORT._protect_strict_checkout_boundaries()
+                _CANDIDATE_SUPPORT._protect_strict_checkout_boundaries()
+
+    def test_formal_preload_binds_the_root_prepared_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root, candidate_sha = (
+                self.prepare_structure_cli_split(temporary_directory)
+            )
+            decoy_root = trusted_root.with_name(".required-ci-decoy")
+            held_root = trusted_root.with_name(".required-ci-held")
+            shutil.copytree(trusted_root, decoy_root, symlinks=True)
+            canary = Path(temporary_directory) / "decoy-support-executed"
+            marker = Path(temporary_directory) / "root-swapped-after-prepare"
+            decoy_support = (
+                distribution_tests_root(decoy_root)
+                / "required_ci_candidate.py"
+            )
+            support_source = decoy_support.read_bytes()
+            future_prefix = b"from __future__ import annotations\n\n"
+            self.assertTrue(support_source.startswith(future_prefix))
+            poison = (
+                future_prefix
+                + (
+                    "__import__('pathlib').Path("
+                    f"{str(canary)!r}"
+                    ").write_text('executed', encoding='utf-8')\n"
+                ).encode("utf-8")
+                + support_source[len(future_prefix) :]
+            )
+            decoy_support.write_bytes(poison)
+            script = distribution_tests_root(trusted_root) / Path(__file__).name
+            bootstrap = textwrap.dedent(
+                f"""
+                import pathlib
+                import stat
+                import sys
+
+                script = pathlib.Path({str(script)!r})
+                trusted_root = pathlib.Path({str(trusted_root)!r})
+                decoy_root = pathlib.Path({str(decoy_root)!r})
+                held_root = pathlib.Path({str(held_root)!r})
+                marker = pathlib.Path({str(marker)!r})
+                swapped = False
+
+                def trace(frame, event, argument):
+                    global swapped
+                    del argument
+                    if (
+                        not swapped
+                        and event == "return"
+                        and frame.f_code.co_name
+                            == "_prepare_formal_checkout_boundary"
+                        and frame.f_locals.get("description")
+                            == "trusted checkout"
+                    ):
+                        prepared_mode = stat.S_IMODE(
+                            trusted_root.stat().st_mode
+                        )
+                        trusted_root.rename(held_root)
+                        decoy_root.rename(trusted_root)
+                        trusted_root.chmod(prepared_mode)
+                        marker.write_text("swapped", encoding="utf-8")
+                        swapped = True
+                    return trace
+
+                sys.argv = [
+                    str(script),
+                    {TRUSTED_STRUCTURE_VALIDATOR_FLAG!r},
+                ]
+                namespace = {{
+                    "__name__": "__main__",
+                    "__file__": str(script),
+                    "__package__": None,
+                }}
+                sys.settrace(trace)
+                exec(
+                    compile(script.read_bytes(), str(script), "exec"),
+                    namespace,
+                )
+                """
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "GITHUB_WORKSPACE": str(trusted_root.parent),
+                    "GITHUB_SHA": candidate_sha,
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                }
+            )
+            completed = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", bootstrap],
+                cwd=trusted_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertTrue(marker.exists(), completed.stderr)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(canary.exists(), completed.stderr)
+            self.assertIn(
+                "repository root changed between preparation and capture",
+                completed.stderr,
+            )
+
+    def test_formal_preload_rejects_tests_root_replacement_after_capture(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root, candidate_sha = (
+                self.prepare_structure_cli_split(temporary_directory)
+            )
+            tests_root = distribution_tests_root(trusted_root)
+            held_root = tests_root.with_name("tests-held-after-capture")
+            marker = Path(temporary_directory) / "root-replaced.marker"
+            script = tests_root / Path(__file__).name
+            source = script.read_text(encoding="utf-8")
+            target_line = source.count(
+                "\n",
+                0,
+                source.index(
+                    "    _active_test_control_plane_names(\n"
+                    "        _TRUSTED_TEST_NAMESPACE_PRELOAD,"
+                ),
+            ) + 1
+            bootstrap = textwrap.dedent(
+                f"""
+                import pathlib
+                import stat
+                import sys
+
+                script = pathlib.Path({str(script)!r})
+                tests_root = pathlib.Path({str(tests_root)!r})
+                held_root = pathlib.Path({str(held_root)!r})
+                marker = pathlib.Path({str(marker)!r})
+                target_line = {target_line!r}
+                replaced = False
+
+                def trace(frame, event, argument):
+                    global replaced
+                    del argument
+                    if (
+                        not replaced
+                        and event == "line"
+                        and frame.f_code.co_filename == str(script)
+                        and frame.f_lineno == target_line
+                    ):
+                        mode = stat.S_IMODE(tests_root.stat().st_mode)
+                        tests_root.rename(held_root)
+                        tests_root.mkdir(mode=mode)
+                        tests_root.chmod(mode)
+                        for entry in sorted(held_root.iterdir()):
+                            entry.rename(tests_root / entry.name)
+                        marker.write_text("replaced", encoding="utf-8")
+                        replaced = True
+                    return trace
+
+                sys.argv = [str(script), {TRUSTED_STRUCTURE_VALIDATOR_FLAG!r}]
+                namespace = {{
+                    "__name__": "__main__",
+                    "__file__": str(script),
+                    "__package__": None,
+                }}
+                sys.settrace(trace)
+                exec(
+                    compile(script.read_bytes(), str(script), "exec"),
+                    namespace,
+                )
+                """
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "GITHUB_WORKSPACE": str(trusted_root.parent),
+                    "GITHUB_SHA": candidate_sha,
+                    REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                    REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                }
+            )
+            completed = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", bootstrap],
+                cwd=trusted_root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertTrue(marker.exists(), completed.stderr)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("root changed during capture", completed.stderr)
+
+    def test_support_reader_revalidates_path_after_parent_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            support = root / "required_ci_candidate.py"
+            held = root / "support.held"
+            source = b"support = True\n"
+            support.write_bytes(source)
+            original_mode = stat.S_IMODE(support.stat().st_mode)
+            parent_identity = (root.stat().st_dev, root.stat().st_ino)
+            actual_fstat = os.fstat
+            parent_fstats = 0
+            replaced = False
+
+            def replace_after_final_path_capture(
+                descriptor: int,
+            ) -> os.stat_result:
+                nonlocal parent_fstats, replaced
+                metadata = actual_fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == parent_identity:
+                    parent_fstats += 1
+                    if parent_fstats == 2 and not replaced:
+                        support.rename(held)
+                        support.write_bytes(source)
+                        support.chmod(original_mode)
+                        replaced = True
+                return metadata
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT.os,
+                    "fstat",
+                    side_effect=replace_after_final_path_capture,
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "object changed while being read",
+                    ):
+                        _CANDIDATE_SUPPORT._read_stable_trusted_support(
+                            support
+                        )
+            finally:
+                if held.exists():
+                    support.unlink()
+                    held.rename(support)
+
+            self.assertTrue(replaced)
+            self.assertEqual(parent_fstats, 2)
+
+    def test_strict_boundary_revalidation_binds_initial_support_object(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            trusted_root = root / ".required-ci"
+            candidate_root = root / ".candidate"
+            trusted_root.mkdir(mode=0o700)
+            candidate_root.mkdir(mode=0o700)
+            support = root / "required_ci_candidate.py"
+            held = root / "support.held"
+            source = b"support = True\n"
+            support.write_bytes(source)
+            original_binding = _CANDIDATE_SUPPORT._trusted_support_file_binding(
+                support.lstat()
+            )
+            original_mode = stat.S_IMODE(support.stat().st_mode)
+            support.rename(held)
+            support.write_bytes(source)
+            support.chmod(original_mode)
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_TRUSTED_CHECKOUT_ROOT",
+                    trusted_root,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "candidate_repository_root",
+                    return_value=candidate_root,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_TRUSTED_SUPPORT_PATH",
+                    support,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_TRUSTED_SUPPORT_SOURCE",
+                    source,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_TRUSTED_SUPPORT_SHA256",
+                    hashlib.sha256(source).hexdigest(),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_TRUSTED_SUPPORT_BINDING",
+                    original_binding,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_acl_is_absent",
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError,
+                        "support source identity is not stable",
+                    ):
+                        _CANDIDATE_SUPPORT._protect_strict_checkout_boundaries()
+            finally:
+                support.unlink()
+                held.rename(support)
+
+    def test_child_launch_commitment_rejects_before_support_execution(
+        self,
+    ) -> None:
+        for scenario in ("missing", "wrong", "late-replacement"):
+            with self.subTest(scenario=scenario):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    trusted_root, candidate_root, candidate_sha = (
+                        self.prepare_structure_cli_split(temporary_directory)
+                    )
+                    clean_snapshot = _active_test_control_plane_snapshot(
+                        trusted_root,
+                        "trusted",
+                    )
+                    clean_commitment = (
+                        _test_control_plane_commitment_from_snapshot(
+                            clean_snapshot
+                        )
+                    )
+                    tests_root = distribution_tests_root(trusted_root)
+                    support_path = tests_root / "required_ci_candidate.py"
+                    canary = Path(temporary_directory) / f"{scenario}.executed"
+                    original_support = support_path.read_text(encoding="utf-8")
+                    future_import = "from __future__ import annotations\n"
+                    self.assertTrue(original_support.startswith(future_import))
+                    support_path.write_text(
+                        original_support.replace(
+                            future_import,
+                            future_import
+                            + "from pathlib import Path\n"
+                            + f"Path({str(canary)!r}).write_text("
+                            + "'executed', encoding='utf-8')\n",
+                            1,
+                        ),
+                        encoding="utf-8",
+                    )
+                    script = tests_root / Path(__file__).name
+                    environment = os.environ.copy()
+                    environment.update(
+                        {
+                            "GITHUB_WORKSPACE": str(trusted_root.parent),
+                            "GITHUB_SHA": candidate_sha,
+                            REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                            REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                        }
+                    )
+                    if scenario == "wrong":
+                        environment[TRUSTED_TEST_LAUNCH_COMMITMENT_ENV] = (
+                            "0" * 64
+                        )
+                    elif scenario == "late-replacement":
+                        environment[TRUSTED_TEST_LAUNCH_COMMITMENT_ENV] = (
+                            clean_commitment
+                        )
+                    else:
+                        environment.pop(
+                            TRUSTED_TEST_LAUNCH_COMMITMENT_ENV,
+                            None,
+                        )
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-B",
+                            str(script),
+                            TRUSTED_TEST_CHILD_FLAG,
+                            str(trusted_root),
+                        ],
+                        cwd=trusted_root,
+                        env=environment,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertFalse(canary.exists())
+                    self.assertIn(
+                        "commitment changed before support load",
+                        completed.stderr,
+                    )
+
+    def test_captured_suite_cannot_forge_the_trusted_runner(self) -> None:
+        missing_module = object()
+        previous_module = sys.modules.pop("test_required", missing_module)
+        original_run = unittest.TextTestRunner.run
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trusted_root, candidate_root = self.prepare_roots(
+                temporary_directory
+            )
+            first_canary = Path(temporary_directory) / "first.executed"
+            second_canary = Path(temporary_directory) / "second.executed"
+            source = (
+                "from pathlib import Path\n"
+                "import unittest\n\n"
+                "def _forged_run(self, suite):\n"
+                "    del self, suite\n"
+                "    result = unittest.TestResult()\n"
+                "    result.testsRun = 2\n"
+                "    return result\n\n"
+                "unittest.TextTestRunner.run = _forged_run\n\n"
+                "class RequiredTests(unittest.TestCase):\n"
+                "    def test_first(self):\n"
+                f"        Path({str(first_canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n\n"
+                "    def test_second(self):\n"
+                f"        Path({str(second_canary)!r}).write_text("
+                "'executed', encoding='utf-8')\n"
+            )
+            self.write_test_module(
+                trusted_root,
+                "test_required.py",
+                source,
+            )
+            self.write_test_module(
+                candidate_root,
+                "test_required.py",
+                source,
+            )
+            candidate_sha = self.initialize_candidate_checkout(candidate_root)
+            try:
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        REQUIRED_CI_CANDIDATE_ROOT_ENV: str(candidate_root),
+                        REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
+                    },
+                    clear=False,
+                ):
+                    for key in LOCAL_SUPERVISOR_ISOLATION_ENV:
+                        os.environ.pop(key, None)
+                    receipt = _trusted_test_suite_receipt(
+                        trusted_root,
+                        candidate_root,
+                    )
+            finally:
+                unittest.TextTestRunner.run = original_run
+                sys.modules.pop("test_required", None)
+                if previous_module is not missing_module:
+                    sys.modules["test_required"] = previous_module
+
+            self.assertEqual(receipt["executed_test_count"], 2)
+            self.assertTrue(first_canary.exists())
+            self.assertTrue(second_canary.exists())
+
+    def test_fixture_staging_uses_captured_control_plane_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            decoy_root = root / "decoy"
+            decoy_root.mkdir()
+            decoy_supervisor = decoy_root / "test_required_ci_workflow.py"
+            decoy_support = decoy_root / "required_ci_candidate.py"
+            decoy_supervisor.write_bytes(
+                b"raise AssertionError('decoy supervisor executed')\n"
+            )
+            decoy_support.write_bytes(
+                b"raise AssertionError('decoy support executed')\n"
+            )
+            fixture_root = root / "fixture"
+            fixture_root.mkdir()
+            with mock.patch.object(
+                sys.modules[__name__],
+                "__file__",
+                str(decoy_supervisor),
+            ), mock.patch.object(
+                sys.modules[__name__],
+                "TRUSTED_CANDIDATE_SUPPORT_PATH",
+                decoy_support,
+            ):
+                trusted_root, candidate_root, _candidate_sha = (
+                    self.prepare_structure_cli_split(str(fixture_root))
+                )
+
+            for checkout_root in (trusted_root, candidate_root):
+                tests_root = distribution_tests_root(checkout_root)
+                self.assertEqual(
+                    (tests_root / "test_required_ci_workflow.py").read_bytes(),
+                    TRUSTED_TEST_SUPERVISOR_BYTES,
+                )
+                self.assertEqual(
+                    (tests_root / "required_ci_candidate.py").read_bytes(),
+                    TRUSTED_CANDIDATE_SUPPORT_SOURCE,
+                )
+
+    def test_candidate_support_consumers_require_the_stable_selected_reader(
+        self,
+    ) -> None:
+        for function in (
+            _CANDIDATE_SUPPORT._session_from_environment,
+            _CANDIDATE_SUPPORT._protect_strict_checkout_boundaries,
+        ):
+            with self.subTest(function=function.__name__):
+                source = inspect.getsource(function)
+                self.assertIn("_read_selected_trusted_support(", source)
+                self.assertNotIn("controller_path.read_bytes(", source)
+                self.assertNotIn("controller_path.read_text(", source)
+                self.assertNotIn("_TRUSTED_SUPPORT_PATH.read_bytes(", source)
+                self.assertNotIn("_TRUSTED_SUPPORT_PATH.read_text(", source)
+
+    def test_control_plane_fixture_builders_never_reopen_logical_sources(
+        self,
+    ) -> None:
+        fixture_builders = (
+            self.prepare_roots,
+            self.prepare_structure_cli_split,
+            self.prepare_private_candidate_checkout,
+            self.prepare_hook_adapter_split,
+            self.test_ordinary_discovery_tolerates_benign_bytecode_cache_without_weakening_formal_entry,
+            self.test_local_formal_copy_never_relocates_shared_import_cache,
+            self.test_structure_cli_rejects_renamed_trusted_checkout_without_binding,
+            self.test_supervisor_rejects_empty_candidate_runtime_with_preserved_inventory,
+            self._exercise_real_watchdog_owner_sigkill_replays_registered_live_ipc_root,
+            self._terminate_marked_process,
+        )
+        forbidden = (
+            "copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH",
+            "copyfile(Path(__file__)",
+            "TRUSTED_CANDIDATE_SUPPORT_PATH.read_bytes",
+            "TRUSTED_CANDIDATE_SUPPORT_PATH.read_text",
+            "Path(__file__).resolve(strict=True).read_bytes",
+            "Path(__file__).resolve(strict=True).read_text",
+            "str(TRUSTED_CANDIDATE_SUPPORT_PATH)",
+        )
+        for function in fixture_builders:
+            with self.subTest(function=function.__name__):
+                source = inspect.getsource(function)
+                self.assertEqual(
+                    [token for token in forbidden if token in source],
+                    [],
+                )
+
 
 class RequiredCiCallerRegressionTests(unittest.TestCase):
     @staticmethod
@@ -38014,7 +46043,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         )
 
     def test_module_postpones_runtime_annotation_evaluation(self) -> None:
-        source = Path(__file__).resolve(strict=True).read_text(encoding="utf-8")
+        source = importlib.util.decode_source(TRUSTED_TEST_SUPERVISOR_BYTES)
 
         self.assertTrue(
             source.startswith("from __future__ import annotations\n"),
@@ -38025,10 +46054,9 @@ class RequiredCiWorkflowTests(unittest.TestCase):
     def test_documented_python_entrypoints_avoid_python_39_only_apis(
         self,
     ) -> None:
-        tests_root = Path(__file__).resolve(strict=True).parent
         test_sources = {
-            path.name: path.read_text(encoding="utf-8")
-            for path in sorted(tests_root.glob("*.py"))
+            name: importlib.util.decode_source(source)
+            for name, source in TRUSTED_TEST_CONTROL_PLANE_SOURCE_ROWS
         }
         source_assignment_policy = {
             "required_ci_candidate.py": {
@@ -38178,7 +46206,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
     def test_workflow_tests_avoid_python_310_parenthesized_context_managers(
         self,
     ) -> None:
-        source = Path(__file__).resolve(strict=True).read_text(encoding="utf-8")
+        source = importlib.util.decode_source(TRUSTED_TEST_SUPERVISOR_BYTES)
         parenthesized_with_lines = [
             source.count("\n", 0, match.start()) + 1
             for match in re.finditer(r"(?m)^[ \t]*with[ \t]+\(", source)
@@ -38397,8 +46425,8 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             tests_root.mkdir(parents=True)
             workflow_test_path = tests_root / "test_required_ci_workflow.py"
             support_path = tests_root / "required_ci_candidate.py"
-            shutil.copyfile(Path(__file__).resolve(strict=True), workflow_test_path)
-            shutil.copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH, support_path)
+            workflow_test_path.write_bytes(TRUSTED_TEST_SUPERVISOR_BYTES)
+            support_path.write_bytes(TRUSTED_CANDIDATE_SUPPORT_SOURCE)
             workflows_root = checkout_root / ".github/workflows"
             workflows_root.mkdir(parents=True)
             (workflows_root / "caller.yml").write_text(
@@ -38426,7 +46454,30 @@ class RequiredCiWorkflowTests(unittest.TestCase):
                         REQUIRED_CI_ISOLATION_MODE_ENV,
                     ):
                         os.environ.pop(key, None)
-                    spec.loader.exec_module(module)
+                    module.__dict__["_TRUSTED_TEST_CONTROL_PLANE_SOURCE_SEED_ROWS"] = (
+                        TRUSTED_TEST_CONTROL_PLANE_SOURCE_ROWS
+                    )
+                    module.__dict__["_TRUSTED_CANDIDATE_SUPPORT_SEED_BYTES"] = (
+                        TRUSTED_CANDIDATE_SUPPORT_SOURCE
+                    )
+                    module.__dict__["_TRUSTED_CANDIDATE_SUPPORT_SEED_BINDING"] = (
+                        _test_control_plane_file_binding(support_path.lstat())
+                    )
+                    module.__dict__["_TRUSTED_TEST_SUPERVISOR_SEED_BYTES"] = (
+                        TRUSTED_TEST_SUPERVISOR_BYTES
+                    )
+                    module.__dict__["_TRUSTED_TEST_SUPERVISOR_SEED_BINDING"] = (
+                        _test_control_plane_file_binding(
+                            workflow_test_path.lstat()
+                        )
+                    )
+                    code = compile(
+                        TRUSTED_TEST_SUPERVISOR_BYTES,
+                        str(workflow_test_path),
+                        "exec",
+                        dont_inherit=True,
+                    )
+                    exec(code, module.__dict__)
 
                 inventory = module._direct_test_inventory(
                     checkout_root, "private trusted"

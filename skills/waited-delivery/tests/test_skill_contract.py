@@ -212,6 +212,163 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("organization required-workflow/ruleset activation", dependencies)
         self.assertIn("treat the leaf as published but not enforced", dependencies)
         self.assertIn("does not claim that activation has occurred", dependencies)
+        self.assertIn("initial bootstrap is not self-authorizing", dependencies)
+        self.assertIn("independent formal review", dependencies)
+        self.assertIn("exact immutable bootstrap revision", dependencies)
+        self.assertIn("must not promote changes", dependencies)
+        self.assertIn("protected two-stage promotion", dependencies)
+        self.assertIn(
+            "complete `skills/waited-delivery/tests/` trusted-harness namespace",
+            dependencies,
+        )
+        self.assertIn("does not activate or claim activation", dependencies)
+        self.assertIn(
+            "candidate green result is compatibility evidence only", dependencies
+        )
+        self.assertIn(
+            "complete active test namespace through one held tests-root descriptor",
+            dependencies,
+        )
+        self.assertIn(
+            "Object identity, source content, and access policy are the protected "
+            "properties",
+            dependencies,
+        )
+        self.assertIn(
+            "`mtime` and `ctime` changes alone are benign metadata transitions",
+            dependencies,
+        )
+        self.assertIn(
+            "Every namespace enumeration independently enforces the "
+            "256-entry bound",
+            dependencies,
+        )
+        self.assertIn("complete captured source set is limited to 16 MiB", dependencies)
+        self.assertIn(
+            "derives the expected candidate leaf set before reading candidate "
+            "content",
+            dependencies,
+        )
+        self.assertIn(
+            "fixes their mode to `0700` through the held descriptors",
+            dependencies,
+        )
+        self.assertIn(
+            "prepared root descriptors remain open through the complete "
+            "namespace capture",
+            dependencies,
+        )
+        self.assertIn(
+            "opened component by component from the held trusted-root "
+            "descriptor",
+            dependencies,
+        )
+        self.assertIn(
+            "revalidates their descriptor and path bindings, the complete "
+            "component chain, and the root ACL state",
+            dependencies,
+        )
+        self.assertIn("verify-only and idempotent", dependencies)
+        self.assertIn(
+            "Namespace capture returns the binding of its held tests-root "
+            "descriptor",
+            dependencies,
+        )
+        self.assertIn(
+            "repository root path and repository directory binding are included",
+            dependencies,
+        )
+        self.assertIn(
+            "already captured supervisor bytes", dependencies
+        )
+        self.assertIn(
+            "freezes the launch authority and test-suite snapshot before any "
+            "isolation callback",
+            dependencies,
+        )
+        self.assertIn(
+            "one parent-held authorized snapshot for both roles",
+            dependencies,
+        )
+        self.assertIn(
+            "canonical bundle derived from the parent-captured suite snapshot",
+            dependencies,
+        )
+        self.assertIn(
+            "compiles the test modules directly from its captured source bytes "
+            "in memory",
+            dependencies,
+        )
+        self.assertIn(
+            "test loading never reopens its source paths or consumes adjacent "
+            "bytecode",
+            dependencies,
+        )
+        self.assertIn(
+            "Captured support bytes are injected before support execution",
+            dependencies,
+        )
+        self.assertIn(
+            "no-follow, nonblocking, double-read descriptor policy",
+            dependencies,
+        )
+        self.assertIn("immutable, validated source row", dependencies)
+        self.assertIn("fresh owner-private staging directory", dependencies)
+        self.assertIn(
+            "`TextTestRunner.run` bound method is also captured before any test "
+            "module is executed",
+            dependencies,
+        )
+        self.assertIn("in-memory source loader", dependencies)
+        self.assertIn("captured `linecache` entry", dependencies)
+        self.assertIn(
+            "fixed child bootstrap seeds that same cache before compiling",
+            dependencies,
+        )
+        self.assertIn("`InspectLoader.get_source` lookup", dependencies)
+        self.assertIn(
+            "precheck, opened descriptor, final path lookup, and loaded support "
+            "binding",
+            dependencies,
+        )
+        self.assertIn(
+            "final path binding as its last filesystem observation",
+            dependencies,
+        )
+        self.assertIn(
+            "equal the initially loaded support binding",
+            dependencies,
+        )
+        self.assertIn(
+            "does not compare device or inode identities across copies",
+            dependencies,
+        )
+        self.assertIn(
+            "do not skip terminal integrity checks",
+            dependencies,
+        )
+        self.assertIn(
+            "preserve the primary failure first and then each independently "
+            "observed integrity failure",
+            dependencies,
+        )
+        self.assertIn("head-and-tail bound directly", dependencies)
+        self.assertIn(
+            "Structure validation applies the same rule",
+            dependencies,
+        )
+        self.assertIn("fresh owner-private absolute bytecode-cache prefix", dependencies)
+        self.assertIn("`-X pycache_prefix`", dependencies)
+        self.assertIn(
+            "does not consume, write, rename, or temporarily hide repository "
+            "`__pycache__` artifacts",
+            dependencies,
+        )
+        self.assertIn("private control-plane copy", dependencies)
+        self.assertIn(
+            "ordinary `Run tests` step in `.github/workflows/ci.yml` is locked",
+            dependencies,
+        )
         self.assertIn(
             "Direct triggers in the leaf and a duplicate caller in this repository "
             "are forbidden",
