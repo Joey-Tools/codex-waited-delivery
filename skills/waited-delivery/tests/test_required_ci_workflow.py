@@ -28,7 +28,7 @@ import time
 import traceback
 import unittest
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from unittest import mock
 
 
@@ -5533,6 +5533,38 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             ),
             namespace_path / basename,
         )
+        wrong_session_basename = f"direct-opt-{'c' * 32}-{nonce}.log"
+        with self.assertRaisesRegex(
+            AssertionError, "strict live broker witness basename changed"
+        ):
+            _strict_live_broker_witness_path(
+                marker,
+                {
+                    **witness_binding,
+                    "basename": wrong_session_basename,
+                },
+                namespace_binding,
+                {
+                    **file_binding,
+                    "path": str(namespace_path / wrong_session_basename),
+                },
+            )
+        wrong_nonce_basename = f"direct-opt-{session_id}-{'d' * 32}.log"
+        with self.assertRaisesRegex(
+            AssertionError, "strict live broker witness basename changed"
+        ):
+            _strict_live_broker_witness_path(
+                marker,
+                {
+                    **witness_binding,
+                    "basename": wrong_nonce_basename,
+                },
+                namespace_binding,
+                {
+                    **file_binding,
+                    "path": str(namespace_path / wrong_nonce_basename),
+                },
+            )
         with self.assertRaisesRegex(
             AssertionError, "strict live broker witness path changed"
         ):
@@ -6579,6 +6611,42 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 readable = ([42], [], []) if failure_mode == "eof" else ([], [], [])
                 read_result = b"" if failure_mode == "eof" else b"unused"
                 captured = io.StringIO()
+                trace: list[str] = []
+                clients_quiescent = False
+
+                def signal_owner(
+                    observed: object, selected_signal: int
+                ) -> None:
+                    self.assertEqual(observed, identity)
+                    self.assertEqual(selected_signal, signal.SIGKILL)
+                    trace.append("signal-owner")
+
+                def close_runner_clients(
+                    registry_path: Path, selected_token: str
+                ) -> None:
+                    nonlocal clients_quiescent
+                    self.assertEqual(registry_path, Path("/tmp/entries"))
+                    self.assertEqual(selected_token, registry_token)
+                    self.assertEqual(trace, ["signal-owner"])
+                    clients_quiescent = True
+                    trace.append("clients-quiescent")
+
+                def owner_loss_cleanup(
+                    selected_session: object, **keywords: object
+                ) -> tuple[object, ...]:
+                    self.assertTrue(clients_quiescent)
+                    self.assertEqual(selected_session, session)
+                    self.assertEqual(
+                        keywords,
+                        {
+                            "recovery_profile": (
+                                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
+                            )
+                        },
+                    )
+                    trace.append("owner-loss-profile-cleanup")
+                    return ()
+
                 with mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "strict_isolation_platform_preflight",
@@ -6591,11 +6659,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     "_process_identity",
                     return_value=identity,
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT, "_root_signal_host_identity"
+                    _CANDIDATE_SUPPORT,
+                    "_root_signal_host_identity",
+                    side_effect=signal_owner,
                 ) as signal_parent, mock.patch.object(
-                    _CANDIDATE_SUPPORT, "_watchdog_close_runner_clients"
+                    _CANDIDATE_SUPPORT,
+                    "_watchdog_close_runner_clients",
+                    side_effect=close_runner_clients,
                 ) as close_clients, mock.patch.object(
-                    _CANDIDATE_SUPPORT, "close_trusted_isolation_chains"
+                    _CANDIDATE_SUPPORT,
+                    "close_trusted_isolation_chains",
+                    side_effect=owner_loss_cleanup,
                 ) as close_registry, mock.patch.object(
                     _CANDIDATE_SUPPORT.select,
                     "select",
@@ -6618,7 +6692,20 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 close_clients.assert_called_once_with(
                     Path("/tmp/entries"), registry_token
                 )
-                close_registry.assert_called_once_with(session)
+                close_registry.assert_called_once_with(
+                    session,
+                    recovery_profile=(
+                        _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
+                    ),
+                )
+                self.assertEqual(
+                    trace,
+                    [
+                        "signal-owner",
+                        "clients-quiescent",
+                        "owner-loss-profile-cleanup",
+                    ],
+                )
                 self.assertIn(
                     f"{_CANDIDATE_SUPPORT._WATCHDOG_RESULT_PREFIX}",
                     captured.getvalue(),
@@ -6709,7 +6796,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(returncode, 1)
         signal_owner.assert_called_once_with(owner, signal.SIGKILL)
         close_clients.assert_called_once_with(root, token)
-        close_registry.assert_called_once_with(session)
+        close_registry.assert_called_once_with(
+            session,
+            recovery_profile=(
+                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
+            ),
+        )
 
     def test_registry_watchdog_is_durable_before_registry_acquisition_returns(
         self,
@@ -6732,6 +6824,14 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
         self.assertLess(
             initialize_source.index("_start_registry_watchdog"),
+            initialize_source.index(
+                "_arm_registry_watchdog_owner_loss_authority"
+            ),
+        )
+        self.assertLess(
+            initialize_source.index(
+                "_arm_registry_watchdog_owner_loss_authority"
+            ),
             initialize_source.index("_active_strict_session"),
         )
         self.assertIn(
@@ -6743,6 +6843,844 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertIn("_watchdog_close_runner_clients", watchdog_replay_source)
         self.assertIn("close_trusted_isolation_chains(session)", watchdog_source)
         self.assertIn("_close_registry_through_watchdog", close_source)
+
+    def test_owner_loss_authority_document_schema_is_exact(self) -> None:
+        runner_uid = 501
+        runner_gid = 502
+        canonical = {
+            "schema_version": 1,
+            "kind": (
+                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_KIND
+            ),
+            "arm_nonce": "a" * 32,
+            "runner_uid": runner_uid,
+            "runner_gid": runner_gid,
+            "registry": {
+                "root": {
+                    "path": "/registry",
+                    "device": 11,
+                    "inode": 12,
+                    "uid": runner_uid,
+                    "gid": runner_gid,
+                    "mode": 0o700,
+                },
+                "entries": {
+                    "path": "/registry/entries",
+                    "device": 11,
+                    "inode": 13,
+                    "uid": runner_uid,
+                    "gid": runner_gid,
+                    "mode": 0o700,
+                },
+                "session_lock": {
+                    "path": "/registry/.session.lock",
+                    "device": 11,
+                    "inode": 14,
+                    "uid": runner_uid,
+                    "gid": runner_gid,
+                    "mode": 0o600,
+                    "nlink": 1,
+                },
+                "token": "b" * 32,
+                "watchdog_token": "c" * 32,
+            },
+            "owner": _CANDIDATE_SUPPORT._process_identity_document(
+                (201, 202, 1, 201, 201, (runner_uid,) * 4)
+            ),
+            "watchdog": _CANDIDATE_SUPPORT._process_identity_document(
+                (301, 302, 201, 301, 301, (runner_uid,) * 4)
+            ),
+            "controller": {
+                "path": str(_CANDIDATE_SUPPORT._TRUSTED_SUPPORT_PATH),
+                "device": 21,
+                "inode": 22,
+                "uid": runner_uid,
+                "gid": runner_gid,
+                "mode": 0o400,
+                "nlink": 1,
+                "size": 23,
+                "sha256": _CANDIDATE_SUPPORT._TRUSTED_SUPPORT_SHA256,
+            },
+            "trusted_source_sha256": (
+                _CANDIDATE_SUPPORT._TRUSTED_SUPPORT_SHA256
+            ),
+        }
+
+        self.assertTrue(
+            _CANDIDATE_SUPPORT._strict_owner_loss_authority_document_is_exact(
+                canonical
+            )
+        )
+
+        def clone() -> dict[str, object]:
+            value = json.loads(json.dumps(canonical))
+            self.assertIsInstance(value, dict)
+            return value
+
+        mutants: list[tuple[str, dict[str, object]]] = []
+        for name, key, replacement in (
+            ("schema-version", "schema_version", 2),
+            ("kind", "kind", "wrong-owner-loss-authority-kind"),
+            ("arm-nonce", "arm_nonce", "g" * 32),
+            ("trusted-source", "trusted_source_sha256", "0" * 64),
+        ):
+            mutant = clone()
+            mutant[key] = replacement
+            mutants.append((name, mutant))
+
+        missing_top_level = clone()
+        missing_top_level.pop("controller")
+        mutants.append(("missing-top-level", missing_top_level))
+
+        extra_top_level = clone()
+        extra_top_level["unexpected"] = True
+        mutants.append(("extra-top-level", extra_top_level))
+
+        missing_registry_key = clone()
+        missing_registry = missing_registry_key["registry"]
+        self.assertIsInstance(missing_registry, dict)
+        missing_registry.pop("watchdog_token")
+        mutants.append(("missing-registry-key", missing_registry_key))
+
+        extra_registry_key = clone()
+        extra_registry = extra_registry_key["registry"]
+        self.assertIsInstance(extra_registry, dict)
+        extra_registry["unexpected"] = True
+        mutants.append(("extra-registry-key", extra_registry_key))
+
+        wrong_registry_binding = clone()
+        wrong_registry = wrong_registry_binding["registry"]
+        self.assertIsInstance(wrong_registry, dict)
+        wrong_root = wrong_registry["root"]
+        self.assertIsInstance(wrong_root, dict)
+        wrong_root["path"] = "relative-registry"
+        mutants.append(("wrong-registry-binding", wrong_registry_binding))
+
+        for name, mutant in mutants:
+            with self.subTest(mutation=name):
+                self.assertFalse(
+                    _CANDIDATE_SUPPORT._strict_owner_loss_authority_document_is_exact(
+                        mutant
+                    )
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "authority document is malformed"
+                ):
+                    _CANDIDATE_SUPPORT._root_publish_strict_owner_loss_authority(
+                        -1, mutant
+                    )
+
+    def test_owner_loss_authority_publication_is_exclusive_and_durable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            namespace = Path(temporary_directory).resolve(strict=True)
+            runner_uid = os.getuid()
+            runner_gid = os.getgid()
+            namespace_metadata = namespace.stat()
+            namespace_identity = (
+                namespace_metadata.st_dev,
+                namespace_metadata.st_ino,
+            )
+            real_open = os.open
+            real_fsync = os.fsync
+            authority_create_calls: list[
+                tuple[object, int, int, int | None, tuple[int, int]]
+            ] = []
+
+            def authority_document(selector: str) -> dict[str, object]:
+                return {
+                    "registry": {
+                        "token": selector * 32,
+                        "watchdog_token": chr(ord(selector) + 1) * 32,
+                    }
+                }
+
+            def open_namespace(
+                _parent_fd: int, _expected: object
+            ) -> tuple[int, dict[str, object]]:
+                return (
+                    os.open(
+                        namespace,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                    ),
+                    {"path": str(namespace)},
+                )
+
+            def record_open(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                if flags & os.O_CREAT:
+                    self.assertIs(type(dir_fd), int)
+                    assert dir_fd is not None
+                    opened_namespace = os.fstat(dir_fd)
+                    authority_create_calls.append(
+                        (
+                            path,
+                            flags,
+                            mode,
+                            dir_fd,
+                            (
+                                opened_namespace.st_dev,
+                                opened_namespace.st_ino,
+                            ),
+                        )
+                    )
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            def classify_fsync(
+                trace: list[str], *, fail_kind: str | None = None
+            ) -> Callable[[int], None]:
+                def selected(descriptor: int) -> None:
+                    kind = (
+                        "namespace"
+                        if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                        else "file"
+                    )
+                    trace.append(kind)
+                    if kind == fail_kind:
+                        raise OSError(errno.EIO, f"injected {kind} fsync failure")
+                    real_fsync(descriptor)
+
+                return selected
+
+            patches = (
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_owner_loss_authority_document_is_exact",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_root_open_strict_live_ipc_witness_namespace",
+                    side_effect=open_namespace,
+                ),
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_live_ipc_witness_namespace_path",
+                    return_value=namespace,
+                ),
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                    runner_uid,
+                ),
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                    runner_gid,
+                ),
+                mock.patch.object(os, "fchown"),
+            )
+            with contextlib.ExitStack() as stack:
+                fchown = stack.enter_context(patches[-1])
+                for selected_patch in patches[:-1]:
+                    stack.enter_context(selected_patch)
+
+                document = authority_document("a")
+                trace: list[str] = []
+                with mock.patch.object(
+                    os, "open", side_effect=record_open
+                ), mock.patch.object(
+                    os, "fsync", side_effect=classify_fsync(trace)
+                ):
+                    authority = (
+                        _CANDIDATE_SUPPORT._root_publish_strict_owner_loss_authority(
+                            -1, document
+                        )
+                    )
+                expected_basename = (
+                    _CANDIDATE_SUPPORT._strict_live_ipc_owner_loss_authority_basename(
+                        "a" * 32, "b" * 32
+                    )
+                )
+                expected_create_flags = (
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC
+                )
+                self.assertEqual(len(authority_create_calls), 1)
+                (
+                    created_basename,
+                    create_flags,
+                    create_mode,
+                    create_dir_fd,
+                    create_namespace_identity,
+                ) = authority_create_calls[0]
+                self.assertEqual(created_basename, expected_basename)
+                self.assertEqual(create_flags, expected_create_flags)
+                self.assertEqual(create_mode, 0o600)
+                self.assertIs(type(create_dir_fd), int)
+                self.assertEqual(create_namespace_identity, namespace_identity)
+                self.assertEqual(authority["basename"], expected_basename)
+                self.assertEqual(trace, ["file", "file", "namespace"])
+                fchown.assert_called_once()
+                authority_path = namespace / str(authority["basename"])
+                expected_data = json.dumps(
+                    document, sort_keys=True, separators=(",", ":")
+                ).encode("ascii")
+                self.assertEqual(authority_path.read_bytes(), expected_data)
+                self.assertEqual(
+                    stat.S_IMODE(authority_path.stat().st_mode),
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_MODE,
+                )
+
+                trace = []
+                with mock.patch.object(
+                    os, "fsync", side_effect=classify_fsync(trace)
+                ):
+                    replayed = (
+                        _CANDIDATE_SUPPORT._root_publish_strict_owner_loss_authority(
+                            -1, document
+                        )
+                    )
+                self.assertEqual(trace, ["file", "namespace"])
+                self.assertEqual(replayed, authority)
+                fchown.assert_called_once()
+
+                collision_document = authority_document("c")
+                collision_basename = (
+                    _CANDIDATE_SUPPORT._strict_live_ipc_owner_loss_authority_basename(
+                        "c" * 32, "d" * 32
+                    )
+                )
+                collision_path = namespace / collision_basename
+                collision_data = json.dumps(
+                    collision_document,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+                original_collision = b"x" * len(collision_data)
+                collision_path.write_bytes(original_collision)
+                collision_path.chmod(
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_MODE
+                )
+                collision_identity = (
+                    collision_path.stat().st_dev,
+                    collision_path.stat().st_ino,
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "replay is inexact"
+                ):
+                    _CANDIDATE_SUPPORT._root_publish_strict_owner_loss_authority(
+                        -1, collision_document
+                    )
+                self.assertEqual(collision_path.read_bytes(), original_collision)
+                self.assertEqual(
+                    (
+                        collision_path.stat().st_dev,
+                        collision_path.stat().st_ino,
+                    ),
+                    collision_identity,
+                )
+                self.assertEqual(
+                    stat.S_IMODE(collision_path.stat().st_mode),
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_MODE,
+                )
+
+                for selector, failed_kind in (
+                    ("e", "file"),
+                    ("1", "namespace"),
+                ):
+                    with self.subTest(fsync_failure=failed_kind):
+                        failing_document = authority_document(selector)
+                        failure_trace: list[str] = []
+                        with mock.patch.object(
+                            os,
+                            "fsync",
+                            side_effect=classify_fsync(
+                                failure_trace, fail_kind=failed_kind
+                            ),
+                        ), self.assertRaisesRegex(
+                            AssertionError, "cannot be published"
+                        ):
+                            _CANDIDATE_SUPPORT._root_publish_strict_owner_loss_authority(
+                                -1, failing_document
+                            )
+                        self.assertIn(failed_kind, failure_trace)
+                        if failed_kind == "file":
+                            self.assertNotIn("namespace", failure_trace)
+
+                        retry_trace: list[str] = []
+                        with mock.patch.object(
+                            os,
+                            "fsync",
+                            side_effect=classify_fsync(retry_trace),
+                        ):
+                            _CANDIDATE_SUPPORT._root_publish_strict_owner_loss_authority(
+                                -1, failing_document
+                            )
+                        self.assertEqual(retry_trace, ["file", "namespace"])
+
+    def test_owner_loss_authority_arm_binds_process_lock_and_controller(
+        self,
+    ) -> None:
+        runner_uid = 501
+        runner_gid = 502
+        owner_identity = (
+            201,
+            202,
+            1,
+            201,
+            201,
+            (runner_uid,) * 4,
+        )
+        watchdog_identity = (
+            301,
+            302,
+            owner_identity[0],
+            301,
+            301,
+            (runner_uid,) * 4,
+        )
+        root_binding = {
+            "path": "/registry",
+            "device": 11,
+            "inode": 12,
+            "uid": runner_uid,
+            "gid": runner_gid,
+            "mode": 0o700,
+        }
+        entries_binding = {
+            "path": "/registry/entries",
+            "device": 11,
+            "inode": 13,
+            "uid": runner_uid,
+            "gid": runner_gid,
+            "mode": 0o700,
+        }
+        lock_binding = {
+            "path": "/registry/.session.lock",
+            "device": 11,
+            "inode": 14,
+            "uid": runner_uid,
+            "gid": runner_gid,
+            "mode": 0o600,
+            "nlink": 1,
+        }
+        entry_path = Path("/registry/entries/chain-" + "a" * 32 + ".json")
+        entry_document = {
+            "target_uid": 60041,
+            "state": "root-authorized",
+            "cleanup_execution_root": False,
+            "registry_owner_uid": runner_uid,
+            "controller_path": str(_CANDIDATE_SUPPORT._TRUSTED_SUPPORT_PATH),
+        }
+
+        def identity_document(identity: tuple[object, ...]) -> dict[str, object]:
+            return {
+                "pid": identity[0],
+                "start_time": identity[1],
+                "parent_pid": identity[2],
+                "process_group": identity[3],
+                "session_id": identity[4],
+                "uids": list(identity[5]),
+            }
+
+        for failure in (
+            "watchdog-parent",
+            "registered-ancestry",
+            "session-lock",
+            "watchdog-command",
+            "controller-binding",
+        ):
+            with self.subTest(arm_failure=failure):
+                selected_watchdog = (
+                    (
+                        watchdog_identity[0],
+                        watchdog_identity[1],
+                        owner_identity[0] + 1,
+                        watchdog_identity[3],
+                        watchdog_identity[4],
+                        watchdog_identity[5],
+                    )
+                    if failure == "watchdog-parent"
+                    else watchdog_identity
+                )
+                arguments = [
+                    str(entry_path),
+                    json.dumps(root_binding),
+                    json.dumps(entries_binding),
+                    json.dumps(lock_binding),
+                    str(runner_uid),
+                    str(runner_gid),
+                    "b" * 32,
+                    "c" * 32,
+                    json.dumps(identity_document(owner_identity)),
+                    json.dumps(identity_document(selected_watchdog)),
+                    str(_CANDIDATE_SUPPORT._TRUSTED_SUPPORT_PATH),
+                    _CANDIDATE_SUPPORT._TRUSTED_SUPPORT_SHA256,
+                    "d" * 32,
+                ]
+
+                def observe_process(path: Path):
+                    selected_pid = int(path.name)
+                    if selected_pid == owner_identity[0]:
+                        return owner_identity
+                    if selected_pid == selected_watchdog[0]:
+                        return selected_watchdog
+                    return None
+
+                lock_error = (
+                    AssertionError("injected exact session lock failure")
+                    if failure == "session-lock"
+                    else None
+                )
+                controller_error = (
+                    AssertionError("injected controller binding failure")
+                    if failure == "controller-binding"
+                    else None
+                )
+                ancestry_error = (
+                    AssertionError("injected registered ancestry failure")
+                    if failure == "registered-ancestry"
+                    else None
+                )
+                command_error = (
+                    AssertionError("injected watchdog command failure")
+                    if failure == "watchdog-command"
+                    else None
+                )
+                with mock.patch.object(
+                    os, "getuid", return_value=0
+                ), mock.patch.object(
+                    os, "geteuid", return_value=0
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_bind_root_controller_parent"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_owner_loss_registry_bindings",
+                    return_value=(41, 42, root_binding, entries_binding),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_owner_loss_session_lock_binding",
+                    return_value=(43, lock_binding),
+                ), mock.patch.object(
+                    os, "open", return_value=44
+                ), mock.patch.object(
+                    os,
+                    "pread",
+                    return_value=json.dumps(entry_document).encode("ascii"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_load_chain_registry_entry",
+                    return_value=entry_document,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_owner_loss_registered_broker_ancestry",
+                    side_effect=ancestry_error,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_process_identity",
+                    side_effect=observe_process,
+                ), mock.patch.object(
+                    os, "pidfd_open", return_value=45, create=True
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.signal,
+                    "pidfd_send_signal",
+                    create=True,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_owner_loss_exact_session_lock_holder",
+                    side_effect=lock_error,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_owner_loss_watchdog_command_is_exact",
+                    side_effect=command_error,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_owner_loss_controller_binding",
+                    side_effect=controller_error,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_root_publish_strict_owner_loss_authority",
+                ) as publish_authority, mock.patch.object(
+                    os, "close"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "print", create=True
+                ) as print_receipt:
+                    returncode = (
+                        _CANDIDATE_SUPPORT._root_owner_loss_authority_arm_main(
+                            arguments
+                        )
+                    )
+
+                self.assertEqual(returncode, 0)
+                publish_authority.assert_not_called()
+                print_receipt.assert_called_once()
+                output = print_receipt.call_args.args[0]
+                self.assertTrue(
+                    output.startswith(_CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX)
+                )
+                receipt = json.loads(
+                    output[len(_CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX) :]
+                )
+                self.assertEqual(receipt["status"], "incomplete")
+                self.assertIn(
+                    {
+                        "watchdog-parent": "owner/watchdog relation",
+                        "registered-ancestry": "registered ancestry failure",
+                        "session-lock": "session lock failure",
+                        "watchdog-command": "watchdog command failure",
+                        "controller-binding": "controller binding failure",
+                    }[failure],
+                    receipt["error"],
+                )
+
+    def test_witness_namespace_retry_repeats_parent_durability_barrier(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve(strict=True)
+            namespace_name = (
+                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+            )
+            namespace_path = parent / namespace_name
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+            )
+            runner_uid = os.geteuid()
+            runner_gid = os.getegid()
+            real_fsync = os.fsync
+            real_open = os.open
+            parent_metadata = os.fstat(parent_fd)
+            parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
+            first_trace: list[str] = []
+            parent_failure_injected = False
+
+            def descriptor_kind(descriptor: int) -> str:
+                descriptor_metadata = os.fstat(descriptor)
+                descriptor_identity = (
+                    descriptor_metadata.st_dev,
+                    descriptor_metadata.st_ino,
+                )
+                if descriptor == parent_fd:
+                    self.assertEqual(descriptor_identity, parent_identity)
+                    return "parent"
+                selected_metadata = namespace_path.lstat()
+                selected_identity = (
+                    selected_metadata.st_dev,
+                    selected_metadata.st_ino,
+                )
+                self.assertEqual(descriptor_identity, selected_identity)
+                self.assertNotEqual(descriptor_identity, parent_identity)
+                self.assertTrue(stat.S_ISDIR(descriptor_metadata.st_mode))
+                return "namespace"
+
+            def fail_first_parent_fsync(descriptor: int) -> None:
+                nonlocal parent_failure_injected
+                kind = descriptor_kind(descriptor)
+                first_trace.append(kind)
+                if kind == "parent" and not parent_failure_injected:
+                    parent_failure_injected = True
+                    raise OSError(errno.EIO, "injected parent fsync failure")
+                real_fsync(descriptor)
+
+            patches = (
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    parent,
+                ),
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                    runner_uid,
+                ),
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                    runner_gid,
+                ),
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_descriptor_mount_id",
+                    return_value=41,
+                ),
+                mock.patch.object(os, "fchown"),
+            )
+            namespace_fd: int | None = None
+            try:
+                with contextlib.ExitStack() as stack:
+                    for selected_patch in patches:
+                        stack.enter_context(selected_patch)
+                    with mock.patch.object(
+                        os,
+                        "fsync",
+                        side_effect=fail_first_parent_fsync,
+                    ), self.assertRaisesRegex(
+                        AssertionError, "namespace is unavailable"
+                    ):
+                        _CANDIDATE_SUPPORT._root_open_strict_live_ipc_witness_namespace(
+                            parent_fd, None
+                        )
+
+                    self.assertTrue(parent_failure_injected)
+                    self.assertEqual(first_trace, ["namespace", "parent"])
+                    before_retry = namespace_path.lstat()
+                    self.assertTrue(stat.S_ISDIR(before_retry.st_mode))
+                    self.assertEqual(
+                        stat.S_IMODE(before_retry.st_mode),
+                        _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_MODE,
+                    )
+
+                    retry_trace: list[str] = []
+
+                    def sync_retry(descriptor: int) -> None:
+                        retry_trace.append(descriptor_kind(descriptor))
+                        real_fsync(descriptor)
+
+                    with mock.patch.object(
+                        os, "fsync", side_effect=sync_retry
+                    ):
+                        namespace_fd, binding = (
+                            _CANDIDATE_SUPPORT._root_open_strict_live_ipc_witness_namespace(
+                                parent_fd, None
+                            )
+                        )
+
+                    self.assertEqual(retry_trace, ["namespace", "parent"])
+                    after_retry = os.fstat(namespace_fd)
+                    self.assertEqual(
+                        (after_retry.st_dev, after_retry.st_ino),
+                        (before_retry.st_dev, before_retry.st_ino),
+                    )
+                    self.assertEqual(
+                        (binding["device"], binding["inode"]),
+                        (before_retry.st_dev, before_retry.st_ino),
+                    )
+
+                    os.close(namespace_fd)
+                    namespace_fd = None
+                    original_identity = (
+                        before_retry.st_dev,
+                        before_retry.st_ino,
+                    )
+                    retired_path = parent / "retired-witness-namespace"
+                    race_trace: list[str] = []
+                    race_opened_fds: list[int] = []
+                    race_opened_identity: tuple[int, int] | None = None
+                    replacement_identity: tuple[int, int] | None = None
+                    replacement_installed = False
+
+                    def capture_namespace_open(
+                        path: str | bytes | os.PathLike[str],
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal race_opened_identity
+                        descriptor = real_open(
+                            path, flags, mode, dir_fd=dir_fd
+                        )
+                        if path == namespace_name and dir_fd == parent_fd:
+                            opened_metadata = os.fstat(descriptor)
+                            race_opened_identity = (
+                                opened_metadata.st_dev,
+                                opened_metadata.st_ino,
+                            )
+                            race_opened_fds.append(descriptor)
+                        return descriptor
+
+                    def replace_after_parent_sync(descriptor: int) -> None:
+                        nonlocal replacement_identity
+                        nonlocal replacement_installed
+                        kind = descriptor_kind(descriptor)
+                        race_trace.append(kind)
+                        real_fsync(descriptor)
+                        if kind == "parent" and not replacement_installed:
+                            os.rename(namespace_path, retired_path)
+                            os.mkdir(
+                                namespace_path,
+                                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_MODE,
+                            )
+                            replacement_metadata = namespace_path.lstat()
+                            replacement_identity = (
+                                replacement_metadata.st_dev,
+                                replacement_metadata.st_ino,
+                            )
+                            replacement_installed = True
+
+                    try:
+                        with mock.patch.object(
+                            os, "open", side_effect=capture_namespace_open
+                        ), mock.patch.object(
+                            os, "fsync", side_effect=replace_after_parent_sync
+                        ), self.assertRaisesRegex(
+                            AssertionError, "namespace identity changed"
+                        ):
+                            _CANDIDATE_SUPPORT._root_open_strict_live_ipc_witness_namespace(
+                                parent_fd, None
+                            )
+
+                        self.assertTrue(replacement_installed)
+                        self.assertEqual(race_trace, ["namespace", "parent"])
+                        self.assertEqual(race_opened_identity, original_identity)
+                        self.assertEqual(len(race_opened_fds), 1)
+                        with self.assertRaises(OSError) as closed_error:
+                            os.fstat(race_opened_fds[0])
+                        self.assertEqual(closed_error.exception.errno, errno.EBADF)
+
+                        retired_metadata = retired_path.lstat()
+                        replacement_metadata = namespace_path.lstat()
+                        self.assertEqual(
+                            (retired_metadata.st_dev, retired_metadata.st_ino),
+                            original_identity,
+                        )
+                        self.assertEqual(
+                            (
+                                replacement_metadata.st_dev,
+                                replacement_metadata.st_ino,
+                            ),
+                            replacement_identity,
+                        )
+                        self.assertNotEqual(
+                            replacement_identity,
+                            original_identity,
+                        )
+                        self.assertEqual(
+                            (
+                                replacement_metadata.st_uid,
+                                replacement_metadata.st_gid,
+                                stat.S_IMODE(replacement_metadata.st_mode),
+                            ),
+                            (
+                                before_retry.st_uid,
+                                before_retry.st_gid,
+                                stat.S_IMODE(before_retry.st_mode),
+                            ),
+                        )
+                        self.assertEqual(list(retired_path.iterdir()), [])
+                        self.assertEqual(list(namespace_path.iterdir()), [])
+                        self.assertEqual(
+                            {entry.name for entry in parent.iterdir()},
+                            {namespace_name, retired_path.name},
+                        )
+                    finally:
+                        for descriptor in race_opened_fds:
+                            try:
+                                os.close(descriptor)
+                            except OSError as error:
+                                if error.errno != errno.EBADF:
+                                    raise
+            finally:
+                if namespace_fd is not None:
+                    os.close(namespace_fd)
+                os.close(parent_fd)
 
     def test_watchdog_owner_pid_reuse_skips_signal_but_still_replays(self) -> None:
         token = "e" * 32
@@ -6792,7 +7730,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         close_clients.assert_called_once_with(
             Path("/tmp/entries"), registry_token
         )
-        close_registry.assert_called_once_with(session)
+        close_registry.assert_called_once_with(
+            session,
+            recovery_profile=(
+                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
+            ),
+        )
 
     def test_watchdog_owner_loss_replay_persists_until_success(self) -> None:
         parent_identity = (123, 456, 123, 123)
@@ -6827,6 +7770,438 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertGreaterEqual(
             main_source.count("_registry_watchdog_replay_until_complete"), 2
         )
+
+        terminal_error = AssertionError("persistent injected replay failure")
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_registry_watchdog_replay",
+            side_effect=terminal_error,
+        ) as bounded_replay, mock.patch.object(
+            _CANDIDATE_SUPPORT.time,
+            "monotonic",
+            side_effect=(0.0, 0.0, 6.0),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.time, "sleep"
+        ) as bounded_sleep, self.assertRaisesRegex(
+            AssertionError, "recovery remained incomplete"
+        ) as bounded:
+            _CANDIDATE_SUPPORT._registry_watchdog_replay_until_complete(
+                parent_identity, session
+            )
+        self.assertIs(bounded.exception.__cause__, terminal_error)
+        bounded_replay.assert_called_once_with(parent_identity, session)
+        bounded_sleep.assert_not_called()
+
+    def test_registry_watchdog_rejects_unauthorized_inherited_session_before_control(
+        self,
+    ) -> None:
+        token = "e" * 32
+        registry_token = "f" * 32
+        parent_identity = (321, 654, 321, 321)
+        session = {
+            "inherited": True,
+            "watchdog_authorized": 1,
+            "environment": {
+                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV: "/tmp/entries",
+                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV: registry_token,
+            },
+        }
+        input_stream = mock.Mock()
+        input_stream.fileno.return_value = 42
+        captured = io.StringIO()
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_active_strict_session",
+            return_value=session,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_registry_watchdog_replay_until_complete",
+            return_value=(),
+        ) as bounded_recovery, mock.patch.object(
+            _CANDIDATE_SUPPORT.select,
+            "select",
+            return_value=([42], [], []),
+        ) as select_control, mock.patch.object(
+            _CANDIDATE_SUPPORT.os, "read", return_value=b"D\n"
+        ) as read_control, mock.patch.object(
+            _CANDIDATE_SUPPORT.sys, "stdin", input_stream
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_root_signal_host_identity"
+        ) as signal_owner, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_watchdog_close_runner_clients"
+        ) as close_clients, mock.patch.object(
+            _CANDIDATE_SUPPORT, "close_trusted_isolation_chains"
+        ) as ordinary_close, contextlib.redirect_stdout(captured):
+            returncode = _CANDIDATE_SUPPORT._registry_watchdog_main(
+                tuple(str(value) for value in (*parent_identity, token))
+            )
+
+        self.assertEqual(returncode, 1, captured.getvalue())
+        bounded_recovery.assert_called_once_with(parent_identity, session)
+        select_control.assert_not_called()
+        read_control.assert_not_called()
+        signal_owner.assert_not_called()
+        close_clients.assert_not_called()
+        ordinary_close.assert_not_called()
+        self.assertNotIn(
+            _CANDIDATE_SUPPORT._WATCHDOG_READY_PREFIX, captured.getvalue()
+        )
+        result_line = next(
+            line
+            for line in captured.getvalue().splitlines()
+            if line.startswith(_CANDIDATE_SUPPORT._WATCHDOG_RESULT_PREFIX)
+        )
+        result = json.loads(
+            result_line[len(_CANDIDATE_SUPPORT._WATCHDOG_RESULT_PREFIX) :]
+        )
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("watchdog is unauthorized", result["error"])
+
+    def test_watchdog_client_inventory_fails_closed_when_environment_is_unreadable(
+        self,
+    ) -> None:
+        identity = (321, 654, 321, 321, 321, (os.getuid(),) * 4)
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.Path,
+            "iterdir",
+            return_value=iter((Path("/proc/321"),)),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            return_value=identity,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.Path,
+            "read_bytes",
+            side_effect=PermissionError(errno.EACCES, "injected denial"),
+        ), self.assertRaisesRegex(
+            AssertionError, "client environment is unreadable"
+        ):
+            _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                Path("/tmp/entries"), "f" * 32
+            )
+
+    def test_watchdog_client_inventory_tracks_exact_live_registry_client(
+        self,
+    ) -> None:
+        runner_uid = os.getuid()
+        registry_path = Path("/tmp/entries")
+        registry_token = "a" * 32
+        client_environment = dict(os.environ)
+        client_environment[_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV] = str(
+            registry_path
+        )
+        client_environment[
+            _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV
+        ] = registry_token
+        client_source = textwrap.dedent(
+            f"""
+            import json
+            import os
+            import sys
+
+            print(json.dumps({{
+                "registry": os.environ[
+                    {_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV!r}
+                ],
+                "token": os.environ[
+                    {_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV!r}
+                ],
+                "uid": os.getuid(),
+            }}), flush=True)
+            sys.stdin.buffer.read(1)
+            """
+        )
+        client = subprocess.Popen(
+            [sys.executable, "-I", "-B", "-c", client_source],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=client_environment,
+            start_new_session=True,
+        )
+        try:
+            assert client.stdout is not None
+            ready = json.loads(
+                _CANDIDATE_SUPPORT._read_watchdog_line(
+                    client.stdout, 5, "client fixture readiness"
+                )
+            )
+            self.assertEqual(ready["registry"], str(registry_path))
+            self.assertNotEqual(ready["registry"], str(registry_path.parent))
+            self.assertEqual(ready["token"], registry_token)
+            self.assertEqual(ready["uid"], runner_uid)
+
+            client_path = Path("/proc") / str(client.pid)
+            client_identity = (
+                client.pid,
+                202,
+                os.getpid(),
+                client.pid,
+                client.pid,
+                (runner_uid,) * 4,
+            )
+            proc_environment = b"\0".join(
+                (
+                    (
+                        f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV}="
+                        f"{ready['registry']}"
+                    ).encode("ascii"),
+                    (
+                        f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV}="
+                        f"{ready['token']}"
+                    ).encode("ascii"),
+                )
+            )
+
+            def process_identity(
+                process_path: Path,
+            ) -> tuple[
+                int, int, int, int, int, tuple[int, int, int, int]
+            ] | None:
+                if (
+                    process_path == client_path
+                    and client.poll() is None
+                ):
+                    return client_identity
+                return None
+
+            def read_environment(environment_path: Path) -> bytes:
+                self.assertEqual(environment_path, client_path / "environ")
+                return proc_environment
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT.Path,
+                "iterdir",
+                side_effect=lambda: iter((client_path,)),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                side_effect=process_identity,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.Path,
+                "read_bytes",
+                autospec=True,
+                side_effect=read_environment,
+            ) as read_client_environment:
+                inventory = _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                    registry_path,
+                    registry_token,
+                    runner_uid=runner_uid,
+                )
+                self.assertEqual(
+                    inventory, {client.pid: client_identity}
+                )
+
+                parent_inventory = (
+                    _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                        registry_path.parent,
+                        registry_token,
+                        runner_uid=runner_uid,
+                    )
+                )
+                self.assertEqual(parent_inventory, {})
+
+                client.terminate()
+                client.communicate(timeout=5)
+                self.assertIsNotNone(client.returncode)
+                self.assertEqual(
+                    _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                        registry_path,
+                        registry_token,
+                        runner_uid=runner_uid,
+                    ),
+                    {},
+                )
+
+            self.assertEqual(read_client_environment.call_count, 2)
+        finally:
+            if client.poll() is None:
+                client.kill()
+                client.communicate(timeout=5)
+
+    def test_watchdog_clients_require_the_expected_registry_token(self) -> None:
+        runner_uid = os.getuid()
+        registry_path = Path("/tmp/entries")
+        expected_token = "a" * 32
+        wrong_token = "b" * 32
+        watchdog_pid = os.getpid()
+        client_pid = watchdog_pid + 100_000
+        watchdog_identity = (
+            watchdog_pid,
+            101,
+            watchdog_pid,
+            watchdog_pid,
+            watchdog_pid,
+            (runner_uid,) * 4,
+        )
+        client_identity = (
+            client_pid,
+            202,
+            watchdog_pid,
+            client_pid,
+            client_pid,
+            (runner_uid,) * 4,
+        )
+        client_path = Path("/proc") / str(client_pid)
+        wrong_token_environment = b"\0".join(
+            (
+                (
+                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV}="
+                    f"{registry_path}"
+                ).encode("ascii"),
+                (
+                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV}="
+                    f"{wrong_token}"
+                ).encode("ascii"),
+            )
+        )
+
+        def process_identity(
+            process_path: Path,
+        ) -> tuple[int, int, int, int, int, tuple[int, int, int, int]] | None:
+            if process_path.name == str(watchdog_pid):
+                return watchdog_identity
+            if process_path.name == str(client_pid):
+                return client_identity
+            return None
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.Path,
+            "iterdir",
+            side_effect=lambda: iter((client_path,)),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            side_effect=process_identity,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.Path,
+            "read_bytes",
+            return_value=wrong_token_environment,
+        ) as read_environment, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_root_signal_host_identity"
+        ) as signal_client, mock.patch.object(
+            _CANDIDATE_SUPPORT.time,
+            "monotonic",
+            side_effect=(0.0, 0.0, 0.1, 0.2, 6.0),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.time, "sleep"
+        ) as sleep:
+            _CANDIDATE_SUPPORT._watchdog_close_runner_clients(
+                registry_path, expected_token
+            )
+            signal_client.assert_not_called()
+
+            inventory = _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                registry_path,
+                expected_token,
+                runner_uid=runner_uid,
+                excluded_identity=watchdog_identity,
+            )
+            self.assertEqual(inventory, {})
+
+            _CANDIDATE_SUPPORT._strict_owner_loss_registered_clients_are_quiescent(
+                registry_path,
+                expected_token,
+                runner_uid,
+                watchdog_identity,
+            )
+
+        signal_client.assert_not_called()
+        self.assertEqual(read_environment.call_count, 7)
+        self.assertEqual(sleep.call_count, 4)
+
+    def test_watchdog_clients_require_the_expected_registry_path(self) -> None:
+        runner_uid = os.getuid()
+        registry_path = Path("/tmp/entries")
+        wrong_registry_path = Path("/tmp/other-entries")
+        expected_token = "a" * 32
+        watchdog_pid = os.getpid()
+        client_pid = watchdog_pid + 100_000
+        watchdog_identity = (
+            watchdog_pid,
+            101,
+            watchdog_pid,
+            watchdog_pid,
+            watchdog_pid,
+            (runner_uid,) * 4,
+        )
+        client_identity = (
+            client_pid,
+            202,
+            watchdog_pid,
+            client_pid,
+            client_pid,
+            (runner_uid,) * 4,
+        )
+        client_path = Path("/proc") / str(client_pid)
+        wrong_path_environment = b"\0".join(
+            (
+                (
+                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV}="
+                    f"{wrong_registry_path}"
+                ).encode("ascii"),
+                (
+                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV}="
+                    f"{expected_token}"
+                ).encode("ascii"),
+            )
+        )
+
+        def process_identity(
+            process_path: Path,
+        ) -> tuple[int, int, int, int, int, tuple[int, int, int, int]] | None:
+            if process_path.name == str(watchdog_pid):
+                return watchdog_identity
+            if process_path.name == str(client_pid):
+                return client_identity
+            return None
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.Path,
+            "iterdir",
+            side_effect=lambda: iter((client_path,)),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            side_effect=process_identity,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.Path,
+            "read_bytes",
+            return_value=wrong_path_environment,
+        ) as read_environment, mock.patch.object(
+            _CANDIDATE_SUPPORT, "_root_signal_host_identity"
+        ) as signal_client, mock.patch.object(
+            _CANDIDATE_SUPPORT.time,
+            "monotonic",
+            side_effect=(0.0, 0.0, 0.1, 0.2, 6.0),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.time, "sleep"
+        ) as sleep:
+            _CANDIDATE_SUPPORT._watchdog_close_runner_clients(
+                registry_path, expected_token
+            )
+            signal_client.assert_not_called()
+
+            inventory = _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                registry_path,
+                expected_token,
+                runner_uid=runner_uid,
+                excluded_identity=watchdog_identity,
+            )
+            self.assertEqual(inventory, {})
+
+            _CANDIDATE_SUPPORT._strict_owner_loss_registered_clients_are_quiescent(
+                registry_path,
+                expected_token,
+                runner_uid,
+                watchdog_identity,
+            )
+
+        signal_client.assert_not_called()
+        self.assertEqual(read_environment.call_count, 7)
+        self.assertEqual(sleep.call_count, 4)
 
     def test_watchdog_pidfd_failure_reaps_gated_launch_by_eof(
         self,
@@ -8531,13 +9906,20 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ) as ensure_backend, mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "_start_registry_watchdog",
-                ) as start_watchdog:
+                ) as start_watchdog, mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_arm_registry_watchdog_owner_loss_authority",
+                    side_effect=lambda session: session.update(
+                        watchdog_owner_loss_authority={"fixture": True}
+                    ),
+                ) as arm_watchdog:
                     with self.assertRaisesRegex(
                         AssertionError, "abandoned without path mutation"
                     ):
                         _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
 
                     start_watchdog.assert_called_once()
+                    arm_watchdog.assert_called_once()
                     ensure_backend.assert_not_called()
                     self.assertTrue(acquired_root.is_dir())
                     self.assertIsNone(_CANDIDATE_SUPPORT._STRICT_SESSION)
@@ -8605,6 +9987,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ), mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "_start_registry_watchdog",
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_arm_registry_watchdog_owner_loss_authority",
+                    side_effect=lambda session: session.update(
+                        watchdog_owner_loss_authority={"fixture": True}
+                    ),
                 ), mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "_active_strict_session",
@@ -8806,6 +10194,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     "_start_registry_watchdog",
                 ), mock.patch.object(
                     _CANDIDATE_SUPPORT,
+                    "_arm_registry_watchdog_owner_loss_authority",
+                    side_effect=lambda session: session.update(
+                        watchdog_owner_loss_authority={"fixture": True}
+                    ),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
                     "_active_strict_session",
                     side_effect=lambda: _CANDIDATE_SUPPORT._STRICT_SESSION,
                 ):
@@ -8844,6 +10238,14 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
         self.assertLess(
             initialize_source.index("_start_registry_watchdog"),
+            initialize_source.index(
+                "_arm_registry_watchdog_owner_loss_authority"
+            ),
+        )
+        self.assertLess(
+            initialize_source.index(
+                "_arm_registry_watchdog_owner_loss_authority"
+            ),
             initialize_source.index("_active_strict_session"),
         )
         self.assertIn("_configure_registry_acquisition_at", initialize_source)
@@ -13608,6 +15010,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "token": "a" * 32,
                 "target_uid": 60000,
                 "closed": False,
+                "watchdog_authorized": True,
             }
             trace: list[str] = []
             spawned = False
@@ -13622,10 +15025,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 return documents[entry_path]
 
             def recover(
-                entry_path: Path, *, allow_recovery_broker: bool
+                entry_path: Path,
+                *,
+                allow_recovery_broker: bool,
+                recovery_profile: str,
             ) -> None:
                 nonlocal spawned
                 self.assertTrue(allow_recovery_broker)
+                self.assertEqual(
+                    recovery_profile,
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE,
+                )
                 document = documents[entry_path]
                 if document["state"] == "closed":
                     return
@@ -13677,7 +15087,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
                 ):
                     _CANDIDATE_SUPPORT._close_trusted_isolation_chains_under_gate(
-                        session
+                        session,
+                        recovery_profile=(
+                            _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
+                        ),
                     )
             finally:
                 _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
@@ -20678,11 +22091,14 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             },
         }
         captured_command: list[str] = []
+        captured_keywords: dict[str, object] = {}
+        invocation_session_id = "d" * 32
 
         def capture_command(
-            command: Sequence[str], **_kwargs: object
+            command: Sequence[str], **kwargs: object
         ) -> bytes:
             captured_command.extend(command)
+            captured_keywords.update(kwargs)
             raise BrokerCommandCaptured
 
         with mock.patch.object(
@@ -20697,15 +22113,29 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             _CANDIDATE_SUPPORT,
             "_run_registered_sudo",
             side_effect=capture_command,
+        ), mock.patch.object(
+            uuid,
+            "uuid4",
+            return_value=mock.Mock(hex=invocation_session_id),
         ), self.assertRaises(BrokerCommandCaptured):
             _CANDIDATE_SUPPORT._invoke_registered_opt_ipc_root(
                 Path("/controller.py"), entry_path, document, "create"
             )
 
         self.assertEqual(captured_command[5], "--isolation-opt-ipc-root")
-        self.assertEqual(len(captured_command), 17)
+        self.assertEqual(len(captured_command), 19)
+        self.assertEqual(captured_command[-1], "-")
+        invocation_entry_path = (
+            entry_path.parent / f"chain-{invocation_session_id}.json"
+        )
+        self.assertEqual(captured_command[7], str(entry_path))
+        self.assertEqual(captured_command[8], str(invocation_entry_path))
+        self.assertNotEqual(captured_command[7], captured_command[8])
+        self.assertEqual(
+            captured_keywords["session_id"], invocation_session_id
+        )
         broker_argv = captured_command[4:]
-        self.assertEqual(len(broker_argv), 13)
+        self.assertEqual(len(broker_argv), 15)
         observed_arguments: list[tuple[str, ...]] = []
 
         def broker_main(arguments: Sequence[str]) -> int:
@@ -20819,6 +22249,26 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     ),
                     dict(parent_binding),
                 )
+
+            real_fsync = os.fsync
+
+            def directory_sync_observer(
+                trace: list[str],
+            ) -> Callable[[int], None]:
+                def observe(descriptor: int) -> None:
+                    observed = os.fstat(descriptor)
+                    if (observed.st_dev, observed.st_ino) == (
+                        parent_metadata.st_dev,
+                        parent_metadata.st_ino,
+                    ):
+                        trace.append("parent")
+                    elif stat.S_ISDIR(observed.st_mode):
+                        trace.append("namespace")
+                    else:
+                        trace.append("witness")
+                    real_fsync(descriptor)
+
+                return observe
 
             with mock.patch.object(
                 _CANDIDATE_SUPPORT,
@@ -20977,13 +22427,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             real_append = (
                                 _CANDIDATE_SUPPORT._append_strict_live_ipc_witness_record
                             )
-                            real_fsync = os.fsync
+                            sync_trace: list[str] = []
                             with mock.patch.object(
                                 _CANDIDATE_SUPPORT,
                                 "_append_strict_live_ipc_witness_record",
                                 wraps=real_append,
                             ) as append_record, mock.patch.object(
-                                os, "fsync", wraps=real_fsync
+                                os,
+                                "fsync",
+                                side_effect=directory_sync_observer(sync_trace),
                             ) as sync_file, self.assertRaises(
                                 AssertionError
                             ) as captured:
@@ -20995,7 +22447,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                 "strict live IPC witness identity changed",
                             )
                             append_record.assert_not_called()
-                            sync_file.assert_not_called()
+                            self.assertEqual(
+                                sync_trace, ["namespace", "parent"]
+                            )
+                            self.assertEqual(sync_file.call_count, 2)
                             self.assertEqual(
                                 witness_path.read_bytes(), before_rejection
                             )
@@ -21021,6 +22476,169 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                 witness_path.read_bytes(), original_bytes
                             )
 
+                repair_cleanup_document = {
+                    **bound_document,
+                    "state": "deleting",
+                    "execution_root_delete_nonce": "7" * 32,
+                }
+                repair_deleting_record = (
+                    _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                        repair_cleanup_document,
+                        phase="deleting",
+                        sequence=2,
+                        previous_sha256=create_receipt["witness"]["file"][
+                            "last_record_sha256"
+                        ],
+                        root_binding=root_binding,
+                        delete_nonce="7" * 32,
+                        deletion_receipt=None,
+                    )
+                )
+                repair_deleting_frame, _repair_deleting_digest = (
+                    _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                        repair_deleting_record
+                    )
+                )
+                repair_root_bound_record = (
+                    _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                        repair_cleanup_document,
+                        phase="root-bound",
+                        sequence=1,
+                        previous_sha256=_intended_digest,
+                        root_binding=root_binding,
+                        delete_nonce=None,
+                        deletion_receipt=None,
+                    )
+                )
+                repair_root_bound_frame, repair_root_bound_digest = (
+                    _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                        repair_root_bound_record
+                    )
+                )
+                self.assertEqual(
+                    original_bytes,
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_MAGIC
+                    + intended_frame
+                    + repair_root_bound_frame,
+                )
+                self.assertEqual(
+                    repair_root_bound_digest,
+                    create_receipt["witness"]["file"][
+                        "last_record_sha256"
+                    ],
+                )
+                repair_tail = repair_deleting_frame[:37]
+                self.assertTrue(
+                    _CANDIDATE_SUPPORT._strict_live_ipc_witness_partial_tail_is_exact(
+                        repair_tail,
+                        [intended_record, repair_root_bound_record],
+                        repair_cleanup_document,
+                    )
+                )
+                replacement_payload = original_bytes + repair_tail
+                held_repair_path = witness_path.with_name(
+                    witness_path.name + ".pre-repair-held"
+                )
+                witness_path.rename(held_repair_path)
+                replacement_fd = os.open(
+                    witness_path,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    0o600,
+                )
+                try:
+                    self.assertEqual(
+                        os.write(replacement_fd, replacement_payload),
+                        len(replacement_payload),
+                    )
+                    os.fsync(replacement_fd)
+                finally:
+                    os.close(replacement_fd)
+                replacement_identity = (
+                    witness_path.stat().st_dev,
+                    witness_path.stat().st_ino,
+                )
+                self.assertNotEqual(replacement_identity, original_identity)
+                self.assertEqual(
+                    replacement_payload[: len(original_bytes)], original_bytes
+                )
+                self.assertEqual(
+                    hashlib.sha256(
+                        replacement_payload[: len(original_bytes)]
+                    ).hexdigest(),
+                    create_receipt["witness"]["file"]["sha256"],
+                )
+                try:
+                    real_append = (
+                        _CANDIDATE_SUPPORT._append_strict_live_ipc_witness_record
+                    )
+                    real_root_operation = (
+                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_operation
+                    )
+                    real_ftruncate = os.ftruncate
+                    real_write = os.write
+                    sync_trace = []
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_append_strict_live_ipc_witness_record",
+                        wraps=real_append,
+                    ) as append_record, mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_registered_opt_ipc_root_operation",
+                        wraps=real_root_operation,
+                    ) as root_operation, mock.patch.object(
+                        os,
+                        "ftruncate",
+                        wraps=real_ftruncate,
+                    ) as truncate_witness, mock.patch.object(
+                        os,
+                        "write",
+                        wraps=real_write,
+                    ) as write_witness, mock.patch.object(
+                        os,
+                        "fsync",
+                        side_effect=directory_sync_observer(sync_trace),
+                    ), self.assertRaises(AssertionError) as captured:
+                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
+                            "cleanup", repair_cleanup_document
+                        )
+                    self.assertEqual(
+                        str(captured.exception),
+                        "strict live IPC witness identity changed",
+                    )
+                    truncate_witness.assert_not_called()
+                    write_witness.assert_not_called()
+                    append_record.assert_not_called()
+                    root_operation.assert_not_called()
+                    self.assertEqual(sync_trace, ["namespace", "parent"])
+                    self.assertEqual(
+                        (
+                            witness_path.stat().st_dev,
+                            witness_path.stat().st_ino,
+                        ),
+                        replacement_identity,
+                    )
+                    self.assertEqual(
+                        witness_path.read_bytes(), replacement_payload
+                    )
+                finally:
+                    try:
+                        witness_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    held_repair_path.rename(witness_path)
+                self.assertEqual(
+                    (
+                        witness_path.stat().st_dev,
+                        witness_path.stat().st_ino,
+                    ),
+                    original_identity,
+                )
+                self.assertEqual(witness_path.read_bytes(), original_bytes)
+
                 held_missing_path = witness_path.with_name(
                     witness_path.name + ".missing-held"
                 )
@@ -21029,13 +22647,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     real_append = (
                         _CANDIDATE_SUPPORT._append_strict_live_ipc_witness_record
                     )
-                    real_fsync = os.fsync
+                    sync_trace = []
                     with mock.patch.object(
                         _CANDIDATE_SUPPORT,
                         "_append_strict_live_ipc_witness_record",
                         wraps=real_append,
                     ) as append_record, mock.patch.object(
-                        os, "fsync", wraps=real_fsync
+                        os,
+                        "fsync",
+                        side_effect=directory_sync_observer(sync_trace),
                     ) as sync_file, self.assertRaises(
                         AssertionError
                     ) as captured:
@@ -21047,7 +22667,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         "strict live IPC witness identity changed",
                     )
                     append_record.assert_not_called()
-                    sync_file.assert_not_called()
+                    self.assertEqual(sync_trace, ["namespace", "parent"])
+                    self.assertEqual(sync_file.call_count, 2)
                     self.assertFalse(witness_path.exists())
                 finally:
                     try:
@@ -21204,13 +22825,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             real_append = (
                                 _CANDIDATE_SUPPORT._append_strict_live_ipc_witness_record
                             )
-                            real_fsync = os.fsync
+                            sync_trace = []
                             with mock.patch.object(
                                 _CANDIDATE_SUPPORT,
                                 "_append_strict_live_ipc_witness_record",
                                 wraps=real_append,
                             ) as append_record, mock.patch.object(
-                                os, "fsync", wraps=real_fsync
+                                os,
+                                "fsync",
+                                side_effect=directory_sync_observer(sync_trace),
                             ) as sync_file, self.assertRaises(
                                 AssertionError
                             ) as captured:
@@ -21222,7 +22845,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                 "strict live IPC witness identity changed",
                             )
                             append_record.assert_not_called()
-                            sync_file.assert_not_called()
+                            self.assertEqual(
+                                sync_trace, ["namespace", "parent"]
+                            )
+                            self.assertEqual(sync_file.call_count, 2)
                             self.assertEqual(
                                 witness_path.read_bytes(), replacement_bytes
                             )
@@ -21419,6 +23045,21 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 )
                 real_rmdir = os.rmdir
                 real_fsync = os.fsync
+                sync_trace: list[str] = []
+
+                def observe_fsync(descriptor: int) -> None:
+                    observed = os.fstat(descriptor)
+                    if (observed.st_dev, observed.st_ino) == (
+                        parent_metadata.st_dev,
+                        parent_metadata.st_ino,
+                    ):
+                        sync_trace.append("parent")
+                    elif stat.S_ISDIR(observed.st_mode):
+                        sync_trace.append("namespace")
+                    else:
+                        sync_trace.append("witness")
+                    real_fsync(descriptor)
+
                 with mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "_append_strict_live_ipc_witness_record",
@@ -21426,7 +23067,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ) as append_record, mock.patch.object(
                     os, "rmdir", wraps=real_rmdir
                 ) as remove_root, mock.patch.object(
-                    os, "fsync", wraps=real_fsync
+                    os, "fsync", side_effect=observe_fsync
                 ) as sync_file, self.assertRaises(AssertionError) as captured:
                     _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
                         "cleanup", document
@@ -21438,7 +23079,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 )
                 append_record.assert_not_called()
                 remove_root.assert_not_called()
-                sync_file.assert_not_called()
+                self.assertEqual(sync_trace, ["namespace", "parent"])
+                self.assertEqual(sync_file.call_count, 2)
                 self.assertEqual(
                     str(captured.exception),
                     "strict live IPC witness root identity changed",
@@ -21469,6 +23111,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     witness_file.write(partial_frame[:37])
                     os.fsync(witness_file.fileno())
                 bytes_with_partial_tail = witness_path.read_bytes()
+                sync_trace.clear()
                 with mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "_append_strict_live_ipc_witness_record",
@@ -21476,7 +23119,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ) as append_record, mock.patch.object(
                     os, "rmdir", wraps=real_rmdir
                 ) as remove_root, mock.patch.object(
-                    os, "fsync", wraps=real_fsync
+                    os, "fsync", side_effect=observe_fsync
                 ) as sync_file, self.assertRaises(AssertionError) as captured:
                     _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
                         "cleanup", document
@@ -21487,7 +23130,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 )
                 append_record.assert_not_called()
                 remove_root.assert_not_called()
-                sync_file.assert_not_called()
+                self.assertEqual(sync_trace, ["namespace", "parent"])
+                self.assertEqual(sync_file.call_count, 2)
                 self.assertEqual(
                     witness_path.read_bytes(), bytes_with_partial_tail
                 )
@@ -21676,6 +23320,21 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     )
                     real_rmdir = os.rmdir
                     real_fsync = os.fsync
+                    sync_trace: list[str] = []
+
+                    def observe_fsync(descriptor: int) -> None:
+                        observed = os.fstat(descriptor)
+                        if (observed.st_dev, observed.st_ino) == (
+                            parent_metadata.st_dev,
+                            parent_metadata.st_ino,
+                        ):
+                            sync_trace.append("parent")
+                        elif stat.S_ISDIR(observed.st_mode):
+                            sync_trace.append("namespace")
+                        else:
+                            sync_trace.append("witness")
+                        real_fsync(descriptor)
+
                     with mock.patch.object(
                         _CANDIDATE_SUPPORT,
                         "_append_strict_live_ipc_witness_record",
@@ -21683,7 +23342,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     ) as append_record, mock.patch.object(
                         os, "rmdir", wraps=real_rmdir
                     ) as remove_root, mock.patch.object(
-                        os, "fsync", wraps=real_fsync
+                        os, "fsync", side_effect=observe_fsync
                     ) as sync_file, self.assertRaises(AssertionError) as captured:
                         _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
                             "cleanup", cleanup_document
@@ -21694,7 +23353,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     )
                     append_record.assert_not_called()
                     remove_root.assert_not_called()
-                    sync_file.assert_not_called()
+                    self.assertEqual(sync_trace, ["namespace", "parent"])
+                    self.assertEqual(sync_file.call_count, 2)
                     self.assertTrue(
                         selected.is_dir(),
                         "stale witness nonce caused the current root to be removed",
@@ -21900,6 +23560,21 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 )
                 real_rmdir = os.rmdir
                 real_fsync = os.fsync
+                sync_trace: list[str] = []
+
+                def observe_fsync(descriptor: int) -> None:
+                    observed = os.fstat(descriptor)
+                    if (observed.st_dev, observed.st_ino) == (
+                        parent_metadata.st_dev,
+                        parent_metadata.st_ino,
+                    ):
+                        sync_trace.append("parent")
+                    elif stat.S_ISDIR(observed.st_mode):
+                        sync_trace.append("namespace")
+                    else:
+                        sync_trace.append("witness")
+                    real_fsync(descriptor)
+
                 with mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "_append_strict_live_ipc_witness_record",
@@ -21907,7 +23582,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ) as append_record, mock.patch.object(
                     os, "rmdir", wraps=real_rmdir
                 ) as remove_root, mock.patch.object(
-                    os, "fsync", wraps=real_fsync
+                    os, "fsync", side_effect=observe_fsync
                 ) as sync_file, self.assertRaises(AssertionError) as captured:
                     _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
                         "cleanup", document
@@ -21919,7 +23594,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 )
                 append_record.assert_not_called()
                 remove_root.assert_not_called()
-                sync_file.assert_not_called()
+                self.assertEqual(sync_trace, ["namespace", "parent"])
+                self.assertEqual(sync_file.call_count, 2)
                 self.assertEqual(witness_path.read_bytes(), witness_bytes)
                 self.assertTrue(
                     selected.is_dir(),
@@ -22199,6 +23875,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 )
                 try:
                     with mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_STRICT_LIVE_IPC_PARENT",
+                        physical_parent,
+                    ), mock.patch.object(
                         _CANDIDATE_SUPPORT,
                         "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
                         os.geteuid(),
@@ -22500,6 +24180,138 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             document
                         ),
                     )
+                    try:
+                        witness_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    os.fsync(namespace_fd)
+                    fresh_open_calls: list[
+                        tuple[object, int, int, int | None]
+                    ] = []
+                    fresh_trace: list[tuple[str, int]] = []
+                    real_fresh_open = os.open
+                    real_fresh_write = os.write
+                    real_fresh_fsync = os.fsync
+
+                    def record_fresh_open(
+                        path: object,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        fresh_open_calls.append(
+                            (path, flags, mode, dir_fd)
+                        )
+                        return real_fresh_open(
+                            path, flags, mode, dir_fd=dir_fd
+                        )
+
+                    def record_fresh_write(
+                        descriptor: int, payload: object
+                    ) -> int:
+                        fresh_trace.append(("write", descriptor))
+                        return real_fresh_write(descriptor, payload)
+
+                    def record_fresh_fsync(descriptor: int) -> None:
+                        fresh_trace.append(
+                            (
+                                (
+                                    "namespace-fsync"
+                                    if descriptor == namespace_fd
+                                    else "file-fsync"
+                                ),
+                                descriptor,
+                            )
+                        )
+                        real_fresh_fsync(descriptor)
+
+                    with self.subTest(
+                        initial_publication="fresh-o-excl"
+                    ), mock.patch.object(
+                        os, "open", side_effect=record_fresh_open
+                    ), mock.patch.object(
+                        os, "write", side_effect=record_fresh_write
+                    ), mock.patch.object(
+                        os, "fsync", side_effect=record_fresh_fsync
+                    ):
+                        (
+                            fresh_witness_fd,
+                            fresh_records,
+                            fresh_data,
+                            fresh_digests,
+                        ) = _CANDIDATE_SUPPORT._root_open_or_create_strict_live_ipc_witness(
+                            namespace_fd, document
+                        )
+                    try:
+                        expected_create_flags = (
+                            os.O_RDWR
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC
+                        )
+                        self.assertEqual(
+                            [
+                                call
+                                for call in fresh_open_calls
+                                if call[1] & os.O_CREAT
+                            ],
+                            [
+                                (
+                                    basename,
+                                    expected_create_flags,
+                                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_FILE_MODE,
+                                    namespace_fd,
+                                )
+                            ],
+                        )
+                        self.assertEqual(fresh_records, [intended_record])
+                        self.assertEqual(fresh_data, initial_publication)
+                        self.assertEqual(fresh_digests, [intended_digest])
+                        self.assertEqual(
+                            fresh_trace[:3],
+                            [
+                                ("write", fresh_witness_fd),
+                                ("file-fsync", fresh_witness_fd),
+                                ("namespace-fsync", namespace_fd),
+                            ],
+                        )
+                        self.assertEqual(
+                            [
+                                descriptor
+                                for event, descriptor in fresh_trace
+                                if event in {"write", "file-fsync"}
+                            ],
+                            [fresh_witness_fd]
+                            * sum(
+                                event in {"write", "file-fsync"}
+                                for event, _descriptor in fresh_trace
+                            ),
+                        )
+                        self.assertEqual(
+                            [
+                                descriptor
+                                for event, descriptor in fresh_trace
+                                if event == "namespace-fsync"
+                            ],
+                            [namespace_fd]
+                            * sum(
+                                event == "namespace-fsync"
+                                for event, _descriptor in fresh_trace
+                            ),
+                        )
+                        self.assertEqual(
+                            os.pread(
+                                fresh_witness_fd,
+                                len(initial_publication) + 1,
+                                0,
+                            ),
+                            initial_publication,
+                        )
+                    finally:
+                        os.close(fresh_witness_fd)
+
                     frame_prefix_lengths = {
                         1,
                         8,
@@ -22792,6 +24604,18 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             float(intended_record["parent_device"]),
                             "strict live IPC witness authority changed",
                         ),
+                        (
+                            "session-id-foreign",
+                            "session_id",
+                            "a" * 32,
+                            "strict live IPC witness authority changed",
+                        ),
+                        (
+                            "witness-nonce-foreign",
+                            "witness_nonce",
+                            "b" * 32,
+                            "strict live IPC witness authority changed",
+                        ),
                     )
                     for label, field, replacement, expected_error in (
                         malformed_record_cases
@@ -22799,11 +24623,57 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         with self.subTest(malformed_record=label):
                             malformed_record = dict(intended_record)
                             malformed_record[field] = replacement
-                            malformed_frame, _malformed_digest = (
+                            if field in {"session_id", "witness_nonce"}:
+                                self.assertRegex(replacement, r"^[0-9a-f]{32}$")
+                                self.assertEqual(
+                                    {
+                                        key: value
+                                        for key, value in malformed_record.items()
+                                        if key != field
+                                    },
+                                    {
+                                        key: value
+                                        for key, value in intended_record.items()
+                                        if key != field
+                                    },
+                                )
+                                self.assertEqual(
+                                    malformed_record["intent_sha256"],
+                                    intended_record["intent_sha256"],
+                                )
+                            malformed_frame, malformed_digest = (
                                 _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
                                     malformed_record
                                 )
                             )
+                            if field in {"session_id", "witness_nonce"}:
+                                canonical_payload = json.dumps(
+                                    malformed_record,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("ascii")
+                                self.assertEqual(
+                                    malformed_digest,
+                                    hashlib.sha256(canonical_payload).hexdigest(),
+                                )
+                                self.assertEqual(
+                                    malformed_frame,
+                                    f"{len(canonical_payload):08x}:".encode("ascii")
+                                    + canonical_payload
+                                    + b":"
+                                    + malformed_digest.encode("ascii")
+                                    + b"\n",
+                                )
+                                with self.assertRaises(
+                                    AssertionError
+                                ) as validator_failure:
+                                    _CANDIDATE_SUPPORT._validate_strict_live_ipc_witness_records(
+                                        [malformed_record], document
+                                    )
+                                self.assertEqual(
+                                    str(validator_failure.exception),
+                                    expected_error,
+                                )
                             seed_witness(magic + malformed_frame)
                             with self.assertRaises(AssertionError) as captured:
                                 unexpected_fd, *_unused = (
@@ -22946,6 +24816,1241 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             self.assertEqual(witness_path.read_bytes(), foreign_bytes)
             finally:
                 os.close(namespace_fd)
+
+    def test_root_live_ipc_witness_retry_fsyncs_complete_unimported_frames(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            physical_parent = fixture_root / "opt"
+            physical_parent.mkdir(mode=0o755)
+            namespace = physical_parent / ".codex-required-ci-witnesses"
+            namespace.mkdir(mode=0o700)
+            entries = fixture_root / "entries"
+            entries.mkdir(mode=0o700)
+            controller = fixture_root / "controller.py"
+            controller.write_text("pass\n", encoding="utf-8")
+            parent_metadata = physical_parent.lstat()
+            namespace_metadata = namespace.lstat()
+            entries_metadata = entries.lstat()
+            parent_binding = {
+                "path": str(physical_parent),
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+                "gid": parent_metadata.st_gid,
+                "mode": stat.S_IMODE(parent_metadata.st_mode),
+                "host_mount_id": 41,
+            }
+            namespace_binding = {
+                "path": str(namespace),
+                "device": namespace_metadata.st_dev,
+                "inode": namespace_metadata.st_ino,
+                "uid": namespace_metadata.st_uid,
+                "gid": namespace_metadata.st_gid,
+                "mode": stat.S_IMODE(namespace_metadata.st_mode),
+            }
+            registry_binding = {
+                "path": str(entries),
+                "device": entries_metadata.st_dev,
+                "inode": entries_metadata.st_ino,
+                "uid": entries_metadata.st_uid,
+                "gid": entries_metadata.st_gid,
+                "mode": stat.S_IMODE(entries_metadata.st_mode),
+            }
+            namespace_fd = os.open(
+                namespace,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            real_fsync = os.fsync
+
+            def replace_file_bytes(descriptor: int, payload: bytes) -> None:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                self.assertEqual(os.write(descriptor, payload), len(payload))
+                os.ftruncate(descriptor, len(payload))
+                real_fsync(descriptor)
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    physical_parent,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                    os.geteuid(),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                    os.getegid(),
+                ):
+                    for index, terminal_phase in enumerate(
+                        ("root-bound", "deleting", "deleted"), start=1
+                    ):
+                        with self.subTest(terminal_phase=terminal_phase):
+                            session_id = str(index) * 32
+                            witness_nonce = str(index + 3) * 32
+                            name = "required-ci-host-ipc-" + session_id
+                            root_path = physical_parent / name
+                            root_path.mkdir(mode=0o710)
+                            root_path.chmod(0o710)
+                            root_metadata = root_path.lstat()
+                            root_binding = {
+                                "path": str(root_path),
+                                "device": root_metadata.st_dev,
+                                "inode": root_metadata.st_ino,
+                                "uid": root_metadata.st_uid,
+                                "gid": root_metadata.st_gid,
+                                "mode": stat.S_IMODE(root_metadata.st_mode),
+                            }
+                            prepared = {
+                                "schema_version": 2,
+                                "token": str(index + 6) * 32,
+                                "registry_owner_uid": os.getuid(),
+                                "state": "prepared",
+                                "session_id": session_id,
+                                "publication_nonce": "a" * 32,
+                                "target_uid": os.getgid(),
+                                "controller_path": str(controller),
+                                "recovery_controller_path": str(controller),
+                                "handshake_path": None,
+                                "execution_root": {
+                                    "path": str(physical_parent),
+                                    "device": parent_metadata.st_dev,
+                                    "inode": parent_metadata.st_ino,
+                                },
+                                "cleanup_execution_root": True,
+                                "cleanup_kind": "direct-opt-root-v1",
+                                "direct_opt_root": {
+                                    "registry": registry_binding,
+                                    "parent": parent_binding,
+                                    "name": name,
+                                    "target_gid": os.getgid(),
+                                    "mode": 0o710,
+                                    "root": None,
+                                    "witness": _direct_opt_witness_fixture(
+                                        session_id, witness_nonce
+                                    ),
+                                },
+                                "execution_root_deleted": None,
+                                "execution_root_delete_nonce": None,
+                                "launcher_parent": None,
+                                "outer_marker": None,
+                                "outer": None,
+                            }
+                            intended = (
+                                _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                                    prepared,
+                                    phase="intended",
+                                    sequence=0,
+                                    previous_sha256=None,
+                                    root_binding=None,
+                                    delete_nonce=None,
+                                    deletion_receipt=None,
+                                )
+                            )
+                            intended_frame, intended_digest = (
+                                _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                                    intended
+                                )
+                            )
+                            records = [intended]
+                            digests = [intended_digest]
+                            data = (
+                                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_MAGIC
+                                + intended_frame
+                            )
+                            basename = prepared["direct_opt_root"]["witness"][
+                                "basename"
+                            ]
+                            witness_path = namespace / str(basename)
+                            witness_fd = os.open(
+                                witness_path,
+                                os.O_RDWR
+                                | os.O_CREAT
+                                | os.O_EXCL
+                                | os.O_NOFOLLOW
+                                | os.O_CLOEXEC,
+                                0o600,
+                            )
+                            try:
+                                replace_file_bytes(witness_fd, data)
+                                file_binding = _CANDIDATE_SUPPORT._strict_live_ipc_witness_file_binding(
+                                    witness_fd,
+                                    prepared,
+                                    records,
+                                    data,
+                                    digests,
+                                )
+                                durable_file_binding = file_binding
+                                document = prepared
+
+                                if terminal_phase != "root-bound":
+                                    root_bound = _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                                        prepared,
+                                        phase="root-bound",
+                                        sequence=len(records),
+                                        previous_sha256=digests[-1],
+                                        root_binding=root_binding,
+                                        delete_nonce=None,
+                                        deletion_receipt=None,
+                                    )
+                                    frame, digest = _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                                        root_bound
+                                    )
+                                    records.append(root_bound)
+                                    digests.append(digest)
+                                    data += frame
+                                    replace_file_bytes(witness_fd, data)
+                                    file_binding = _CANDIDATE_SUPPORT._strict_live_ipc_witness_file_binding(
+                                        witness_fd,
+                                        prepared,
+                                        records,
+                                        data,
+                                        digests,
+                                    )
+                                    durable_file_binding = file_binding
+                                    document = {
+                                        **prepared,
+                                        "state": "deleting",
+                                        "execution_root": {
+                                            key: root_binding[key]
+                                            for key in (
+                                                "path",
+                                                "device",
+                                                "inode",
+                                            )
+                                        },
+                                        "execution_root_delete_nonce": "b" * 32,
+                                        "direct_opt_root": {
+                                            **prepared["direct_opt_root"],
+                                            "root": root_binding,
+                                            "witness": {
+                                                **prepared["direct_opt_root"][
+                                                    "witness"
+                                                ],
+                                                "namespace": namespace_binding,
+                                                "file": file_binding,
+                                            },
+                                        },
+                                    }
+
+                                if terminal_phase == "deleted":
+                                    deleting = _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                                        document,
+                                        phase="deleting",
+                                        sequence=len(records),
+                                        previous_sha256=digests[-1],
+                                        root_binding=root_binding,
+                                        delete_nonce=document[
+                                            "execution_root_delete_nonce"
+                                        ],
+                                        deletion_receipt=None,
+                                    )
+                                    frame, digest = _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                                        deleting
+                                    )
+                                    records.append(deleting)
+                                    digests.append(digest)
+                                    data += frame
+                                    replace_file_bytes(witness_fd, data)
+                                    root_path.rmdir()
+
+                                deletion_receipt = None
+                                if terminal_phase == "deleted":
+                                    deletion_receipt = {
+                                        "kind": "direct-empty-rmdir-v1",
+                                        "parent_device": parent_binding["device"],
+                                        "parent_inode": parent_binding["inode"],
+                                        "device": root_binding["device"],
+                                        "inode": root_binding["inode"],
+                                        "name": name,
+                                    }
+                                append_arguments = {
+                                    "phase": terminal_phase,
+                                    "root_binding": root_binding,
+                                    "delete_nonce": (
+                                        None
+                                        if terminal_phase == "root-bound"
+                                        else document[
+                                            "execution_root_delete_nonce"
+                                        ]
+                                    ),
+                                    "deletion_receipt": deletion_receipt,
+                                }
+                                expected_record = _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                                    document,
+                                    phase=terminal_phase,
+                                    sequence=len(records),
+                                    previous_sha256=digests[-1],
+                                    root_binding=root_binding,
+                                    delete_nonce=append_arguments[
+                                        "delete_nonce"
+                                    ],
+                                    deletion_receipt=deletion_receipt,
+                                )
+                                expected_frame, expected_digest = _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                                    expected_record
+                                )
+                                expected_records = [*records, expected_record]
+                                expected_data = data + expected_frame
+                                expected_digests = [*digests, expected_digest]
+
+                                def fail_first_file_fsync(
+                                    descriptor: int,
+                                ) -> None:
+                                    if descriptor == witness_fd:
+                                        raise OSError(
+                                            "injected first frame fsync failure"
+                                        )
+                                    real_fsync(descriptor)
+
+                                with mock.patch.object(
+                                    os,
+                                    "fsync",
+                                    side_effect=fail_first_file_fsync,
+                                ), self.assertRaisesRegex(
+                                    AssertionError,
+                                    "strict live IPC witness cannot be written",
+                                ):
+                                    _CANDIDATE_SUPPORT._append_strict_live_ipc_witness_record(
+                                        witness_fd,
+                                        namespace_fd,
+                                        document,
+                                        records,
+                                        data,
+                                        digests,
+                                        **append_arguments,
+                                    )
+                                self.assertGreater(
+                                    witness_path.stat().st_size,
+                                    durable_file_binding["size"],
+                                )
+                                witness_identity = (
+                                    witness_path.stat().st_dev,
+                                    witness_path.stat().st_ino,
+                                )
+                                complete_suffix = witness_path.read_bytes()
+                                self.assertEqual(complete_suffix, expected_data)
+                            finally:
+                                os.close(witness_fd)
+
+                            retry_sync_identities: list[tuple[int, int]] = []
+
+                            def fail_retry_witness_fsync(
+                                descriptor: int,
+                            ) -> None:
+                                metadata = os.fstat(descriptor)
+                                identity = (metadata.st_dev, metadata.st_ino)
+                                if identity == witness_identity:
+                                    retry_sync_identities.append(identity)
+                                    raise OSError(
+                                        "injected retry frame fsync failure"
+                                    )
+                                real_fsync(descriptor)
+
+                            with mock.patch.object(
+                                os,
+                                "fsync",
+                                side_effect=fail_retry_witness_fsync,
+                            ), self.assertRaisesRegex(
+                                AssertionError,
+                                "strict live IPC witness extension is not durable",
+                            ):
+                                unexpected_fd, *_unused = _CANDIDATE_SUPPORT._root_open_or_create_strict_live_ipc_witness(
+                                    namespace_fd, document
+                                )
+                                os.close(unexpected_fd)
+                            self.assertEqual(
+                                retry_sync_identities, [witness_identity]
+                            )
+                            self.assertEqual(
+                                witness_path.read_bytes(), complete_suffix
+                            )
+
+                            successful_sync_identities: list[
+                                tuple[int, int]
+                            ] = []
+
+                            def record_successful_fsync(
+                                descriptor: int,
+                            ) -> None:
+                                metadata = os.fstat(descriptor)
+                                successful_sync_identities.append(
+                                    (metadata.st_dev, metadata.st_ino)
+                                )
+                                real_fsync(descriptor)
+
+                            with mock.patch.object(
+                                os,
+                                "fsync",
+                                side_effect=record_successful_fsync,
+                            ):
+                                (
+                                    recovered_fd,
+                                    recovered_records,
+                                    recovered_data,
+                                    recovered_digests,
+                                ) = _CANDIDATE_SUPPORT._root_open_or_create_strict_live_ipc_witness(
+                                    namespace_fd, document
+                                )
+                            try:
+                                self.assertEqual(
+                                    successful_sync_identities,
+                                    [witness_identity],
+                                )
+                                self.assertEqual(
+                                    recovered_records,
+                                    expected_records,
+                                )
+                                self.assertEqual(
+                                    recovered_data,
+                                    expected_data,
+                                )
+                                self.assertEqual(
+                                    recovered_digests,
+                                    expected_digests,
+                                )
+                                self.assertEqual(
+                                    [
+                                        record["sequence"]
+                                        for record in recovered_records
+                                    ],
+                                    list(range(len(expected_records))),
+                                )
+                                self.assertEqual(
+                                    [
+                                        record["previous_sha256"]
+                                        for record in recovered_records[1:]
+                                    ],
+                                    expected_digests[:-1],
+                                )
+                            finally:
+                                os.close(recovered_fd)
+            finally:
+                os.close(namespace_fd)
+
+    def test_parent_cleanup_import_waits_for_complete_witness_suffix_fsync(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            registry_root = fixture_root / "registry"
+            entries = registry_root / "entries"
+            entries.mkdir(parents=True, mode=0o700)
+            controller = registry_root / "controller.py"
+            controller.write_text("pass\n", encoding="utf-8")
+            physical_parent = fixture_root / "opt"
+            physical_parent.mkdir(mode=0o755)
+            self.enterContext(
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    physical_parent,
+                )
+            )
+            self.enterContext(
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                    os.geteuid(),
+                )
+            )
+            self.enterContext(
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                    os.getegid(),
+                )
+            )
+            namespace = (
+                physical_parent
+                / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+            )
+            namespace.mkdir(mode=0o700)
+            target_uid = 60047
+            token = "7" * 32
+            session_id = "8" * 32
+            witness_nonce = "9" * 32
+            delete_nonce = "b" * 32
+            name = "required-ci-host-ipc-" + session_id
+            root_path = physical_parent / name
+            root_path.mkdir(mode=0o710)
+            root_path.chmod(0o710)
+            parent_metadata = physical_parent.lstat()
+            namespace_metadata = namespace.lstat()
+            entries_metadata = entries.lstat()
+            root_metadata = root_path.lstat()
+            parent_binding = {
+                "path": str(physical_parent),
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+                "gid": parent_metadata.st_gid,
+                "mode": stat.S_IMODE(parent_metadata.st_mode),
+                "host_mount_id": 41,
+            }
+            namespace_binding = {
+                "path": str(namespace),
+                "device": namespace_metadata.st_dev,
+                "inode": namespace_metadata.st_ino,
+                "uid": namespace_metadata.st_uid,
+                "gid": namespace_metadata.st_gid,
+                "mode": stat.S_IMODE(namespace_metadata.st_mode),
+            }
+            registry_binding = {
+                "path": str(entries),
+                "device": entries_metadata.st_dev,
+                "inode": entries_metadata.st_ino,
+                "uid": entries_metadata.st_uid,
+                "gid": entries_metadata.st_gid,
+                "mode": stat.S_IMODE(entries_metadata.st_mode),
+            }
+            root_binding = {
+                "path": str(root_path),
+                "device": root_metadata.st_dev,
+                "inode": root_metadata.st_ino,
+                "uid": os.getuid(),
+                "gid": target_uid,
+                "mode": 0o710,
+            }
+            prepared = {
+                "schema_version": 2,
+                "token": token,
+                "registry_owner_uid": os.getuid(),
+                "state": "prepared",
+                "session_id": session_id,
+                "publication_nonce": "a" * 32,
+                "target_uid": target_uid,
+                "controller_path": str(controller),
+                "recovery_controller_path": str(controller),
+                "handshake_path": None,
+                "execution_root": {
+                    "path": str(physical_parent),
+                    "device": parent_metadata.st_dev,
+                    "inode": parent_metadata.st_ino,
+                },
+                "cleanup_execution_root": True,
+                "cleanup_kind": "direct-opt-root-v1",
+                "direct_opt_root": {
+                    "registry": registry_binding,
+                    "parent": parent_binding,
+                    "name": name,
+                    "target_gid": target_uid,
+                    "mode": 0o710,
+                    "root": None,
+                    "witness": _direct_opt_witness_fixture(
+                        session_id, witness_nonce
+                    ),
+                },
+                "execution_root_deleted": None,
+                "execution_root_delete_nonce": None,
+                "launcher_parent": None,
+                "outer_marker": None,
+                "outer": None,
+            }
+            intended = _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                prepared,
+                phase="intended",
+                sequence=0,
+                previous_sha256=None,
+                root_binding=None,
+                delete_nonce=None,
+                deletion_receipt=None,
+            )
+            intended_frame, intended_digest = (
+                _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                    intended
+                )
+            )
+            root_bound = _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                prepared,
+                phase="root-bound",
+                sequence=1,
+                previous_sha256=intended_digest,
+                root_binding=root_binding,
+                delete_nonce=None,
+                deletion_receipt=None,
+            )
+            root_bound_frame, root_bound_digest = (
+                _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                    root_bound
+                )
+            )
+            durable_records = [intended, root_bound]
+            durable_digests = [intended_digest, root_bound_digest]
+            durable_data = (
+                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_MAGIC
+                + intended_frame
+                + root_bound_frame
+            )
+            basename = str(
+                prepared["direct_opt_root"]["witness"]["basename"]
+            )
+            witness_path = namespace / basename
+            witness_fd = os.open(
+                witness_path,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                0o600,
+            )
+            real_fsync = os.fsync
+            try:
+                self.assertEqual(
+                    os.write(witness_fd, durable_data), len(durable_data)
+                )
+                real_fsync(witness_fd)
+                durable_file = (
+                    _CANDIDATE_SUPPORT._strict_live_ipc_witness_file_binding(
+                        witness_fd,
+                        prepared,
+                        durable_records,
+                        durable_data,
+                        durable_digests,
+                    )
+                )
+            finally:
+                os.close(witness_fd)
+            deleting = {
+                **prepared,
+                "state": "deleting",
+                "execution_root": {
+                    field: root_binding[field]
+                    for field in ("path", "device", "inode")
+                },
+                "execution_root_delete_nonce": delete_nonce,
+                "direct_opt_root": {
+                    **prepared["direct_opt_root"],
+                    "root": root_binding,
+                    "witness": {
+                        **prepared["direct_opt_root"]["witness"],
+                        "namespace": namespace_binding,
+                        "file": durable_file,
+                    },
+                },
+            }
+            deleting_record = (
+                _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                    deleting,
+                    phase="deleting",
+                    sequence=2,
+                    previous_sha256=root_bound_digest,
+                    root_binding=root_binding,
+                    delete_nonce=delete_nonce,
+                    deletion_receipt=None,
+                )
+            )
+            deleting_frame, deleting_digest = (
+                _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                    deleting_record
+                )
+            )
+            complete_deleting_data = durable_data + deleting_frame
+            witness_fd = os.open(
+                witness_path,
+                os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            namespace_fd = os.open(
+                namespace,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+            )
+            try:
+
+                def fail_initial_deleting_fsync(descriptor: int) -> None:
+                    if descriptor == witness_fd:
+                        raise OSError("injected deleting fsync failure")
+                    real_fsync(descriptor)
+
+                with mock.patch.object(
+                    os,
+                    "fsync",
+                    side_effect=fail_initial_deleting_fsync,
+                ), self.assertRaisesRegex(
+                    AssertionError,
+                    "strict live IPC witness cannot be written",
+                ):
+                    _CANDIDATE_SUPPORT._append_strict_live_ipc_witness_record(
+                        witness_fd,
+                        namespace_fd,
+                        deleting,
+                        durable_records,
+                        durable_data,
+                        durable_digests,
+                        phase="deleting",
+                        root_binding=root_binding,
+                        delete_nonce=delete_nonce,
+                        deletion_receipt=None,
+                    )
+            finally:
+                os.close(witness_fd)
+                os.close(namespace_fd)
+            self.assertEqual(witness_path.read_bytes(), complete_deleting_data)
+            witness_identity = (
+                witness_path.stat().st_dev,
+                witness_path.stat().st_ino,
+            )
+            entry_path = entries / f"chain-{session_id}.json"
+            with _CANDIDATE_SUPPORT._chain_registry_lock(
+                entry_path, create=True
+            ):
+                _CANDIDATE_SUPPORT._write_chain_registry_entry(
+                    entry_path, deleting, create=True
+                )
+            session = {
+                "root": registry_root,
+                "entries": entries,
+                "controller_path": controller,
+                "token": token,
+                "target_uid": target_uid,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+
+            def open_parent(expected: object = None):
+                self.assertEqual(expected, parent_binding)
+                return (
+                    os.open(
+                        physical_parent,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                    ),
+                    dict(parent_binding),
+                )
+
+            trace: list[str] = []
+            barrier_trace: list[tuple[str, int | None]] = []
+            real_read_witness_log = (
+                _CANDIDATE_SUPPORT._read_strict_live_ipc_witness_log
+            )
+            real_write_chain_registry_entry = (
+                _CANDIDATE_SUPPORT._write_chain_registry_entry
+            )
+
+            def root_cleanup(
+                operation: str,
+                selected_parent: Mapping[str, object],
+                selected_name: str,
+                runner_uid: int,
+                selected_target_uid: int,
+                expected_root: Mapping[str, object] | None,
+                **keywords: object,
+            ) -> dict[str, object]:
+                self.assertEqual(operation, "cleanup")
+                self.assertEqual(selected_parent, parent_binding)
+                self.assertEqual(selected_name, name)
+                self.assertEqual(runner_uid, os.getuid())
+                self.assertEqual(selected_target_uid, target_uid)
+                self.assertEqual(expected_root, root_binding)
+                self.assertEqual(
+                    keywords, {"owner_loss_capability": None}
+                )
+                self.assertIn("fsync-witness", trace)
+                trace.append("root-cleanup")
+                barrier_trace.append(("root-cleanup", None))
+                root_path.rmdir()
+                return {
+                    "status": "complete",
+                    "operation": "cleanup",
+                    "parent": dict(parent_binding),
+                    "root": dict(root_binding),
+                    "origin_absent": True,
+                }
+
+            def in_process_broker(
+                _command: Sequence[str], **_keywords: object
+            ) -> bytes:
+                try:
+                    receipt = (
+                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
+                            "cleanup", deleting
+                        )
+                    )
+                    receipt.update(
+                        {
+                            "schema_version": 1,
+                            "kind": "direct-opt-root-v1",
+                            "token": token,
+                            "session_id": session_id,
+                            "delete_nonce": delete_nonce,
+                        }
+                    )
+                except BaseException as error:
+                    receipt = {
+                        "status": "incomplete",
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                return (
+                    _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                    + json.dumps(
+                        receipt, sort_keys=True, separators=(",", ":")
+                    )
+                    + "\n"
+                ).encode("ascii")
+
+            def record_registry_import(
+                selected_entry_path: Path,
+                selected_document: Mapping[str, object],
+                *,
+                create: bool,
+            ) -> None:
+                barrier_trace.append(("registry-import", None))
+                real_write_chain_registry_entry(
+                    selected_entry_path,
+                    selected_document,
+                    create=create,
+                )
+
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            original_root_identity = (
+                root_path.stat().st_dev,
+                root_path.stat().st_ino,
+            )
+            registry_before = entry_path.read_bytes()
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    physical_parent,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                    os.geteuid(),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                    os.getegid(),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_open_strict_live_ipc_parent",
+                    side_effect=open_parent,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_descriptor_mount_id",
+                    return_value=41,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_run_registered_sudo",
+                    side_effect=in_process_broker,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_root_registered_opt_ipc_root_operation",
+                    side_effect=root_cleanup,
+                ) as root_lifecycle, mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_write_chain_registry_entry",
+                    side_effect=record_registry_import,
+                ) as write_entry:
+
+                    def fail_recovery_fsync(descriptor: int) -> None:
+                        metadata = os.fstat(descriptor)
+                        if (metadata.st_dev, metadata.st_ino) == witness_identity:
+                            trace.append("failed-fsync-witness")
+                            raise OSError("injected recovery fsync failure")
+                        real_fsync(descriptor)
+
+                    with mock.patch.object(
+                        os, "fsync", side_effect=fail_recovery_fsync
+                    ), self.assertRaisesRegex(
+                        AssertionError,
+                        "extension is not durable",
+                    ):
+                        _CANDIDATE_SUPPORT._invoke_registered_opt_ipc_root(
+                            controller,
+                            entry_path,
+                            deleting,
+                            "cleanup",
+                        )
+                    root_lifecycle.assert_not_called()
+                    write_entry.assert_not_called()
+                    self.assertEqual(entry_path.read_bytes(), registry_before)
+                    self.assertEqual(
+                        _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                            entry_path,
+                            expected_token=token,
+                            expected_target_uid=target_uid,
+                            expected_recovery_controller=controller,
+                        ),
+                        deleting,
+                    )
+                    self.assertEqual(
+                        (
+                            root_path.stat().st_dev,
+                            root_path.stat().st_ino,
+                        ),
+                        original_root_identity,
+                    )
+                    self.assertEqual(
+                        witness_path.read_bytes(), complete_deleting_data
+                    )
+
+                    for changed_component in (
+                        "records",
+                        "data",
+                        "digests",
+                    ):
+                        with self.subTest(
+                            post_fsync_reread=changed_component
+                        ):
+                            trace.clear()
+                            barrier_trace.clear()
+                            root_lifecycle.reset_mock()
+                            write_entry.reset_mock()
+                            reread_count = 0
+                            attempt_trace: list[tuple[str, int]] = []
+
+                            def mutate_post_fsync_reread(
+                                descriptor: int,
+                                selected_namespace_fd: int,
+                                selected_document: Mapping[str, object],
+                                *,
+                                repair_partial_tail: bool,
+                            ) -> tuple[
+                                list[dict[str, object]],
+                                bytes,
+                                list[str],
+                            ]:
+                                nonlocal reread_count
+                                reread_count += 1
+                                attempt_trace.append(
+                                    (
+                                        (
+                                            "initial-read"
+                                            if reread_count == 1
+                                            else "post-fsync-reread"
+                                        ),
+                                        descriptor,
+                                    )
+                                )
+                                (
+                                    selected_records,
+                                    selected_data,
+                                    selected_digests,
+                                ) = real_read_witness_log(
+                                    descriptor,
+                                    selected_namespace_fd,
+                                    selected_document,
+                                    repair_partial_tail=repair_partial_tail,
+                                )
+                                if reread_count != 2:
+                                    return (
+                                        selected_records,
+                                        selected_data,
+                                        selected_digests,
+                                    )
+                                if changed_component == "records":
+                                    selected_records = selected_records[:-1]
+                                elif changed_component == "data":
+                                    replacement = (
+                                        b"X"
+                                        if selected_data[-1:] != b"X"
+                                        else b"Y"
+                                    )
+                                    selected_data = (
+                                        selected_data[:-1] + replacement
+                                    )
+                                else:
+                                    selected_digests = [
+                                        *selected_digests[:-1],
+                                        "0" * 64,
+                                    ]
+                                return (
+                                    selected_records,
+                                    selected_data,
+                                    selected_digests,
+                                )
+
+                            def record_barrier_fsync(
+                                descriptor: int,
+                            ) -> None:
+                                metadata = os.fstat(descriptor)
+                                if (
+                                    metadata.st_dev,
+                                    metadata.st_ino,
+                                ) == witness_identity:
+                                    attempt_trace.append(
+                                        ("fsync", descriptor)
+                                    )
+                                real_fsync(descriptor)
+
+                            with mock.patch.object(
+                                _CANDIDATE_SUPPORT,
+                                "_read_strict_live_ipc_witness_log",
+                                side_effect=mutate_post_fsync_reread,
+                            ), mock.patch.object(
+                                os,
+                                "fsync",
+                                side_effect=record_barrier_fsync,
+                            ), self.assertRaisesRegex(
+                                AssertionError,
+                                "extension changed during synchronization",
+                            ):
+                                _CANDIDATE_SUPPORT._invoke_registered_opt_ipc_root(
+                                    controller,
+                                    entry_path,
+                                    deleting,
+                                    "cleanup",
+                                )
+                            self.assertEqual(len(attempt_trace), 3)
+                            barrier_descriptor = attempt_trace[0][1]
+                            self.assertEqual(
+                                attempt_trace,
+                                [
+                                    (
+                                        "initial-read",
+                                        barrier_descriptor,
+                                    ),
+                                    ("fsync", barrier_descriptor),
+                                    (
+                                        "post-fsync-reread",
+                                        barrier_descriptor,
+                                    ),
+                                ],
+                            )
+                            root_lifecycle.assert_not_called()
+                            write_entry.assert_not_called()
+                            self.assertEqual(
+                                entry_path.read_bytes(), registry_before
+                            )
+                            self.assertEqual(
+                                (
+                                    root_path.stat().st_dev,
+                                    root_path.stat().st_ino,
+                                ),
+                                original_root_identity,
+                            )
+                            self.assertEqual(
+                                witness_path.read_bytes(),
+                                complete_deleting_data,
+                            )
+
+                    trace.clear()
+                    barrier_trace.clear()
+                    root_lifecycle.reset_mock()
+                    write_entry.reset_mock()
+                    successful_read_count = 0
+
+                    def record_successful_read(
+                        descriptor: int,
+                        selected_namespace_fd: int,
+                        selected_document: Mapping[str, object],
+                        *,
+                        repair_partial_tail: bool,
+                    ) -> tuple[
+                        list[dict[str, object]],
+                        bytes,
+                        list[str],
+                    ]:
+                        nonlocal successful_read_count
+                        successful_read_count += 1
+                        barrier_trace.append(
+                            (
+                                {
+                                    1: "initial-read",
+                                    2: "post-fsync-reread",
+                                }.get(
+                                    successful_read_count,
+                                    "witness-read",
+                                ),
+                                descriptor,
+                            )
+                        )
+                        return real_read_witness_log(
+                            descriptor,
+                            selected_namespace_fd,
+                            selected_document,
+                            repair_partial_tail=repair_partial_tail,
+                        )
+
+                    def record_successful_fsync(descriptor: int) -> None:
+                        metadata = os.fstat(descriptor)
+                        if (metadata.st_dev, metadata.st_ino) == witness_identity:
+                            trace.append("fsync-witness")
+                            barrier_trace.append(("fsync", descriptor))
+                        real_fsync(descriptor)
+
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_read_strict_live_ipc_witness_log",
+                        side_effect=record_successful_read,
+                    ), mock.patch.object(
+                        os, "fsync", side_effect=record_successful_fsync
+                    ):
+                        imported = (
+                            _CANDIDATE_SUPPORT._invoke_registered_opt_ipc_root(
+                                controller,
+                                entry_path,
+                                deleting,
+                                "cleanup",
+                            )
+                        )
+                    self.assertFalse(root_path.exists())
+                    barrier_descriptor = barrier_trace[0][1]
+                    self.assertIsNotNone(barrier_descriptor)
+                    self.assertEqual(
+                        barrier_trace[:3],
+                        [
+                            ("initial-read", barrier_descriptor),
+                            ("fsync", barrier_descriptor),
+                            (
+                                "post-fsync-reread",
+                                barrier_descriptor,
+                            ),
+                        ],
+                    )
+                    witness_descriptor_events = [
+                        descriptor
+                        for event, descriptor in barrier_trace
+                        if event
+                        in {
+                            "initial-read",
+                            "post-fsync-reread",
+                            "witness-read",
+                            "fsync",
+                        }
+                    ]
+                    self.assertTrue(witness_descriptor_events)
+                    self.assertEqual(
+                        witness_descriptor_events,
+                        [barrier_descriptor]
+                        * len(witness_descriptor_events),
+                    )
+                    root_cleanup_index = barrier_trace.index(
+                        ("root-cleanup", None)
+                    )
+                    registry_import_index = barrier_trace.index(
+                        ("registry-import", None)
+                    )
+                    self.assertLess(2, root_cleanup_index)
+                    self.assertLess(
+                        root_cleanup_index,
+                        registry_import_index,
+                    )
+                    self.assertGreaterEqual(trace.count("fsync-witness"), 2)
+                    self.assertLess(
+                        trace.index("fsync-witness"),
+                        trace.index("root-cleanup"),
+                    )
+                    self.assertEqual(root_lifecycle.call_count, 1)
+                    self.assertEqual(write_entry.call_count, 1)
+                    persisted = (
+                        _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                            entry_path,
+                            expected_token=token,
+                            expected_target_uid=target_uid,
+                            expected_recovery_controller=controller,
+                        )
+                    )
+                    self.assertEqual(persisted["state"], "deleting")
+                    deletion_receipt = persisted["execution_root_deleted"]
+                    self.assertEqual(imported["deleted"], deletion_receipt)
+                    self.assertEqual(
+                        imported["witness"],
+                        persisted["direct_opt_root"]["witness"],
+                    )
+                    self.assertEqual(
+                        deletion_receipt,
+                        {
+                            "kind": "direct-empty-rmdir-v1",
+                            "parent_device": parent_binding["device"],
+                            "parent_inode": parent_binding["inode"],
+                            "device": root_binding["device"],
+                            "inode": root_binding["inode"],
+                            "name": name,
+                        },
+                    )
+                    persisted_file = persisted["direct_opt_root"]["witness"][
+                        "file"
+                    ]
+                    self.assertEqual(persisted_file["phase"], "deleted")
+                    final_namespace_fd = os.open(
+                        namespace,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                    )
+                    final_witness_fd = os.open(
+                        witness_path,
+                        os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    )
+                    try:
+                        final_records, final_data, final_digests = (
+                            _CANDIDATE_SUPPORT._read_strict_live_ipc_witness_log(
+                                final_witness_fd,
+                                final_namespace_fd,
+                                persisted,
+                                repair_partial_tail=False,
+                            )
+                        )
+                    finally:
+                        os.close(final_witness_fd)
+                        os.close(final_namespace_fd)
+                    expected_deleted = (
+                        _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                            deleting,
+                            phase="deleted",
+                            sequence=3,
+                            previous_sha256=deleting_digest,
+                            root_binding=root_binding,
+                            delete_nonce=delete_nonce,
+                            deletion_receipt=deletion_receipt,
+                        )
+                    )
+                    deleted_frame, deleted_digest = _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                        expected_deleted
+                    )
+                    self.assertEqual(
+                        final_records,
+                        [
+                            intended,
+                            root_bound,
+                            deleting_record,
+                            expected_deleted,
+                        ],
+                    )
+                    self.assertEqual(
+                        final_data, complete_deleting_data + deleted_frame
+                    )
+                    self.assertEqual(
+                        final_digests,
+                        [
+                            intended_digest,
+                            root_bound_digest,
+                            deleting_digest,
+                            deleted_digest,
+                        ],
+                    )
+                    terminal_oracle = {
+                        "size": len(final_data),
+                        "sha256": hashlib.sha256(final_data).hexdigest(),
+                        "last_record_sha256": final_digests[-1],
+                        "phase": final_records[-1]["phase"],
+                    }
+                    imported_file = imported["witness"]["file"]
+                    for source, selected_file in (
+                        ("returned", imported_file),
+                        ("persisted", persisted_file),
+                    ):
+                        with self.subTest(terminal_binding_source=source):
+                            self.assertEqual(
+                                {
+                                    field: selected_file[field]
+                                    for field in terminal_oracle
+                                },
+                                terminal_oracle,
+                            )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
 
     def test_root_live_ipc_finalize_retains_exact_terminal_witness(
         self,
@@ -24015,6 +27120,4285 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 self.assertTrue(selected.is_dir())
                 self.assertTrue(detached.is_dir())
 
+    def test_root_live_ipc_owner_loss_residue_contract_is_exact(self) -> None:
+        import socket
+
+        with tempfile.TemporaryDirectory(
+            prefix="ci-ipc-", dir="/tmp"
+        ) as temporary_directory:
+            root = Path(temporary_directory) / (
+                "required-ci-host-ipc-" + "a" * 32
+            )
+            root.mkdir(mode=0o710)
+            os.chown(root, os.getuid(), os.getgid())
+            root.chmod(0o710)
+            root_metadata = root.lstat()
+            root_binding = {
+                "path": str(root),
+                "device": root_metadata.st_dev,
+                "inode": root_metadata.st_ino,
+                "uid": root_metadata.st_uid,
+                "gid": root_metadata.st_gid,
+                "mode": 0o710,
+            }
+            socket_path = root / "post-seal.sock"
+            fifo_path = root / "post-seal.fifo"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            root_fd = -1
+            try:
+                listener.bind(str(socket_path))
+                socket_path.chmod(0o666)
+                os.mkfifo(fifo_path, 0o666)
+                fifo_path.chmod(0o666)
+                root_fd = os.open(
+                    root,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                )
+                parent_metadata = root.parent.lstat()
+                parent_binding = {
+                    "path": str(root.parent),
+                    "device": parent_metadata.st_dev,
+                    "inode": parent_metadata.st_ino,
+                    "uid": parent_metadata.st_uid,
+                    "gid": parent_metadata.st_gid,
+                    "mode": stat.S_IMODE(parent_metadata.st_mode),
+                    "host_mount_id": 19,
+                }
+
+                def open_parent(expected: object = None):
+                    self.assertEqual(expected, parent_binding)
+                    return (
+                        os.open(
+                            root.parent,
+                            os.O_RDONLY
+                            | os.O_DIRECTORY
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC,
+                        ),
+                        dict(parent_binding),
+                    )
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    root.parent,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_open_strict_live_ipc_parent",
+                    side_effect=open_parent,
+                ), self.assertRaisesRegex(AssertionError, "not empty"):
+                    _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_operation(
+                        "cleanup",
+                        parent_binding,
+                        root.name,
+                        os.getuid(),
+                        os.getgid(),
+                        root_binding,
+                    )
+                inventory = (
+                    _CANDIDATE_SUPPORT._strict_live_ipc_quiescent_residue_inventory(
+                        root_fd,
+                        root_binding,
+                        os.getuid(),
+                        os.getgid(),
+                    )
+                )
+                self.assertEqual(
+                    set(inventory), {"post-seal.sock", "post-seal.fifo"}
+                )
+                self.assertTrue(
+                    stat.S_ISSOCK(inventory["post-seal.sock"].st_mode)
+                )
+                self.assertTrue(
+                    stat.S_ISFIFO(inventory["post-seal.fifo"].st_mode)
+                )
+                for foreign_uid, foreign_gid in (
+                    (os.getuid() + 1, os.getgid()),
+                    (os.getuid(), os.getgid() + 1),
+                ):
+                    with self.subTest(
+                        foreign_uid=foreign_uid,
+                        foreign_gid=foreign_gid,
+                    ), self.assertRaisesRegex(
+                        AssertionError, "type or access policy"
+                    ):
+                        _CANDIDATE_SUPPORT._strict_live_ipc_quiescent_residue_inventory(
+                            root_fd,
+                            root_binding,
+                            foreign_uid,
+                            foreign_gid,
+                        )
+                    self.assertTrue(socket_path.exists())
+                    self.assertTrue(fifo_path.exists())
+
+                real_stat = os.stat
+                fifo_metadata = fifo_path.lstat()
+                stable_fifo_fields = {
+                    "mode": fifo_metadata.st_mode,
+                    "uid": fifo_metadata.st_uid,
+                    "gid": fifo_metadata.st_gid,
+                    "device": fifo_metadata.st_dev,
+                    "nlink": fifo_metadata.st_nlink,
+                    "size": fifo_metadata.st_size,
+                }
+                self.assertTrue(stat.S_ISFIFO(stable_fifo_fields["mode"]))
+                self.assertEqual(stable_fifo_fields["uid"], os.getuid())
+                self.assertEqual(stable_fifo_fields["gid"], os.getgid())
+                self.assertEqual(stable_fifo_fields["device"], root_metadata.st_dev)
+                self.assertEqual(stable_fifo_fields["nlink"], 1)
+                self.assertEqual(stable_fifo_fields["size"], 0)
+                for field, tuple_index, unsafe_value in (
+                    ("device", 2, root_metadata.st_dev + 1),
+                    ("nlink", 3, 2),
+                    ("size", 6, 1),
+                ):
+                    mutation_count = 0
+
+                    def mutate_one_fifo_field(
+                        path: object,
+                        *args: object,
+                        **kwargs: object,
+                    ) -> os.stat_result:
+                        nonlocal mutation_count
+                        observed = real_stat(path, *args, **kwargs)
+                        if (
+                            path == fifo_path.name
+                            and kwargs.get("dir_fd") == root_fd
+                            and kwargs.get("follow_symlinks") is False
+                        ):
+                            mutation_count += 1
+                            values = list(observed)
+                            values[tuple_index] = unsafe_value
+                            mutated = os.stat_result(values)
+                            self.assertTrue(stat.S_ISFIFO(mutated.st_mode))
+                            self.assertEqual(mutated.st_uid, os.getuid())
+                            self.assertEqual(mutated.st_gid, os.getgid())
+                            self.assertEqual(
+                                stat.S_IMODE(mutated.st_mode), 0o666
+                            )
+                            for stable_field in ("device", "nlink", "size"):
+                                expected = (
+                                    unsafe_value
+                                    if stable_field == field
+                                    else stable_fifo_fields[stable_field]
+                                )
+                                self.assertEqual(
+                                    getattr(
+                                        mutated,
+                                        {
+                                            "device": "st_dev",
+                                            "nlink": "st_nlink",
+                                            "size": "st_size",
+                                        }[stable_field],
+                                    ),
+                                    expected,
+                                )
+                            return mutated
+                        return observed
+
+                    original_identities = {
+                        path.name: (path.lstat().st_dev, path.lstat().st_ino)
+                        for path in (socket_path, fifo_path)
+                    }
+                    with self.subTest(unsafe_fifo_field=field), mock.patch.object(
+                        os,
+                        "stat",
+                        side_effect=mutate_one_fifo_field,
+                    ), self.assertRaisesRegex(
+                        AssertionError, "type or access policy"
+                    ):
+                        _CANDIDATE_SUPPORT._strict_live_ipc_quiescent_residue_inventory(
+                            root_fd,
+                            root_binding,
+                            os.getuid(),
+                            os.getgid(),
+                        )
+                    self.assertEqual(mutation_count, 1)
+                    self.assertEqual(
+                        {
+                            path.name: (path.lstat().st_dev, path.lstat().st_ino)
+                            for path in (socket_path, fifo_path)
+                        },
+                        original_identities,
+                    )
+
+                replacement_values = list(fifo_metadata)
+                replacement_values[1] = fifo_metadata.st_ino + 1
+                replacement_metadata = os.stat_result(replacement_values)
+                self.assertEqual(
+                    replacement_metadata.st_dev, fifo_metadata.st_dev
+                )
+                self.assertNotEqual(
+                    replacement_metadata.st_ino, fifo_metadata.st_ino
+                )
+                self.assertEqual(
+                    replacement_metadata.st_mode, fifo_metadata.st_mode
+                )
+                self.assertEqual(
+                    replacement_metadata.st_uid, fifo_metadata.st_uid
+                )
+                self.assertEqual(
+                    replacement_metadata.st_gid, fifo_metadata.st_gid
+                )
+                self.assertEqual(
+                    replacement_metadata.st_nlink, fifo_metadata.st_nlink
+                )
+                self.assertEqual(
+                    replacement_metadata.st_size, fifo_metadata.st_size
+                )
+                with self.subTest(
+                    residue_replacement="same-policy-new-inode"
+                ), mock.patch.object(
+                    os, "O_PATH", 0x200000, create=True
+                ), mock.patch.object(
+                    os, "open", return_value=71
+                ) as open_residue, mock.patch.object(
+                    os, "stat", return_value=fifo_metadata
+                ), mock.patch.object(
+                    os, "fstat", return_value=replacement_metadata
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_live_ipc_residue_acl_is_absent",
+                ), mock.patch.object(
+                    os, "close"
+                ) as close_residue, self.assertRaisesRegex(
+                    AssertionError, "identity changed"
+                ):
+                    _CANDIDATE_SUPPORT._open_strict_live_ipc_quiescent_residues(
+                        root_fd, {fifo_path.name: fifo_metadata}
+                    )
+                open_residue.assert_called_once()
+                close_residue.assert_called_once_with(71)
+
+                with self.subTest(
+                    residue_acl="benign-absent"
+                ), mock.patch.object(
+                    os, "fstat", return_value=fifo_metadata
+                ) as acl_fstat, mock.patch.object(
+                    os, "listxattr", return_value=[], create=True
+                ) as list_acl:
+                    _CANDIDATE_SUPPORT._strict_live_ipc_residue_acl_is_absent(
+                        73, fifo_metadata, expected_nlink=1
+                    )
+                self.assertEqual(acl_fstat.call_count, 2)
+                list_acl.assert_called_once_with(73)
+
+                with self.subTest(
+                    residue_acl="present"
+                ), mock.patch.object(
+                    os, "fstat", return_value=fifo_metadata
+                ), mock.patch.object(
+                    os,
+                    "listxattr",
+                    return_value=["system.posix_acl_access"],
+                    create=True,
+                ), self.assertRaisesRegex(
+                    AssertionError, "unexpected POSIX ACL"
+                ):
+                    _CANDIDATE_SUPPORT._strict_live_ipc_residue_acl_is_absent(
+                        73, fifo_metadata, expected_nlink=1
+                    )
+
+                with self.subTest(
+                    residue_acl="unreadable"
+                ), mock.patch.object(
+                    os, "fstat", return_value=fifo_metadata
+                ), mock.patch.object(
+                    os,
+                    "listxattr",
+                    side_effect=OSError(errno.EIO, "injected ACL read failure"),
+                    create=True,
+                ), self.assertRaisesRegex(
+                    AssertionError, "ACL is unreadable"
+                ):
+                    _CANDIDATE_SUPPORT._strict_live_ipc_residue_acl_is_absent(
+                        73, fifo_metadata, expected_nlink=1
+                    )
+
+                unknown = root / "unknown-regular"
+                unknown.write_bytes(b"must remain")
+                before = {
+                    path.name: (path.lstat().st_dev, path.lstat().st_ino)
+                    for path in (socket_path, fifo_path, unknown)
+                }
+                with self.assertRaisesRegex(
+                    AssertionError, "not allowlisted"
+                ):
+                    _CANDIDATE_SUPPORT._strict_live_ipc_quiescent_residue_inventory(
+                        root_fd,
+                        root_binding,
+                        os.getuid(),
+                        os.getgid(),
+                    )
+                self.assertEqual(
+                    {
+                        path.name: (path.lstat().st_dev, path.lstat().st_ino)
+                        for path in (socket_path, fifo_path, unknown)
+                    },
+                    before,
+                )
+                unknown.unlink()
+
+                fifo_path.chmod(0o600)
+                with self.assertRaisesRegex(
+                    AssertionError, "type or access policy"
+                ):
+                    _CANDIDATE_SUPPORT._strict_live_ipc_quiescent_residue_inventory(
+                        root_fd,
+                        root_binding,
+                        os.getuid(),
+                        os.getgid(),
+                    )
+                self.assertTrue(socket_path.exists())
+                self.assertTrue(fifo_path.exists())
+                fifo_path.chmod(0o666)
+                listener.close()
+                socket_path.unlink()
+                socket_path.write_bytes(b"")
+                socket_path.chmod(0o666)
+                with self.assertRaisesRegex(
+                    AssertionError, "type or access policy"
+                ):
+                    _CANDIDATE_SUPPORT._strict_live_ipc_quiescent_residue_inventory(
+                        root_fd,
+                        root_binding,
+                        os.getuid(),
+                        os.getgid(),
+                    )
+                self.assertEqual(
+                    socket_path.read_bytes(),
+                    b"",
+                )
+                self.assertTrue(fifo_path.exists())
+                socket_path.unlink()
+                replay_inventory = (
+                    _CANDIDATE_SUPPORT._strict_live_ipc_quiescent_residue_inventory(
+                        root_fd,
+                        root_binding,
+                        os.getuid(),
+                        os.getgid(),
+                    )
+                )
+                self.assertEqual(set(replay_inventory), {"post-seal.fifo"})
+                socket_path.symlink_to(fifo_path.name)
+                with self.assertRaisesRegex(
+                    AssertionError, "type or access policy"
+                ):
+                    _CANDIDATE_SUPPORT._strict_live_ipc_quiescent_residue_inventory(
+                        root_fd,
+                        root_binding,
+                        os.getuid(),
+                        os.getgid(),
+                    )
+                self.assertTrue(socket_path.is_symlink())
+                self.assertTrue(fifo_path.exists())
+            finally:
+                if root_fd >= 0:
+                    os.close(root_fd)
+                listener.close()
+
+    def test_root_live_ipc_owner_loss_string_is_not_a_deletion_capability(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve(strict=True)
+            parent_metadata = parent.lstat()
+            parent_binding = {
+                "path": str(parent),
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+                "gid": parent_metadata.st_gid,
+                "mode": stat.S_IMODE(parent_metadata.st_mode),
+                "host_mount_id": 29,
+            }
+            name = "required-ci-host-ipc-" + "d" * 32
+            root = parent / name
+            root.mkdir(mode=0o710)
+            root.chmod(0o710)
+            root_metadata = root.lstat()
+            root_binding = {
+                "path": str(root),
+                "device": root_metadata.st_dev,
+                "inode": root_metadata.st_ino,
+                "uid": root_metadata.st_uid,
+                "gid": root_metadata.st_gid,
+                "mode": 0o710,
+            }
+            fifo = root / "post-seal.fifo"
+            os.mkfifo(fifo, 0o666)
+            fifo.chmod(0o666)
+            fifo_identity = (fifo.lstat().st_dev, fifo.lstat().st_ino)
+
+            def open_parent(expected: object = None):
+                self.assertEqual(expected, parent_binding)
+                return (
+                    os.open(
+                        parent,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                    ),
+                    dict(parent_binding),
+                )
+
+            def bind_fifo(
+                root_fd: int,
+                inventory: Mapping[str, os.stat_result],
+            ) -> dict[str, int]:
+                self.assertEqual(set(inventory), {fifo.name})
+                descriptor = os.open(
+                    fifo.name,
+                    os.O_RDONLY
+                    | os.O_NONBLOCK
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    dir_fd=root_fd,
+                )
+                return {fifo.name: descriptor}
+
+            original_fstat = os.fstat
+
+            def linux_directory_unlink_metadata(
+                descriptor: int,
+            ) -> os.stat_result:
+                observed = original_fstat(descriptor)
+                if (
+                    sys.platform != "linux"
+                    and not root.exists()
+                    and stat.S_ISDIR(observed.st_mode)
+                    and (observed.st_dev, observed.st_ino)
+                    == (root_binding["device"], root_binding["inode"])
+                ):
+                    values = list(observed)
+                    values[3] = 0
+                    return os.stat_result(values)
+                return observed
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_PARENT",
+                parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_strict_live_ipc_parent",
+                side_effect=open_parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_strict_live_ipc_quiescent_residues",
+                side_effect=bind_fifo,
+            ) as bind_residue, mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_seal_strict_live_ipc_root_for_quiescent_cleanup",
+                side_effect=lambda root_fd, *_args: os.fstat(root_fd),
+            ) as seal_root, mock.patch.object(
+                os,
+                "fstat",
+                side_effect=linux_directory_unlink_metadata,
+            ), mock.patch.object(
+                os, "unlink", wraps=os.unlink
+            ) as unlink_residue, self.assertRaisesRegex(
+                AssertionError, "owner-loss authority.*unavailable"
+            ):
+                _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_operation(
+                    "cleanup",
+                    parent_binding,
+                    name,
+                    os.getuid(),
+                    os.getgid(),
+                    root_binding,
+                    cleanup_profile=(
+                        _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
+                    ),
+                    residue_owner_gid=os.getgid(),
+                )
+
+            bind_residue.assert_not_called()
+            seal_root.assert_not_called()
+            unlink_residue.assert_not_called()
+            self.assertEqual(
+                (fifo.lstat().st_dev, fifo.lstat().st_ino), fifo_identity
+            )
+            self.assertEqual(
+                (root.lstat().st_dev, root.lstat().st_ino),
+                (root_binding["device"], root_binding["inode"]),
+            )
+
+    def test_root_live_ipc_owner_loss_authority_revalidation_is_fail_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            physical_parent = Path(temporary_directory).resolve(strict=True)
+            namespace = (
+                physical_parent
+                / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+            )
+            namespace.mkdir(mode=0o700)
+            runner_uid = os.getuid()
+            runner_gid = os.getgid()
+            owner_identity = (
+                201,
+                202,
+                1,
+                201,
+                201,
+                (runner_uid,) * 4,
+            )
+            watchdog_identity = (
+                301,
+                302,
+                owner_identity[0],
+                301,
+                301,
+                (runner_uid,) * 4,
+            )
+            outer_identity = (
+                401,
+                402,
+                watchdog_identity[0],
+                401,
+                401,
+                (runner_uid,) * 4,
+            )
+
+            def make_capability(
+                label: str,
+                *,
+                consumed: bool = True,
+                expected_root_identity: tuple[int, int] = (41, 42),
+            ) -> tuple[object, Path]:
+                authority_document = {
+                    "label": label,
+                    "registry": {
+                        "session_lock": {"label": "bound-session-lock"},
+                        "watchdog_token": "e" * 32,
+                    },
+                }
+                authority_data = json.dumps(
+                    authority_document,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+                authority_path = namespace / f"authority-{label}.json"
+                authority_path.write_bytes(authority_data)
+                authority_path.chmod(
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_MODE
+                )
+                authority_fd = os.open(
+                    authority_path,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+                namespace_fd = os.open(
+                    namespace,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                )
+                witness_digest = "f" * 64
+                witness_prefix = (
+                    b"owner-loss-root-bound-prefix:"
+                    + witness_digest.encode("ascii")
+                    + b"\n"
+                )
+                witness_path = namespace / f"witness-{label}.log"
+                witness_path.write_bytes(witness_prefix)
+                witness_path.chmod(0o600)
+                witness_fd = os.open(
+                    witness_path,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+                witness_metadata = os.fstat(witness_fd)
+                opened = os.fstat(authority_fd)
+                capability = (
+                    _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability(
+                        authority_basename=authority_path.name,
+                        authority_document=authority_document,
+                        authority_fd=authority_fd,
+                        authority_identity=(opened.st_dev, opened.st_ino),
+                        authority_sha256=hashlib.sha256(
+                            authority_data
+                        ).hexdigest(),
+                        delete_nonce="a" * 32,
+                        expected_root_identity=expected_root_identity,
+                        namespace_fd=namespace_fd,
+                        outer_identity=outer_identity,
+                        owner_identity=owner_identity,
+                        registry_path=physical_parent / "entries",
+                        registry_token="b" * 32,
+                        request_nonce="c" * 32,
+                        root_name="required-ci-host-ipc-" + "d" * 32,
+                        runner_gid=runner_gid,
+                        runner_uid=runner_uid,
+                        watchdog_identity=watchdog_identity,
+                        watchdog_pidfd=-1,
+                        witness_basename=witness_path.name,
+                        witness_descriptor=witness_fd,
+                        witness_identity={
+                            "path": str(witness_path),
+                            "device": witness_metadata.st_dev,
+                            "inode": witness_metadata.st_ino,
+                            "uid": witness_metadata.st_uid,
+                            "gid": witness_metadata.st_gid,
+                            "mode": stat.S_IMODE(witness_metadata.st_mode),
+                            "nlink": witness_metadata.st_nlink,
+                        },
+                        witness_prefix_sha256=hashlib.sha256(
+                            witness_prefix
+                        ).hexdigest(),
+                        witness_prefix_size=len(witness_prefix),
+                        witness_root_record_sha256=witness_digest,
+                    )
+                )
+                capability.consumed = consumed
+                return capability, authority_path
+
+            def witness_protected_state(path: Path) -> dict[str, object]:
+                metadata = path.lstat()
+                return {
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "uid": metadata.st_uid,
+                    "gid": metadata.st_gid,
+                    "mode": stat.S_IMODE(metadata.st_mode),
+                    "nlink": metadata.st_nlink,
+                    "size": metadata.st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_PARENT",
+                physical_parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                runner_uid,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                runner_gid,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_authority_document_is_exact",
+                return_value=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_exact_session_lock_holder",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_watchdog_command_is_exact",
+            ):
+                capability, _authority_path = make_capability(
+                    "witness-prefix-content-rewrite",
+                    consumed=False,
+                )
+                witness_path = namespace / capability.witness_basename
+                original_prefix = witness_path.read_bytes()
+                before_rewrite = witness_protected_state(witness_path)
+                rewritten_prefix = bytes(
+                    [original_prefix[0] ^ 1]
+                ) + original_prefix[1:]
+                rewrite_fd = os.open(
+                    witness_path,
+                    os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+                try:
+                    self.assertEqual(
+                        os.pwrite(rewrite_fd, rewritten_prefix, 0),
+                        len(rewritten_prefix),
+                    )
+                    os.fsync(rewrite_fd)
+                finally:
+                    os.close(rewrite_fd)
+                after_rewrite = witness_protected_state(witness_path)
+                self.assertEqual(
+                    {
+                        key: before_rewrite[key]
+                        for key in (
+                            "device",
+                            "inode",
+                            "uid",
+                            "gid",
+                            "mode",
+                            "nlink",
+                            "size",
+                        )
+                    },
+                    {
+                        key: after_rewrite[key]
+                        for key in (
+                            "device",
+                            "inode",
+                            "uid",
+                            "gid",
+                            "mode",
+                            "nlink",
+                            "size",
+                        )
+                    },
+                )
+                self.assertNotEqual(
+                    before_rewrite["sha256"], after_rewrite["sha256"]
+                )
+                try:
+                    with self.subTest(
+                        failure="witness-same-inode-equal-size-content-rewrite"
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ) as watchdog_probe, self.assertRaisesRegex(
+                        AssertionError, "witness authority changed"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=True,
+                            root_fd=None,
+                        )
+                    watchdog_probe.assert_not_called()
+                    self.assertFalse(capability.consumed)
+                    self.assertFalse(capability.root_operation_started)
+                    self.assertEqual(
+                        witness_protected_state(witness_path), after_rewrite
+                    )
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, _authority_path = make_capability(
+                    "witness-path-replacement",
+                    consumed=False,
+                )
+                witness_path = namespace / capability.witness_basename
+                original_prefix = witness_path.read_bytes()
+                before_replacement = witness_protected_state(witness_path)
+                witness_path.unlink()
+                replacement_fd = os.open(
+                    witness_path,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    0o600,
+                )
+                try:
+                    self.assertEqual(
+                        os.write(replacement_fd, original_prefix),
+                        len(original_prefix),
+                    )
+                    os.fsync(replacement_fd)
+                finally:
+                    os.close(replacement_fd)
+                witness_path.chmod(0o600)
+                after_replacement = witness_protected_state(witness_path)
+                self.assertEqual(
+                    {
+                        key: before_replacement[key]
+                        for key in (
+                            "uid",
+                            "gid",
+                            "mode",
+                            "nlink",
+                            "size",
+                            "sha256",
+                        )
+                    },
+                    {
+                        key: after_replacement[key]
+                        for key in (
+                            "uid",
+                            "gid",
+                            "mode",
+                            "nlink",
+                            "size",
+                            "sha256",
+                        )
+                    },
+                )
+                self.assertNotEqual(
+                    (
+                        before_replacement["device"],
+                        before_replacement["inode"],
+                    ),
+                    (
+                        after_replacement["device"],
+                        after_replacement["inode"],
+                    ),
+                )
+                try:
+                    with self.subTest(
+                        failure="witness-same-policy-path-replacement"
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ) as watchdog_probe, self.assertRaisesRegex(
+                        AssertionError, "witness authority changed"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=True,
+                            root_fd=None,
+                        )
+                    watchdog_probe.assert_not_called()
+                    self.assertFalse(capability.consumed)
+                    self.assertFalse(capability.root_operation_started)
+                    self.assertEqual(
+                        witness_protected_state(witness_path), after_replacement
+                    )
+                    held_replaced = os.fstat(capability.witness_descriptor)
+                    self.assertEqual(held_replaced.st_nlink, 0)
+                    self.assertEqual(
+                        (
+                            held_replaced.st_dev,
+                            held_replaced.st_ino,
+                        ),
+                        (
+                            before_replacement["device"],
+                            before_replacement["inode"],
+                        ),
+                    )
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, _authority_path = make_capability(
+                    "witness-prefix-truncate",
+                    consumed=False,
+                )
+                witness_path = namespace / capability.witness_basename
+                before_truncate = witness_protected_state(witness_path)
+                truncate_fd = os.open(
+                    witness_path,
+                    os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+                try:
+                    os.ftruncate(
+                        truncate_fd,
+                        capability.witness_prefix_size - 1,
+                    )
+                    os.fsync(truncate_fd)
+                finally:
+                    os.close(truncate_fd)
+                after_truncate = witness_protected_state(witness_path)
+                self.assertEqual(
+                    {
+                        key: before_truncate[key]
+                        for key in (
+                            "device",
+                            "inode",
+                            "uid",
+                            "gid",
+                            "mode",
+                            "nlink",
+                        )
+                    },
+                    {
+                        key: after_truncate[key]
+                        for key in (
+                            "device",
+                            "inode",
+                            "uid",
+                            "gid",
+                            "mode",
+                            "nlink",
+                        )
+                    },
+                )
+                self.assertLess(
+                    after_truncate["size"], before_truncate["size"]
+                )
+                try:
+                    with self.subTest(
+                        failure="witness-prefix-truncate"
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ) as watchdog_probe, self.assertRaisesRegex(
+                        AssertionError, "witness authority changed"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=True,
+                            root_fd=None,
+                        )
+                    watchdog_probe.assert_not_called()
+                    self.assertFalse(capability.consumed)
+                    self.assertFalse(capability.root_operation_started)
+                    self.assertEqual(
+                        witness_protected_state(witness_path), after_truncate
+                    )
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, _authority_path = make_capability(
+                    "witness-prefix-acl",
+                    consumed=False,
+                )
+                witness_path = namespace / capability.witness_basename
+                acl_state = witness_protected_state(witness_path)
+
+                def witness_acl(
+                    target: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> list[str]:
+                    del args, kwargs
+                    if target == capability.witness_descriptor:
+                        return ["system.posix_acl_access"]
+                    return []
+
+                try:
+                    with self.subTest(
+                        failure="witness-access-policy-acl"
+                    ), mock.patch.object(
+                        os,
+                        "listxattr",
+                        side_effect=witness_acl,
+                        create=True,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ) as watchdog_probe, self.assertRaisesRegex(
+                        AssertionError, "unexpected POSIX ACL"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=True,
+                            root_fd=None,
+                        )
+                    watchdog_probe.assert_not_called()
+                    self.assertFalse(capability.consumed)
+                    self.assertFalse(capability.root_operation_started)
+                    self.assertEqual(
+                        witness_protected_state(witness_path), acl_state
+                    )
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                root_name = "required-ci-host-ipc-" + "d" * 32
+                execution_root = physical_parent / root_name
+                execution_root.mkdir(mode=0o710)
+                execution_root.chmod(0o710)
+                residue = execution_root / "post-seal.fifo"
+                os.mkfifo(residue, 0o666)
+                residue.chmod(0o666)
+                root_metadata = execution_root.lstat()
+                expected_root = {
+                    "path": str(execution_root),
+                    "device": root_metadata.st_dev,
+                    "inode": root_metadata.st_ino,
+                    "uid": root_metadata.st_uid,
+                    "gid": root_metadata.st_gid,
+                    "mode": stat.S_IMODE(root_metadata.st_mode),
+                }
+                parent_metadata = physical_parent.lstat()
+                parent_binding = {
+                    "path": str(physical_parent),
+                    "device": parent_metadata.st_dev,
+                    "inode": parent_metadata.st_ino,
+                    "uid": parent_metadata.st_uid,
+                    "gid": parent_metadata.st_gid,
+                    "mode": stat.S_IMODE(parent_metadata.st_mode),
+                    "host_mount_id": 29,
+                }
+                capability, _authority_path = make_capability(
+                    "witness-root-mutation-barrier",
+                    expected_root_identity=(
+                        root_metadata.st_dev,
+                        root_metadata.st_ino,
+                    ),
+                )
+                witness_path = namespace / capability.witness_basename
+                original_prefix = witness_path.read_bytes()
+                mutated_prefix = original_prefix[:-1] + b"!"
+                mutation_fd = os.open(
+                    witness_path,
+                    os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+                try:
+                    self.assertEqual(
+                        os.pwrite(mutation_fd, mutated_prefix, 0),
+                        len(mutated_prefix),
+                    )
+                    os.fsync(mutation_fd)
+                finally:
+                    os.close(mutation_fd)
+                root_identity = (
+                    root_metadata.st_dev,
+                    root_metadata.st_ino,
+                    root_metadata.st_uid,
+                    root_metadata.st_gid,
+                    stat.S_IMODE(root_metadata.st_mode),
+                )
+                residue_metadata = residue.lstat()
+                residue_identity = (
+                    residue_metadata.st_dev,
+                    residue_metadata.st_ino,
+                    residue_metadata.st_uid,
+                    residue_metadata.st_gid,
+                    stat.S_IMODE(residue_metadata.st_mode),
+                )
+
+                def open_parent(
+                    expected: object = None,
+                ) -> tuple[int, dict[str, object]]:
+                    self.assertEqual(expected, parent_binding)
+                    return (
+                        os.open(
+                            physical_parent,
+                            os.O_RDONLY
+                            | os.O_DIRECTORY
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC,
+                        ),
+                        dict(parent_binding),
+                    )
+
+                try:
+                    with self.subTest(
+                        failure="witness-drift-precedes-root-mutation"
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_open_strict_live_ipc_parent",
+                        side_effect=open_parent,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_live_ipc_quiescent_residue_inventory",
+                    ) as inventory, mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_open_strict_live_ipc_quiescent_residues",
+                    ) as open_residues, mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_seal_strict_live_ipc_root_for_quiescent_cleanup",
+                    ) as seal_root, mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ) as watchdog_probe, mock.patch.object(
+                        os, "unlink", wraps=os.unlink
+                    ) as unlink_residue, mock.patch.object(
+                        os, "rmdir", wraps=os.rmdir
+                    ) as unlink_root, mock.patch.object(
+                        os, "fsync", wraps=os.fsync
+                    ) as durable_mutation, self.assertRaisesRegex(
+                        AssertionError, "witness authority changed"
+                    ):
+                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_operation(
+                            "cleanup",
+                            parent_binding,
+                            root_name,
+                            runner_uid,
+                            runner_gid,
+                            expected_root,
+                            owner_loss_capability=capability,
+                        )
+                    inventory.assert_not_called()
+                    open_residues.assert_not_called()
+                    seal_root.assert_not_called()
+                    watchdog_probe.assert_not_called()
+                    unlink_residue.assert_not_called()
+                    unlink_root.assert_not_called()
+                    durable_mutation.assert_not_called()
+                    self.assertTrue(capability.consumed)
+                    self.assertFalse(capability.root_operation_started)
+                    observed_root = execution_root.lstat()
+                    self.assertEqual(
+                        (
+                            observed_root.st_dev,
+                            observed_root.st_ino,
+                            observed_root.st_uid,
+                            observed_root.st_gid,
+                            stat.S_IMODE(observed_root.st_mode),
+                        ),
+                        root_identity,
+                    )
+                    observed_residue = residue.lstat()
+                    self.assertEqual(
+                        (
+                            observed_residue.st_dev,
+                            observed_residue.st_ino,
+                            observed_residue.st_uid,
+                            observed_residue.st_gid,
+                            stat.S_IMODE(observed_residue.st_mode),
+                        ),
+                        residue_identity,
+                    )
+                    self.assertEqual(witness_path.read_bytes(), mutated_prefix)
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+                residue.unlink()
+                execution_root.rmdir()
+
+                capability, _authority_path = make_capability("dead")
+                try:
+                    with self.subTest(failure="watchdog-dead"), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        side_effect=ProcessLookupError(
+                            "injected dead watchdog"
+                        ),
+                        create=True,
+                    ), self.assertRaisesRegex(
+                        AssertionError, "watchdog is not alive"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=False,
+                            root_fd=None,
+                        )
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, _authority_path = make_capability("lock-lost")
+                try:
+                    with self.subTest(failure="watchdog-lock-lost"), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_exact_session_lock_holder",
+                        side_effect=AssertionError(
+                            "injected watchdog session lock loss"
+                        ),
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_watchdog_command_is_exact",
+                    ) as command_check, mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_revalidate_broker_ancestry",
+                    ) as ancestry_check, mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_registered_clients_are_quiescent",
+                    ) as client_scan, self.assertRaisesRegex(
+                        AssertionError, "session lock loss"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=False,
+                            root_fd=None,
+                        )
+                    command_check.assert_not_called()
+                    ancestry_check.assert_not_called()
+                    client_scan.assert_not_called()
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, _authority_path = make_capability(
+                    "command-changed"
+                )
+                try:
+                    with self.subTest(failure="watchdog-command-changed"), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_watchdog_command_is_exact",
+                        side_effect=AssertionError(
+                            "injected watchdog command binding change"
+                        ),
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_revalidate_broker_ancestry",
+                    ) as ancestry_check, mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_registered_clients_are_quiescent",
+                    ) as client_scan, self.assertRaisesRegex(
+                        AssertionError, "command binding change"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=False,
+                            root_fd=None,
+                        )
+                    ancestry_check.assert_not_called()
+                    client_scan.assert_not_called()
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, _authority_path = make_capability("owner-live")
+                try:
+                    with self.subTest(failure="owner-still-live"), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_revalidate_broker_ancestry",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        return_value=owner_identity,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_registered_clients_are_quiescent",
+                    ) as client_scan, self.assertRaisesRegex(
+                        AssertionError, "owner is still alive"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=False,
+                            root_fd=None,
+                        )
+                    client_scan.assert_not_called()
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, _authority_path = make_capability(
+                    "owner-live-metadata-changed"
+                )
+                changed_owner_metadata = (
+                    owner_identity[0],
+                    owner_identity[1],
+                    owner_identity[2] + 17,
+                    owner_identity[3] + 19,
+                    owner_identity[4] + 23,
+                    owner_identity[5],
+                )
+                try:
+                    with self.subTest(
+                        failure="same-owner-instance-metadata-changed"
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_revalidate_broker_ancestry",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        return_value=changed_owner_metadata,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_registered_clients_are_quiescent",
+                    ) as client_scan, self.assertRaisesRegex(
+                        AssertionError, "owner is still alive"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=False,
+                            root_fd=None,
+                        )
+                    client_scan.assert_not_called()
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, _authority_path = make_capability(
+                    "client-reappeared"
+                )
+                try:
+                    with self.subTest(
+                        failure="client-reappears-through-capability"
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_revalidate_broker_ancestry",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        return_value=None,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_registered_clients_are_quiescent",
+                        side_effect=AssertionError(
+                            "injected client reappearance"
+                        ),
+                    ) as client_scan, self.assertRaisesRegex(
+                        AssertionError, "client reappearance"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=False,
+                            root_fd=None,
+                        )
+                    client_scan.assert_called_once_with(
+                        capability.registry_path,
+                        capability.registry_token,
+                        capability.runner_uid,
+                        capability.watchdog_identity,
+                    )
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, authority_path = make_capability("replacement")
+                authority_path.unlink()
+                authority_path.write_bytes(b'{"label":"replacement"}')
+                authority_path.chmod(
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_MODE
+                )
+                try:
+                    with self.subTest(failure="authority-replacement"), mock.patch.object(
+                        _CANDIDATE_SUPPORT.signal,
+                        "pidfd_send_signal",
+                        create=True,
+                    ) as watchdog_probe, self.assertRaisesRegex(
+                        AssertionError, "authority.*access policy|identity changed"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                            capability,
+                            consume=False,
+                            root_fd=None,
+                        )
+                    watchdog_probe.assert_not_called()
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+                capability, _authority_path = make_capability("pid-reuse")
+                reused_watchdog = (
+                    watchdog_identity[0],
+                    watchdog_identity[1] + 1,
+                    *watchdog_identity[2:],
+                )
+                try:
+                    with self.subTest(failure="watchdog-pid-reuse"), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        return_value=reused_watchdog,
+                    ), self.assertRaisesRegex(
+                        AssertionError, "watchdog/outer ancestry changed"
+                    ):
+                        _CANDIDATE_SUPPORT._strict_owner_loss_revalidate_broker_ancestry(
+                            capability
+                        )
+                finally:
+                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                        capability
+                    )
+
+            reappeared_client = (
+                501,
+                502,
+                1,
+                501,
+                501,
+                (runner_uid,) * 4,
+            )
+            with self.subTest(failure="client-reappears"), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_watchdog_client_inventory",
+                side_effect=({}, {reappeared_client[0]: reappeared_client}),
+            ) as inventory, mock.patch.object(
+                _CANDIDATE_SUPPORT.time, "sleep"
+            ) as scan_delay, self.assertRaisesRegex(
+                AssertionError, "clients are not quiescent"
+            ):
+                _CANDIDATE_SUPPORT._strict_owner_loss_registered_clients_are_quiescent(
+                    physical_parent / "entries",
+                    "b" * 32,
+                    runner_uid,
+                    watchdog_identity,
+                )
+            self.assertEqual(inventory.call_count, 2)
+            for observed in inventory.call_args_list:
+                self.assertEqual(
+                    observed,
+                    mock.call(
+                        physical_parent / "entries",
+                        "b" * 32,
+                        runner_uid=runner_uid,
+                        excluded_identity=watchdog_identity,
+                    ),
+                )
+            scan_delay.assert_called_once_with(
+                _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_INTERVAL_SECONDS
+            )
+
+    def test_root_live_ipc_owner_loss_process_authority_is_exact(self) -> None:
+        runner_uid = os.getuid()
+        identity = (
+            301,
+            302,
+            201,
+            301,
+            301,
+            (runner_uid,) * 4,
+        )
+        owner_identity = (
+            201,
+            202,
+            1,
+            201,
+            201,
+            (runner_uid,) * 4,
+        )
+        reparented_identity = (
+            identity[0],
+            identity[1],
+            1,
+            identity[3],
+            identity[4],
+            identity[5],
+        )
+        self.assertNotEqual(reparented_identity[2], identity[2])
+        lock_binding = {
+            "path": "/registry/.session.lock",
+            "device": 41,
+            "inode": 42,
+            "uid": runner_uid,
+            "gid": os.getgid(),
+            "mode": 0o600,
+            "nlink": 1,
+        }
+        lock_metadata = os.stat_result(
+            (
+                stat.S_IFREG | 0o600,
+                lock_binding["inode"],
+                lock_binding["device"],
+                1,
+                runner_uid,
+                os.getgid(),
+                0,
+                0,
+                0,
+                0,
+            )
+        )
+        exact_fdinfo = (
+            b"pos:\t0\n"
+            b"flags:\t02100000\n"
+            b"lock:\t1: FLOCK  ADVISORY  WRITE 301 00:29:42 0 EOF\n"
+        )
+
+        def validate_lock(
+            fdinfo: bytes,
+            *,
+            observed_identity: tuple[
+                int, int, int, int, int, tuple[int, int, int, int]
+            ] = identity,
+            allow_reparent: bool = False,
+        ) -> None:
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                return_value=observed_identity,
+            ), mock.patch.object(
+                os, "listdir", return_value=["7"]
+            ), mock.patch.object(
+                Path, "stat", return_value=lock_metadata
+            ), mock.patch.object(
+                Path, "open", return_value=io.BytesIO(fdinfo)
+            ):
+                _CANDIDATE_SUPPORT._strict_owner_loss_exact_session_lock_holder(
+                    identity,
+                    lock_binding,
+                    allow_reparent=allow_reparent,
+                )
+
+        validate_lock(exact_fdinfo)
+        validate_lock(
+            exact_fdinfo,
+            observed_identity=reparented_identity,
+            allow_reparent=True,
+        )
+        for description, changed_fdinfo in (
+            (
+                "shared-lock",
+                exact_fdinfo.replace(b"WRITE", b"READ "),
+            ),
+            (
+                "foreign-owner",
+                exact_fdinfo.replace(b"WRITE 301", b"WRITE 999"),
+            ),
+            (
+                "posix-lock",
+                exact_fdinfo.replace(b"FLOCK", b"POSIX"),
+            ),
+            (
+                "missing-lock",
+                b"pos:\t0\nflags:\t02100000\n",
+            ),
+        ):
+            with self.subTest(lock_failure=description), self.assertRaisesRegex(
+                AssertionError, "does not hold the session lock"
+            ):
+                validate_lock(changed_fdinfo)
+
+        controller = Path("/trusted/required_ci_candidate.py")
+        token = "f" * 32
+        exact_arguments = [
+            str(_CANDIDATE_SUPPORT._STRICT_PRIMITIVES["python"]),
+            *_CANDIDATE_SUPPORT._ROOT_PYTHON_ARGUMENTS,
+            str(controller),
+            "--isolation-registry-watchdog",
+            str(owner_identity[0]),
+            str(owner_identity[1]),
+            str(owner_identity[3]),
+            str(owner_identity[4]),
+            token,
+            "57",
+        ]
+
+        def validate_command(
+            arguments: Sequence[str],
+            *,
+            observed_identity: tuple[
+                int, int, int, int, int, tuple[int, int, int, int]
+            ] = identity,
+        ) -> None:
+            command = b"\0".join(
+                value.encode("ascii") for value in arguments
+            ) + b"\0"
+            with mock.patch.object(
+                Path, "open", return_value=io.BytesIO(command)
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                return_value=observed_identity,
+            ):
+                _CANDIDATE_SUPPORT._strict_owner_loss_watchdog_command_is_exact(
+                    identity,
+                    owner_identity,
+                    controller,
+                    token,
+                )
+
+        validate_command(exact_arguments)
+        validate_command(
+            exact_arguments, observed_identity=reparented_identity
+        )
+        controller_index = 1 + len(
+            _CANDIDATE_SUPPORT._ROOT_PYTHON_ARGUMENTS
+        )
+        owner_start_index = controller_index + 3
+        token_index = controller_index + 6
+
+        def changed_argument(index: int, value: str) -> list[str]:
+            changed = list(exact_arguments)
+            changed[index] = value
+            return changed
+
+        command_mutations = {
+            "controller": changed_argument(
+                controller_index, "/trusted/replacement.py"
+            ),
+            "owner-start": changed_argument(
+                owner_start_index, str(owner_identity[1] + 1)
+            ),
+            "token": changed_argument(token_index, "e" * 32),
+            "gate": changed_argument(-1, "not-a-descriptor"),
+            "extra": [*exact_arguments, "unexpected"],
+        }
+        for description, arguments in command_mutations.items():
+            with self.subTest(command_failure=description), self.assertRaisesRegex(
+                AssertionError, "command binding is invalid"
+            ):
+                validate_command(arguments)
+
+        outer_identity = (
+            401,
+            402,
+            reparented_identity[0],
+            401,
+            401,
+            (runner_uid,) * 4,
+        )
+        root_broker_identity = (
+            os.getpid(),
+            502,
+            outer_identity[0],
+            os.getpid(),
+            os.getpid(),
+            (0, 0, 0, 0),
+        )
+        capability = mock.Mock(
+            watchdog_identity=identity,
+            outer_identity=outer_identity,
+            runner_uid=runner_uid,
+        )
+
+        def reparented_ancestry(path: Path):
+            selected_pid = int(path.name)
+            return {
+                identity[0]: reparented_identity,
+                outer_identity[0]: outer_identity,
+                root_broker_identity[0]: root_broker_identity,
+            }.get(selected_pid)
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            side_effect=reparented_ancestry,
+        ):
+            registered_outer = (
+                _CANDIDATE_SUPPORT._strict_owner_loss_registered_broker_ancestry(
+                    {
+                        "launcher_parent": (
+                            _CANDIDATE_SUPPORT._registered_process_binding(
+                                identity
+                            )
+                        ),
+                        "outer": _CANDIDATE_SUPPORT._registered_process_binding(
+                            outer_identity
+                        ),
+                    },
+                    identity,
+                    runner_uid,
+                    allow_ancestor_reparent=True,
+                )
+            )
+            self.assertEqual(registered_outer, outer_identity)
+            _CANDIDATE_SUPPORT._strict_owner_loss_revalidate_broker_ancestry(
+                capability
+            )
+
+        registry_path = Path("/registry/entries")
+        registry_token = "b" * 32
+        watchdog_environment = b"\0".join(
+            (
+                (
+                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV}="
+                    f"{registry_path}"
+                ).encode("ascii"),
+                (
+                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV}="
+                    f"{registry_token}"
+                ).encode("ascii"),
+            )
+        )
+        with mock.patch.object(
+            Path,
+            "iterdir",
+            return_value=[Path(f"/proc/{identity[0]}")],
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_process_identity",
+            return_value=reparented_identity,
+        ), mock.patch.object(
+            Path, "read_bytes", return_value=watchdog_environment
+        ) as read_environment:
+            inventory = _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                registry_path,
+                registry_token,
+                runner_uid=runner_uid,
+                excluded_identity=identity,
+            )
+        self.assertEqual(inventory, {})
+        read_environment.assert_not_called()
+
+    def test_root_live_ipc_owner_loss_uses_the_invocation_entry_for_caller_binding(
+        self,
+    ) -> None:
+        class InvocationEntryObserved(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            registry_root = fixture_root / "registry"
+            entries = registry_root / "entries"
+            entries.mkdir(parents=True, mode=0o700)
+            registry_root.chmod(0o700)
+            physical_parent = fixture_root / "opt"
+            physical_parent.mkdir(mode=0o755)
+            namespace = (
+                physical_parent
+                / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+            )
+            namespace.mkdir(mode=0o700)
+            runner_uid = os.getuid()
+            runner_gid = os.getgid()
+            registry_token = "1" * 32
+            watchdog_token = "2" * 32
+            session_id = "3" * 32
+            delete_nonce = "4" * 32
+            root_name = "required-ci-host-ipc-" + session_id
+            execution_root = physical_parent / root_name
+            execution_root.mkdir(mode=0o710)
+
+            def directory_binding(path: Path) -> dict[str, object]:
+                metadata = path.lstat()
+                return {
+                    "path": str(path),
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "uid": metadata.st_uid,
+                    "gid": metadata.st_gid,
+                    "mode": stat.S_IMODE(metadata.st_mode),
+                }
+
+            registry_root_binding = directory_binding(registry_root)
+            entries_binding = directory_binding(entries)
+            parent_binding = {
+                **directory_binding(physical_parent),
+                "host_mount_id": 41,
+            }
+            root_metadata = execution_root.lstat()
+            root_binding = {
+                "path": str(execution_root),
+                "device": root_metadata.st_dev,
+                "inode": root_metadata.st_ino,
+                "uid": runner_uid,
+                "gid": 60047,
+                "mode": 0o710,
+            }
+            lock_binding = {
+                "path": str(registry_root / ".session.lock"),
+                "device": registry_root_binding["device"],
+                "inode": registry_root_binding["inode"] + 1,
+                "uid": runner_uid,
+                "gid": runner_gid,
+                "mode": 0o600,
+                "nlink": 1,
+            }
+            witness = _direct_opt_witness_fixture(session_id, "5" * 32)
+            witness_namespace = {
+                **directory_binding(namespace),
+                "uid": runner_uid,
+                "gid": runner_gid,
+                "mode": 0o700,
+            }
+            witness_path = namespace / str(witness["basename"])
+            witness_root_digest = "7" * 64
+            witness_root_prefix = (
+                b"owner-loss-root-bound-prefix:"
+                + witness_root_digest.encode("ascii")
+                + b"\n"
+            )
+            witness_path.write_bytes(witness_root_prefix)
+            witness_path.chmod(0o600)
+            witness_metadata = witness_path.lstat()
+            witnessed_file_binding = {
+                "path": str(witness_path),
+                "device": witness_metadata.st_dev,
+                "inode": witness_metadata.st_ino,
+                "uid": witness_metadata.st_uid,
+                "gid": witness_metadata.st_gid,
+                "mode": 0o600,
+                "nlink": 1,
+                "size": len(witness_root_prefix),
+                "sha256": hashlib.sha256(
+                    witness_root_prefix
+                ).hexdigest(),
+                "last_record_sha256": witness_root_digest,
+                "phase": "root-bound",
+            }
+            witness_descriptor = os.open(
+                witness_path,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            self.addCleanup(os.close, witness_descriptor)
+            direct_binding = {
+                "registry": entries_binding,
+                "parent": parent_binding,
+                "name": root_name,
+                "target_gid": 60047,
+                "mode": 0o710,
+                "root": None,
+                "witness": witness,
+            }
+            owner_identity = (
+                201,
+                202,
+                1,
+                201,
+                201,
+                (runner_uid,) * 4,
+            )
+            watchdog_identity = (
+                301,
+                302,
+                owner_identity[0],
+                301,
+                301,
+                (runner_uid,) * 4,
+            )
+            entry_document = {
+                "schema_version": 2,
+                "token": registry_token,
+                "registry_owner_uid": runner_uid,
+                "state": "deleting",
+                "session_id": session_id,
+                "publication_nonce": "8" * 32,
+                "target_uid": 60047,
+                "controller_path": "/trusted/controller.py",
+                "recovery_controller_path": "/trusted/controller.py",
+                "handshake_path": None,
+                "execution_root": {
+                    key: root_binding[key]
+                    for key in ("path", "device", "inode")
+                },
+                "cleanup_execution_root": True,
+                "cleanup_kind": "direct-opt-root-v1",
+                "direct_opt_root": direct_binding,
+                "execution_root_deleted": None,
+                "execution_root_delete_nonce": delete_nonce,
+                "launcher_parent": _CANDIDATE_SUPPORT._registered_process_binding(
+                    owner_identity
+                ),
+                "outer_marker": "old-owner-target-entry",
+                "outer": _CANDIDATE_SUPPORT._registered_process_binding(
+                    owner_identity
+                ),
+            }
+            invocation_entry_document = {
+                "fixture": "watchdog-owned-invocation-entry",
+                "launcher_parent": _CANDIDATE_SUPPORT._registered_process_binding(
+                    watchdog_identity
+                ),
+            }
+            controller_binding = {
+                "path": "/trusted/controller.py",
+                "device": 51,
+                "inode": 52,
+                "uid": runner_uid,
+                "gid": runner_gid,
+                "mode": 0o400,
+                "nlink": 1,
+                "size": 53,
+                "sha256": "9" * 64,
+            }
+            authority_document = {
+                "schema_version": 1,
+                "kind": _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_KIND,
+                "arm_nonce": "a" * 32,
+                "runner_uid": runner_uid,
+                "runner_gid": runner_gid,
+                "registry": {
+                    "root": registry_root_binding,
+                    "entries": entries_binding,
+                    "session_lock": lock_binding,
+                    "token": registry_token,
+                    "watchdog_token": watchdog_token,
+                },
+                "owner": _CANDIDATE_SUPPORT._process_identity_document(
+                    owner_identity
+                ),
+                "watchdog": _CANDIDATE_SUPPORT._process_identity_document(
+                    watchdog_identity
+                ),
+                "controller": controller_binding,
+                "trusted_source_sha256": "b" * 64,
+            }
+            authority_data = json.dumps(
+                authority_document,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            authority_basename = (
+                _CANDIDATE_SUPPORT._strict_live_ipc_owner_loss_authority_basename(
+                    registry_token, watchdog_token
+                )
+            )
+            (namespace / authority_basename).write_bytes(authority_data)
+            entry_path = entries / f"chain-{session_id}.json"
+
+            def open_parent(
+                _expected: object = None,
+            ) -> tuple[int, dict[str, object]]:
+                return (
+                    os.open(
+                        physical_parent,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                    ),
+                    dict(parent_binding),
+                )
+
+            def open_namespace(
+                _parent_fd: int,
+            ) -> tuple[int, dict[str, object]]:
+                return (
+                    os.open(
+                        namespace,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                    ),
+                    dict(witness_namespace),
+                )
+
+            def bind_authority(
+                _path: Path,
+                _descriptor: int,
+                **_keywords: object,
+            ) -> tuple[dict[str, object], bytes]:
+                return ({"sha256": hashlib.sha256(authority_data).hexdigest()}, authority_data)
+
+            def observe_invocation(
+                selected_document: Mapping[str, object],
+                selected_watchdog: tuple[object, ...],
+                selected_runner_uid: int,
+                *,
+                allow_ancestor_reparent: bool,
+            ) -> None:
+                self.assertIs(
+                    selected_document, invocation_entry_document
+                )
+                self.assertIsNot(selected_document, entry_document)
+                self.assertEqual(selected_watchdog, watchdog_identity)
+                self.assertEqual(selected_runner_uid, runner_uid)
+                self.assertTrue(allow_ancestor_reparent)
+                raise InvocationEntryObserved
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_PARENT",
+                physical_parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                runner_uid,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                runner_gid,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_directory_policy_binding",
+                return_value=registry_root_binding,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_watchdog_token",
+                return_value=watchdog_token,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_session_lock_binding",
+                side_effect=lambda *_args, **_kwargs: (
+                    os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC),
+                    lock_binding,
+                ),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_strict_live_ipc_parent",
+                side_effect=open_parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_root_open_existing_strict_live_ipc_witness_namespace",
+                side_effect=open_namespace,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_file_binding",
+                side_effect=bind_authority,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_authority_document_is_exact",
+                return_value=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_controller_binding",
+                return_value=controller_binding,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_exact_session_lock_holder",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_watchdog_command_is_exact",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_registered_broker_ancestry",
+                side_effect=observe_invocation,
+            ), self.assertRaises(InvocationEntryObserved):
+                _CANDIDATE_SUPPORT._root_strict_owner_loss_cleanup_capability(
+                    entry_path,
+                    entry_document,
+                    invocation_entry_document,
+                    entries_binding,
+                    witnessed_root_binding=root_binding,
+                    witnessed_namespace_binding=witness_namespace,
+                    witnessed_file_binding=witnessed_file_binding,
+                    witnessed_descriptor=witness_descriptor,
+                    witnessed_root_prefix=witness_root_prefix,
+                    witnessed_root_record_sha256=witness_root_digest,
+                )
+
+    def test_root_live_ipc_owner_loss_mints_after_unimported_witness_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            physical_parent = fixture_root / "opt"
+            physical_parent.mkdir(mode=0o755)
+            namespace = (
+                physical_parent
+                / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+            )
+            namespace.mkdir(mode=0o700)
+            entries = fixture_root / "registry" / "entries"
+            entries.mkdir(parents=True, mode=0o700)
+            session_id = "6" * 32
+            witness_nonce = "7" * 32
+            delete_nonce = "8" * 32
+            name = "required-ci-host-ipc-" + session_id
+            root = physical_parent / name
+            root.mkdir(mode=0o710)
+            root.chmod(0o710)
+
+            def directory_binding(path: Path) -> dict[str, object]:
+                metadata = path.lstat()
+                return {
+                    "path": str(path),
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "uid": metadata.st_uid,
+                    "gid": metadata.st_gid,
+                    "mode": stat.S_IMODE(metadata.st_mode),
+                }
+
+            parent_binding = {
+                **directory_binding(physical_parent),
+                "host_mount_id": 41,
+            }
+            namespace_binding = directory_binding(namespace)
+            registry_binding = directory_binding(entries)
+            root_binding = directory_binding(root)
+            witness = _direct_opt_witness_fixture(
+                session_id, witness_nonce
+            )
+            document = {
+                "schema_version": 2,
+                "token": "9" * 32,
+                "registry_owner_uid": os.getuid(),
+                "state": "deleting",
+                "session_id": session_id,
+                "publication_nonce": "a" * 32,
+                "target_uid": os.getgid(),
+                "controller_path": "/trusted/controller.py",
+                "recovery_controller_path": "/trusted/controller.py",
+                "handshake_path": None,
+                "execution_root": {
+                    key: parent_binding[key]
+                    for key in ("path", "device", "inode")
+                },
+                "cleanup_execution_root": True,
+                "cleanup_kind": "direct-opt-root-v1",
+                "direct_opt_root": {
+                    "registry": registry_binding,
+                    "parent": parent_binding,
+                    "name": name,
+                    "target_gid": os.getgid(),
+                    "mode": 0o710,
+                    "root": None,
+                    "witness": witness,
+                },
+                "execution_root_deleted": None,
+                "execution_root_delete_nonce": delete_nonce,
+                "launcher_parent": None,
+                "outer_marker": None,
+                "outer": None,
+            }
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_PARENT",
+                physical_parent,
+            ):
+                intended = _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                    document,
+                    phase="intended",
+                    sequence=0,
+                    previous_sha256=None,
+                    root_binding=None,
+                    delete_nonce=None,
+                    deletion_receipt=None,
+                )
+                intended_frame, intended_digest = (
+                    _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                        intended
+                    )
+                )
+                root_bound = (
+                    _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                        document,
+                        phase="root-bound",
+                        sequence=1,
+                        previous_sha256=intended_digest,
+                        root_binding=root_binding,
+                        delete_nonce=None,
+                        deletion_receipt=None,
+                    )
+                )
+                root_bound_frame, root_bound_digest = (
+                    _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                        root_bound
+                    )
+                )
+            root_bound_prefix = (
+                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_MAGIC
+                + intended_frame
+                + root_bound_frame
+            )
+            witness_path = namespace / str(witness["basename"])
+            witness_path.write_bytes(root_bound_prefix)
+            witness_path.chmod(0o600)
+            witness_identity = (
+                witness_path.stat().st_dev,
+                witness_path.stat().st_ino,
+            )
+            identity = (
+                101,
+                102,
+                1,
+                101,
+                101,
+                (os.getuid(),) * 4,
+            )
+            capability: (
+                _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability | None
+            ) = None
+            authorization = mock.Mock()
+            authorization.root_name = name
+            authorization.runner_uid = os.getuid()
+            authorization.target_gid = os.getgid()
+            authorization.delete_nonce = delete_nonce
+            authorization.witness_basename = str(witness["basename"])
+            authorization.namespace_binding = namespace_binding
+            authorization.invocation_binding = None
+            trace: list[str] = []
+            barrier_trace: list[
+                tuple[str, int, object, tuple[int, int]]
+            ] = []
+            exclusive_witness_descriptors: set[int] = set()
+            opened_witness_fd: int | None = None
+            inject_post_fsync_reread_drift = True
+            drifted_reread_descriptor: int | None = None
+
+            self.assertIsNone(witness["file"])
+
+            def descriptor_identity(descriptor: int) -> tuple[int, int]:
+                metadata = os.fstat(descriptor)
+                return metadata.st_dev, metadata.st_ino
+
+            def open_parent(
+                expected: object = None,
+            ) -> tuple[int, dict[str, object]]:
+                self.assertEqual(expected, parent_binding)
+                return (
+                    os.open(
+                        physical_parent,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                    ),
+                    dict(parent_binding),
+                )
+
+            def open_namespace(
+                _parent_fd: int, expected: object = None
+            ) -> tuple[int, dict[str, object]]:
+                self.assertIsNone(expected)
+                return (
+                    os.open(
+                        namespace,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                    ),
+                    dict(namespace_binding),
+                )
+
+            real_open_witness = (
+                _CANDIDATE_SUPPORT._root_open_or_create_strict_live_ipc_witness
+            )
+
+            def record_open_witness(
+                namespace_descriptor: int,
+                selected_document: Mapping[str, object],
+                *,
+                allow_create: bool = True,
+                mutation_guard: object = None,
+            ) -> tuple[int, list[dict[str, object]], bytes, list[str]]:
+                nonlocal opened_witness_fd
+                namespace_identity = descriptor_identity(namespace_descriptor)
+                self.assertIs(selected_document, document)
+                self.assertIs(allow_create, True)
+                self.assertTrue(callable(mutation_guard))
+                self.assertEqual(
+                    namespace_identity,
+                    (
+                        namespace_binding["device"],
+                        namespace_binding["inode"],
+                    ),
+                )
+                barrier_trace.append(
+                    (
+                        "open-existing",
+                        namespace_descriptor,
+                        allow_create,
+                        namespace_identity,
+                    )
+                )
+                selected = real_open_witness(
+                    namespace_descriptor,
+                    selected_document,
+                    allow_create=allow_create,
+                    mutation_guard=mutation_guard,
+                )
+                descriptor = selected[0]
+                self.assertIsNone(opened_witness_fd)
+                opened_witness_fd = descriptor
+                self.assertIn(descriptor, exclusive_witness_descriptors)
+                self.assertEqual(descriptor_identity(descriptor), witness_identity)
+                barrier_trace.append(
+                    (
+                        "open-return",
+                        descriptor,
+                        allow_create,
+                        descriptor_identity(descriptor),
+                    )
+                )
+                return selected
+
+            def mint_authorization(
+                selected_namespace: Mapping[str, object],
+            ) -> object:
+                self.assertEqual(selected_namespace, namespace_binding)
+                return authorization
+
+            def revalidate_authorization(selected: object) -> object:
+                self.assertIs(selected, authorization)
+                return authorization
+
+            def mint_capability(
+                witnessed_root: Mapping[str, object],
+                witnessed_namespace: Mapping[str, object],
+                witnessed_file: Mapping[str, object],
+                witnessed_descriptor: int,
+                witnessed_prefix: bytes,
+                witnessed_root_digest: str,
+            ) -> object:
+                nonlocal capability
+                trace.append("mint-capability")
+                self.assertIsNotNone(opened_witness_fd)
+                self.assertEqual(witnessed_descriptor, opened_witness_fd)
+                self.assertIn(
+                    witnessed_descriptor, exclusive_witness_descriptors
+                )
+                barrier_trace.append(
+                    (
+                        "mint-capability",
+                        witnessed_descriptor,
+                        None,
+                        descriptor_identity(witnessed_descriptor),
+                    )
+                )
+                self.assertEqual(witnessed_root, root_binding)
+                self.assertEqual(witnessed_namespace, namespace_binding)
+                self.assertEqual(
+                    (
+                        witnessed_file["device"],
+                        witnessed_file["inode"],
+                        witnessed_file["uid"],
+                        witnessed_file["gid"],
+                        witnessed_file["mode"],
+                        witnessed_file["nlink"],
+                        witnessed_file["phase"],
+                    ),
+                    (
+                        witness_identity[0],
+                        witness_identity[1],
+                        os.getuid(),
+                        os.getgid(),
+                        0o600,
+                        1,
+                        "root-bound",
+                    ),
+                )
+                self.assertEqual(
+                    (
+                        os.fstat(witnessed_descriptor).st_dev,
+                        os.fstat(witnessed_descriptor).st_ino,
+                    ),
+                    witness_identity,
+                )
+                self.assertEqual(witnessed_prefix, root_bound_prefix)
+                self.assertEqual(
+                    witnessed_root_digest, root_bound_digest
+                )
+                capability = (
+                    _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability(
+                        authority_basename=(
+                            "owner-loss-authority-test.json"
+                        ),
+                        authority_document={},
+                        authority_fd=-1,
+                        authority_identity=(1, 2),
+                        authority_sha256="b" * 64,
+                        delete_nonce=delete_nonce,
+                        expected_root_identity=(
+                            root_binding["device"], root_binding["inode"]
+                        ),
+                        namespace_fd=-1,
+                        outer_identity=identity,
+                        owner_identity=identity,
+                        registry_path=entries,
+                        registry_token="9" * 32,
+                        request_nonce="c" * 32,
+                        root_name=name,
+                        runner_gid=os.getgid(),
+                        runner_uid=os.getuid(),
+                        watchdog_identity=identity,
+                        watchdog_pidfd=-1,
+                        witness_basename=str(witness["basename"]),
+                        witness_descriptor=os.dup(witnessed_descriptor),
+                        witness_identity={
+                            field: witnessed_file[field]
+                            for field in (
+                                "path",
+                                "device",
+                                "inode",
+                                "uid",
+                                "gid",
+                                "mode",
+                                "nlink",
+                            )
+                        },
+                        witness_prefix_sha256=hashlib.sha256(
+                            witnessed_prefix
+                        ).hexdigest(),
+                        witness_prefix_size=len(witnessed_prefix),
+                        witness_root_record_sha256=(
+                            witnessed_root_digest
+                        ),
+                    )
+                )
+                return capability
+
+            def consume_capability(
+                selected: object,
+                *,
+                consume: bool,
+                root_fd: int | None,
+            ) -> object:
+                trace.append("consume-capability")
+                self.assertIsNotNone(capability)
+                self.assertIs(selected, capability)
+                self.assertTrue(consume)
+                self.assertIsNone(root_fd)
+                self.assertFalse(capability.consumed)
+                capability.consumed = True
+                return capability
+
+            def cleanup_root(
+                operation: str,
+                selected_parent: Mapping[str, object],
+                selected_name: str,
+                runner_uid: int,
+                target_gid: int,
+                expected_root: Mapping[str, object] | None,
+                **keywords: object,
+            ) -> dict[str, object]:
+                trace.append("root-cleanup")
+                self.assertIsNotNone(capability)
+                self.assertEqual(operation, "cleanup")
+                self.assertEqual(selected_parent, parent_binding)
+                self.assertEqual(selected_name, name)
+                self.assertEqual(runner_uid, os.getuid())
+                self.assertEqual(target_gid, os.getgid())
+                self.assertEqual(expected_root, root_binding)
+                self.assertEqual(
+                    keywords,
+                    {"owner_loss_capability": capability},
+                )
+                self.assertTrue(capability.consumed)
+                root.rmdir()
+                return {
+                    "status": "complete",
+                    "operation": "cleanup",
+                    "parent": dict(parent_binding),
+                    "root": dict(root_binding),
+                    "origin_absent": True,
+                }
+
+            real_read = (
+                _CANDIDATE_SUPPORT._read_strict_live_ipc_witness_log
+            )
+
+            def record_read(
+                descriptor: int,
+                namespace_descriptor: int,
+                selected_document: Mapping[str, object],
+                *,
+                repair_partial_tail: bool,
+            ) -> tuple[list[dict[str, object]], bytes, list[str]]:
+                nonlocal drifted_reread_descriptor
+                self.assertIs(selected_document, document)
+                self.assertEqual(
+                    descriptor_identity(namespace_descriptor),
+                    (
+                        namespace_binding["device"],
+                        namespace_binding["inode"],
+                    ),
+                )
+                self.assertIn(descriptor, exclusive_witness_descriptors)
+                self.assertEqual(descriptor_identity(descriptor), witness_identity)
+                selected = real_read(
+                    descriptor,
+                    namespace_descriptor,
+                    selected_document,
+                    repair_partial_tail=repair_partial_tail,
+                )
+                barrier_trace.append(
+                    (
+                        "read-witness",
+                        descriptor,
+                        repair_partial_tail,
+                        descriptor_identity(descriptor),
+                    )
+                )
+                trace.append("read-" + str(selected[0][-1]["phase"]))
+                if (
+                    inject_post_fsync_reread_drift
+                    and not repair_partial_tail
+                    and drifted_reread_descriptor is None
+                ):
+                    drifted_reread_descriptor = descriptor
+                    barrier_trace.append(
+                        (
+                            "return-drift",
+                            descriptor,
+                            repair_partial_tail,
+                            descriptor_identity(descriptor),
+                        )
+                    )
+                    return selected[0], selected[1] + b"\x00", selected[2]
+                return selected
+
+            real_fsync = os.fsync
+
+            def record_fsync(descriptor: int) -> None:
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == witness_identity:
+                    self.assertIn(
+                        descriptor, exclusive_witness_descriptors
+                    )
+                    barrier_trace.append(
+                        (
+                            "fsync-witness",
+                            descriptor,
+                            None,
+                            (metadata.st_dev, metadata.st_ino),
+                        )
+                    )
+                    trace.append("fsync-witness")
+                real_fsync(descriptor)
+
+            real_flock = fcntl.flock
+
+            def record_flock(descriptor: int, operation: int) -> None:
+                identity_value = descriptor_identity(descriptor)
+                real_flock(descriptor, operation)
+                if identity_value != witness_identity:
+                    return
+                if operation == fcntl.LOCK_EX:
+                    exclusive_witness_descriptors.add(descriptor)
+                    event = "flock-exclusive"
+                elif operation == fcntl.LOCK_UN:
+                    exclusive_witness_descriptors.discard(descriptor)
+                    event = "flock-unlock"
+                else:
+                    self.fail(
+                        "unexpected strict live IPC witness flock operation"
+                    )
+                barrier_trace.append(
+                    (event, descriptor, operation, identity_value)
+                )
+
+            real_write = os.write
+
+            def record_write(descriptor: int, value: object) -> int:
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == witness_identity:
+                    self.assertIn("consume-capability", trace)
+                    trace.append("write-witness")
+                return real_write(descriptor, value)
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_PARENT",
+                physical_parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                os.getuid(),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                os.getgid(),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_strict_live_ipc_parent",
+                side_effect=open_parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_root_open_strict_live_ipc_witness_namespace",
+                side_effect=open_namespace,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_root_open_existing_strict_live_ipc_witness_namespace",
+                side_effect=open_namespace,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_root_open_or_create_strict_live_ipc_witness",
+                side_effect=record_open_witness,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_read_strict_live_ipc_witness_log",
+                side_effect=record_read,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_revalidate_strict_owner_loss_capability",
+                side_effect=consume_capability,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_revalidate_strict_owner_loss_authorization",
+                side_effect=revalidate_authorization,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_root_registered_opt_ipc_root_operation",
+                side_effect=cleanup_root,
+            ), mock.patch.object(
+                os, "fsync", side_effect=record_fsync
+            ), mock.patch.object(
+                fcntl, "flock", side_effect=record_flock
+            ), mock.patch.object(
+                os, "write", side_effect=record_write
+            ):
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "extension changed during synchronization",
+                ):
+                    _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
+                        "cleanup",
+                        document,
+                        owner_loss_authorization_factory=(
+                            mint_authorization
+                        ),
+                        owner_loss_capability_factory=mint_capability,
+                    )
+
+                self.assertIsNone(capability)
+                self.assertTrue(root.is_dir())
+                self.assertEqual(directory_binding(root), root_binding)
+                self.assertEqual(witness_path.read_bytes(), root_bound_prefix)
+                self.assertIsNone(opened_witness_fd)
+                self.assertIsNotNone(drifted_reread_descriptor)
+                self.assertNotIn("mint-capability", trace)
+                self.assertNotIn("root-cleanup", trace)
+                self.assertNotIn("write-witness", trace)
+                self.assertEqual(
+                    [event[0] for event in barrier_trace],
+                    [
+                        "open-existing",
+                        "flock-exclusive",
+                        "read-witness",
+                        "fsync-witness",
+                        "read-witness",
+                        "return-drift",
+                    ],
+                )
+                negative_witness_events = barrier_trace[1:]
+                self.assertTrue(
+                    all(
+                        event[1] == drifted_reread_descriptor
+                        and event[3] == witness_identity
+                        for event in negative_witness_events
+                    )
+                )
+                self.assertEqual(
+                    [
+                        event[2]
+                        for event in negative_witness_events
+                        if event[0] == "read-witness"
+                    ],
+                    [True, False],
+                )
+                self.assertEqual(
+                    negative_witness_events[0][2], fcntl.LOCK_EX
+                )
+
+                exclusive_witness_descriptors.clear()
+                barrier_trace.clear()
+                trace.clear()
+                inject_post_fsync_reread_drift = False
+                drifted_reread_descriptor = None
+                opened_witness_fd = None
+                receipt = (
+                    _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
+                        "cleanup",
+                        document,
+                        owner_loss_authorization_factory=(
+                            mint_authorization
+                        ),
+                        owner_loss_capability_factory=mint_capability,
+                    )
+                )
+
+            self.assertFalse(root.exists())
+            self.assertEqual(receipt["root"], root_binding)
+            self.assertEqual(receipt["deleted"]["device"], root_binding["device"])
+            self.assertEqual(receipt["deleted"]["inode"], root_binding["inode"])
+            self.assertEqual(receipt["witness"]["file"]["phase"], "deleted")
+            mint_index = trace.index("mint-capability")
+            consume_index = trace.index("consume-capability")
+            cleanup_index = trace.index("root-cleanup")
+            first_write_index = trace.index("write-witness")
+            self.assertIn("fsync-witness", trace[:mint_index])
+            self.assertTrue(
+                any(event == "read-root-bound" for event in trace[:mint_index])
+            )
+            self.assertLess(mint_index, consume_index)
+            self.assertLess(consume_index, first_write_index)
+            self.assertLess(first_write_index, cleanup_index)
+            mint_barrier_index = next(
+                index
+                for index, event in enumerate(barrier_trace)
+                if event[0] == "mint-capability"
+            )
+            before_mint = barrier_trace[: mint_barrier_index + 1]
+            self.assertEqual(
+                [event[0] for event in before_mint],
+                [
+                    "open-existing",
+                    "flock-exclusive",
+                    "read-witness",
+                    "fsync-witness",
+                    "read-witness",
+                    "open-return",
+                    "flock-exclusive",
+                    "read-witness",
+                    "mint-capability",
+                ],
+            )
+            self.assertIsNotNone(opened_witness_fd)
+            self.assertIs(before_mint[0][2], True)
+            self.assertEqual(
+                [
+                    event[2]
+                    for event in before_mint
+                    if event[0] == "read-witness"
+                ],
+                [True, False, False],
+            )
+            self.assertTrue(
+                all(
+                    event[1] == opened_witness_fd
+                    and event[3] == witness_identity
+                    for event in before_mint[1:]
+                )
+            )
+            self.assertEqual(
+                [
+                    event[2]
+                    for event in before_mint
+                    if event[0] == "flock-exclusive"
+                ],
+                [fcntl.LOCK_EX, fcntl.LOCK_EX],
+            )
+
+    def test_root_live_ipc_owner_loss_recovers_pre_root_bound_crash_windows(
+        self,
+    ) -> None:
+        scenarios = (
+            ("missing-witness-root-absent", "missing", False, True),
+            ("intended-root-absent", "intended", False, True),
+            ("intended-root-present", "intended", True, True),
+            (
+                "partial-root-bound-root-present",
+                "partial-root-bound",
+                True,
+                True,
+            ),
+            ("missing-witness-root-present", "missing", True, False),
+        )
+        for (
+            scenario,
+            initial_witness,
+            root_present,
+            recovery_allowed,
+        ) in scenarios:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(self.subTest(scenario=scenario))
+                temporary_directory = stack.enter_context(
+                    tempfile.TemporaryDirectory()
+                )
+                fixture_root = Path(temporary_directory).resolve(strict=True)
+                physical_parent = fixture_root / "opt"
+                physical_parent.mkdir(mode=0o755)
+                namespace = (
+                    physical_parent
+                    / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+                )
+                namespace.mkdir(mode=0o700)
+                entries = fixture_root / "registry" / "entries"
+                entries.mkdir(parents=True, mode=0o700)
+                session_id = {
+                    "missing-witness-root-absent": "1",
+                    "intended-root-absent": "2",
+                    "intended-root-present": "3",
+                    "partial-root-bound-root-present": "4",
+                    "missing-witness-root-present": "5",
+                }[scenario] * 32
+                witness_nonce = "6" * 32
+                delete_nonce = "7" * 32
+                root_name = "required-ci-host-ipc-" + session_id
+                root_path = physical_parent / root_name
+
+                def directory_binding(path: Path) -> dict[str, object]:
+                    metadata = path.lstat()
+                    return {
+                        "path": str(path),
+                        "device": metadata.st_dev,
+                        "inode": metadata.st_ino,
+                        "uid": metadata.st_uid,
+                        "gid": metadata.st_gid,
+                        "mode": stat.S_IMODE(metadata.st_mode),
+                    }
+
+                parent_binding = {
+                    **directory_binding(physical_parent),
+                    "host_mount_id": 53,
+                }
+                namespace_binding = directory_binding(namespace)
+                registry_binding = directory_binding(entries)
+                root_binding: dict[str, object] | None = None
+                if root_present:
+                    root_path.mkdir(mode=0o710)
+                    root_path.chmod(0o710)
+                    root_binding = directory_binding(root_path)
+                witness = _direct_opt_witness_fixture(
+                    session_id, witness_nonce
+                )
+                document = {
+                    "schema_version": 2,
+                    "token": "8" * 32,
+                    "registry_owner_uid": os.getuid(),
+                    "state": "deleting",
+                    "session_id": session_id,
+                    "publication_nonce": "9" * 32,
+                    "target_uid": os.getgid(),
+                    "controller_path": "/trusted/controller.py",
+                    "recovery_controller_path": "/trusted/controller.py",
+                    "handshake_path": None,
+                    "execution_root": {
+                        key: parent_binding[key]
+                        for key in ("path", "device", "inode")
+                    },
+                    "cleanup_execution_root": True,
+                    "cleanup_kind": "direct-opt-root-v1",
+                    "direct_opt_root": {
+                        "registry": registry_binding,
+                        "parent": parent_binding,
+                        "name": root_name,
+                        "target_gid": os.getgid(),
+                        "mode": 0o710,
+                        "root": None,
+                        "witness": witness,
+                    },
+                    "execution_root_deleted": None,
+                    "execution_root_delete_nonce": delete_nonce,
+                    "launcher_parent": None,
+                    "outer_marker": None,
+                    "outer": None,
+                }
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    physical_parent,
+                ):
+                    intended = (
+                        _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                            document,
+                            phase="intended",
+                            sequence=0,
+                            previous_sha256=None,
+                            root_binding=None,
+                            delete_nonce=None,
+                            deletion_receipt=None,
+                        )
+                    )
+                    intended_frame, intended_digest = (
+                        _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                            intended
+                        )
+                    )
+                    root_bound_frame = b""
+                    if root_binding is not None:
+                        root_bound = (
+                            _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                                document,
+                                phase="root-bound",
+                                sequence=1,
+                                previous_sha256=intended_digest,
+                                root_binding=root_binding,
+                                delete_nonce=None,
+                                deletion_receipt=None,
+                            )
+                        )
+                        root_bound_frame, _ = (
+                            _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                                root_bound
+                            )
+                        )
+                witness_path = namespace / str(witness["basename"])
+                if initial_witness != "missing":
+                    initial_data = (
+                        _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_MAGIC
+                        + intended_frame
+                    )
+                    if initial_witness == "partial-root-bound":
+                        self.assertGreater(len(root_bound_frame), 8)
+                        initial_data += root_bound_frame[:-7]
+                    witness_path.write_bytes(initial_data)
+                    witness_path.chmod(0o600)
+
+                trace: list[str] = []
+                authorization = mock.Mock()
+                authorization.root_name = root_name
+                authorization.runner_uid = os.getuid()
+                authorization.target_gid = os.getgid()
+                authorization.delete_nonce = delete_nonce
+                authorization.witness_basename = str(witness["basename"])
+                authorization.namespace_binding = namespace_binding
+                authorization.invocation_binding = None
+                minted_capabilities: list[
+                    _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability
+                ] = []
+
+                def open_parent(
+                    expected: object = None,
+                ) -> tuple[int, dict[str, object]]:
+                    self.assertEqual(expected, parent_binding)
+                    return (
+                        os.open(
+                            physical_parent,
+                            os.O_RDONLY
+                            | os.O_DIRECTORY
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC,
+                        ),
+                        dict(parent_binding),
+                    )
+
+                def open_namespace(
+                    _parent_fd: int, expected: object = None
+                ) -> tuple[int, dict[str, object]]:
+                    self.assertIsNone(expected)
+                    return (
+                        os.open(
+                            namespace,
+                            os.O_RDONLY
+                            | os.O_DIRECTORY
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC,
+                        ),
+                        dict(namespace_binding),
+                    )
+
+                def authorize_owner_loss(
+                    selected_namespace: Mapping[str, object],
+                ):
+                    self.assertEqual(
+                        selected_namespace, namespace_binding
+                    )
+                    self.assertNotIn("open-witness", trace)
+                    self.assertNotIn("adopt-root", trace)
+                    self.assertNotIn("append-root-bound", trace)
+                    trace.append("authorize-owner-loss")
+                    return authorization
+
+                def revalidate_authorization(selected: object):
+                    self.assertIs(selected, authorization)
+                    return authorization
+
+                real_open_witness = (
+                    _CANDIDATE_SUPPORT._root_open_or_create_strict_live_ipc_witness
+                )
+
+                def open_witness(
+                    namespace_fd: int,
+                    selected_document: Mapping[str, object],
+                    *,
+                    allow_create: bool = True,
+                    mutation_guard: object = None,
+                ):
+                    trace.append("open-witness")
+                    self.assertIs(selected_document, document)
+                    self.assertTrue(callable(mutation_guard))
+                    return real_open_witness(
+                        namespace_fd,
+                        selected_document,
+                        allow_create=allow_create,
+                        mutation_guard=mutation_guard,
+                    )
+
+                real_append = (
+                    _CANDIDATE_SUPPORT._append_strict_live_ipc_witness_record
+                )
+
+                def append_witness(*args: object, **kwargs: object):
+                    phase = str(kwargs["phase"])
+                    result = real_append(*args, **kwargs)
+                    trace.append("append-" + phase)
+                    return result
+
+                def mint_capability(
+                    witnessed_root: Mapping[str, object],
+                    witnessed_namespace: Mapping[str, object],
+                    witnessed_file: Mapping[str, object],
+                    witnessed_descriptor: int,
+                    witnessed_prefix: bytes,
+                    witnessed_root_digest: str,
+                ) -> _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability:
+                    trace.append("mint-capability")
+                    self.assertIsNotNone(root_binding)
+                    self.assertEqual(witnessed_root, root_binding)
+                    self.assertEqual(witnessed_namespace, namespace_binding)
+                    self.assertEqual(witnessed_file["phase"], "root-bound")
+                    self.assertEqual(
+                        hashlib.sha256(witnessed_prefix).hexdigest(),
+                        witnessed_file["sha256"],
+                    )
+                    identity = (
+                        101,
+                        102,
+                        1,
+                        101,
+                        101,
+                        (os.getuid(),) * 4,
+                    )
+                    capability = (
+                        _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability(
+                            authority_basename="owner-loss-crash-window.json",
+                            authority_document={},
+                            authority_fd=-1,
+                            authority_identity=(1, 2),
+                            authority_sha256="a" * 64,
+                            delete_nonce=delete_nonce,
+                            expected_root_identity=(
+                                int(witnessed_root["device"]),
+                                int(witnessed_root["inode"]),
+                            ),
+                            namespace_fd=-1,
+                            outer_identity=identity,
+                            owner_identity=identity,
+                            registry_path=entries,
+                            registry_token="8" * 32,
+                            request_nonce="b" * 32,
+                            root_name=root_name,
+                            runner_gid=os.getgid(),
+                            runner_uid=os.getuid(),
+                            watchdog_identity=identity,
+                            watchdog_pidfd=-1,
+                            witness_basename=str(witness["basename"]),
+                            witness_descriptor=os.dup(witnessed_descriptor),
+                            witness_identity={
+                                field: witnessed_file[field]
+                                for field in (
+                                    "path",
+                                    "device",
+                                    "inode",
+                                    "uid",
+                                    "gid",
+                                    "mode",
+                                    "nlink",
+                                )
+                            },
+                            witness_prefix_sha256=hashlib.sha256(
+                                witnessed_prefix
+                            ).hexdigest(),
+                            witness_prefix_size=len(witnessed_prefix),
+                            witness_root_record_sha256=(
+                                witnessed_root_digest
+                            ),
+                        )
+                    )
+                    minted_capabilities.append(capability)
+                    return capability
+
+                def revalidate_capability(
+                    selected: object,
+                    *,
+                    consume: bool,
+                    root_fd: int | None,
+                ):
+                    self.assertIn(selected, minted_capabilities)
+                    self.assertTrue(consume)
+                    self.assertIsNone(root_fd)
+                    selected.consumed = True
+                    trace.append("consume-capability")
+                    return selected
+
+                def root_operation(
+                    operation: str,
+                    selected_parent: Mapping[str, object],
+                    selected_name: str,
+                    runner_uid: int,
+                    target_gid: int,
+                    expected_root: Mapping[str, object] | None,
+                    **kwargs: object,
+                ) -> dict[str, object]:
+                    self.assertEqual(selected_parent, parent_binding)
+                    self.assertEqual(selected_name, root_name)
+                    self.assertEqual(runner_uid, os.getuid())
+                    self.assertEqual(target_gid, os.getgid())
+                    if operation == "adopt":
+                        trace.append("adopt-root")
+                        self.assertTrue(root_path.is_dir())
+                        self.assertIsNone(expected_root)
+                        self.assertEqual(
+                            kwargs,
+                            {
+                                "allow_controller_created_adoption": True,
+                                "owner_loss_authorization": authorization,
+                            },
+                        )
+                        adopted_binding = directory_binding(root_path)
+                        self.assertEqual(adopted_binding, root_binding)
+                        return {
+                            "status": "complete",
+                            "operation": operation,
+                            "parent": dict(parent_binding),
+                            "root": adopted_binding,
+                            "origin_absent": False,
+                        }
+                    self.assertEqual(operation, "cleanup")
+                    trace.append("cleanup-root")
+                    if expected_root is None:
+                        self.assertFalse(root_path.exists())
+                        self.assertEqual(
+                            kwargs,
+                            {
+                                "owner_loss_authorization": authorization,
+                                "owner_loss_capability": None,
+                            },
+                        )
+                    else:
+                        self.assertEqual(expected_root, root_binding)
+                        self.assertIs(
+                            kwargs.get("owner_loss_capability"),
+                            minted_capabilities[-1],
+                        )
+                        self.assertIsNone(
+                            kwargs.get("owner_loss_authorization")
+                        )
+                        root_path.rmdir()
+                    return {
+                        "status": "complete",
+                        "operation": operation,
+                        "parent": dict(parent_binding),
+                        "root": expected_root,
+                        "origin_absent": True,
+                    }
+
+                operation_keywords: dict[str, object] = {
+                    "owner_loss_capability_factory": mint_capability,
+                }
+                if "owner_loss_authorization_factory" in inspect.signature(
+                    _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation
+                ).parameters:
+                    operation_keywords["owner_loss_authorization_factory"] = (
+                        authorize_owner_loss
+                    )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    physical_parent,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                    os.getuid(),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                    os.getgid(),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_open_strict_live_ipc_parent",
+                    side_effect=open_parent,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_root_open_strict_live_ipc_witness_namespace",
+                    side_effect=open_namespace,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_root_open_existing_strict_live_ipc_witness_namespace",
+                    side_effect=open_namespace,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_root_open_or_create_strict_live_ipc_witness",
+                    side_effect=open_witness,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_append_strict_live_ipc_witness_record",
+                    side_effect=append_witness,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_revalidate_strict_owner_loss_capability",
+                    side_effect=revalidate_capability,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_revalidate_strict_owner_loss_authorization",
+                    side_effect=revalidate_authorization,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_root_registered_opt_ipc_root_operation",
+                    side_effect=root_operation,
+                ):
+                    if recovery_allowed:
+                        receipt = (
+                            _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
+                                "cleanup", document, **operation_keywords
+                            )
+                        )
+                    else:
+                        with self.assertRaises(AssertionError):
+                            _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
+                                "cleanup", document, **operation_keywords
+                            )
+
+                self.assertEqual(trace[0], "authorize-owner-loss")
+                if not recovery_allowed:
+                    self.assertTrue(root_path.is_dir())
+                    self.assertEqual(
+                        directory_binding(root_path), root_binding
+                    )
+                    self.assertFalse(witness_path.exists())
+                    self.assertEqual(minted_capabilities, [])
+                    self.assertEqual(trace, ["authorize-owner-loss"])
+                    continue
+                self.assertFalse(root_path.exists())
+                self.assertEqual(receipt["root"], root_binding)
+                self.assertEqual(receipt["witness"]["file"]["phase"], "deleted")
+                self.assertTrue(witness_path.is_file())
+                witness_fd = os.open(
+                    witness_path,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+                namespace_fd = os.open(
+                    namespace,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                )
+                try:
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_STRICT_LIVE_IPC_PARENT",
+                        physical_parent,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                        os.getuid(),
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                        os.getgid(),
+                    ):
+                        records, _, _ = (
+                            _CANDIDATE_SUPPORT._read_strict_live_ipc_witness_log(
+                                witness_fd,
+                                namespace_fd,
+                                document,
+                                repair_partial_tail=False,
+                            )
+                        )
+                finally:
+                    os.close(namespace_fd)
+                    os.close(witness_fd)
+                expected_phases = (
+                    ["intended", "root-bound", "deleting", "deleted"]
+                    if root_present
+                    else ["intended", "deleting", "deleted"]
+                )
+                self.assertEqual(
+                    [record["phase"] for record in records],
+                    expected_phases,
+                )
+                if root_present:
+                    self.assertEqual(len(minted_capabilities), 1)
+                    self.assertEqual(
+                        [
+                            event
+                            for event in trace
+                            if event
+                            in {
+                                "authorize-owner-loss",
+                                "adopt-root",
+                                "append-root-bound",
+                                "mint-capability",
+                                "consume-capability",
+                                "append-deleting",
+                                "cleanup-root",
+                                "append-deleted",
+                            }
+                        ],
+                        [
+                            "authorize-owner-loss",
+                            "adopt-root",
+                            "append-root-bound",
+                            "mint-capability",
+                            "consume-capability",
+                            "append-deleting",
+                            "cleanup-root",
+                            "append-deleted",
+                        ],
+                    )
+                else:
+                    self.assertEqual(minted_capabilities, [])
+                    self.assertNotIn("adopt-root", trace)
+                    self.assertNotIn("consume-capability", trace)
+                    self.assertEqual(
+                        [
+                            event
+                            for event in trace
+                            if event
+                            in {
+                                "authorize-owner-loss",
+                                "append-deleting",
+                                "cleanup-root",
+                                "append-deleted",
+                            }
+                        ],
+                        [
+                            "authorize-owner-loss",
+                            "append-deleting",
+                            "cleanup-root",
+                            "append-deleted",
+                        ],
+                    )
+
+    def test_root_live_ipc_owner_loss_cleanup_replays_partial_allowlist_prefix(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve(strict=True)
+            parent_metadata = parent.lstat()
+            parent_binding = {
+                "path": str(parent),
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+                "gid": parent_metadata.st_gid,
+                "mode": stat.S_IMODE(parent_metadata.st_mode),
+                "host_mount_id": 23,
+            }
+            name = "required-ci-host-ipc-" + "c" * 32
+            root = parent / name
+            root.mkdir(mode=0o710)
+            os.chown(root, os.getuid(), os.getgid())
+            root.chmod(0o710)
+            root_metadata = root.lstat()
+            root_binding = {
+                "path": str(root),
+                "device": root_metadata.st_dev,
+                "inode": root_metadata.st_ino,
+                "uid": root_metadata.st_uid,
+                "gid": root_metadata.st_gid,
+                "mode": 0o710,
+            }
+            first_fifo = root / "hang.fifo"
+            remaining_fifo = root / "post-seal.fifo"
+            os.mkfifo(first_fifo, 0o666)
+            first_fifo.chmod(0o666)
+            os.mkfifo(remaining_fifo, 0o666)
+            remaining_fifo.chmod(0o666)
+            residue_fifos = (first_fifo, remaining_fifo)
+            residue_identities = {
+                fifo.name: (fifo.lstat().st_dev, fifo.lstat().st_ino)
+                for fifo in residue_fifos
+            }
+            self.assertEqual(
+                tuple(sorted(path.name for path in root.iterdir())),
+                ("hang.fifo", "post-seal.fifo"),
+            )
+            cleanup_trace: list[str] = []
+            opened_parent_fd: int | None = None
+            opened_root_fd: int | None = None
+            root_unlinked = False
+            deleted_root_witness_observed = False
+
+            def open_parent(expected: object = None):
+                nonlocal opened_parent_fd
+                self.assertEqual(expected, parent_binding)
+                descriptor = os.open(
+                    parent,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                )
+                self.assertIsNone(opened_parent_fd)
+                opened_parent_fd = descriptor
+                return (
+                    descriptor,
+                    dict(parent_binding),
+                )
+
+            def bind_remaining_fifos(
+                root_fd: int,
+                inventory: Mapping[str, os.stat_result],
+            ) -> dict[str, int]:
+                nonlocal opened_root_fd
+                cleanup_trace.append("bind-residue")
+                self.assertIsNone(opened_root_fd)
+                opened_root_fd = root_fd
+                self.assertEqual(
+                    tuple(inventory),
+                    ("hang.fifo", "post-seal.fifo"),
+                )
+                descriptors: dict[str, int] = {}
+                for fifo in residue_fifos:
+                    expected = inventory[fifo.name]
+                    self.assertTrue(stat.S_ISFIFO(expected.st_mode))
+                    self.assertEqual(expected.st_uid, os.getuid())
+                    self.assertEqual(expected.st_gid, os.getgid())
+                    self.assertEqual(stat.S_IMODE(expected.st_mode), 0o666)
+                    self.assertEqual(expected.st_nlink, 1)
+                    descriptor = os.open(
+                        fifo.name,
+                        os.O_RDONLY
+                        | os.O_NONBLOCK
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        dir_fd=root_fd,
+                    )
+                    descriptors[fifo.name] = descriptor
+                    opened = os.fstat(descriptor)
+                    self.assertEqual(
+                        (opened.st_dev, opened.st_ino),
+                        residue_identities[fifo.name],
+                    )
+                    self.assertEqual(
+                        (opened.st_dev, opened.st_ino),
+                        (expected.st_dev, expected.st_ino),
+                    )
+                return descriptors
+
+            original_fstat = os.fstat
+
+            def linux_directory_unlink_metadata(
+                descriptor: int,
+            ) -> os.stat_result:
+                nonlocal deleted_root_witness_observed
+                observed = original_fstat(descriptor)
+                if root_unlinked and descriptor == opened_root_fd:
+                    self.assertFalse(deleted_root_witness_observed)
+                    cleanup_trace.append("deleted-root-witness")
+                    deleted_root_witness_observed = True
+                if (
+                    sys.platform != "linux"
+                    and not root.exists()
+                    and stat.S_ISDIR(observed.st_mode)
+                    and (observed.st_dev, observed.st_ino)
+                    == (root_binding["device"], root_binding["inode"])
+                ):
+                    values = list(observed)
+                    values[3] = 0
+                    return os.stat_result(values)
+                return observed
+
+            identity = (
+                101,
+                102,
+                101,
+                101,
+                101,
+                (os.getuid(),) * 4,
+            )
+            capability = (
+                _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability(
+                    authority_basename="owner-loss-authority-test.json",
+                    authority_document={},
+                    authority_fd=-1,
+                    authority_identity=(1, 2),
+                    authority_sha256="a" * 64,
+                    delete_nonce="b" * 32,
+                    expected_root_identity=(
+                        root_binding["device"],
+                        root_binding["inode"],
+                    ),
+                    namespace_fd=-1,
+                    outer_identity=identity,
+                    owner_identity=identity,
+                    registry_path=parent,
+                    registry_token="c" * 32,
+                    request_nonce="d" * 32,
+                    root_name=name,
+                    runner_gid=os.getgid(),
+                    runner_uid=os.getuid(),
+                    watchdog_identity=identity,
+                    watchdog_pidfd=-1,
+                    witness_basename="owner-loss-witness-test.log",
+                    witness_descriptor=-1,
+                    witness_identity={},
+                    witness_prefix_sha256="e" * 64,
+                    witness_prefix_size=1,
+                    witness_root_record_sha256="f" * 64,
+                )
+            )
+            capability.consumed = True
+
+            def revalidate_test_capability(
+                selected: object,
+                *,
+                consume: bool,
+                root_fd: int | None,
+            ) -> object:
+                cleanup_trace.append("revalidate-capability")
+                self.assertIs(selected, capability)
+                self.assertFalse(consume)
+                self.assertIsInstance(root_fd, int)
+                return capability
+
+            def seal_test_root(root_fd: int, *_args: object) -> os.stat_result:
+                cleanup_trace.append("seal-root")
+                return os.fstat(root_fd)
+
+            def revalidate_test_acl(
+                descriptor: int,
+                expected: os.stat_result,
+                *,
+                expected_nlink: int,
+            ) -> None:
+                cleanup_trace.append("revalidate-acl")
+                self.assertGreaterEqual(descriptor, 0)
+                current = original_fstat(descriptor)
+                self.assertEqual(
+                    (expected.st_dev, expected.st_ino),
+                    (current.st_dev, current.st_ino),
+                )
+                self.assertTrue(stat.S_ISFIFO(current.st_mode))
+                self.assertEqual(current.st_uid, os.getuid())
+                self.assertEqual(current.st_gid, os.getgid())
+                self.assertEqual(stat.S_IMODE(current.st_mode), 0o666)
+                self.assertEqual(expected_nlink, 1)
+
+            real_unlink = os.unlink
+
+            def unlink_test_residue(
+                path: str, *args: object, **kwargs: object
+            ) -> None:
+                self.assertNotIn("fsync-root", cleanup_trace)
+                self.assertIn(path, residue_identities)
+                self.assertEqual(kwargs.get("dir_fd"), opened_root_fd)
+                cleanup_trace.append(f"unlink-residue:{path}")
+                real_unlink(path, *args, **kwargs)
+
+            real_fsync = os.fsync
+
+            def fsync_test_directory(descriptor: int) -> None:
+                if descriptor == opened_root_fd:
+                    self.assertEqual(
+                        cleanup_trace[-2:],
+                        [
+                            "unlink-residue:hang.fifo",
+                            "unlink-residue:post-seal.fifo",
+                        ],
+                    )
+                    self.assertNotIn("fsync-root", cleanup_trace)
+                    cleanup_trace.append("fsync-root")
+                elif descriptor == opened_parent_fd:
+                    self.assertIn("deleted-root-witness", cleanup_trace)
+                    cleanup_trace.append("fsync-parent")
+                else:
+                    raise AssertionError(
+                        "unexpected descriptor durability barrier"
+                    )
+                real_fsync(descriptor)
+
+            real_rmdir = os.rmdir
+
+            def rmdir_test_root(
+                path: str, *args: object, **kwargs: object
+            ) -> None:
+                nonlocal root_unlinked
+                self.assertEqual(path, name)
+                self.assertEqual(kwargs.get("dir_fd"), opened_parent_fd)
+                self.assertEqual(
+                    cleanup_trace[-3:],
+                    [
+                        "unlink-residue:hang.fifo",
+                        "unlink-residue:post-seal.fifo",
+                        "fsync-root",
+                    ],
+                )
+                cleanup_trace.append("rmdir-root")
+                real_rmdir(path, *args, **kwargs)
+                root_unlinked = True
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_PARENT",
+                parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_strict_live_ipc_parent",
+                side_effect=open_parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_strict_live_ipc_quiescent_residues",
+                side_effect=bind_remaining_fifos,
+            ) as bind_residue, mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_seal_strict_live_ipc_root_for_quiescent_cleanup",
+                side_effect=seal_test_root,
+            ) as seal_root, mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_live_ipc_residue_acl_is_absent",
+                side_effect=revalidate_test_acl,
+            ) as revalidate_acl, mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_revalidate_strict_owner_loss_capability",
+                side_effect=revalidate_test_capability,
+            ) as revalidate_capability, mock.patch.object(
+                os,
+                "unlink",
+                side_effect=unlink_test_residue,
+            ) as unlink_residue, mock.patch.object(
+                os,
+                "fsync",
+                side_effect=fsync_test_directory,
+            ) as fsync_directory, mock.patch.object(
+                os,
+                "rmdir",
+                side_effect=rmdir_test_root,
+            ) as rmdir_root, mock.patch.object(
+                os,
+                "fstat",
+                side_effect=linux_directory_unlink_metadata,
+            ), mock.patch.object(
+                shutil,
+                "rmtree",
+                side_effect=AssertionError("recursive cleanup is forbidden"),
+            ) as recursive_cleanup:
+                cleaned = (
+                    _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_operation(
+                        "cleanup",
+                        parent_binding,
+                        name,
+                        os.getuid(),
+                        os.getgid(),
+                        root_binding,
+                        owner_loss_capability=capability,
+                    )
+                )
+
+            bind_residue.assert_called_once()
+            seal_root.assert_called_once()
+            self.assertGreaterEqual(revalidate_capability.call_count, 2)
+            self.assertEqual(revalidate_acl.call_count, 2)
+            self.assertEqual(unlink_residue.call_count, 2)
+            self.assertEqual(fsync_directory.call_count, 2)
+            self.assertEqual(
+                fsync_directory.call_args_list,
+                [mock.call(opened_root_fd), mock.call(opened_parent_fd)],
+            )
+            rmdir_root.assert_called_once()
+            self.assertEqual(
+                cleanup_trace,
+                [
+                    "revalidate-capability",
+                    "bind-residue",
+                    "seal-root",
+                    "revalidate-acl",
+                    "revalidate-acl",
+                    "revalidate-capability",
+                    "unlink-residue:hang.fifo",
+                    "unlink-residue:post-seal.fifo",
+                    "fsync-root",
+                    "rmdir-root",
+                    "deleted-root-witness",
+                    "fsync-parent",
+                ],
+            )
+            recursive_cleanup.assert_not_called()
+            self.assertEqual(cleaned["root"], root_binding)
+            self.assertTrue(cleaned["origin_absent"])
+            self.assertFalse(root.exists())
+
+    def test_root_live_ipc_owner_loss_acl_drift_is_zero_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve(strict=True)
+            parent_metadata = parent.lstat()
+            parent_binding = {
+                "path": str(parent),
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+                "gid": parent_metadata.st_gid,
+                "mode": stat.S_IMODE(parent_metadata.st_mode),
+                "host_mount_id": 31,
+            }
+            name = "required-ci-host-ipc-" + "e" * 32
+            root = parent / name
+            root.mkdir(mode=0o710)
+            root.chmod(0o710)
+            root_metadata = root.lstat()
+            root_binding = {
+                "path": str(root),
+                "device": root_metadata.st_dev,
+                "inode": root_metadata.st_ino,
+                "uid": root_metadata.st_uid,
+                "gid": root_metadata.st_gid,
+                "mode": 0o710,
+            }
+            fifos = (root / "hang.fifo", root / "post-seal.fifo")
+            for fifo in fifos:
+                os.mkfifo(fifo, 0o666)
+                fifo.chmod(0o666)
+            fifo_identities = {
+                fifo.name: (fifo.lstat().st_dev, fifo.lstat().st_ino)
+                for fifo in fifos
+            }
+            trace: list[str] = []
+
+            def open_parent(expected: object = None):
+                self.assertEqual(expected, parent_binding)
+                return (
+                    os.open(
+                        parent,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                    ),
+                    dict(parent_binding),
+                )
+
+            def bind_fifos(
+                root_fd: int,
+                inventory: Mapping[str, os.stat_result],
+            ) -> dict[str, int]:
+                trace.append("bind-residues")
+                self.assertEqual(set(inventory), set(fifo_identities))
+                return {
+                    fifo.name: os.open(
+                        fifo.name,
+                        os.O_RDONLY
+                        | os.O_NONBLOCK
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        dir_fd=root_fd,
+                    )
+                    for fifo in fifos
+                }
+
+            identity = (
+                101,
+                102,
+                1,
+                101,
+                101,
+                (os.getuid(),) * 4,
+            )
+            capability = _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability(
+                authority_basename="owner-loss-authority-acl.json",
+                authority_document={},
+                authority_fd=-1,
+                authority_identity=(1, 2),
+                authority_sha256="a" * 64,
+                delete_nonce="b" * 32,
+                expected_root_identity=(
+                    root_binding["device"],
+                    root_binding["inode"],
+                ),
+                namespace_fd=-1,
+                outer_identity=identity,
+                owner_identity=identity,
+                registry_path=parent,
+                registry_token="c" * 32,
+                request_nonce="d" * 32,
+                root_name=name,
+                runner_gid=os.getgid(),
+                runner_uid=os.getuid(),
+                watchdog_identity=identity,
+                watchdog_pidfd=-1,
+                witness_basename="owner-loss-witness-acl.log",
+                witness_descriptor=-1,
+                witness_identity={},
+                witness_prefix_sha256="e" * 64,
+                witness_prefix_size=1,
+                witness_root_record_sha256="f" * 64,
+            )
+            capability.consumed = True
+
+            def revalidate_capability(
+                selected: object,
+                *,
+                consume: bool,
+                root_fd: int | None,
+            ) -> object:
+                trace.append("revalidate-capability")
+                self.assertIs(selected, capability)
+                self.assertFalse(consume)
+                self.assertIsInstance(root_fd, int)
+                return capability
+
+            def seal_root(root_fd: int, *_args: object) -> os.stat_result:
+                trace.append("seal-root")
+                return os.fstat(root_fd)
+
+            def reject_acl(
+                descriptor: int,
+                expected: os.stat_result,
+                *,
+                expected_nlink: int,
+            ) -> None:
+                self.assertGreaterEqual(descriptor, 0)
+                self.assertEqual(expected_nlink, 1)
+                selected_name = next(
+                    name
+                    for name, selected_identity in fifo_identities.items()
+                    if selected_identity
+                    == (expected.st_dev, expected.st_ino)
+                )
+                if selected_name == "hang.fifo":
+                    trace.append("acl-absent")
+                    return
+                self.assertEqual(selected_name, "post-seal.fifo")
+                trace.append("acl-present")
+                raise AssertionError(
+                    "strict live IPC quiescent residue has an unexpected POSIX ACL"
+                )
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_STRICT_LIVE_IPC_PARENT",
+                parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_strict_live_ipc_parent",
+                side_effect=open_parent,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_strict_live_ipc_quiescent_residues",
+                side_effect=bind_fifos,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_seal_strict_live_ipc_root_for_quiescent_cleanup",
+                side_effect=seal_root,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_live_ipc_residue_acl_is_absent",
+                side_effect=reject_acl,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_revalidate_strict_owner_loss_capability",
+                side_effect=revalidate_capability,
+            ), mock.patch.object(
+                os, "unlink", wraps=os.unlink
+            ) as unlink_residue, self.assertRaisesRegex(
+                AssertionError, "unexpected POSIX ACL"
+            ):
+                _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_operation(
+                    "cleanup",
+                    parent_binding,
+                    name,
+                    os.getuid(),
+                    os.getgid(),
+                    root_binding,
+                    owner_loss_capability=capability,
+                )
+
+            unlink_residue.assert_not_called()
+            self.assertEqual(
+                trace,
+                [
+                    "revalidate-capability",
+                    "bind-residues",
+                    "seal-root",
+                    "acl-absent",
+                    "acl-present",
+                ],
+            )
+            self.assertEqual(
+                {
+                    fifo.name: (fifo.lstat().st_dev, fifo.lstat().st_ino)
+                    for fifo in fifos
+                },
+                fifo_identities,
+            )
+            self.assertEqual(
+                (root.lstat().st_dev, root.lstat().st_ino),
+                (root_binding["device"], root_binding["inode"]),
+            )
+
+    def test_root_live_ipc_owner_loss_rejects_late_residue_path_replacement(
+        self,
+    ) -> None:
+        for attack_window, session_character in (
+            ("post-seal", "6"),
+            ("post-capability-revalidation", "7"),
+        ):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    self.subTest(attack_window=attack_window)
+                )
+                temporary_directory = stack.enter_context(
+                    tempfile.TemporaryDirectory()
+                )
+                parent = Path(temporary_directory).resolve(strict=True)
+                parent_metadata = parent.lstat()
+                parent_binding = {
+                    "path": str(parent),
+                    "device": parent_metadata.st_dev,
+                    "inode": parent_metadata.st_ino,
+                    "uid": parent_metadata.st_uid,
+                    "gid": parent_metadata.st_gid,
+                    "mode": stat.S_IMODE(parent_metadata.st_mode),
+                    "host_mount_id": 37,
+                }
+                name = "required-ci-host-ipc-" + session_character * 32
+                root = parent / name
+                root.mkdir(mode=0o710)
+                root.chmod(0o710)
+                root_metadata = root.lstat()
+                root_binding = {
+                    "path": str(root),
+                    "device": root_metadata.st_dev,
+                    "inode": root_metadata.st_ino,
+                    "uid": root_metadata.st_uid,
+                    "gid": root_metadata.st_gid,
+                    "mode": 0o710,
+                }
+                residue = root / "hang.fifo"
+                os.mkfifo(residue, 0o666)
+                residue.chmod(0o666)
+                original_metadata = residue.lstat()
+                original_identity = (
+                    original_metadata.st_dev,
+                    original_metadata.st_ino,
+                )
+                original_policy = (
+                    stat.S_IFMT(original_metadata.st_mode),
+                    original_metadata.st_uid,
+                    original_metadata.st_gid,
+                    stat.S_IMODE(original_metadata.st_mode),
+                    original_metadata.st_nlink,
+                    original_metadata.st_size,
+                )
+                relocated_original = parent / f"{attack_window}-original.fifo"
+                replacement_identity: tuple[int, int] | None = None
+                replacement_created = False
+                revalidation_count = 0
+                acl_revalidation_count = 0
+                witness_deleted_mutations: list[dict[str, object]] = []
+                identity = (
+                    101,
+                    102,
+                    1,
+                    101,
+                    101,
+                    (os.getuid(),) * 4,
+                )
+                capability = _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability(
+                    authority_basename=("owner-loss-authority-replacement.json"),
+                    authority_document={},
+                    authority_fd=-1,
+                    authority_identity=(1, 2),
+                    authority_sha256="a" * 64,
+                    delete_nonce="b" * 32,
+                    expected_root_identity=(
+                        root_binding["device"],
+                        root_binding["inode"],
+                    ),
+                    namespace_fd=-1,
+                    outer_identity=identity,
+                    owner_identity=identity,
+                    registry_path=parent,
+                    registry_token="c" * 32,
+                    request_nonce="d" * 32,
+                    root_name=name,
+                    runner_gid=os.getgid(),
+                    runner_uid=os.getuid(),
+                    watchdog_identity=identity,
+                    watchdog_pidfd=-1,
+                    witness_basename=("owner-loss-witness-replacement.log"),
+                    witness_descriptor=-1,
+                    witness_identity={},
+                    witness_prefix_sha256="e" * 64,
+                    witness_prefix_size=1,
+                    witness_root_record_sha256="f" * 64,
+                )
+                capability.consumed = True
+
+                def open_parent(
+                    expected: object = None,
+                ) -> tuple[int, dict[str, object]]:
+                    self.assertEqual(expected, parent_binding)
+                    return (
+                        os.open(
+                            parent,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        ),
+                        dict(parent_binding),
+                    )
+
+                def replace_selected_residue() -> None:
+                    nonlocal replacement_created, replacement_identity
+                    self.assertFalse(replacement_created)
+                    os.rename(residue, relocated_original)
+                    os.mkfifo(residue, 0o666)
+                    residue.chmod(0o666)
+                    replacement_metadata = residue.lstat()
+                    replacement_identity = (
+                        replacement_metadata.st_dev,
+                        replacement_metadata.st_ino,
+                    )
+                    replacement_policy = (
+                        stat.S_IFMT(replacement_metadata.st_mode),
+                        replacement_metadata.st_uid,
+                        replacement_metadata.st_gid,
+                        stat.S_IMODE(replacement_metadata.st_mode),
+                        replacement_metadata.st_nlink,
+                        replacement_metadata.st_size,
+                    )
+                    self.assertEqual(replacement_policy, original_policy)
+                    self.assertNotEqual(replacement_identity, original_identity)
+                    replacement_created = True
+
+                def seal_root(root_fd: int, *_args: object) -> os.stat_result:
+                    if attack_window == "post-seal":
+                        replace_selected_residue()
+                    return os.fstat(root_fd)
+
+                def revalidate_capability(
+                    selected: object,
+                    *,
+                    consume: bool,
+                    root_fd: int | None,
+                ) -> object:
+                    nonlocal revalidation_count
+                    revalidation_count += 1
+                    self.assertIs(selected, capability)
+                    self.assertFalse(consume)
+                    self.assertIsInstance(root_fd, int)
+                    if (
+                        attack_window == "post-capability-revalidation"
+                        and revalidation_count == 2
+                    ):
+                        replace_selected_residue()
+                    return capability
+
+                def revalidate_acl(
+                    descriptor: int,
+                    expected: os.stat_result,
+                    *,
+                    expected_nlink: int,
+                ) -> None:
+                    nonlocal acl_revalidation_count
+                    acl_revalidation_count += 1
+                    self.assertTrue(
+                        _CANDIDATE_SUPPORT._strict_live_ipc_residue_metadata_matches(
+                            os.fstat(descriptor),
+                            expected,
+                            expected_nlink=expected_nlink,
+                        )
+                    )
+
+                def cleanup_then_mark_witness_deleted() -> None:
+                    cleaned = (
+                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_operation(
+                            "cleanup",
+                            parent_binding,
+                            name,
+                            os.getuid(),
+                            os.getgid(),
+                            root_binding,
+                            owner_loss_capability=capability,
+                        )
+                    )
+                    witness_deleted_mutations.append(cleaned)
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_STRICT_LIVE_IPC_PARENT",
+                            parent,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_open_strict_live_ipc_parent",
+                            side_effect=open_parent,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_seal_strict_live_ipc_root_for_quiescent_cleanup",
+                            side_effect=seal_root,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_revalidate_strict_owner_loss_capability",
+                            side_effect=revalidate_capability,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_strict_live_ipc_residue_acl_is_absent",
+                            side_effect=revalidate_acl,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            os,
+                            "O_PATH",
+                            os.O_RDONLY | os.O_NONBLOCK,
+                            create=True,
+                        )
+                    )
+                    unlink_residue = stack.enter_context(
+                        mock.patch.object(os, "unlink", wraps=os.unlink)
+                    )
+                    rmdir_root = stack.enter_context(
+                        mock.patch.object(os, "rmdir", wraps=os.rmdir)
+                    )
+                    stack.enter_context(
+                        self.assertRaisesRegex(
+                            AssertionError,
+                            "strict live IPC quiescent residue identity changed",
+                        )
+                    )
+                    cleanup_then_mark_witness_deleted()
+
+                self.assertTrue(replacement_created)
+                self.assertEqual(
+                    revalidation_count,
+                    1 if attack_window == "post-seal" else 2,
+                )
+                self.assertEqual(
+                    acl_revalidation_count,
+                    1 if attack_window == "post-seal" else 2,
+                )
+                unlink_residue.assert_not_called()
+                rmdir_root.assert_not_called()
+                self.assertEqual(witness_deleted_mutations, [])
+                self.assertEqual(
+                    (root.lstat().st_dev, root.lstat().st_ino),
+                    (root_binding["device"], root_binding["inode"]),
+                )
+                preserved_original = relocated_original.lstat()
+                preserved_replacement = residue.lstat()
+                self.assertEqual(
+                    (
+                        preserved_original.st_dev,
+                        preserved_original.st_ino,
+                    ),
+                    original_identity,
+                )
+                self.assertEqual(
+                    (
+                        preserved_replacement.st_dev,
+                        preserved_replacement.st_ino,
+                    ),
+                    replacement_identity,
+                )
+                self.assertNotEqual(
+                    (
+                        preserved_original.st_dev,
+                        preserved_original.st_ino,
+                    ),
+                    (
+                        preserved_replacement.st_dev,
+                        preserved_replacement.st_ino,
+                    ),
+                )
+                self.assertEqual(
+                    (
+                        stat.S_IFMT(preserved_original.st_mode),
+                        preserved_original.st_uid,
+                        preserved_original.st_gid,
+                        stat.S_IMODE(preserved_original.st_mode),
+                        preserved_original.st_nlink,
+                        preserved_original.st_size,
+                    ),
+                    original_policy,
+                )
+                self.assertEqual(
+                    (
+                        stat.S_IFMT(preserved_replacement.st_mode),
+                        preserved_replacement.st_uid,
+                        preserved_replacement.st_gid,
+                        stat.S_IMODE(preserved_replacement.st_mode),
+                        preserved_replacement.st_nlink,
+                        preserved_replacement.st_size,
+                    ),
+                    original_policy,
+                )
+
+    def test_root_live_ipc_owner_loss_seal_is_monotonic_and_replayable(
+        self,
+    ) -> None:
+        runner_uid = 501
+        target_gid = 60031
+        expected_root = {
+            "path": "/opt/required-ci-host-ipc-" + "b" * 32,
+            "device": 41,
+            "inode": 42,
+            "uid": runner_uid,
+            "gid": target_gid,
+            "mode": 0o710,
+        }
+
+        def metadata(policy: list[int]) -> os.stat_result:
+            uid, gid, mode = policy
+            return os.stat_result(
+                (
+                    stat.S_IFDIR | mode,
+                    expected_root["inode"],
+                    expected_root["device"],
+                    2,
+                    uid,
+                    gid,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            )
+
+        for initial_policy, expected_trace in (
+            (
+                (runner_uid, target_gid, 0o710),
+                [
+                    ("fstat", (runner_uid, target_gid, 0o710)),
+                    ("fchown", (0, 0)),
+                    ("fstat", (0, 0, 0o710)),
+                    ("fchmod", 0o500),
+                    ("fsync", (0, 0, 0o500)),
+                    ("fstat", (0, 0, 0o500)),
+                ],
+            ),
+            (
+                (0, 0, 0o710),
+                [
+                    ("fstat", (0, 0, 0o710)),
+                    ("fchmod", 0o500),
+                    ("fsync", (0, 0, 0o500)),
+                    ("fstat", (0, 0, 0o500)),
+                ],
+            ),
+            (
+                (0, 0, 0o500),
+                [
+                    ("fstat", (0, 0, 0o500)),
+                    ("fsync", (0, 0, 0o500)),
+                    ("fstat", (0, 0, 0o500)),
+                ],
+            ),
+        ):
+            with self.subTest(initial_policy=initial_policy):
+                policy = list(initial_policy)
+                trace: list[tuple[str, object]] = []
+
+                def read_policy(descriptor: int) -> os.stat_result:
+                    self.assertEqual(descriptor, 57)
+                    trace.append(("fstat", tuple(policy)))
+                    return metadata(policy)
+
+                def chown(descriptor: int, uid: int, gid: int) -> None:
+                    self.assertEqual(descriptor, 57)
+                    self.assertEqual((uid, gid), (0, 0))
+                    trace.append(("fchown", (uid, gid)))
+                    policy[:2] = [uid, gid]
+
+                def chmod(descriptor: int, mode: int) -> None:
+                    self.assertEqual(descriptor, 57)
+                    self.assertEqual(mode, 0o500)
+                    trace.append(("fchmod", mode))
+                    policy[2] = mode
+
+                def fsync(descriptor: int) -> None:
+                    self.assertEqual(descriptor, 57)
+                    self.assertEqual(tuple(policy), (0, 0, 0o500))
+                    trace.append(("fsync", tuple(policy)))
+
+                with mock.patch.object(
+                    os,
+                    "fstat",
+                    side_effect=read_policy,
+                ), mock.patch.object(
+                    os, "fchown", side_effect=chown
+                ), mock.patch.object(
+                    os, "fchmod", side_effect=chmod
+                ), mock.patch.object(os, "fsync", side_effect=fsync):
+                    sealed = (
+                        _CANDIDATE_SUPPORT._seal_strict_live_ipc_root_for_quiescent_cleanup(
+                            57,
+                            expected_root,
+                            runner_uid,
+                            target_gid,
+                        )
+                    )
+                self.assertEqual(
+                    (
+                        sealed.st_dev,
+                        sealed.st_ino,
+                        sealed.st_uid,
+                        sealed.st_gid,
+                        stat.S_IMODE(sealed.st_mode),
+                    ),
+                    (41, 42, 0, 0, 0o500),
+                )
+                self.assertEqual(trace, expected_trace)
+
+        unsafe_policy = [runner_uid, target_gid, 0o700]
+        with mock.patch.object(
+            os,
+            "fstat",
+            side_effect=lambda _descriptor: metadata(unsafe_policy),
+        ), mock.patch.object(os, "fchown") as fchown, mock.patch.object(
+            os, "fchmod"
+        ) as fchmod, mock.patch.object(os, "fsync") as fsync, self.assertRaisesRegex(
+            AssertionError, "seal policy is unsafe"
+        ):
+            _CANDIDATE_SUPPORT._seal_strict_live_ipc_root_for_quiescent_cleanup(
+                57,
+                expected_root,
+                runner_uid,
+                target_gid,
+            )
+        fchown.assert_not_called()
+        fchmod.assert_not_called()
+        fsync.assert_not_called()
+
     def test_root_live_ipc_broker_resumes_only_controller_created_policy(
         self,
     ) -> None:
@@ -24525,9 +31909,26 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         "witness": witness_receipt,
                         "origin_absent": False,
                     }
+                    invocation_session_id = "9" * 32
+                    invocation_entry_path = (
+                        entries
+                        / f"chain-{invocation_session_id}.json"
+                    )
+                    invocation_bytes = b"{}"
+                    invocation_entry_path.write_bytes(invocation_bytes)
+                    invocation_entry_path.chmod(0o600)
+                    invocation_launcher = (
+                        901,
+                        902,
+                        1,
+                        901,
+                        901,
+                        (registry_binding["uid"],) * 4,
+                    )
                     arguments = (
                         "create",
                         str(entry_path),
+                        str(invocation_entry_path),
                         json.dumps(
                             registry_binding,
                             sort_keys=True,
@@ -24545,6 +31946,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         token,
                         session_id,
                         "-",
+                        "-",
                     )
                     original_bytes = entry_path.read_bytes()
                     original_identity = (
@@ -24552,8 +31954,40 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         entry_path.stat().st_ino,
                     )
 
+                    def open_invocation(
+                        registry_fd: int,
+                        selected_registry: Mapping[str, object],
+                        selected_path: Path,
+                        runner_uid: int,
+                        selected_target_uid: int,
+                        selected_token: str,
+                    ):
+                        self.assertEqual(selected_registry, registry_binding)
+                        self.assertEqual(selected_path, invocation_entry_path)
+                        self.assertEqual(runner_uid, registry_binding["uid"])
+                        self.assertEqual(selected_target_uid, target_uid)
+                        self.assertEqual(selected_token, token)
+                        descriptor = os.open(
+                            invocation_entry_path.name,
+                            os.O_RDONLY
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC,
+                            dir_fd=registry_fd,
+                        )
+                        metadata = os.fstat(descriptor)
+                        data = os.pread(descriptor, 4097, 0)
+                        return (
+                            descriptor,
+                            metadata,
+                            data,
+                            {"fixture": "invocation"},
+                            invocation_launcher,
+                        )
+
                     def run_broker(
-                        *, replace_entry: bool
+                        *,
+                        replace_entry: bool,
+                        replace_invocation: bool = False,
                     ) -> dict[str, object]:
                         def root_operation(
                             *_args: object, **_kwargs: object
@@ -24564,6 +31998,16 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                 )
                                 entry_path.write_bytes(original_bytes)
                                 entry_path.chmod(0o600)
+                            if replace_invocation:
+                                invocation_entry_path.rename(
+                                    invocation_entry_path.with_name(
+                                        invocation_entry_path.name + ".held"
+                                    )
+                                )
+                                invocation_entry_path.write_bytes(
+                                    invocation_bytes
+                                )
+                                invocation_entry_path.chmod(0o600)
                             return dict(root_receipt)
 
                         output = io.StringIO()
@@ -24583,6 +32027,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             _CANDIDATE_SUPPORT,
                             "_root_registered_opt_ipc_witness_operation",
                             side_effect=root_operation,
+                        ), mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_root_open_registered_opt_ipc_invocation",
+                            side_effect=open_invocation,
+                        ), mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_strict_owner_loss_registered_broker_ancestry",
                         ), contextlib.redirect_stdout(output):
                             self.assertEqual(
                                 _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_main(
@@ -24612,10 +32063,33 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         original_identity,
                     )
 
+                    replaced_invocation = run_broker(
+                        replace_entry=False,
+                        replace_invocation=True,
+                    )
+                    self.assertEqual(
+                        replaced_invocation["status"], "incomplete"
+                    )
+                    self.assertIn(
+                        "entry changed during use",
+                        str(replaced_invocation["error"]),
+                    )
+                    held_invocation = invocation_entry_path.with_name(
+                        invocation_entry_path.name + ".held"
+                    )
+                    self.assertEqual(
+                        held_invocation.read_bytes(), invocation_bytes
+                    )
+                    self.assertEqual(
+                        invocation_entry_path.read_bytes(), invocation_bytes
+                    )
+                    invocation_entry_path.unlink()
+                    held_invocation.rename(invocation_entry_path)
+
                     replaced = run_broker(replace_entry=True)
                     self.assertEqual(replaced["status"], "incomplete")
                     self.assertIn(
-                        "durable intent changed during broker use",
+                        "entry changed during use",
                         str(replaced["error"]),
                     )
                     self.assertEqual(entry_path.read_bytes(), original_bytes)
@@ -24625,6 +32099,1966 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     )
             finally:
                 _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+    def test_root_live_ipc_cleanup_rejects_invocation_replacement_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            registry_root = fixture_root / "registry"
+            entries = registry_root / "entries"
+            entries.mkdir(parents=True, mode=0o700)
+            controller = registry_root / "controller.py"
+            controller.write_text("pass\n", encoding="utf-8")
+            physical_parent = fixture_root / "opt"
+            physical_parent.mkdir(mode=0o755)
+
+            entries_metadata = entries.lstat()
+            parent_metadata = physical_parent.lstat()
+            runner_uid = entries_metadata.st_uid
+            target_uid = 60043
+            token = "a" * 32
+            session_id = "b" * 32
+            invocation_session_id = "c" * 32
+            delete_nonce = "d" * 32
+            root_name = "required-ci-host-ipc-" + session_id
+            registry_binding = {
+                "path": str(entries),
+                "device": entries_metadata.st_dev,
+                "inode": entries_metadata.st_ino,
+                "uid": runner_uid,
+                "gid": entries_metadata.st_gid,
+                "mode": stat.S_IMODE(entries_metadata.st_mode),
+            }
+            parent_binding = {
+                "path": str(physical_parent),
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+                "gid": parent_metadata.st_gid,
+                "mode": stat.S_IMODE(parent_metadata.st_mode),
+                "host_mount_id": 43,
+            }
+            witness = _direct_opt_witness_fixture(session_id, "e" * 32)
+            direct_binding = {
+                "registry": registry_binding,
+                "parent": parent_binding,
+                "name": root_name,
+                "target_gid": target_uid,
+                "mode": 0o710,
+                "root": None,
+                "witness": witness,
+            }
+            session = {
+                "root": registry_root,
+                "entries": entries,
+                "controller_path": controller,
+                "token": token,
+                "target_uid": target_uid,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    physical_parent,
+                ):
+                    entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                        controller,
+                        None,
+                        target_uid,
+                        execution_root=physical_parent,
+                        cleanup_execution_root=True,
+                        cleanup_kind="direct-opt-root-v1",
+                        direct_opt_root=direct_binding,
+                        session_id=session_id,
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        entry_path,
+                        ("prepared",),
+                        "closing",
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        entry_path,
+                        ("closing",),
+                        "deleting",
+                        execution_root_delete_nonce=delete_nonce,
+                    )
+
+                    invocation_launcher = (
+                        901,
+                        902,
+                        1,
+                        901,
+                        901,
+                        (runner_uid,) * 4,
+                    )
+                    invocation_entry_path = (
+                        entries
+                        / f"chain-{invocation_session_id}.json"
+                    )
+                    registered_invocation = (
+                        _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                            controller,
+                            None,
+                            target_uid,
+                            execution_root=physical_parent,
+                            session_id=invocation_session_id,
+                        )
+                    )
+                    self.assertEqual(
+                        registered_invocation,
+                        invocation_entry_path,
+                    )
+                    _CANDIDATE_SUPPORT._update_trusted_root_chain(
+                        invocation_entry_path,
+                        "prepared",
+                        launcher_parent=(
+                            _CANDIDATE_SUPPORT._registered_process_binding(
+                                invocation_launcher
+                            )
+                        ),
+                        outer_marker=(
+                            f"required-ci-outer-{invocation_session_id}"
+                        ),
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        invocation_entry_path,
+                        ("prepared",),
+                        "outer-bound",
+                        outer=[901, 902, 901, 901],
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        invocation_entry_path,
+                        ("outer-bound",),
+                        "root-authorized",
+                    )
+
+                    target_bytes = entry_path.read_bytes()
+                    target_metadata = entry_path.stat()
+                    target_identity = (
+                        target_metadata.st_dev,
+                        target_metadata.st_ino,
+                    )
+                    invocation_bytes = invocation_entry_path.read_bytes()
+                    invocation_metadata = invocation_entry_path.stat()
+                    invocation_identity = (
+                        invocation_metadata.st_dev,
+                        invocation_metadata.st_ino,
+                    )
+                    held_invocation = invocation_entry_path.with_name(
+                        invocation_entry_path.name + ".held"
+                    )
+                    root_path = physical_parent / root_name
+                    witness_namespace = (
+                        physical_parent
+                        / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+                    )
+                    witness_path = witness_namespace / str(witness["basename"])
+                    self.assertFalse(root_path.exists())
+                    self.assertFalse(witness_namespace.exists())
+                    self.assertFalse(witness_path.exists())
+
+                    arguments = (
+                        "cleanup",
+                        str(entry_path),
+                        str(invocation_entry_path),
+                        json.dumps(
+                            registry_binding,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        json.dumps(
+                            parent_binding,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        root_name,
+                        str(runner_uid),
+                        str(target_uid),
+                        "-",
+                        token,
+                        session_id,
+                        delete_nonce,
+                        "-",
+                    )
+                    real_stat = os.stat
+                    replacement_observed = False
+
+                    def replace_invocation_before_selection(
+                        path: os.PathLike[str] | str | bytes,
+                        *,
+                        dir_fd: int | None = None,
+                        follow_symlinks: bool = True,
+                    ) -> os.stat_result:
+                        nonlocal replacement_observed
+                        if (
+                            not replacement_observed
+                            and path == invocation_entry_path.name
+                            and dir_fd is not None
+                            and follow_symlinks is False
+                        ):
+                            invocation_entry_path.rename(held_invocation)
+                            invocation_entry_path.write_bytes(
+                                invocation_bytes
+                            )
+                            invocation_entry_path.chmod(0o600)
+                            replacement_observed = True
+                        return real_stat(
+                            path,
+                            dir_fd=dir_fd,
+                            follow_symlinks=follow_symlinks,
+                        )
+
+                    witness_operation = mock.Mock(
+                        side_effect=AssertionError(
+                            "witness operation reached after invocation replacement"
+                        )
+                    )
+                    root_operation = mock.Mock(
+                        side_effect=AssertionError(
+                            "root operation reached after invocation replacement"
+                        )
+                    )
+                    open_witness = mock.Mock(
+                        side_effect=AssertionError(
+                            "witness mutation reached after invocation replacement"
+                        )
+                    )
+                    append_witness = mock.Mock(
+                        side_effect=AssertionError(
+                            "witness append reached after invocation replacement"
+                        )
+                    )
+                    registry_write = mock.Mock(
+                        side_effect=AssertionError(
+                            "registry write reached after invocation replacement"
+                        )
+                    )
+                    output = io.StringIO()
+                    with _CANDIDATE_SUPPORT._chain_registry_lock(
+                        entry_path
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_TRUSTED_SUPPORT_PATH",
+                        controller,
+                    ), mock.patch.object(
+                        os, "getuid", return_value=0
+                    ), mock.patch.object(
+                        os, "geteuid", return_value=0
+                    ), mock.patch.object(
+                        os,
+                        "stat",
+                        side_effect=replace_invocation_before_selection,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        return_value=invocation_launcher,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_bind_root_controller_parent",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_registered_broker_ancestry",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_registered_opt_ipc_witness_operation",
+                        witness_operation,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_registered_opt_ipc_root_operation",
+                        root_operation,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_open_or_create_strict_live_ipc_witness",
+                        open_witness,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_append_strict_live_ipc_witness_record",
+                        append_witness,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_write_chain_registry_entry",
+                        registry_write,
+                    ), contextlib.redirect_stdout(output):
+                        self.assertEqual(
+                            _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_main(
+                                arguments
+                            ),
+                            0,
+                        )
+
+                    line = output.getvalue()
+                    self.assertTrue(
+                        line.startswith(
+                            _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                        )
+                    )
+                    receipt = json.loads(
+                        line[
+                            len(
+                                _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                            ) :
+                        ]
+                    )
+                    self.assertEqual(receipt["status"], "incomplete")
+                    self.assertIn(
+                        "root invocation entry is invalid",
+                        str(receipt["error"]),
+                    )
+                    self.assertTrue(replacement_observed)
+                    witness_operation.assert_not_called()
+                    root_operation.assert_not_called()
+                    open_witness.assert_not_called()
+                    append_witness.assert_not_called()
+                    registry_write.assert_not_called()
+
+                    self.assertEqual(entry_path.read_bytes(), target_bytes)
+                    current_target = entry_path.stat()
+                    self.assertEqual(
+                        (current_target.st_dev, current_target.st_ino),
+                        target_identity,
+                    )
+                    self.assertFalse(root_path.exists())
+                    self.assertFalse(witness_namespace.exists())
+                    self.assertFalse(witness_path.exists())
+                    self.assertEqual(
+                        held_invocation.read_bytes(), invocation_bytes
+                    )
+                    self.assertEqual(
+                        invocation_entry_path.read_bytes(), invocation_bytes
+                    )
+                    held_metadata = held_invocation.stat()
+                    replacement_metadata = invocation_entry_path.stat()
+                    self.assertEqual(
+                        (held_metadata.st_dev, held_metadata.st_ino),
+                        invocation_identity,
+                    )
+                    self.assertNotEqual(
+                        (
+                            replacement_metadata.st_dev,
+                            replacement_metadata.st_ino,
+                        ),
+                        invocation_identity,
+                    )
+                    self.assertEqual(
+                        stat.S_IMODE(held_metadata.st_mode), 0o600
+                    )
+                    self.assertEqual(
+                        stat.S_IMODE(replacement_metadata.st_mode), 0o600
+                    )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+    def test_root_live_ipc_cleanup_rejects_open_invocation_fd_drift_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            registry_root = fixture_root / "registry"
+            entries = registry_root / "entries"
+            entries.mkdir(parents=True, mode=0o700)
+            controller = registry_root / "controller.py"
+            controller.write_text("pass\n", encoding="utf-8")
+            physical_parent = fixture_root / "opt"
+            physical_parent.mkdir(mode=0o755)
+
+            entries_metadata = entries.lstat()
+            parent_metadata = physical_parent.lstat()
+            runner_uid = entries_metadata.st_uid
+            target_uid = 60044
+            token = "1" * 32
+            session_id = "2" * 32
+            invocation_session_id = "3" * 32
+            delete_nonce = "4" * 32
+            root_name = "required-ci-host-ipc-" + session_id
+            registry_binding = {
+                "path": str(entries),
+                "device": entries_metadata.st_dev,
+                "inode": entries_metadata.st_ino,
+                "uid": runner_uid,
+                "gid": entries_metadata.st_gid,
+                "mode": stat.S_IMODE(entries_metadata.st_mode),
+            }
+            parent_binding = {
+                "path": str(physical_parent),
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+                "gid": parent_metadata.st_gid,
+                "mode": stat.S_IMODE(parent_metadata.st_mode),
+                "host_mount_id": 44,
+            }
+            witness = _direct_opt_witness_fixture(session_id, "5" * 32)
+            direct_binding = {
+                "registry": registry_binding,
+                "parent": parent_binding,
+                "name": root_name,
+                "target_gid": target_uid,
+                "mode": 0o710,
+                "root": None,
+                "witness": witness,
+            }
+            session = {
+                "root": registry_root,
+                "entries": entries,
+                "controller_path": controller,
+                "token": token,
+                "target_uid": target_uid,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    physical_parent,
+                ):
+                    entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                        controller,
+                        None,
+                        target_uid,
+                        execution_root=physical_parent,
+                        cleanup_execution_root=True,
+                        cleanup_kind="direct-opt-root-v1",
+                        direct_opt_root=direct_binding,
+                        session_id=session_id,
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        entry_path,
+                        ("prepared",),
+                        "closing",
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        entry_path,
+                        ("closing",),
+                        "deleting",
+                        execution_root_delete_nonce=delete_nonce,
+                    )
+
+                    invocation_launcher = (
+                        911,
+                        912,
+                        1,
+                        911,
+                        911,
+                        (runner_uid,) * 4,
+                    )
+                    invocation_entry_path = (
+                        entries / f"chain-{invocation_session_id}.json"
+                    )
+                    registered_invocation = (
+                        _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                            controller,
+                            None,
+                            target_uid,
+                            execution_root=physical_parent,
+                            session_id=invocation_session_id,
+                        )
+                    )
+                    self.assertEqual(
+                        registered_invocation,
+                        invocation_entry_path,
+                    )
+                    _CANDIDATE_SUPPORT._update_trusted_root_chain(
+                        invocation_entry_path,
+                        "prepared",
+                        launcher_parent=(
+                            _CANDIDATE_SUPPORT._registered_process_binding(
+                                invocation_launcher
+                            )
+                        ),
+                        outer_marker=(
+                            f"required-ci-outer-{invocation_session_id}"
+                        ),
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        invocation_entry_path,
+                        ("prepared",),
+                        "outer-bound",
+                        outer=[911, 912, 911, 911],
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        invocation_entry_path,
+                        ("outer-bound",),
+                        "root-authorized",
+                    )
+
+                    target_bytes = entry_path.read_bytes()
+                    target_metadata = entry_path.stat()
+                    invocation_bytes = invocation_entry_path.read_bytes()
+                    invocation_metadata = invocation_entry_path.stat()
+
+                    def security_binding(
+                        metadata: os.stat_result,
+                    ) -> tuple[int, int, int, int, int, int, int]:
+                        return (
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mode,
+                            metadata.st_uid,
+                            metadata.st_gid,
+                            metadata.st_nlink,
+                            metadata.st_size,
+                        )
+
+                    target_binding = security_binding(target_metadata)
+                    invocation_binding = security_binding(
+                        invocation_metadata
+                    )
+                    root_path = physical_parent / root_name
+                    witness_namespace = (
+                        physical_parent
+                        / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+                    )
+                    witness_path = witness_namespace / str(witness["basename"])
+                    self.assertFalse(root_path.exists())
+                    self.assertFalse(witness_namespace.exists())
+                    self.assertFalse(witness_path.exists())
+
+                    arguments = (
+                        "cleanup",
+                        str(entry_path),
+                        str(invocation_entry_path),
+                        json.dumps(
+                            registry_binding,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        json.dumps(
+                            parent_binding,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        root_name,
+                        str(runner_uid),
+                        str(target_uid),
+                        "-",
+                        token,
+                        session_id,
+                        delete_nonce,
+                        "-",
+                    )
+                    real_open = os.open
+                    real_fstat = os.fstat
+                    real_pread = os.pread
+                    real_stat = os.stat
+                    # Preserve pathname identity, content, and access policy;
+                    # only the opened descriptor's object identity drifts.
+                    invocation_fd: int | None = None
+                    invocation_fstat_bindings: list[
+                        tuple[int, int, int, int, int, int, int]
+                    ] = []
+                    invocation_preads: list[bytes] = []
+                    selected_path_bindings: list[
+                        tuple[int, int, int, int, int, int, int]
+                    ] = []
+
+                    def track_open(
+                        path: os.PathLike[str] | str | bytes,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal invocation_fd
+                        descriptor = real_open(
+                            path,
+                            flags,
+                            mode,
+                            dir_fd=dir_fd,
+                        )
+                        if (
+                            path == invocation_entry_path.name
+                            and dir_fd is not None
+                        ):
+                            self.assertIsNone(invocation_fd)
+                            invocation_fd = descriptor
+                        return descriptor
+
+                    def report_open_fd_drift(
+                        descriptor: int,
+                    ) -> os.stat_result:
+                        observed = real_fstat(descriptor)
+                        if descriptor != invocation_fd:
+                            return observed
+                        invocation_fstat_bindings.append(
+                            security_binding(observed)
+                        )
+                        if len(invocation_fstat_bindings) % 2 == 0:
+                            changed_values = list(observed)
+                            changed_values[stat.ST_INO] += 1
+                            changed = os.stat_result(changed_values)
+                            invocation_fstat_bindings[-1] = security_binding(
+                                changed
+                            )
+                            return changed
+                        return observed
+
+                    def record_open_fd_read(
+                        descriptor: int,
+                        length: int,
+                        offset: int,
+                    ) -> bytes:
+                        data = real_pread(descriptor, length, offset)
+                        if descriptor == invocation_fd:
+                            invocation_preads.append(data)
+                        return data
+
+                    def record_selected_path(
+                        path: os.PathLike[str] | str | bytes,
+                        *,
+                        dir_fd: int | None = None,
+                        follow_symlinks: bool = True,
+                    ) -> os.stat_result:
+                        selected = real_stat(
+                            path,
+                            dir_fd=dir_fd,
+                            follow_symlinks=follow_symlinks,
+                        )
+                        if (
+                            path == invocation_entry_path.name
+                            and dir_fd is not None
+                            and follow_symlinks is False
+                        ):
+                            selected_path_bindings.append(
+                                security_binding(selected)
+                            )
+                        return selected
+
+                    witness_operation = mock.Mock(
+                        side_effect=AssertionError(
+                            "witness operation reached after open FD drift"
+                        )
+                    )
+                    root_operation = mock.Mock(
+                        side_effect=AssertionError(
+                            "root operation reached after open FD drift"
+                        )
+                    )
+                    open_witness = mock.Mock(
+                        side_effect=AssertionError(
+                            "witness mutation reached after open FD drift"
+                        )
+                    )
+                    append_witness = mock.Mock(
+                        side_effect=AssertionError(
+                            "witness append reached after open FD drift"
+                        )
+                    )
+                    registry_write = mock.Mock(
+                        side_effect=AssertionError(
+                            "registry write reached after open FD drift"
+                        )
+                    )
+                    output = io.StringIO()
+                    with _CANDIDATE_SUPPORT._chain_registry_lock(
+                        entry_path
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_TRUSTED_SUPPORT_PATH",
+                        controller,
+                    ), mock.patch.object(
+                        os, "getuid", return_value=0
+                    ), mock.patch.object(
+                        os, "geteuid", return_value=0
+                    ), mock.patch.object(
+                        os, "open", side_effect=track_open
+                    ), mock.patch.object(
+                        os, "fstat", side_effect=report_open_fd_drift
+                    ), mock.patch.object(
+                        os, "pread", side_effect=record_open_fd_read
+                    ), mock.patch.object(
+                        os, "stat", side_effect=record_selected_path
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        return_value=invocation_launcher,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_bind_root_controller_parent",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_registered_broker_ancestry",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_registered_opt_ipc_witness_operation",
+                        witness_operation,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_registered_opt_ipc_root_operation",
+                        root_operation,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_open_or_create_strict_live_ipc_witness",
+                        open_witness,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_append_strict_live_ipc_witness_record",
+                        append_witness,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_write_chain_registry_entry",
+                        registry_write,
+                    ), contextlib.redirect_stdout(output):
+                        self.assertEqual(
+                            _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_main(
+                                arguments
+                            ),
+                            0,
+                        )
+
+                    line = output.getvalue()
+                    self.assertTrue(
+                        line.startswith(
+                            _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                        )
+                    )
+                    receipt = json.loads(
+                        line[
+                            len(
+                                _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                            ) :
+                        ]
+                    )
+                    self.assertEqual(receipt["status"], "incomplete")
+                    self.assertIn(
+                        "root invocation entry is invalid",
+                        str(receipt["error"]),
+                    )
+                    self.assertIsNotNone(invocation_fd)
+                    self.assertEqual(len(invocation_fstat_bindings), 2)
+                    self.assertEqual(
+                        invocation_fstat_bindings[0], invocation_binding
+                    )
+                    expected_drift = list(invocation_binding)
+                    expected_drift[1] += 1
+                    self.assertEqual(
+                        invocation_fstat_bindings[1], tuple(expected_drift)
+                    )
+                    self.assertEqual(invocation_preads, [invocation_bytes])
+                    self.assertEqual(
+                        selected_path_bindings,
+                        [invocation_binding],
+                    )
+                    witness_operation.assert_not_called()
+                    root_operation.assert_not_called()
+                    open_witness.assert_not_called()
+                    append_witness.assert_not_called()
+                    registry_write.assert_not_called()
+
+                    self.assertEqual(entry_path.read_bytes(), target_bytes)
+                    self.assertEqual(
+                        security_binding(entry_path.stat()),
+                        target_binding,
+                    )
+                    self.assertEqual(
+                        invocation_entry_path.read_bytes(),
+                        invocation_bytes,
+                    )
+                    self.assertEqual(
+                        security_binding(invocation_entry_path.stat()),
+                        invocation_binding,
+                    )
+                    self.assertFalse(root_path.exists())
+                    self.assertFalse(witness_namespace.exists())
+                    self.assertFalse(witness_path.exists())
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+    def test_root_live_ipc_cleanup_reloads_bound_invocation_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            fixture_root = Path(temporary_directory).resolve(strict=True)
+            registry_root = fixture_root / "registry"
+            entries = registry_root / "entries"
+            entries.mkdir(parents=True, mode=0o700)
+            controller = registry_root / "controller.py"
+            controller.write_text("pass\n", encoding="utf-8")
+            physical_parent = fixture_root / "opt"
+            physical_parent.mkdir(mode=0o755)
+
+            entries_metadata = entries.lstat()
+            parent_metadata = physical_parent.lstat()
+            runner_uid = entries_metadata.st_uid
+            target_uid = 60045
+            token = "6" * 32
+            session_id = "7" * 32
+            invocation_session_id = "8" * 32
+            delete_nonce = "9" * 32
+            root_name = "required-ci-host-ipc-" + session_id
+            registry_binding = {
+                "path": str(entries),
+                "device": entries_metadata.st_dev,
+                "inode": entries_metadata.st_ino,
+                "uid": runner_uid,
+                "gid": entries_metadata.st_gid,
+                "mode": stat.S_IMODE(entries_metadata.st_mode),
+            }
+            parent_binding = {
+                "path": str(physical_parent),
+                "device": parent_metadata.st_dev,
+                "inode": parent_metadata.st_ino,
+                "uid": parent_metadata.st_uid,
+                "gid": parent_metadata.st_gid,
+                "mode": stat.S_IMODE(parent_metadata.st_mode),
+                "host_mount_id": 45,
+            }
+            witness = _direct_opt_witness_fixture(session_id, "a" * 32)
+            direct_binding = {
+                "registry": registry_binding,
+                "parent": parent_binding,
+                "name": root_name,
+                "target_gid": target_uid,
+                "mode": 0o710,
+                "root": None,
+                "witness": witness,
+            }
+            session = {
+                "root": registry_root,
+                "entries": entries,
+                "controller_path": controller,
+                "token": token,
+                "target_uid": target_uid,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_LIVE_IPC_PARENT",
+                    physical_parent,
+                ):
+                    entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                        controller,
+                        None,
+                        target_uid,
+                        execution_root=physical_parent,
+                        cleanup_execution_root=True,
+                        cleanup_kind="direct-opt-root-v1",
+                        direct_opt_root=direct_binding,
+                        session_id=session_id,
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        entry_path,
+                        ("prepared",),
+                        "closing",
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        entry_path,
+                        ("closing",),
+                        "deleting",
+                        execution_root_delete_nonce=delete_nonce,
+                    )
+
+                    invocation_launcher = (
+                        921,
+                        922,
+                        1,
+                        921,
+                        921,
+                        (runner_uid,) * 4,
+                    )
+                    invocation_entry_path = (
+                        entries / f"chain-{invocation_session_id}.json"
+                    )
+                    registered_invocation = (
+                        _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                            controller,
+                            None,
+                            target_uid,
+                            execution_root=physical_parent,
+                            session_id=invocation_session_id,
+                        )
+                    )
+                    self.assertEqual(
+                        registered_invocation,
+                        invocation_entry_path,
+                    )
+                    _CANDIDATE_SUPPORT._update_trusted_root_chain(
+                        invocation_entry_path,
+                        "prepared",
+                        launcher_parent=(
+                            _CANDIDATE_SUPPORT._registered_process_binding(
+                                invocation_launcher
+                            )
+                        ),
+                        outer_marker=(
+                            f"required-ci-outer-{invocation_session_id}"
+                        ),
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        invocation_entry_path,
+                        ("prepared",),
+                        "outer-bound",
+                        outer=[921, 922, 921, 921],
+                    )
+                    _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                        invocation_entry_path,
+                        ("outer-bound",),
+                        "root-authorized",
+                    )
+
+                    target_bytes = entry_path.read_bytes()
+                    target_metadata = entry_path.stat()
+                    invocation_bytes = invocation_entry_path.read_bytes()
+                    invocation_metadata = invocation_entry_path.stat()
+                    invocation_document = json.loads(invocation_bytes)
+                    replacement_nonce = "b" * 32
+                    if (
+                        invocation_document.get("publication_nonce")
+                        == replacement_nonce
+                    ):
+                        replacement_nonce = "c" * 32
+                    invocation_document["publication_nonce"] = (
+                        replacement_nonce
+                    )
+                    drifted_invocation_bytes = json.dumps(
+                        invocation_document,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("ascii")
+                    self.assertNotEqual(
+                        drifted_invocation_bytes,
+                        invocation_bytes,
+                    )
+                    self.assertEqual(
+                        len(drifted_invocation_bytes),
+                        len(invocation_bytes),
+                    )
+
+                    def security_binding(
+                        metadata: os.stat_result,
+                    ) -> tuple[int, int, int, int, int, int, int]:
+                        return (
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mode,
+                            metadata.st_uid,
+                            metadata.st_gid,
+                            metadata.st_nlink,
+                            metadata.st_size,
+                        )
+
+                    target_binding = security_binding(target_metadata)
+                    invocation_binding = security_binding(
+                        invocation_metadata
+                    )
+                    root_path = physical_parent / root_name
+                    witness_namespace = (
+                        physical_parent
+                        / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+                    )
+                    witness_path = witness_namespace / str(witness["basename"])
+                    self.assertFalse(root_path.exists())
+                    self.assertFalse(witness_namespace.exists())
+                    self.assertFalse(witness_path.exists())
+
+                    arguments = (
+                        "cleanup",
+                        str(entry_path),
+                        str(invocation_entry_path),
+                        json.dumps(
+                            registry_binding,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        json.dumps(
+                            parent_binding,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        root_name,
+                        str(runner_uid),
+                        str(target_uid),
+                        "-",
+                        token,
+                        session_id,
+                        delete_nonce,
+                        "-",
+                    )
+                    real_open = os.open
+                    real_fstat = os.fstat
+                    real_pread = os.pread
+                    real_stat = os.stat
+                    real_loader = (
+                        _CANDIDATE_SUPPORT._load_chain_registry_entry
+                    )
+                    invocation_fd: int | None = None
+                    invocation_fstat_bindings: list[
+                        tuple[int, int, int, int, int, int, int]
+                    ] = []
+                    invocation_preads: list[bytes] = []
+                    invocation_loader_descriptors: list[int | None] = []
+                    selected_path_bindings: list[
+                        tuple[int, int, int, int, int, int, int]
+                    ] = []
+                    in_place_drift_bindings: list[
+                        tuple[
+                            tuple[int, int, int, int, int, int, int],
+                            tuple[int, int, int, int, int, int, int],
+                        ]
+                    ] = []
+
+                    def track_open(
+                        path: os.PathLike[str] | str | bytes,
+                        flags: int,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> int:
+                        nonlocal invocation_fd
+                        descriptor = real_open(
+                            path,
+                            flags,
+                            mode,
+                            dir_fd=dir_fd,
+                        )
+                        if (
+                            path == invocation_entry_path.name
+                            and dir_fd is not None
+                        ):
+                            self.assertIsNone(invocation_fd)
+                            invocation_fd = descriptor
+                        return descriptor
+
+                    def record_stable_open_fd(
+                        descriptor: int,
+                    ) -> os.stat_result:
+                        observed = real_fstat(descriptor)
+                        if descriptor == invocation_fd:
+                            invocation_fstat_bindings.append(
+                                security_binding(observed)
+                            )
+                        return observed
+
+                    def drift_after_preliminary_read(
+                        descriptor: int,
+                        length: int,
+                        offset: int,
+                    ) -> bytes:
+                        data = real_pread(descriptor, length, offset)
+                        if descriptor != invocation_fd:
+                            return data
+                        invocation_preads.append(data)
+                        if len(invocation_preads) == 1:
+                            before = security_binding(
+                                real_stat(invocation_entry_path)
+                            )
+                            writer = real_open(
+                                invocation_entry_path,
+                                os.O_WRONLY | os.O_CLOEXEC,
+                            )
+                            try:
+                                self.assertEqual(
+                                    os.pwrite(
+                                        writer,
+                                        drifted_invocation_bytes,
+                                        0,
+                                    ),
+                                    len(drifted_invocation_bytes),
+                                )
+                                os.fsync(writer)
+                            finally:
+                                os.close(writer)
+                            after = security_binding(
+                                real_stat(invocation_entry_path)
+                            )
+                            in_place_drift_bindings.append((before, after))
+                        return data
+
+                    def record_selected_path(
+                        path: os.PathLike[str] | str | bytes,
+                        *,
+                        dir_fd: int | None = None,
+                        follow_symlinks: bool = True,
+                    ) -> os.stat_result:
+                        selected = real_stat(
+                            path,
+                            dir_fd=dir_fd,
+                            follow_symlinks=follow_symlinks,
+                        )
+                        if (
+                            path == invocation_entry_path.name
+                            and dir_fd is not None
+                            and follow_symlinks is False
+                        ):
+                            selected_path_bindings.append(
+                                security_binding(selected)
+                            )
+                        return selected
+
+                    def record_bound_load(
+                        path: Path,
+                        *,
+                        expected_token: str | None = None,
+                        expected_target_uid: int | None = None,
+                        expected_recovery_controller: Path | None = None,
+                        bound_descriptor: int | None = None,
+                    ) -> dict[str, object]:
+                        if path == invocation_entry_path:
+                            invocation_loader_descriptors.append(
+                                bound_descriptor
+                            )
+                        return real_loader(
+                            path,
+                            expected_token=expected_token,
+                            expected_target_uid=expected_target_uid,
+                            expected_recovery_controller=(
+                                expected_recovery_controller
+                            ),
+                            bound_descriptor=bound_descriptor,
+                        )
+
+                    witness_operation = mock.Mock(
+                        side_effect=AssertionError(
+                            "witness operation reached after content drift"
+                        )
+                    )
+                    root_operation = mock.Mock(
+                        side_effect=AssertionError(
+                            "root operation reached after content drift"
+                        )
+                    )
+                    open_witness = mock.Mock(
+                        side_effect=AssertionError(
+                            "witness mutation reached after content drift"
+                        )
+                    )
+                    append_witness = mock.Mock(
+                        side_effect=AssertionError(
+                            "witness append reached after content drift"
+                        )
+                    )
+                    registry_write = mock.Mock(
+                        side_effect=AssertionError(
+                            "registry write reached after content drift"
+                        )
+                    )
+                    output = io.StringIO()
+                    with _CANDIDATE_SUPPORT._chain_registry_lock(
+                        entry_path
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_TRUSTED_SUPPORT_PATH",
+                        controller,
+                    ), mock.patch.object(
+                        os, "getuid", return_value=0
+                    ), mock.patch.object(
+                        os, "geteuid", return_value=0
+                    ), mock.patch.object(
+                        os, "open", side_effect=track_open
+                    ), mock.patch.object(
+                        os, "fstat", side_effect=record_stable_open_fd
+                    ), mock.patch.object(
+                        os, "pread", side_effect=drift_after_preliminary_read
+                    ), mock.patch.object(
+                        os, "stat", side_effect=record_selected_path
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_load_chain_registry_entry",
+                        side_effect=record_bound_load,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        return_value=invocation_launcher,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_bind_root_controller_parent",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_registered_broker_ancestry",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_registered_opt_ipc_witness_operation",
+                        witness_operation,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_registered_opt_ipc_root_operation",
+                        root_operation,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_open_or_create_strict_live_ipc_witness",
+                        open_witness,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_append_strict_live_ipc_witness_record",
+                        append_witness,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_write_chain_registry_entry",
+                        registry_write,
+                    ), contextlib.redirect_stdout(output):
+                        self.assertEqual(
+                            _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_main(
+                                arguments
+                            ),
+                            0,
+                        )
+
+                    line = output.getvalue()
+                    self.assertTrue(
+                        line.startswith(
+                            _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                        )
+                    )
+                    receipt = json.loads(
+                        line[
+                            len(
+                                _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                            ) :
+                        ]
+                    )
+                    self.assertEqual(receipt["status"], "incomplete")
+                    self.assertIn(
+                        "root invocation entry",
+                        str(receipt["error"]),
+                    )
+                    self.assertIsNotNone(invocation_fd)
+                    self.assertEqual(
+                        invocation_loader_descriptors,
+                        [invocation_fd],
+                    )
+                    self.assertEqual(
+                        invocation_preads,
+                        [
+                            invocation_bytes,
+                            drifted_invocation_bytes,
+                        ],
+                    )
+                    self.assertEqual(
+                        in_place_drift_bindings,
+                        [(invocation_binding, invocation_binding)],
+                    )
+                    self.assertTrue(invocation_fstat_bindings)
+                    self.assertTrue(
+                        all(
+                            observed == invocation_binding
+                            for observed in invocation_fstat_bindings
+                        )
+                    )
+                    self.assertTrue(selected_path_bindings)
+                    self.assertTrue(
+                        all(
+                            observed == invocation_binding
+                            for observed in selected_path_bindings
+                        )
+                    )
+                    witness_operation.assert_not_called()
+                    root_operation.assert_not_called()
+                    open_witness.assert_not_called()
+                    append_witness.assert_not_called()
+                    registry_write.assert_not_called()
+
+                    self.assertEqual(entry_path.read_bytes(), target_bytes)
+                    self.assertEqual(
+                        security_binding(entry_path.stat()),
+                        target_binding,
+                    )
+                    self.assertEqual(
+                        invocation_entry_path.read_bytes(),
+                        drifted_invocation_bytes,
+                    )
+                    self.assertEqual(
+                        security_binding(invocation_entry_path.stat()),
+                        invocation_binding,
+                    )
+                    self.assertFalse(root_path.exists())
+                    self.assertFalse(witness_namespace.exists())
+                    self.assertFalse(witness_path.exists())
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+    def test_root_live_ipc_cleanup_revalidates_invocation_after_helper_return(
+        self,
+    ) -> None:
+        for (
+            attack,
+            session_character,
+            invocation_character,
+            target_uid,
+            namespace_preexisting,
+        ) in (
+            ("same-inode-content", "b", "e", 60046, True),
+            ("pathname-replacement", "c", "f", 60047, True),
+            ("same-inode-content", "a", "2", 60048, False),
+            ("pathname-replacement", "d", "3", 60049, False),
+        ):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    self.subTest(
+                        attack=attack,
+                        namespace_preexisting=namespace_preexisting,
+                    )
+                )
+                temporary_directory = stack.enter_context(
+                    tempfile.TemporaryDirectory()
+                )
+                fixture_root = Path(temporary_directory).resolve(strict=True)
+                registry_root = fixture_root / "registry"
+                entries = registry_root / "entries"
+                entries.mkdir(parents=True, mode=0o700)
+                controller = registry_root / "controller.py"
+                controller.write_text("pass\n", encoding="utf-8")
+                physical_parent = fixture_root / "opt"
+                physical_parent.mkdir(mode=0o755)
+
+                entries_metadata = entries.lstat()
+                parent_metadata = physical_parent.lstat()
+                runner_uid = entries_metadata.st_uid
+                runner_gid = entries_metadata.st_gid
+                token = "d" * 32
+                session_id = session_character * 32
+                invocation_session_id = invocation_character * 32
+                delete_nonce = "1" * 32
+                root_name = "required-ci-host-ipc-" + session_id
+                registry_binding = {
+                    "path": str(entries),
+                    "device": entries_metadata.st_dev,
+                    "inode": entries_metadata.st_ino,
+                    "uid": runner_uid,
+                    "gid": runner_gid,
+                    "mode": stat.S_IMODE(entries_metadata.st_mode),
+                }
+                parent_binding = {
+                    "path": str(physical_parent),
+                    "device": parent_metadata.st_dev,
+                    "inode": parent_metadata.st_ino,
+                    "uid": parent_metadata.st_uid,
+                    "gid": parent_metadata.st_gid,
+                    "mode": stat.S_IMODE(parent_metadata.st_mode),
+                    "host_mount_id": 61,
+                }
+                witness = _direct_opt_witness_fixture(
+                    session_id,
+                    "2" * 32,
+                )
+                direct_binding = {
+                    "registry": registry_binding,
+                    "parent": parent_binding,
+                    "name": root_name,
+                    "target_gid": target_uid,
+                    "mode": 0o710,
+                    "root": None,
+                    "witness": witness,
+                }
+                session = {
+                    "root": registry_root,
+                    "entries": entries,
+                    "controller_path": controller,
+                    "token": token,
+                    "target_uid": target_uid,
+                    "closed": False,
+                    "inherited": True,
+                    "watchdog_authorized": True,
+                }
+                previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+                _CANDIDATE_SUPPORT._STRICT_SESSION = session
+                try:
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_STRICT_LIVE_IPC_PARENT",
+                        physical_parent,
+                    ):
+                        entry_path = (
+                            _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                                controller,
+                                None,
+                                target_uid,
+                                execution_root=physical_parent,
+                                cleanup_execution_root=True,
+                                cleanup_kind="direct-opt-root-v1",
+                                direct_opt_root=direct_binding,
+                                session_id=session_id,
+                            )
+                        )
+                        _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                            entry_path,
+                            ("prepared",),
+                            "closing",
+                        )
+                        _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                            entry_path,
+                            ("closing",),
+                            "deleting",
+                            execution_root_delete_nonce=delete_nonce,
+                        )
+                        invocation_launcher = (
+                            921,
+                            922,
+                            1,
+                            921,
+                            921,
+                            (runner_uid,) * 4,
+                        )
+                        invocation_entry_path = (
+                            entries
+                            / f"chain-{invocation_session_id}.json"
+                        )
+                        registered_invocation = (
+                            _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                                controller,
+                                None,
+                                target_uid,
+                                execution_root=physical_parent,
+                                session_id=invocation_session_id,
+                            )
+                        )
+                        self.assertEqual(
+                            registered_invocation,
+                            invocation_entry_path,
+                        )
+                        _CANDIDATE_SUPPORT._update_trusted_root_chain(
+                            invocation_entry_path,
+                            "prepared",
+                            launcher_parent=(
+                                _CANDIDATE_SUPPORT._registered_process_binding(
+                                    invocation_launcher
+                                )
+                            ),
+                            outer_marker=(
+                                f"required-ci-outer-{invocation_session_id}"
+                            ),
+                        )
+                        _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                            invocation_entry_path,
+                            ("prepared",),
+                            "outer-bound",
+                            outer=[921, 922, 921, 921],
+                        )
+                        _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                            invocation_entry_path,
+                            ("outer-bound",),
+                            "root-authorized",
+                        )
+
+                    target_bytes = entry_path.read_bytes()
+                    target_metadata = entry_path.stat()
+                    invocation_bytes = invocation_entry_path.read_bytes()
+                    invocation_metadata = invocation_entry_path.stat()
+                    invocation_identity = (
+                        invocation_metadata.st_dev,
+                        invocation_metadata.st_ino,
+                    )
+                    held_invocation = invocation_entry_path.with_name(
+                        invocation_entry_path.name + ".held"
+                    )
+                    root_path = physical_parent / root_name
+                    witness_namespace = (
+                        physical_parent
+                        / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+                    )
+                    witness_namespace_binding: dict[str, object] | None = None
+                    if namespace_preexisting:
+                        witness_namespace.mkdir(mode=0o700)
+                        witness_namespace_metadata = witness_namespace.stat()
+                        witness_namespace_binding = {
+                            "path": str(witness_namespace),
+                            "device": witness_namespace_metadata.st_dev,
+                            "inode": witness_namespace_metadata.st_ino,
+                            "uid": witness_namespace_metadata.st_uid,
+                            "gid": witness_namespace_metadata.st_gid,
+                            "mode": stat.S_IMODE(
+                                witness_namespace_metadata.st_mode
+                            ),
+                        }
+                    witness_path = witness_namespace / str(
+                        witness["basename"]
+                    )
+                    self.assertFalse(root_path.exists())
+                    if namespace_preexisting:
+                        self.assertEqual(list(witness_namespace.iterdir()), [])
+                    else:
+                        self.assertFalse(witness_namespace.exists())
+
+                    def security_binding(
+                        metadata: os.stat_result,
+                    ) -> tuple[int, int, int, int, int, int, int]:
+                        return (
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mode,
+                            metadata.st_uid,
+                            metadata.st_gid,
+                            metadata.st_nlink,
+                            metadata.st_size,
+                        )
+
+                    target_binding = security_binding(target_metadata)
+                    invocation_binding = security_binding(
+                        invocation_metadata
+                    )
+                    arguments = (
+                        "cleanup",
+                        str(entry_path),
+                        str(invocation_entry_path),
+                        json.dumps(
+                            registry_binding,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        json.dumps(
+                            parent_binding,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        root_name,
+                        str(runner_uid),
+                        str(target_uid),
+                        "-",
+                        token,
+                        session_id,
+                        delete_nonce,
+                        "-",
+                    )
+                    real_open_invocation = (
+                        _CANDIDATE_SUPPORT._root_open_registered_opt_ipc_invocation
+                    )
+                    real_revalidate_invocation = (
+                        _CANDIDATE_SUPPORT._revalidate_strict_live_ipc_root_invocation_binding
+                    )
+                    event_trace: list[str] = []
+                    helper_returned = False
+                    bound_invocation_descriptor: int | None = None
+                    attacked_snapshot: dict[
+                        str, tuple[tuple[int, int, int, int, int, int, int], bytes]
+                    ] | None = None
+
+                    def registry_snapshot() -> dict[
+                        str, tuple[tuple[int, int, int, int, int, int, int], bytes]
+                    ]:
+                        return {
+                            path.name: (
+                                security_binding(path.stat()),
+                                path.read_bytes(),
+                            )
+                            for path in entries.iterdir()
+                            if path.is_file()
+                        }
+
+                    def open_then_bind(*args: object, **kwargs: object):
+                        nonlocal helper_returned
+                        nonlocal bound_invocation_descriptor
+                        result = real_open_invocation(*args, **kwargs)
+                        descriptor, metadata, data, document, _launcher = result
+                        self.assertFalse(helper_returned)
+                        event_trace.append("helper-return")
+                        self.assertEqual(
+                            (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino),
+                            invocation_identity,
+                        )
+                        self.assertEqual(security_binding(metadata), invocation_binding)
+                        self.assertEqual(data, invocation_bytes)
+                        self.assertEqual(json.loads(data), document)
+                        before_timestamp = invocation_entry_path.stat()
+                        os.utime(
+                            invocation_entry_path,
+                            ns=(
+                                before_timestamp.st_atime_ns,
+                                before_timestamp.st_mtime_ns + 1_000_000_000,
+                            ),
+                            follow_symlinks=False,
+                        )
+                        after_timestamp = invocation_entry_path.stat()
+                        self.assertNotEqual(
+                            before_timestamp.st_mtime_ns,
+                            after_timestamp.st_mtime_ns,
+                        )
+                        self.assertEqual(
+                            security_binding(after_timestamp),
+                            invocation_binding,
+                        )
+                        self.assertEqual(
+                            invocation_entry_path.read_bytes(),
+                            invocation_bytes,
+                        )
+                        event_trace.append("benign-timestamp-change")
+                        helper_returned = True
+                        bound_invocation_descriptor = descriptor
+                        return result
+
+                    def revalidate_invocation(value: object):
+                        event_trace.append("revalidate-invocation")
+                        return real_revalidate_invocation(value)
+
+                    real_witness_operation = (
+                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation
+                    )
+                    real_open_witness_namespace = (
+                        _CANDIDATE_SUPPORT._root_open_strict_live_ipc_witness_namespace
+                    )
+                    namespace_mutation_guard: object = None
+                    namespace_parent_descriptor: int | None = None
+
+                    def inject_attack() -> None:
+                        nonlocal attacked_snapshot
+                        self.assertIsNone(attacked_snapshot)
+                        self.assertTrue(helper_returned)
+                        self.assertIsNotNone(bound_invocation_descriptor)
+                        descriptor = bound_invocation_descriptor
+                        assert descriptor is not None
+                        if attack == "same-inode-content":
+                            drifted_document = json.loads(invocation_bytes)
+                            drifted_document["publication_nonce"] = "3" * 32
+                            drifted_bytes = json.dumps(
+                                drifted_document,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("ascii")
+                            self.assertEqual(
+                                len(drifted_bytes), len(invocation_bytes)
+                            )
+                            attack_fd = os.open(
+                                invocation_entry_path,
+                                os.O_WRONLY
+                                | os.O_NOFOLLOW
+                                | os.O_CLOEXEC,
+                            )
+                            try:
+                                self.assertEqual(
+                                    os.pwrite(attack_fd, drifted_bytes, 0),
+                                    len(drifted_bytes),
+                                )
+                                os.fsync(attack_fd)
+                            finally:
+                                os.close(attack_fd)
+                            self.assertEqual(
+                                security_binding(os.fstat(descriptor)),
+                                invocation_binding,
+                            )
+                            self.assertEqual(
+                                os.pread(descriptor, 4097, 0),
+                                drifted_bytes,
+                            )
+                        else:
+                            invocation_entry_path.rename(held_invocation)
+                            invocation_entry_path.write_bytes(
+                                invocation_bytes
+                            )
+                            invocation_entry_path.chmod(0o600)
+                            self.assertEqual(
+                                security_binding(held_invocation.stat()),
+                                invocation_binding,
+                            )
+                            self.assertNotEqual(
+                                (
+                                    invocation_entry_path.stat().st_dev,
+                                    invocation_entry_path.stat().st_ino,
+                                ),
+                                invocation_identity,
+                            )
+                            self.assertEqual(
+                                stat.S_IMODE(
+                                    invocation_entry_path.stat().st_mode
+                                ),
+                                0o600,
+                            )
+                        event_trace.append("attack")
+                        attacked_snapshot = registry_snapshot()
+
+                    def attack_then_witness(
+                        *args: object, **kwargs: object
+                    ):
+                        if namespace_preexisting:
+                            inject_attack()
+                        return real_witness_operation(*args, **kwargs)
+
+                    def open_parent(
+                        expected: object = None,
+                    ) -> tuple[int, dict[str, object]]:
+                        self.assertEqual(expected, parent_binding)
+                        return (
+                            os.open(
+                                physical_parent,
+                                os.O_RDONLY
+                                | os.O_DIRECTORY
+                                | os.O_NOFOLLOW
+                                | os.O_CLOEXEC,
+                            ),
+                            dict(parent_binding),
+                        )
+
+                    def open_witness_namespace(
+                        _parent_fd: int,
+                        expected: object = None,
+                        *,
+                        mutation_guard: object = None,
+                    ) -> tuple[int, dict[str, object]]:
+                        nonlocal namespace_mutation_guard
+                        nonlocal namespace_parent_descriptor
+                        self.assertIsNone(expected)
+                        if not namespace_preexisting:
+                            event_trace.append("namespace-opener-enter")
+                            self.assertFalse(witness_namespace.exists())
+                            namespace_mutation_guard = mutation_guard
+                            namespace_parent_descriptor = _parent_fd
+                            namespace_keywords: dict[str, object] = {}
+                            if "mutation_guard" in inspect.signature(
+                                real_open_witness_namespace
+                            ).parameters:
+                                namespace_keywords["mutation_guard"] = (
+                                    mutation_guard
+                                )
+                            with mock.patch.object(
+                                os,
+                                "stat",
+                                side_effect=stat_then_attack,
+                            ), mock.patch.object(
+                                os, "mkdir", side_effect=track_mkdir
+                            ):
+                                return real_open_witness_namespace(
+                                    _parent_fd,
+                                    expected,
+                                    **namespace_keywords,
+                                )
+                        event_trace.append("open-witness-namespace")
+                        assert witness_namespace_binding is not None
+                        return (
+                            os.open(
+                                witness_namespace,
+                                os.O_RDONLY
+                                | os.O_DIRECTORY
+                                | os.O_NOFOLLOW
+                                | os.O_CLOEXEC,
+                            ),
+                            dict(witness_namespace_binding),
+                        )
+
+                    def cleanup_absent_root(
+                        operation: str,
+                        selected_parent: Mapping[str, object],
+                        selected_name: str,
+                        selected_runner_uid: int,
+                        selected_target_uid: int,
+                        expected_root: Mapping[str, object] | None,
+                        **kwargs: object,
+                    ) -> dict[str, object]:
+                        self.assertEqual(operation, "cleanup")
+                        self.assertEqual(selected_parent, parent_binding)
+                        self.assertEqual(selected_name, root_name)
+                        self.assertEqual(selected_runner_uid, runner_uid)
+                        self.assertEqual(selected_target_uid, target_uid)
+                        self.assertIsNone(expected_root)
+                        self.assertEqual(
+                            kwargs, {"owner_loss_capability": None}
+                        )
+                        self.assertFalse(root_path.exists())
+                        return {
+                            "status": "complete",
+                            "operation": "cleanup",
+                            "parent": dict(parent_binding),
+                            "root": None,
+                            "origin_absent": True,
+                        }
+
+                    output = io.StringIO()
+                    euid_calls = 0
+
+                    def root_then_witness_owner() -> int:
+                        nonlocal euid_calls
+                        euid_calls += 1
+                        return 0 if euid_calls == 1 else runner_uid
+
+                    real_mkdir = os.mkdir
+                    real_stat = os.stat
+
+                    def stat_then_attack(
+                        path: object,
+                        *args: object,
+                        **kwargs: object,
+                    ) -> os.stat_result:
+                        try:
+                            return real_stat(path, *args, **kwargs)
+                        except FileNotFoundError:
+                            if (
+                                path
+                                == _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+                            ):
+                                self.assertEqual(
+                                    kwargs.get("dir_fd"),
+                                    namespace_parent_descriptor,
+                                )
+                                self.assertIs(
+                                    kwargs.get("follow_symlinks"), False
+                                )
+                                event_trace.append(
+                                    "namespace-absence-observed"
+                                )
+                                inject_attack()
+                            raise
+
+                    def track_mkdir(
+                        path: str | bytes,
+                        mode: int = 0o777,
+                        *,
+                        dir_fd: int | None = None,
+                    ) -> None:
+                        if (
+                            path
+                            == _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+                            and dir_fd is not None
+                        ):
+                            event_trace.append("mkdir-witness-namespace")
+                        if dir_fd is None:
+                            real_mkdir(path, mode)
+                        else:
+                            real_mkdir(path, mode, dir_fd=dir_fd)
+
+                    with _CANDIDATE_SUPPORT._chain_registry_lock(
+                        entry_path
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_TRUSTED_SUPPORT_PATH",
+                        controller,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_STRICT_LIVE_IPC_PARENT",
+                        physical_parent,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
+                        runner_uid,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
+                        runner_gid,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_open_strict_live_ipc_parent",
+                        side_effect=open_parent,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_open_strict_live_ipc_witness_namespace",
+                        side_effect=open_witness_namespace,
+                    ), mock.patch.object(
+                        os, "getuid", return_value=0
+                    ), mock.patch.object(
+                        os,
+                        "geteuid",
+                        side_effect=root_then_witness_owner,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_bind_root_controller_parent",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_process_identity",
+                        return_value=invocation_launcher,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_strict_owner_loss_registered_broker_ancestry",
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_open_registered_opt_ipc_invocation",
+                        side_effect=open_then_bind,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_revalidate_strict_live_ipc_root_invocation_binding",
+                        side_effect=revalidate_invocation,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_registered_opt_ipc_witness_operation",
+                        side_effect=attack_then_witness,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_root_registered_opt_ipc_root_operation",
+                        side_effect=cleanup_absent_root,
+                    ), contextlib.redirect_stdout(output):
+                        self.assertEqual(
+                            _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_main(
+                                arguments
+                            ),
+                            0,
+                        )
+
+                    line = output.getvalue()
+                    self.assertTrue(
+                        line.startswith(
+                            _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                        )
+                    )
+                    receipt = json.loads(
+                        line[
+                            len(
+                                _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                            ) :
+                        ]
+                    )
+                    self.assertTrue(helper_returned)
+                    self.assertIsNotNone(attacked_snapshot)
+                    if namespace_preexisting:
+                        expected_trace = [
+                            "helper-return",
+                            "benign-timestamp-change",
+                            "revalidate-invocation",
+                            "attack",
+                            "revalidate-invocation",
+                        ]
+                        self.assertIsNone(namespace_mutation_guard)
+                    else:
+                        expected_trace = [
+                            "helper-return",
+                            "benign-timestamp-change",
+                            "revalidate-invocation",
+                            "revalidate-invocation",
+                            "revalidate-invocation",
+                            "namespace-opener-enter",
+                            "namespace-absence-observed",
+                            "attack",
+                            "revalidate-invocation",
+                        ]
+                        self.assertTrue(callable(namespace_mutation_guard))
+                    self.assertEqual(event_trace, expected_trace)
+                    self.assertEqual(receipt["status"], "incomplete")
+                    self.assertRegex(
+                        str(receipt["error"]),
+                        r"(?:invocation|entry).*(?:changed|invalid)",
+                    )
+                    self.assertEqual(registry_snapshot(), attacked_snapshot)
+                    self.assertEqual(entry_path.read_bytes(), target_bytes)
+                    self.assertEqual(
+                        security_binding(entry_path.stat()),
+                        target_binding,
+                    )
+                    self.assertFalse(root_path.exists())
+                    if namespace_preexisting:
+                        assert witness_namespace_binding is not None
+                        self.assertEqual(
+                            (
+                                witness_namespace.stat().st_dev,
+                                witness_namespace.stat().st_ino,
+                                witness_namespace.stat().st_uid,
+                                witness_namespace.stat().st_gid,
+                                stat.S_IMODE(
+                                    witness_namespace.stat().st_mode
+                                ),
+                            ),
+                            (
+                                witness_namespace_binding["device"],
+                                witness_namespace_binding["inode"],
+                                witness_namespace_binding["uid"],
+                                witness_namespace_binding["gid"],
+                                witness_namespace_binding["mode"],
+                            ),
+                        )
+                        self.assertEqual(
+                            list(witness_namespace.iterdir()), []
+                        )
+                    else:
+                        self.assertFalse(witness_namespace.exists())
+                    self.assertFalse(witness_path.exists())
+                finally:
+                    _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
 
     def test_registered_live_ipc_root_schema_rejects_one_field_at_a_time(
         self,
@@ -25381,9 +34815,55 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             expected_recovery_controller=controller,
                         )
                     )
+                    invocation_entry_path = (
+                        entries / ("chain-" + "5" * 32 + ".json")
+                    )
+                    invocation_bytes = b"{}"
+                    invocation_entry_path.write_bytes(invocation_bytes)
+                    invocation_entry_path.chmod(0o600)
+                    invocation_launcher = (
+                        501,
+                        502,
+                        1,
+                        501,
+                        501,
+                        (registry_binding["uid"],) * 4,
+                    )
+
+                    def open_crash_invocation(
+                        registry_fd: int,
+                        selected_registry: Mapping[str, object],
+                        selected_path: Path,
+                        runner_uid: int,
+                        selected_target_uid: int,
+                        selected_token: str,
+                    ):
+                        self.assertEqual(selected_registry, registry_binding)
+                        self.assertEqual(selected_path, invocation_entry_path)
+                        self.assertEqual(runner_uid, registry_binding["uid"])
+                        self.assertEqual(selected_target_uid, target_uid)
+                        self.assertEqual(selected_token, token)
+                        descriptor = os.open(
+                            invocation_entry_path.name,
+                            os.O_RDONLY
+                            | os.O_NOFOLLOW
+                            | os.O_CLOEXEC,
+                            dir_fd=registry_fd,
+                        )
+                        metadata = os.fstat(descriptor)
+                        data = os.pread(descriptor, 4097, 0)
+                        return (
+                            descriptor,
+                            metadata,
+                            data,
+                            {"fixture": "invocation"},
+                            invocation_launcher,
+                        )
+
                     broker_arguments = (
                         "cleanup",
                         str(entry_path),
+                        str(invocation_entry_path),
                         json.dumps(
                             registry_binding,
                             sort_keys=True,
@@ -25401,6 +34881,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         token,
                         session_id,
                         str(crash_document["execution_root_delete_nonce"]),
+                        "-",
                     )
                     marker_read_fd, marker_write_fd = os.pipe()
                     fixture_euid = os.geteuid()
@@ -25489,9 +34970,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                     os,
                                     "geteuid",
                                     side_effect=root_then_witness_owner,
-                                ), mock.patch.object(
+                                ), mock.patch.multiple(
                                     _CANDIDATE_SUPPORT,
-                                    "_bind_root_controller_parent",
+                                    _bind_root_controller_parent=mock.DEFAULT,
+                                    _root_open_registered_opt_ipc_invocation=mock.Mock(
+                                        side_effect=open_crash_invocation
+                                    ),
+                                    _strict_owner_loss_registered_broker_ancestry=mock.DEFAULT,
                                 ), mock.patch.object(
                                     _CANDIDATE_SUPPORT,
                                     "_append_strict_live_ipc_witness_record",
@@ -25650,6 +35135,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             from pathlib import Path
             import runpy
             import signal
+            import socket
             import sys
 
             support = runpy.run_path(sys.argv[1])
@@ -25689,6 +35175,30 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     heartbeat = session["watchdog_heartbeat"]
                     if not heartbeat.is_alive():
                         raise AssertionError("watchdog heartbeat is not active")
+                    root_path = Path(str(direct["root"]["path"]))
+                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    socket_path = root_path / "post-seal.sock"
+                    fifo_path = root_path / "post-seal.fifo"
+                    listener.bind(str(socket_path))
+                    socket_path.chmod(0o666)
+                    os.mkfifo(fifo_path, 0o666)
+                    fifo_path.chmod(0o666)
+                    residues = {}
+                    for residue_path, kind in (
+                        (socket_path, "socket"),
+                        (fifo_path, "fifo"),
+                    ):
+                        metadata = residue_path.lstat()
+                        residues[residue_path.name] = {
+                            "device": metadata.st_dev,
+                            "inode": metadata.st_ino,
+                            "uid": metadata.st_uid,
+                            "gid": metadata.st_gid,
+                            "mode": metadata.st_mode & 0o7777,
+                            "nlink": metadata.st_nlink,
+                            "size": metadata.st_size,
+                            "kind": kind,
+                        }
                     marker = {
                         "owner_pid": os.getpid(),
                         "registry_root": str(registry["root"]),
@@ -25698,13 +35208,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         "publication_nonce": document["publication_nonce"],
                         "parent": direct["parent"],
                         "root": direct["root"],
+                        "residues": residues,
                         "witness": witness,
                         "watchdog_pid": watchdog.pid,
                         "watchdog_stdout_fd": watchdog.stdout.fileno(),
                         "watchdog_token": session["watchdog_token"],
-                        "watchdog_identity": list(
-                            session["watchdog_identity"][:5]
-                        ),
+                        "watchdog_identity": [
+                            *session["watchdog_identity"][:5],
+                            list(session["watchdog_identity"][5]),
+                        ],
                     }
                     print(
                         "REQUIRED_CI_WATCHDOG_OWNER_READY:"
@@ -25751,7 +35263,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         owner_pidfd: int | None = None
         watchdog_output_fd: int | None = None
         watchdog_pidfd: int | None = None
-        client: subprocess.Popen[bytes] | None = None
         marker: dict[str, object] | None = None
         try:
             self.assertIsNotNone(owner.stdout)
@@ -25842,6 +35353,26 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertGreater(witness_file["size"], 0)
             self.assertRegex(witness_file["sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(witness_file["last_record_sha256"], r"^[0-9a-f]{64}$")
+            residues = marker["residues"]
+            self.assertEqual(
+                set(residues), {"post-seal.sock", "post-seal.fifo"}
+            )
+            for basename, expected_kind in (
+                ("post-seal.sock", "socket"),
+                ("post-seal.fifo", "fifo"),
+            ):
+                residue = residues[basename]
+                self.assertEqual(residue["kind"], expected_kind)
+                self.assertEqual(residue["device"], root_binding["device"])
+                self.assertEqual(residue["uid"], os.getuid())
+                self.assertEqual(residue["gid"], os.getgid())
+                self.assertEqual(residue["mode"], 0o666)
+                self.assertEqual(residue["nlink"], 1)
+                self.assertEqual(residue["size"], 0)
+                self.assertEqual(
+                    (root_path / basename).lstat().st_ino,
+                    residue["inode"],
+                )
             self.assertTrue(root_path.is_dir())
             self.assertTrue(entry_path.is_file())
             with self.assertRaises(PermissionError) as denied_witness:
@@ -25858,49 +35389,35 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
 
             watchdog_pid = int(marker["watchdog_pid"])
-            watchdog_identity = tuple(marker["watchdog_identity"])
-            self.assertEqual(len(watchdog_identity), 5)
+            serialized_watchdog_identity = marker["watchdog_identity"]
+            self.assertIsInstance(serialized_watchdog_identity, list)
+            assert isinstance(serialized_watchdog_identity, list)
+            self.assertEqual(len(serialized_watchdog_identity), 6)
+            self.assertIsInstance(serialized_watchdog_identity[5], list)
+            watchdog_identity = (
+                *serialized_watchdog_identity[:5],
+                tuple(serialized_watchdog_identity[5]),
+            )
             self.assertEqual(watchdog_identity[0], watchdog_pid)
             watchdog_output_fd = os.open(
                 f"/proc/{owner.pid}/fd/{int(marker['watchdog_stdout_fd'])}",
                 os.O_RDONLY | os.O_CLOEXEC,
             )
             watchdog_pidfd = os.pidfd_open(watchdog_pid, 0)
-            client_environment = dict(owner_environment)
-            client_environment[
-                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV
-            ] = str(registry_root)
-            client_environment[
-                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV
-            ] = str(marker["registry_token"])
-            client = subprocess.Popen(
-                [
-                    str(_CANDIDATE_SUPPORT._STRICT_PRIMITIVES["python"]),
-                    *_CANDIDATE_SUPPORT._ROOT_PYTHON_ARGUMENTS,
-                    "-c",
-                    "import signal\nwhile True: signal.pause()\n",
-                ],
-                cwd=str(TRUSTED_REPO_ROOT),
-                env=client_environment,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+            self.assertEqual(entry_path.parent, registry_root / "entries")
+            self.assertEqual(
+                preimport_document["direct_opt_root"]["registry"]["path"],
+                str(entry_path.parent),
             )
-            client_deadline = time.monotonic() + 5
-            while time.monotonic() < client_deadline:
-                client_inventory = (
-                    _CANDIDATE_SUPPORT._watchdog_client_inventory(
-                        registry_root, str(marker["registry_token"])
-                    )
-                )
-                if client.pid in client_inventory:
-                    break
-                if client.poll() is not None:
-                    self.fail("real registry watchdog client exited before recovery")
-                time.sleep(0.05)
-            else:
-                self.fail("real registry watchdog client was not observable")
+            self.assertEqual(
+                _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                    entry_path.parent,
+                    str(marker["registry_token"]),
+                    runner_uid=os.getuid(),
+                    excluded_identity=watchdog_identity,
+                ),
+                {},
+            )
             owner_pidfd = os.pidfd_open(owner.pid, 0)
             signal.pidfd_send_signal(owner_pidfd, signal.SIGKILL, None, 0)
             owner.wait(timeout=10)
@@ -25926,9 +35443,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertLess(
                 terminal["elapsed_ns"], terminal["heartbeat_timeout_ns"]
             )
-            assert client is not None
-            client.wait(timeout=10)
-            self.assertEqual(client.returncode, -signal.SIGKILL)
             recovery = result["recovery"]
             self.assertEqual(recovery["direct_opt_root_count"], 1)
             recovered_root = recovery["direct_opt_root"]
@@ -26006,18 +35520,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 observed = _CANDIDATE_SUPPORT._process_identity(
                     Path("/proc") / str(watchdog_pid)
                 )
-                if observed is None or tuple(observed[:5]) != watchdog_identity:
+                if (
+                    observed is None
+                    or tuple(observed[:5]) != watchdog_identity[:5]
+                ):
                     break
                 time.sleep(0.05)
             else:
                 self.fail("real registry watchdog was not reaped")
         finally:
-            if client is not None and client.poll() is None:
-                try:
-                    os.kill(client.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                client.wait(timeout=10)
             if owner.poll() is None:
                 try:
                     os.kill(owner.pid, signal.SIGKILL)
