@@ -405,8 +405,23 @@ _STRICT_ZERO_SCAN_INTERVAL_SECONDS = 0.05
 _STRICT_REGISTRY_ENTRY_LIMIT = 256
 _STRICT_WATCHDOG_HEARTBEAT_SECONDS = 1.0
 _STRICT_WATCHDOG_TIMEOUT_SECONDS = 5.0
-# These are operational fail-closed cutoffs, not global scheduler or cleanup
-# bounds.  The outer cutoff leaves additional observation time after the
+# Owner-loss completion shares the watchdog's bounded result and reap
+# envelopes instead of inventing a suite-level cleanup timeout.
+_STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS = (
+    CANDIDATE_PROCESS_TIMEOUT_SECONDS
+    + CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS
+)
+_STRICT_ZERO_SCAN_STABILITY_SECONDS = (
+    _STRICT_ZERO_SCAN_COUNT * _STRICT_ZERO_SCAN_INTERVAL_SECONDS
+)
+_OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS = (
+    _STRICT_WATCHDOG_TIMEOUT_SECONDS
+    + _STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS
+    + CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS
+    + _STRICT_ZERO_SCAN_STABILITY_SECONDS
+)
+# The following are operational fail-closed cutoffs, not global scheduler or
+# cleanup bounds.  The outer cutoff leaves additional observation time after the
 # inner cutoff, while any deadline exhaustion still rejects the probe.
 _REGISTERED_ROOT_ACTIVE_ACK_TIMEOUT_SECONDS = 15.0
 _OUTER_TARGET_ACTIVE_FAULT_ACK_TIMEOUT_SECONDS = 30.0
@@ -17169,8 +17184,7 @@ def _drain_authorized_watchdog_launch(
         process.stdin.flush()
     result_line = _read_watchdog_line(
         process.stdout,
-        CANDIDATE_PROCESS_TIMEOUT_SECONDS
-        + CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS,
+        _STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS,
         "authorized abort result",
     )
     expected_ready = f"{_WATCHDOG_READY_PREFIX}{watchdog_token}\n".encode(
@@ -17179,8 +17193,7 @@ def _drain_authorized_watchdog_launch(
     if result_line == expected_ready:
         result_line = _read_watchdog_line(
             process.stdout,
-            CANDIDATE_PROCESS_TIMEOUT_SECONDS
-            + CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS,
+            _STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS,
             "authorized abort result",
         )
     process.wait(timeout=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS)
@@ -18719,8 +18732,7 @@ def _close_registry_through_watchdog(
             process.stdin.flush()
         result_line = _read_watchdog_line(
             process.stdout,
-            CANDIDATE_PROCESS_TIMEOUT_SECONDS
-            + CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS,
+            _STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS,
             "result",
         )
         process.wait(timeout=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS)
@@ -20865,6 +20877,108 @@ def _wait_process_pidfd_terminal(
         )
 
 
+def _pidfd_is_terminal(descriptor: int) -> bool:
+    if type(descriptor) is not int or descriptor < 0:
+        raise AssertionError("strict outer owner pidfd is malformed")
+    try:
+        readable, _, _ = select.select([descriptor], [], [], 0)
+    except (OSError, ValueError) as error:
+        raise AssertionError(
+            "strict outer owner pidfd cannot be revalidated"
+        ) from error
+    return descriptor in readable
+
+
+def _wait_outer_owner_watchdog_cleanup(
+    root: Path,
+    identity: tuple[int, int],
+    *,
+    watchdog_pidfd: int,
+    bound_descriptor: int,
+    deadline: float,
+    boundary: str,
+    selected_signal: int,
+) -> None:
+    if (
+        type(identity) is not tuple
+        or len(identity) != 2
+        or any(type(value) is not int or value < 0 for value in identity)
+        or type(bound_descriptor) is not int
+        or bound_descriptor < 0
+        or type(deadline) not in (int, float)
+        or boundary not in _OUTER_OWNER_FAULT_BOUNDARIES
+        or selected_signal not in (signal.SIGKILL, signal.SIGSTOP)
+    ):
+        raise AssertionError(
+            "strict outer owner watchdog cleanup state is malformed"
+        )
+    context = (
+        f"boundary={boundary!r} signal={signal.Signals(selected_signal).name}"
+    )
+    zero_count = 0
+    while True:
+        now = time.monotonic()
+        watchdog_terminal = _pidfd_is_terminal(watchdog_pidfd)
+        if now >= deadline:
+            if not watchdog_terminal:
+                raise AssertionError(
+                    "strict outer owner watchdog liveness timeout "
+                    f"({context})"
+                )
+            raise AssertionError(
+                "strict outer owner watchdog terminal cleanup failure "
+                f"({context})"
+            )
+        try:
+            metadata = root.lstat()
+        except FileNotFoundError:
+            zero_count = zero_count + 1 if watchdog_terminal else 0
+        except OSError as error:
+            raise AssertionError(
+                "strict outer owner registry root cannot be revalidated "
+                f"({context})"
+            ) from error
+        else:
+            if (metadata.st_dev, metadata.st_ino) != identity:
+                raise AssertionError(
+                    "strict outer owner registry root identity changed "
+                    f"({context})"
+                )
+            zero_count = 0
+            if watchdog_terminal:
+                raise AssertionError(
+                    "strict outer owner watchdog terminal cleanup failure: "
+                    f"registry root is still present ({context})"
+                )
+        if watchdog_terminal and zero_count >= _STRICT_ZERO_SCAN_COUNT:
+            try:
+                bound_metadata = os.fstat(bound_descriptor)
+            except OSError as error:
+                raise AssertionError(
+                    "strict outer owner bound registry descriptor cannot be "
+                    f"revalidated ({context})"
+                ) from error
+            if (bound_metadata.st_dev, bound_metadata.st_ino) != identity:
+                raise AssertionError(
+                    "strict outer owner bound registry root identity changed "
+                    f"({context})"
+                )
+            if bound_metadata.st_nlink != 0:
+                raise AssertionError(
+                    "strict outer owner exact registry unlink is unproved "
+                    f"({context})"
+                )
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "strict outer owner watchdog terminal cleanup failure: "
+                    f"completion deadline expired ({context})"
+                )
+            return
+        time.sleep(
+            min(_STRICT_ZERO_SCAN_INTERVAL_SECONDS, deadline - now)
+        )
+
+
 def _outer_owner_fault_probe_main(arguments: Sequence[str]) -> int:
     registry: dict[str, object] | None = None
     pause_descriptor = -1
@@ -21230,32 +21344,44 @@ def _probe_independent_outer_owner_fault(
         _assert_outer_owner_registry_descriptor_binding(
             registry_descriptor, registry_policy_binding
         )
-        _signal_process_pidfd(owner_pidfd, selected_signal)
-        process.wait(
-            timeout=(
-                _STRICT_WATCHDOG_TIMEOUT_SECONDS
-                + (CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS * 3)
-            )
+        recovery_deadline = (
+            time.monotonic()
+            + _OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS
         )
+        _signal_process_pidfd(owner_pidfd, selected_signal)
+        owner_timeout_seconds = recovery_deadline - time.monotonic()
+        if owner_timeout_seconds <= 0:
+            raise AssertionError(
+                "strict outer owner liveness timeout before owner wait "
+                f"(boundary={boundary!r} "
+                f"signal={signal.Signals(selected_signal).name})"
+            )
+        try:
+            process.wait(timeout=owner_timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(
+                "strict outer owner liveness timeout while waiting for owner "
+                f"(boundary={boundary!r} "
+                f"signal={signal.Signals(selected_signal).name})"
+            ) from error
         if process.returncode != -signal.SIGKILL:
             raise AssertionError(
                 "strict outer owner was not terminated by an exact SIGKILL"
             )
-        _wait_process_pidfd_terminal(
-            owner_pidfd,
-            timeout_seconds=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS,
-            description="owner",
-        )
+        if not _pidfd_is_terminal(owner_pidfd):
+            raise AssertionError(
+                "strict outer owner terminal pidfd state is unproved"
+            )
         os.close(pause_write_fd)
         pause_write_fd = -1
-        _wait_exact_registry_root_absent(
+        _wait_outer_owner_watchdog_cleanup(
             registry_root,
             registry_identity,
-            timeout_seconds=(
-                _STRICT_WATCHDOG_TIMEOUT_SECONDS
-                + (CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS * 3)
-            ),
+            watchdog_pidfd=watchdog_pidfd,
             bound_descriptor=registry_descriptor,
+            deadline=recovery_deadline,
+            boundary=boundary,
+            selected_signal=selected_signal,
         )
         _wait_outer_owner_session_quiescent(
             outer,
@@ -21266,11 +21392,6 @@ def _probe_independent_outer_owner_fault(
             outer_pidfd,
             timeout_seconds=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS,
             description="outer anchor",
-        )
-        _wait_process_pidfd_terminal(
-            watchdog_pidfd,
-            timeout_seconds=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS,
-            description="watchdog",
         )
         for index, descriptor in enumerate(root_active_pidfds):
             _wait_process_pidfd_terminal(

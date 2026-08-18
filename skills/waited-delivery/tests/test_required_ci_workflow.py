@@ -14190,6 +14190,41 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "raise AssertionError('formal support executed before guard')\n",
                 encoding="utf-8",
             )
+            cache_relative = (
+                "__pycache__/test_required_ci_workflow."
+                f"{sys.implementation.cache_tag}.pyc"
+            )
+            namespace_rejection = (
+                "trusted active test control-plane namespace contains "
+                "unexpected entries"
+            )
+            unsafe_cache_rejection = (
+                f"trusted {cache_relative!r} active test control-plane file "
+                "is unsafe"
+            )
+
+            def assert_closed_formal_rejection(
+                completed: subprocess.CompletedProcess[str],
+                *,
+                case: str,
+                expected: str | None = None,
+            ) -> None:
+                with self.subTest(cache_case=case):
+                    self.assertNotEqual(completed.returncode, 0)
+                    observed = [
+                        message
+                        for message in (
+                            namespace_rejection,
+                            unsafe_cache_rejection,
+                        )
+                        if message in completed.stderr
+                    ]
+                    if expected is None:
+                        self.assertEqual(len(observed), 1, completed.stderr)
+                    else:
+                        self.assertEqual(observed, [expected], completed.stderr)
+                    self.assertFalse(support_canary.exists())
+
             formal_entry = subprocess.run(
                 [
                     sys.executable,
@@ -14203,13 +14238,35 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 text=True,
                 timeout=30,
             )
-            self.assertNotEqual(formal_entry.returncode, 0)
-            self.assertIn(
-                "trusted active test control-plane namespace contains "
-                "unexpected entries",
-                formal_entry.stderr,
+            assert_closed_formal_rejection(
+                formal_entry,
+                case="native-cache",
             )
-            self.assertFalse(support_canary.exists())
+
+            oversized_cache = (
+                pycache_root / Path(cache_relative).name
+            )
+            oversized_cache.write_bytes(
+                b"x" * (TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES + 1)
+            )
+            oversized_formal_entry = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(workflow_test_path),
+                    TRUSTED_STRUCTURE_VALIDATOR_FLAG,
+                ],
+                cwd=checkout_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert_closed_formal_rejection(
+                oversized_formal_entry,
+                case="oversized-cache",
+                expected=unsafe_cache_rejection,
+            )
 
     def test_local_formal_copy_never_relocates_shared_import_cache(
         self,
@@ -19139,6 +19196,285 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     )
             finally:
                 os.close(registry_descriptor)
+
+    def _run_outer_owner_cleanup_observer_fixture(
+        self,
+        *,
+        absent_at: float | None = None,
+        terminal_at: float | None = None,
+        replacement_at: float | None = None,
+        path_error: OSError | None = None,
+        bound_identity: tuple[int, int] = (101, 202),
+        bound_nlink: int = 0,
+        fstat_advance: float = 0.0,
+        sleep_advance: float = 5.0,
+    ) -> tuple[AssertionError | None, float, list[float], mock.Mock]:
+        clock = {"now": 0.0}
+        original_identity = (101, 202)
+        original_metadata = types.SimpleNamespace(
+            st_dev=original_identity[0],
+            st_ino=original_identity[1],
+        )
+        replacement_metadata = types.SimpleNamespace(st_dev=303, st_ino=404)
+        bound_metadata = types.SimpleNamespace(
+            st_dev=bound_identity[0],
+            st_ino=bound_identity[1],
+            st_nlink=bound_nlink,
+        )
+        terminal_observations: list[float] = []
+
+        class RegistryRoot:
+            def lstat(self) -> object:
+                now = clock["now"]
+                if path_error is not None:
+                    raise path_error
+                if replacement_at is not None and now >= replacement_at:
+                    return replacement_metadata
+                if absent_at is not None and now >= absent_at:
+                    raise FileNotFoundError
+                return original_metadata
+
+        def pidfd_is_terminal(_descriptor: int) -> bool:
+            terminal_observations.append(clock["now"])
+            return terminal_at is not None and clock["now"] >= terminal_at
+
+        def advance_clock(_seconds: float) -> None:
+            remaining = max(
+                0.0,
+                _CANDIDATE_SUPPORT
+                ._OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS
+                - clock["now"],
+            )
+            clock["now"] += min(sleep_advance, remaining)
+
+        def read_bound_metadata(_descriptor: int) -> object:
+            clock["now"] += fstat_advance
+            return bound_metadata
+
+        fstat = mock.Mock(side_effect=read_bound_metadata)
+        caught: AssertionError | None = None
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.time,
+            "monotonic",
+            side_effect=lambda: clock["now"],
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.time,
+            "sleep",
+            side_effect=advance_clock,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_pidfd_is_terminal",
+            side_effect=pidfd_is_terminal,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os,
+            "fstat",
+            fstat,
+        ):
+            try:
+                _CANDIDATE_SUPPORT._wait_outer_owner_watchdog_cleanup(
+                    RegistryRoot(),  # type: ignore[arg-type]
+                    original_identity,
+                    watchdog_pidfd=71,
+                    bound_descriptor=72,
+                    deadline=(
+                        _CANDIDATE_SUPPORT
+                        ._OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS
+                    ),
+                    boundary="after-target-active",
+                    selected_signal=signal.SIGKILL,
+                )
+            except AssertionError as error:
+                caught = error
+        return caught, clock["now"], terminal_observations, fstat
+
+    def test_outer_fault_combined_observer_accepts_cleanup_after_old_budget(
+        self,
+    ) -> None:
+        error, elapsed, observations, fstat = (
+            self._run_outer_owner_cleanup_observer_fixture(
+                absent_at=25.0,
+                terminal_at=25.0,
+            )
+        )
+
+        self.assertIsNone(error)
+        self.assertGreaterEqual(elapsed, 35.0)
+        self.assertEqual(
+            len([observed for observed in observations if observed >= 25.0]),
+            _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_COUNT,
+        )
+        fstat.assert_called_once_with(72)
+
+    def test_outer_fault_combined_observer_rejects_absent_root_with_live_watchdog(
+        self,
+    ) -> None:
+        error, elapsed, _observations, fstat = (
+            self._run_outer_owner_cleanup_observer_fixture(absent_at=0.0)
+        )
+
+        self.assertIsNotNone(error)
+        self.assertIn("watchdog liveness timeout", str(error))
+        self.assertEqual(
+            elapsed,
+            _CANDIDATE_SUPPORT
+            ._OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS,
+        )
+        fstat.assert_not_called()
+
+    def test_outer_fault_combined_observer_reserves_terminal_stability_scan(
+        self,
+    ) -> None:
+        stage_envelope = (
+            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT._STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT.CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS
+        )
+        terminal_at = (
+            stage_envelope
+            - _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_INTERVAL_SECONDS
+        )
+        error, elapsed, _observations, fstat = (
+            self._run_outer_owner_cleanup_observer_fixture(
+                absent_at=terminal_at,
+                terminal_at=terminal_at,
+                sleep_advance=(
+                    _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_INTERVAL_SECONDS
+                ),
+            )
+        )
+
+        self.assertIsNone(error)
+        self.assertGreater(elapsed, stage_envelope)
+        self.assertLess(
+            elapsed,
+            _CANDIDATE_SUPPORT
+            ._OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS,
+        )
+        fstat.assert_called_once_with(72)
+
+    def test_outer_fault_combined_observer_rejects_terminal_watchdog_with_root(
+        self,
+    ) -> None:
+        error, elapsed, observations, fstat = (
+            self._run_outer_owner_cleanup_observer_fixture(terminal_at=0.0)
+        )
+
+        self.assertIsNotNone(error)
+        self.assertIn("terminal cleanup failure", str(error))
+        self.assertEqual(elapsed, 0.0)
+        self.assertEqual(observations, [0.0])
+        fstat.assert_not_called()
+
+    def test_outer_fault_combined_observer_rejects_live_path_replacement(
+        self,
+    ) -> None:
+        error, elapsed, _observations, fstat = (
+            self._run_outer_owner_cleanup_observer_fixture(
+                replacement_at=0.0
+            )
+        )
+
+        self.assertIsNotNone(error)
+        self.assertIn("registry root identity changed", str(error))
+        self.assertEqual(elapsed, 0.0)
+        fstat.assert_not_called()
+
+    def test_outer_fault_combined_observer_rejects_unreadable_path(self) -> None:
+        error, elapsed, _observations, fstat = (
+            self._run_outer_owner_cleanup_observer_fixture(
+                path_error=PermissionError("injected denial")
+            )
+        )
+
+        self.assertIsNotNone(error)
+        self.assertIn("registry root cannot be revalidated", str(error))
+        self.assertEqual(elapsed, 0.0)
+        fstat.assert_not_called()
+
+    def test_outer_fault_combined_observer_requires_unlinked_bound_root(
+        self,
+    ) -> None:
+        for fixture, expected in (
+            (
+                {"bound_identity": (303, 404)},
+                "bound registry root identity changed",
+            ),
+            ({"bound_nlink": 1}, "exact registry unlink is unproved"),
+        ):
+            with self.subTest(expected=expected):
+                error, _elapsed, _observations, fstat = (
+                    self._run_outer_owner_cleanup_observer_fixture(
+                        absent_at=0.0,
+                        terminal_at=0.0,
+                        **fixture,  # type: ignore[arg-type]
+                    )
+                )
+
+                self.assertIsNotNone(error)
+                self.assertIn(expected, str(error))
+                fstat.assert_called_once_with(72)
+
+    def test_outer_fault_combined_observer_rechecks_deadline_after_fstat(
+        self,
+    ) -> None:
+        error, elapsed, _observations, fstat = (
+            self._run_outer_owner_cleanup_observer_fixture(
+                absent_at=0.0,
+                terminal_at=0.0,
+                fstat_advance=40.0,
+            )
+        )
+
+        self.assertIsNotNone(error)
+        self.assertIn("completion deadline expired", str(error))
+        self.assertGreaterEqual(
+            elapsed,
+            _CANDIDATE_SUPPORT
+            ._OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS,
+        )
+        fstat.assert_called_once_with(72)
+
+    def test_outer_fault_recovery_uses_one_parent_owned_deadline(self) -> None:
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS,
+            _CANDIDATE_SUPPORT.CANDIDATE_PROCESS_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT.CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT
+            ._OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS,
+            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT._STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT.CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS
+            + _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_STABILITY_SECONDS,
+        )
+        source = inspect.getsource(
+            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
+        )
+        deadline = source.index("recovery_deadline =")
+        owner_signal = source.index(
+            "_signal_process_pidfd(owner_pidfd, selected_signal)"
+        )
+        owner_wait = source.index("process.wait(timeout=owner_timeout_seconds)")
+        close_pause = source.index("os.close(pause_write_fd)")
+        combined_observer = source.index(
+            "_wait_outer_owner_watchdog_cleanup("
+        )
+        session_quiescence = source.index(
+            "_wait_outer_owner_session_quiescent("
+        )
+
+        self.assertLess(deadline, owner_signal)
+        self.assertLess(owner_signal, owner_wait)
+        self.assertLess(owner_wait, close_pause)
+        self.assertLess(close_pause, combined_observer)
+        self.assertLess(combined_observer, session_quiescence)
+        self.assertIn("deadline=recovery_deadline", source)
+        self.assertNotIn("_wait_exact_registry_root_absent(", source)
+        self.assertNotIn(
+            "_wait_process_pidfd_terminal(\n            watchdog_pidfd",
+            source,
+        )
 
     def test_outer_fault_probe_reaches_real_target_active_boundary(self) -> None:
         ensure_source = inspect.getsource(
