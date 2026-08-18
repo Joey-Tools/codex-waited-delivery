@@ -3764,8 +3764,7 @@ if (
 ):
     raise SystemExit(150)
 if core_pattern.startswith("|"):
-    if not core_pattern[1:].strip():
-        raise SystemExit(150)
+    raise SystemExit(150)
 elif (
     core_pattern in {".", ".."}
     or "/" in core_pattern

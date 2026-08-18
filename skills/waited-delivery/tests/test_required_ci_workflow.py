@@ -22224,6 +22224,147 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertLess(command.index("--ipc"), command.index("/usr/bin/setpriv"))
         self.assertNotIn("/usr/bin/prlimit", command)
 
+    def test_strict_bootstrap_rejects_piped_core_pattern_before_launch(
+        self,
+    ) -> None:
+        bootstrap_source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        with self.root_command_mount_contract():
+            command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                self.root_command_config(), 1234, 9
+            )
+        bootstrap_command_index = command.index(bootstrap_source)
+        setpriv_index = command.index("/usr/bin/setpriv")
+        candidate_bootstrap_index = command.index(
+            _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE
+        )
+        self.assertEqual(setpriv_index, bootstrap_command_index + 8)
+        self.assertLess(setpriv_index, candidate_bootstrap_index)
+
+        bootstrap_nodes = ast.parse(bootstrap_source).body
+        core_pattern_start = next(
+            index
+            for index, node in enumerate(bootstrap_nodes)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "core_pattern_descriptor"
+                for target in node.targets
+            )
+        )
+        core_pattern_end = next(
+            index
+            for index, node in enumerate(bootstrap_nodes[core_pattern_start:])
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "AT_EMPTY_PATH"
+                for target in node.targets
+            )
+        ) + core_pattern_start
+        core_pattern_nodes = bootstrap_nodes[core_pattern_start:core_pattern_end]
+        launch_stages = ["readiness", "setpriv", "candidate"]
+        for stage in launch_stages:
+            core_pattern_nodes.append(
+                ast.Expr(
+                    value=ast.Call(
+                        func=ast.Name(id="record_stage", ctx=ast.Load()),
+                        args=[ast.Constant(stage)],
+                        keywords=[],
+                    )
+                )
+            )
+        core_pattern_module = ast.Module(
+            body=core_pattern_nodes,
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(core_pattern_module)
+        core_pattern_code = compile(
+            core_pattern_module,
+            "<strict-core-pattern-gate>",
+            "exec",
+        )
+
+        self.assertLess(
+            bootstrap_source.index("core_pattern_descriptor = None"),
+            bootstrap_source.index('os.write(readiness_fd, b"G")'),
+        )
+        self.assertLess(
+            bootstrap_source.index("core_pattern_descriptor = None"),
+            bootstrap_source.index("os.execve(continuation_argv[0]"),
+        )
+        live_contract = inspect.getsource(
+            self._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read
+        )
+        self.assertIn(
+            'if core_pattern.startswith("|"):\n            self.fail(',
+            live_contract,
+        )
+
+        def execute_core_pattern_gate(
+            pattern: bytes,
+            observed_stages: list[str],
+            observed_io: list[tuple[object, ...]],
+        ) -> None:
+            def open_core_pattern(path: str, flags: int) -> int:
+                observed_io.append(("open", path, flags))
+                return 41
+
+            def read_core_pattern(descriptor: int, maximum: int) -> bytes:
+                observed_io.append(("read", descriptor, maximum))
+                return pattern
+
+            def close_core_pattern(descriptor: int) -> None:
+                observed_io.append(("close", descriptor))
+
+            fake_os = types.SimpleNamespace(
+                O_CLOEXEC=os.O_CLOEXEC,
+                O_NOFOLLOW=os.O_NOFOLLOW,
+                O_RDONLY=os.O_RDONLY,
+                close=close_core_pattern,
+                open=open_core_pattern,
+                read=read_core_pattern,
+            )
+            exec(
+                core_pattern_code,
+                {
+                    "os": fake_os,
+                    "record_stage": observed_stages.append,
+                },
+            )
+
+        expected_io = [
+            (
+                "open",
+                "/proc/sys/kernel/core_pattern",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            ),
+            ("read", 41, 4097),
+            ("close", 41),
+        ]
+        for pattern in (
+            b"|/usr/share/apport/apport %p\n",
+            b"|handler\n",
+        ):
+            piped_stages: list[str] = []
+            piped_io: list[tuple[object, ...]] = []
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(SystemExit) as rejected:
+                    execute_core_pattern_gate(
+                        pattern, piped_stages, piped_io
+                    )
+                self.assertEqual(rejected.exception.code, 150)
+                self.assertEqual(piped_stages, [])
+                self.assertEqual(piped_io, expected_io)
+
+        for pattern in (b"core\n", b"core.%p\n"):
+            ordinary_stages: list[str] = []
+            ordinary_io: list[tuple[object, ...]] = []
+            with self.subTest(pattern=pattern):
+                execute_core_pattern_gate(
+                    pattern, ordinary_stages, ordinary_io
+                )
+            self.assertEqual(ordinary_stages, launch_stages)
+            self.assertEqual(ordinary_io, expected_io)
+
     def test_strict_bootstrap_nofile_capacity_matches_live_descriptor_peak(
         self,
     ) -> None:
@@ -23232,7 +23373,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             bootstrap_source,
         )
         self.assertIn('"/proc/sys/kernel/core_pattern"', bootstrap_source)
-        self.assertIn('core_pattern.startswith("|")', bootstrap_source)
+        self.assertIn(
+            'if core_pattern.startswith("|"):\n    raise SystemExit(150)',
+            bootstrap_source,
+        )
         self.assertLess(
             bootstrap_source.index(
                 "resource.setrlimit(limit_name, (value, value))"
@@ -29704,6 +29848,14 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 raise RegisteredRootSelected(selected_binding)
                 yield
 
+            core_pattern_path = Path("/proc/sys/kernel/core_pattern")
+            original_read_bytes = Path.read_bytes
+
+            def isolated_read_bytes(path: Path) -> bytes:
+                if path == core_pattern_path:
+                    return b"core\n"
+                return original_read_bytes(path)
+
             with mock.patch.object(sys, "platform", "linux"), mock.patch.dict(
                 os.environ,
                 {
@@ -29712,6 +29864,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 },
                 clear=False,
             ), mock.patch.object(
+                Path,
+                "read_bytes",
+                autospec=True,
+                side_effect=isolated_read_bytes,
+            ) as read_bytes, mock.patch.object(
                 _CANDIDATE_SUPPORT, "_ensure_strict_backend"
             ), mock.patch.object(
                 _CANDIDATE_SUPPORT,
@@ -29728,6 +29885,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 self._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read()
 
             self.assertEqual(captured.exception.args, (selected_binding,))
+            read_bytes.assert_called_once_with(core_pattern_path)
 
     def test_registered_live_ipc_root_publishes_before_create_and_recovers(
         self,
@@ -43499,6 +43657,36 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(mode, REQUIRED_CI_ISOLATION_MODE)
         if sys.platform != "linux":
             self.skipTest("strict live mount and IPC isolation requires Linux")
+        try:
+            core_pattern_bytes = Path(
+                "/proc/sys/kernel/core_pattern"
+            ).read_bytes()
+            core_pattern = core_pattern_bytes.decode("ascii")
+        except (OSError, UnicodeDecodeError):
+            self.fail("strict live host core_pattern is unreadable")
+        if core_pattern.endswith("\n"):
+            core_pattern = core_pattern[:-1]
+        if (
+            not core_pattern
+            or "\n" in core_pattern
+            or "\r" in core_pattern
+            or "\x00" in core_pattern
+        ):
+            self.fail("strict live host core_pattern is malformed")
+        if core_pattern.startswith("|"):
+            self.fail(
+                "strict live core isolation requires a non-piped host "
+                "core_pattern because piped handlers bypass RLIMIT_CORE"
+            )
+        if (
+            core_pattern in {".", ".."}
+            or "/" in core_pattern
+            or not all(
+                0x21 <= ord(character) <= 0x7E
+                for character in core_pattern
+            )
+        ):
+            self.fail("strict live host core_pattern is unsafe")
         _CANDIDATE_SUPPORT._ensure_strict_backend()
 
         host_mount_namespace = os.readlink("/proc/self/ns/mnt")
@@ -44390,8 +44578,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         ):
                             raise SystemExit(92)
                         if core_pattern.startswith("|"):
-                            if not core_pattern[1:].strip():
-                                raise SystemExit(92)
+                            raise SystemExit(92)
                         elif (
                             core_pattern in {".", ".."}
                             or "/" in core_pattern
@@ -45140,17 +45327,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     self.assertLessEqual(core_file["size"], 1)
                 core_pattern = result["core_pattern"]
                 self.assertIsInstance(core_pattern, str)
-                if core_pattern.startswith("|"):
-                    self.assertTrue(core_pattern[1:].strip())
-                else:
-                    self.assertNotIn(core_pattern, {".", ".."})
-                    self.assertNotIn("/", core_pattern)
-                    self.assertTrue(
-                        all(
-                            0x21 <= ord(character) <= 0x7E
-                            for character in core_pattern
-                        )
+                self.assertFalse(core_pattern.startswith("|"))
+                self.assertNotIn(core_pattern, {".", ".."})
+                self.assertNotIn("/", core_pattern)
+                self.assertTrue(
+                    all(
+                        0x21 <= ord(character) <= 0x7E
+                        for character in core_pattern
                     )
+                )
                 self.assertEqual(result["setrlimit_errno"], errno.EACCES)
                 self.assertEqual(result["prlimit_errno"], errno.EACCES)
                 actual_core_files = []

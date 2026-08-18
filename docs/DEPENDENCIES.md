@@ -144,6 +144,16 @@ cannot silently discard the diagnostic tail. Structure validation applies the
 same rule to its primary result, both control-plane snapshots, and the candidate
 binding.
 
+Linux strict-live execution also requires a bounded, non-piped kernel
+`core_pattern`. The root bootstrap rejects every `|...` handler before it
+signals readiness or enters the candidate credential boundary because Linux
+does not enforce `RLIMIT_CORE` for core dumps delivered to a userspace pipe.
+Ordinary relative patterns such as `core` or `core.%p` remain constrained by
+the fixed one-byte core limit. A host configured for Apport,
+systemd-coredump, or another piped handler is therefore incompatible with the
+strict backend and fails closed; the harness does not skip or rewrite that
+host policy.
+
 The documented ordinary discovery command creates a fresh owner-private
 absolute bytecode-cache prefix outside the checkout, passes it with Python's
 `-X pycache_prefix`, and disables bytecode writes with `-B`. It therefore does
