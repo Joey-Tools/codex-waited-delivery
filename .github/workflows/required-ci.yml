@@ -79,10 +79,6 @@ jobs:
             /opt/hostedtoolcache \
             "$python_family_dir" \
             "$python_version_dir"
-      - name: Compile candidate Python helpers
-        timeout-minutes: 2
-        run: |
-          python3 -I -X pycache_prefix="$RUNNER_TEMP/required-ci-pycache" -m py_compile "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/waited_delivery_bridge.py" "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/waited_delivery_hook_adapter.py" "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/waited_delivery_runner.py"
       - name: Validate Required CI structure
         timeout-minutes: 3
         env:

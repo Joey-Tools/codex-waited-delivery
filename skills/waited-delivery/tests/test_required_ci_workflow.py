@@ -1694,7 +1694,6 @@ TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES = 3
 TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES = 3
 TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES = 3
 STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES = 2
-TRUSTED_COMPILE_TIMEOUT_MINUTES = 2
 TRUSTED_STRUCTURE_TIMEOUT_MINUTES = 3
 TRUSTED_TEST_STEP_TIMEOUT_MINUTES = 15
 REQUIRED_CI_CANDIDATE_ROOT_ENV = _CANDIDATE_SUPPORT.CANDIDATE_ROOT_ENV
@@ -1718,7 +1717,6 @@ TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES = (
     + TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES
     + TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES
     + STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES
-    + TRUSTED_COMPILE_TIMEOUT_MINUTES
     + TRUSTED_STRUCTURE_TIMEOUT_MINUTES
 )
 TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 10 * 60
@@ -1727,7 +1725,7 @@ TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS = (
     TRUSTED_TEST_SUITE_TIMEOUT_SECONDS + TRUSTED_TEST_CLEANUP_RESERVE_SECONDS
 )
 TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS = 3 * 60
-TRUSTED_JOB_RUNNER_MARGIN_MINUTES = 5
+TRUSTED_JOB_RUNNER_MARGIN_MINUTES = 7
 TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS = 1
 TRUSTED_TEST_CHILD_REAP_TIMEOUT_SECONDS = 5
 TRUSTED_WORKFLOW_INVENTORY_LIMIT = 256
@@ -1952,14 +1950,6 @@ TRUSTED_RUNTIME_ENV = {
     **TRUSTED_VALIDATOR_ENV,
     REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE,
 }
-CANDIDATE_COMPILE_COMMAND = (
-    'python3 -I -X pycache_prefix="$RUNNER_TEMP/required-ci-pycache" '
-    '-m py_compile "$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/'
-    'waited_delivery_bridge.py" "$GITHUB_WORKSPACE/.candidate/skills/'
-    'waited-delivery/scripts/waited_delivery_hook_adapter.py" '
-    '"$GITHUB_WORKSPACE/.candidate/skills/waited-delivery/scripts/'
-    'waited_delivery_runner.py"'
-)
 TRUSTED_VALIDATOR_COMMAND = (
     'python3 -I "$GITHUB_WORKSPACE/.required-ci/skills/waited-delivery/tests/'
     f'test_required_ci_workflow.py" {TRUSTED_STRUCTURE_VALIDATOR_FLAG}'
@@ -2118,10 +2108,6 @@ TRUSTED_TEST_SUPERVISOR_STEP = (
 )
 REQUIRED_EXECUTION_STEPS = (
     f"{CI_STRICT_RUNTIME_HARDENING_STEP}"
-    "      - name: Compile candidate Python helpers\n"
-    f"        timeout-minutes: {TRUSTED_COMPILE_TIMEOUT_MINUTES}\n"
-    "        run: |\n"
-    f"          {CANDIDATE_COMPILE_COMMAND}\n"
     "      - name: Validate Required CI structure\n"
     f"        timeout-minutes: {TRUSTED_STRUCTURE_TIMEOUT_MINUTES}\n"
     "        env:\n"
@@ -5488,8 +5474,8 @@ def _validate_test_job(
             f"test job steps must use a block sequence on line {steps_line}"
         )
     step_indent, steps = _step_blocks(steps_property, "test")
-    if len(steps) != 8:
-        raise AssertionError("test job must contain exactly the eight required steps")
+    if len(steps) != 7:
+        raise AssertionError("test job must contain exactly the seven required steps")
 
     guard = _require_step_properties(
         steps[0],
@@ -5599,31 +5585,8 @@ def _validate_test_job(
         "strict runtime hardening command",
     )
 
-    compile_step = _require_step_properties(
-        steps[5],
-        step_indent,
-        ["name", "timeout-minutes", "run"],
-        "compile step",
-    )
-    _require_scalar(
-        compile_step["name"],
-        "Compile candidate Python helpers",
-        "compile step name",
-    )
-    _require_exact_timeout(
-        compile_step["timeout-minutes"],
-        TRUSTED_COMPILE_TIMEOUT_MINUTES,
-        "compile step timeout",
-    )
-    _require_run_block(
-        lines,
-        compile_step["run"],
-        CANDIDATE_COMPILE_COMMAND,
-        "compile step command",
-    )
-
     validator_step = _require_step_properties(
-        steps[6],
+        steps[5],
         step_indent,
         ["name", "timeout-minutes", "env", "run"],
         "validator step",
@@ -5649,7 +5612,7 @@ def _validate_test_job(
     )
 
     test_step = _require_step_properties(
-        steps[7],
+        steps[6],
         step_indent,
         ["name", "timeout-minutes", "working-directory", "env", "run"],
         "test step",
@@ -6137,6 +6100,55 @@ def _frozen_candidate_file_bytes(
     return source
 
 
+def _validate_frozen_candidate_python_helpers(
+    repo_root: Path,
+    candidate_sha: str,
+) -> None:
+    captured_sources: list[tuple[Path, bytes]] = []
+    for content_relative_path in (
+        _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS
+    ):
+        repository_relative_path = (
+            TRUSTED_CONTENT_RELATIVE_ROOT / content_relative_path
+        )
+        try:
+            source = _read_bound_repository_file(
+                repo_root,
+                repository_relative_path,
+                "candidate Python helper",
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                "candidate Python helper path binding failed: "
+                f"{repository_relative_path.as_posix()}"
+            ) from error
+        frozen_source = _frozen_candidate_file_bytes(
+            repo_root,
+            candidate_sha,
+            repository_relative_path,
+        )
+        if source != frozen_source:
+            raise AssertionError(
+                "candidate Python helper does not match the frozen commit: "
+                f"{repository_relative_path.as_posix()}"
+            )
+        captured_sources.append((repository_relative_path, source))
+
+    for repository_relative_path, source in captured_sources:
+        try:
+            compile(
+                source,
+                repository_relative_path.as_posix(),
+                "exec",
+                dont_inherit=True,
+            )
+        except (SyntaxError, ValueError, OverflowError) as error:
+            raise AssertionError(
+                "candidate Python helper has invalid syntax: "
+                f"{repository_relative_path.as_posix()}"
+            ) from error
+
+
 def _frozen_candidate_workflow_sources(
     repo_root: Path, candidate_sha: str
 ) -> dict[Path, bytes]:
@@ -6247,6 +6259,8 @@ def validate_required_ci_repository(
         raise AssertionError(
             "candidate trusted support must match the Required CI source"
         )
+    if candidate_sha is not None:
+        _validate_frozen_candidate_python_helpers(repo_root, candidate_sha)
     checkouts = validate_required_workflow(workflow)
     callers = (
         required_ci_callers_in_repository(repo_root)
@@ -6604,7 +6618,7 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
         self.assertLess(
             required_workflow.index(CI_STRICT_RUNTIME_HARDENING_STEP),
             required_workflow.index(
-                "      - name: Compile candidate Python helpers\n"
+                "      - name: Validate Required CI structure\n"
             ),
         )
         self.assertIn(
@@ -6995,14 +7009,8 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             (
                 "strict runtime hardening",
                 "      - name: Harden strict live runtime roots\n",
-                "      - name: Compile candidate Python helpers\n",
-                STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES,
-            ),
-            (
-                "compile",
-                "      - name: Compile candidate Python helpers\n",
                 "      - name: Validate Required CI structure\n",
-                TRUSTED_COMPILE_TIMEOUT_MINUTES,
+                STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES,
             ),
             (
                 "structure",
@@ -7105,16 +7113,6 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             f'tests/test_required_ci_workflow.py" {TRUSTED_STRUCTURE_VALIDATOR_FLAG}'
         )
         fixtures = {
-            "compile lacks isolated mode": workflow.replace(
-                CANDIDATE_COMPILE_COMMAND,
-                CANDIDATE_COMPILE_COMMAND.replace("python3 -I", "python3", 1),
-                1,
-            ),
-            "compile uses a relative candidate path": workflow.replace(
-                CANDIDATE_COMPILE_COMMAND,
-                "python3 -I -m py_compile skills/waited-delivery/scripts/*.py",
-                1,
-            ),
             "validator lacks isolated mode": workflow.replace(
                 TRUSTED_VALIDATOR_COMMAND,
                 TRUSTED_VALIDATOR_COMMAND.replace("python3 -I", "python3", 1),
@@ -8137,40 +8135,40 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             validate_required_workflow(workflow)
 
     def test_commands_must_be_bound_to_the_intended_run_steps(self) -> None:
+        swapped_commands = REQUIRED_EXECUTION_STEPS.replace(
+            TRUSTED_VALIDATOR_COMMAND,
+            "__TRUSTED_VALIDATOR_COMMAND__",
+            1,
+        ).replace(
+            TRUSTED_TEST_SUPERVISOR_COMMAND,
+            TRUSTED_VALIDATOR_COMMAND,
+            1,
+        ).replace(
+            "__TRUSTED_VALIDATOR_COMMAND__",
+            TRUSTED_TEST_SUPERVISOR_COMMAND,
+            1,
+        )
+        name_smuggling = REQUIRED_EXECUTION_STEPS.replace(
+            f"          {TRUSTED_VALIDATOR_COMMAND}\n",
+            "          true\n",
+            1,
+        ).replace(
+            "      - name: Validate Required CI structure\n",
+            "      - name: |\n"
+            "          Validate Required CI structure\n"
+            f"          {TRUSTED_VALIDATOR_COMMAND}\n",
+            1,
+        )
+        self.assertIn(
+            "      - name: |\n"
+            "          Validate Required CI structure\n"
+            f"          {TRUSTED_VALIDATOR_COMMAND}\n",
+            name_smuggling,
+        )
+        self.assertIn("        run: |\n          true\n", name_smuggling)
         fixtures = {
-            "name smuggling": (
-                "      - name: |\n"
-                "          Compile candidate Python helpers\n"
-                f"          {CANDIDATE_COMPILE_COMMAND}\n"
-                "        run: true\n"
-                "      - name: |\n"
-                "          Validate Required CI structure\n"
-                f"          {TRUSTED_VALIDATOR_COMMAND}\n"
-                "        env:\n"
-                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
-                "        run: true\n"
-                "      - name: |\n"
-                "          Run trusted Required CI tests\n"
-                f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
-                "        env:\n"
-                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
-                "        run: true\n"
-            ),
-            "swapped run steps": (
-                "      - name: Compile candidate Python helpers\n"
-                "        run: |\n"
-                f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
-                "      - name: Validate Required CI structure\n"
-                "        env:\n"
-                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
-                "        run: |\n"
-                f"          {TRUSTED_VALIDATOR_COMMAND}\n"
-                "      - name: Run trusted Required CI tests\n"
-                "        env:\n"
-                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
-                "        run: |\n"
-                f"          {CANDIDATE_COMPILE_COMMAND}\n"
-            ),
+            "name smuggling": name_smuggling,
+            "swapped run steps": swapped_commands,
         }
 
         for name, trailing_steps in fixtures.items():
@@ -8182,22 +8180,16 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
 
     def test_commands_cannot_run_in_suppressed_steps(self) -> None:
         workflow = self.required_workflow(
-            trailing_steps=(
-                "      - name: Compile candidate Python helpers\n"
-                "        if: false\n"
-                "        run: |\n"
-                f"          {CANDIDATE_COMPILE_COMMAND}\n"
+            trailing_steps=REQUIRED_EXECUTION_STEPS.replace(
+                "      - name: Validate Required CI structure\n",
                 "      - name: Validate Required CI structure\n"
-                "        env:\n"
-                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
-                "        run: |\n"
-                f"          {TRUSTED_VALIDATOR_COMMAND}\n"
+                "        if: false\n",
+                1,
+            ).replace(
+                "      - name: Run trusted Required CI tests\n",
                 "      - name: Run trusted Required CI tests\n"
-                "        continue-on-error: true\n"
-                "        env:\n"
-                "          REQUIRED_CI_CANDIDATE_ROOT: ${{ github.workspace }}/.candidate\n"
-                "        run: |\n"
-                f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
+                "        continue-on-error: true\n",
+                1,
             )
         )
 
@@ -15109,6 +15101,128 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     validate_required_ci_repository(
                         candidate_root, candidate_sha=candidate_sha
                     )
+
+    def test_structure_validation_rejects_symlinked_candidate_helper_before_compile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            _, candidate_root, candidate_sha = self.prepare_structure_cli_split(
+                temporary_directory
+            )
+            helper_relative_path = (
+                _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS[1]
+            )
+            helper_path = (
+                distribution_content_root(candidate_root) / helper_relative_path
+            )
+            outside_path = root / "outside-helper.py"
+            outside_path.write_text(
+                "raise SystemExit('external helper was followed')\n",
+                encoding="utf-8",
+            )
+            helper_path.unlink()
+            helper_path.symlink_to(outside_path)
+
+            with mock.patch("builtins.compile") as candidate_compile:
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "candidate Python helper path binding",
+                ):
+                    validate_required_ci_repository(
+                        candidate_root, candidate_sha=candidate_sha
+                    )
+
+            candidate_compile.assert_not_called()
+
+    def test_structure_validation_binds_candidate_helper_bytes_to_frozen_commit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root, candidate_sha = self.prepare_structure_cli_split(
+                temporary_directory
+            )
+            helper_relative_path = (
+                _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS[0]
+            )
+            helper_path = (
+                distribution_content_root(candidate_root) / helper_relative_path
+            )
+            helper_path.write_text(
+                "raise SystemExit('replacement')\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch("builtins.compile") as candidate_compile:
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "candidate Python helper does not match the frozen commit",
+                ):
+                    validate_required_ci_repository(
+                        candidate_root, candidate_sha=candidate_sha
+                    )
+
+            candidate_compile.assert_not_called()
+
+    def test_structure_validation_compiles_bound_frozen_candidate_helper_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _, candidate_root, _ = self.prepare_structure_cli_split(
+                temporary_directory
+            )
+            helper_relative_path = (
+                _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS[0]
+            )
+            helper_path = (
+                distribution_content_root(candidate_root) / helper_relative_path
+            )
+            helper_path.write_text("def invalid(:\n", encoding="utf-8")
+            for command in (
+                [
+                    _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                    "-C",
+                    str(candidate_root),
+                    "add",
+                    "--all",
+                ],
+                [
+                    _CANDIDATE_SUPPORT.TRUSTED_GIT_EXECUTABLE,
+                    "-C",
+                    str(candidate_root),
+                    "-c",
+                    "user.name=Required CI Test",
+                    "-c",
+                    "user.email=required-ci@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "invalid candidate helper",
+                ],
+            ):
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            candidate_sha = _CANDIDATE_SUPPORT._run_candidate_git(
+                candidate_root,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ).decode("ascii").strip()
+
+            with self.assertRaisesRegex(
+                AssertionError,
+                "candidate Python helper has invalid syntax",
+            ):
+                validate_required_ci_repository(
+                    candidate_root, candidate_sha=candidate_sha
+                )
 
     def test_structure_validation_scans_callers_from_frozen_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -46011,9 +46125,9 @@ class RequiredCiWorkflowTests(unittest.TestCase):
     ) -> None:
         job_timeout_seconds = int(EXPECTED_TEST_TIMEOUT_MINUTES) * 60
 
-        self.assertEqual(TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES, 17)
+        self.assertEqual(TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES, 15)
         self.assertEqual(TRUSTED_TEST_STEP_TIMEOUT_MINUTES, 15)
-        self.assertEqual(TRUSTED_JOB_RUNNER_MARGIN_MINUTES, 5)
+        self.assertEqual(TRUSTED_JOB_RUNNER_MARGIN_MINUTES, 7)
         self.assertEqual(
             TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES
             + TRUSTED_TEST_STEP_TIMEOUT_MINUTES

@@ -1489,7 +1489,7 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
         self.assertEqual(events[0]["session_id"], "session-prompt-fault")
 
     def test_stop_hook_fallback_prompt_preserves_terminal_child_status(self) -> None:
-        for child_status in ("completed", "failed"):
+        for child_status in ("completed", "failed", "interrupted"):
             label = f"terminal-fallback-{child_status}"
             with self.subTest(child_status=child_status):
                 completed, events = self._run_stop_fault_probe(
@@ -1509,9 +1509,56 @@ class WaitedDeliveryHookAdapterTest(unittest.TestCase):
                 self.assertIn(
                     f"--child-session-id child-{label}", completed.stderr
                 )
+                self.assertIn("reconcile-active-run", completed.stderr)
                 self.assertEqual(
                     [event["error_message"] for event in events],
                     ["required-ci injected continuation failure"],
+                )
+
+    def test_stop_hook_last_resort_prompt_preserves_terminal_child_status(
+        self,
+    ) -> None:
+        for child_status in ("completed", "failed", "interrupted"):
+            label = f"terminal-last-resort-{child_status}"
+            with self.subTest(child_status=child_status):
+                completed, events = self._run_stop_fault_probe(
+                    "continuation",
+                    "fallback",
+                    label=label,
+                    child_status=child_status,
+                )
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                self.assertEqual(completed.stdout, "")
+                self.assertIn(
+                    "Then reconcile the active run before replying.",
+                    completed.stderr,
+                )
+                expected_command_prefix = shlex.join(
+                    [
+                        completed.args[0],
+                        completed.args[5],
+                        "reconcile-active-run",
+                    ]
+                )
+                self.assertIn(
+                    f"Run:\n{expected_command_prefix} ", completed.stderr
+                )
+                self.assertNotIn(
+                    "Run this from the repo root:", completed.stderr
+                )
+                self.assertIn(
+                    f"--child-status {child_status}", completed.stderr
+                )
+                self.assertIn(
+                    f"--child-session-id child-{label}", completed.stderr
+                )
+                self.assertIn("reconcile-active-run", completed.stderr)
+                self.assertEqual(
+                    [event["error_message"] for event in events],
+                    [
+                        "required-ci injected continuation failure",
+                        "required-ci injected fallback failure",
+                    ],
                 )
 
     def test_stop_hook_fallback_prompt_waits_for_active_child(self) -> None:
