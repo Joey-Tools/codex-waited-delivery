@@ -39,6 +39,23 @@ jobs:
       - name: Harden strict live runtime roots
         timeout-minutes: 2
         run: |
+          if [[ "${GITHUB_ACTIONS:-}" != "true" || "${RUNNER_OS:-}" != "Linux" || "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then
+            echo "strict live core policy requires a GitHub-hosted Linux VM" >&2
+            exit 1
+          fi
+          sudo_tool=/usr/bin/sudo
+          sysctl_tool=/usr/sbin/sysctl
+          core_pattern_path=/proc/sys/kernel/core_pattern
+          for tool in "$sudo_tool" "$sysctl_tool"; do
+            if [[ ! -f "$tool" || -L "$tool" || ! -x "$tool" ]]; then
+              echo "trusted strict core policy tool is unavailable: $tool" >&2
+              exit 1
+            fi
+          done
+          if [[ ! -f "$core_pattern_path" || -L "$core_pattern_path" || ! -r "$core_pattern_path" ]]; then
+            echo "strict core_pattern path is unavailable" >&2
+            exit 1
+          fi
           if [[ ! "$pythonLocation" =~ ^/opt/hostedtoolcache/Python/[0-9]+\.[0-9]+\.[0-9]+/x64$ ]]; then
             echo "unexpected configured Python location: $pythonLocation" >&2
             exit 1
@@ -65,20 +82,25 @@ jobs:
             exit 1
           fi
           unset POSIXLY_CORRECT
-          sudo "$acl_tool" --recursive --physical --remove-all --remove-default -- /usr/share/zoneinfo "$pythonLocation"
-          sudo "$acl_tool" --remove-all --remove-default -- \
+          "$sudo_tool" -n "$acl_tool" --recursive --physical --remove-all --remove-default -- /usr/share/zoneinfo "$pythonLocation"
+          "$sudo_tool" -n "$acl_tool" --remove-all --remove-default -- \
             /usr/share \
             /opt \
             /opt/hostedtoolcache \
             "$python_family_dir" \
             "$python_version_dir"
-          sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"
-          sudo chmod a-w -- \
+          "$sudo_tool" -n chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"
+          "$sudo_tool" -n chmod a-w -- \
             /usr/share \
             /opt \
             /opt/hostedtoolcache \
             "$python_family_dir" \
             "$python_version_dir"
+          "$sudo_tool" -n "$sysctl_tool" --quiet --write "kernel.core_pattern=core"
+          if [[ "$(<"$core_pattern_path")" != "core" ]]; then
+            echo "strict core_pattern configuration did not stick" >&2
+            exit 1
+          fi
       - name: Validate Required CI structure
         timeout-minutes: 3
         env:

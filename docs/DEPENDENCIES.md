@@ -145,14 +145,25 @@ same rule to its primary result, both control-plane snapshots, and the candidate
 binding.
 
 Linux strict-live execution also requires a bounded, non-piped kernel
-`core_pattern`. The root bootstrap rejects every `|...` handler before it
+`core_pattern`. The trusted Required CI leaf first proves that it is running on
+a GitHub-hosted Linux VM, validates the absolute `sudo`, `sysctl`, and procfs
+paths, writes the fixed literal `core`, and reads the value back exactly. A
+standard GitHub-hosted job receives a fresh VM, so the safe value stays in
+place until VM teardown instead of restoring the original host-wide handler.
+The ordinary pull-request workflow mirrors this setup only as compatibility
+evidence; the protected reusable leaf remains the authority for candidate
+evaluation. Self-hosted, shared-kernel, non-Linux, and direct harness launches
+cannot establish this workflow precondition and fail closed when the host
+still exposes a piped handler.
+
+The root bootstrap independently rejects every `|...` handler before it
 signals readiness or enters the candidate credential boundary because Linux
 does not enforce `RLIMIT_CORE` for core dumps delivered to a userspace pipe.
 Ordinary relative patterns such as `core` or `core.%p` remain constrained by
-the fixed one-byte core limit. A host configured for Apport,
-systemd-coredump, or another piped handler is therefore incompatible with the
-strict backend and fails closed; the harness does not skip or rewrite that
-host policy.
+the fixed one-byte core limit. The harness never rewrites this global policy;
+it only verifies the value established by the trusted workflow, and it never
+turns an Apport, systemd-coredump, or other piped host configuration into a
+skip.
 
 The documented ordinary discovery command creates a fresh owner-private
 absolute bytecode-cache prefix outside the checkout, passes it with Python's

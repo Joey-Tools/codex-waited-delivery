@@ -348,6 +348,35 @@ def _read_stable_test_control_plane_path(
             os.close(parent_descriptor)
 
 
+def _revalidate_strict_host_core_pattern(expected_bytes: bytes) -> None:
+    """Bind the protected kernel policy by exact content, not procfs metadata."""
+
+    try:
+        observed_bytes = Path("/proc/sys/kernel/core_pattern").read_bytes()
+    except OSError as error:
+        raise AssertionError(
+            "strict live final core_pattern read failed"
+        ) from error
+    if observed_bytes != expected_bytes:
+        raise AssertionError(
+            "strict live host core_pattern changed during candidate execution"
+        )
+
+
+def _finish_strict_live_cleanup(
+    cleanup_errors: list[str],
+    expected_core_pattern_bytes: bytes,
+) -> None:
+    """Append final policy drift after earlier cleanup errors, then fail once."""
+
+    try:
+        _revalidate_strict_host_core_pattern(expected_core_pattern_bytes)
+    except BaseException as error:
+        cleanup_errors.append(str(error))
+    if cleanup_errors:
+        raise AssertionError("; ".join(cleanup_errors))
+
+
 def _test_control_plane_namespace_capture(
     tests_root: Path,
     description: str,
@@ -1989,6 +2018,26 @@ README_DISCOVERY_COMMAND = (
     "cache.cleanup(); sys.exit(125 if completed is None else completed.returncode)'"
 )
 STRICT_RUNTIME_HARDENING_COMMAND = (
+    'if [[ "${GITHUB_ACTIONS:-}" != "true" || '
+    '"${RUNNER_OS:-}" != "Linux" || '
+    '"${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then\n'
+    '  echo "strict live core policy requires a GitHub-hosted Linux VM" >&2\n'
+    "  exit 1\n"
+    "fi\n"
+    "sudo_tool=/usr/bin/sudo\n"
+    "sysctl_tool=/usr/sbin/sysctl\n"
+    "core_pattern_path=/proc/sys/kernel/core_pattern\n"
+    'for tool in "$sudo_tool" "$sysctl_tool"; do\n'
+    '  if [[ ! -f "$tool" || -L "$tool" || ! -x "$tool" ]]; then\n'
+    '    echo "trusted strict core policy tool is unavailable: $tool" >&2\n'
+    "    exit 1\n"
+    "  fi\n"
+    "done\n"
+    'if [[ ! -f "$core_pattern_path" || -L "$core_pattern_path" || '
+    '! -r "$core_pattern_path" ]]; then\n'
+    '  echo "strict core_pattern path is unavailable" >&2\n'
+    "  exit 1\n"
+    "fi\n"
     'if [[ ! "$pythonLocation" =~ '
     "^/opt/hostedtoolcache/Python/"
     "[0-9]+\\.[0-9]+\\.[0-9]+/x64$ ]]; then\n"
@@ -2018,21 +2067,29 @@ STRICT_RUNTIME_HARDENING_COMMAND = (
     "  exit 1\n"
     "fi\n"
     "unset POSIXLY_CORRECT\n"
-    'sudo "$acl_tool" --recursive --physical --remove-all --remove-default -- '
+    '"$sudo_tool" -n "$acl_tool" --recursive --physical --remove-all '
+    '--remove-default -- '
     '/usr/share/zoneinfo "$pythonLocation"\n'
-    'sudo "$acl_tool" --remove-all --remove-default -- \\\n'
+    '"$sudo_tool" -n "$acl_tool" --remove-all --remove-default -- \\\n'
     "  /usr/share \\\n"
     "  /opt \\\n"
     "  /opt/hostedtoolcache \\\n"
     '  "$python_family_dir" \\\n'
     '  "$python_version_dir"\n'
-    'sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"\n'
-    "sudo chmod a-w -- \\\n"
+    '"$sudo_tool" -n chmod -R a-w -- /usr/share/zoneinfo '
+    '"$pythonLocation"\n'
+    '"$sudo_tool" -n chmod a-w -- \\\n'
     "  /usr/share \\\n"
     "  /opt \\\n"
     "  /opt/hostedtoolcache \\\n"
     '  "$python_family_dir" \\\n'
-    '  "$python_version_dir"'
+    '  "$python_version_dir"\n'
+    '"$sudo_tool" -n "$sysctl_tool" --quiet --write '
+    '"kernel.core_pattern=core"\n'
+    'if [[ "$(<"$core_pattern_path")" != "core" ]]; then\n'
+    '  echo "strict core_pattern configuration did not stick" >&2\n'
+    "  exit 1\n"
+    "fi"
 )
 CI_STRICT_RUNTIME_HARDENING_STEP = (
     "      - name: Harden strict live runtime roots\n"
@@ -6685,12 +6742,13 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
             CI_STRICT_RUNTIME_HARDENING_STEP,
         )
         recursive_acl_command = (
-            'sudo "$acl_tool" --recursive --physical --remove-all '
-            "--remove-default -- "
+            '"$sudo_tool" -n "$acl_tool" --recursive --physical '
+            "--remove-all --remove-default -- "
             '/usr/share/zoneinfo "$pythonLocation"'
         )
         ancestor_acl_command = (
-            'sudo "$acl_tool" --remove-all --remove-default -- \\\n'
+            '"$sudo_tool" -n "$acl_tool" --remove-all '
+            "--remove-default -- \\\n"
             "  /usr/share \\\n"
             "  /opt \\\n"
             "  /opt/hostedtoolcache \\\n"
@@ -6702,15 +6760,19 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
         self.assertLess(
             STRICT_RUNTIME_HARDENING_COMMAND.index(recursive_acl_command),
             STRICT_RUNTIME_HARDENING_COMMAND.index(
-                'sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"'
+                '"$sudo_tool" -n chmod -R a-w -- '
+                '/usr/share/zoneinfo "$pythonLocation"'
             ),
         )
         self.assertLess(
             STRICT_RUNTIME_HARDENING_COMMAND.index(ancestor_acl_command),
-            STRICT_RUNTIME_HARDENING_COMMAND.index("sudo chmod a-w --"),
+            STRICT_RUNTIME_HARDENING_COMMAND.index(
+                '"$sudo_tool" -n chmod a-w --'
+            ),
         )
         self.assertIn(
-            'sudo chmod -R a-w -- /usr/share/zoneinfo "$pythonLocation"',
+            '"$sudo_tool" -n chmod -R a-w -- '
+            '/usr/share/zoneinfo "$pythonLocation"',
             CI_STRICT_RUNTIME_HARDENING_STEP,
         )
         self.assertNotIn(
@@ -6732,6 +6794,141 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertIn(path, CI_STRICT_RUNTIME_HARDENING_STEP)
+
+        hosted_gate = (
+            'if [[ "${GITHUB_ACTIONS:-}" != "true" || '
+            '"${RUNNER_OS:-}" != "Linux" || '
+            '"${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then'
+        )
+        sysctl_write = (
+            '"$sudo_tool" -n "$sysctl_tool" --quiet --write '
+            '"kernel.core_pattern=core"'
+        )
+        exact_reread = 'if [[ "$(<"$core_pattern_path")" != "core" ]]; then'
+        first_privileged_call = STRICT_RUNTIME_HARDENING_COMMAND.index(
+            '"$sudo_tool" -n'
+        )
+        self.assertTrue(STRICT_RUNTIME_HARDENING_COMMAND.startswith(hosted_gate))
+        self.assertLess(
+            STRICT_RUNTIME_HARDENING_COMMAND.index(hosted_gate),
+            first_privileged_call,
+        )
+        self.assertLess(
+            STRICT_RUNTIME_HARDENING_COMMAND.index("sudo_tool=/usr/bin/sudo"),
+            first_privileged_call,
+        )
+        self.assertLess(
+            STRICT_RUNTIME_HARDENING_COMMAND.index("sysctl_tool=/usr/sbin/sysctl"),
+            first_privileged_call,
+        )
+        self.assertLess(
+            STRICT_RUNTIME_HARDENING_COMMAND.index(
+                '"$sudo_tool" -n chmod a-w --'
+            ),
+            STRICT_RUNTIME_HARDENING_COMMAND.index(sysctl_write),
+        )
+        self.assertLess(
+            STRICT_RUNTIME_HARDENING_COMMAND.index(sysctl_write),
+            STRICT_RUNTIME_HARDENING_COMMAND.index(exact_reread),
+        )
+        for required_literal in (
+            "core_pattern_path=/proc/sys/kernel/core_pattern",
+            '"kernel.core_pattern=core"',
+            exact_reread,
+        ):
+            with self.subTest(required_literal=required_literal):
+                self.assertIn(required_literal, STRICT_RUNTIME_HARDENING_COMMAND)
+        for forbidden_fragment in (
+            "|| true",
+            "original_core_pattern",
+            "restore_core_pattern",
+            "trap ",
+            "${CORE_PATTERN",
+            "$CORE_PATTERN",
+            " sudo ",
+            "\nsudo ",
+        ):
+            with self.subTest(forbidden_fragment=forbidden_fragment):
+                self.assertNotIn(
+                    forbidden_fragment,
+                    STRICT_RUNTIME_HARDENING_COMMAND,
+                )
+
+    def test_strict_runtime_live_revalidates_core_policy_after_cleanup(
+        self,
+    ) -> None:
+        with mock.patch.object(Path, "read_bytes", return_value=b"core\n"):
+            _revalidate_strict_host_core_pattern(b"core\n")
+        with mock.patch.object(
+            Path,
+            "read_bytes",
+            return_value=b"|/usr/share/apport/apport %p\n",
+        ):
+            with self.assertRaisesRegex(
+                AssertionError,
+                "core_pattern changed during candidate execution",
+            ):
+                _revalidate_strict_host_core_pattern(b"core\n")
+        with mock.patch.object(
+            Path,
+            "read_bytes",
+            side_effect=PermissionError(errno.EACCES, "denied"),
+        ):
+            with self.assertRaisesRegex(
+                AssertionError,
+                "final core_pattern read failed",
+            ):
+                _revalidate_strict_host_core_pattern(b"core\n")
+
+        with mock.patch(
+            f"{__name__}._revalidate_strict_host_core_pattern",
+            side_effect=AssertionError("core policy drift"),
+        ) as revalidate:
+            with self.assertRaisesRegex(
+                AssertionError,
+                "isolation cleanup failed; core policy drift",
+            ):
+                _finish_strict_live_cleanup(
+                    ["isolation cleanup failed"],
+                    b"core\n",
+                )
+        revalidate.assert_called_once_with(b"core\n")
+        with mock.patch(
+            f"{__name__}._revalidate_strict_host_core_pattern"
+        ) as revalidate:
+            _finish_strict_live_cleanup([], b"core\n")
+        revalidate.assert_called_once_with(b"core\n")
+
+        live_source = inspect.getsource(
+            TrustedCandidateTestSupervisorRegressionTests.
+            _exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read
+        )
+        live_tree = ast.parse(textwrap.dedent(live_source))
+        live_function = live_tree.body[0]
+        self.assertIsInstance(live_function, ast.FunctionDef)
+        finish_statements = [
+            node
+            for node in ast.walk(live_function)
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "_finish_strict_live_cleanup"
+        ]
+        self.assertEqual(len(finish_statements), 1)
+        finish_statement = finish_statements[0]
+        finalizers = [
+            node
+            for node in ast.walk(live_function)
+            if isinstance(node, ast.Try)
+            and finish_statement in node.finalbody
+        ]
+        self.assertEqual(len(finalizers), 1)
+        self.assertIn(finalizers[0], live_function.body)
+        self.assertIs(finalizers[0].finalbody[-1], finish_statement)
+        self.assertEqual(
+            ast.unparse(finish_statement),
+            "_finish_strict_live_cleanup(cleanup_errors, core_pattern_bytes)",
+        )
 
     def test_checkout_inputs_cannot_be_smuggled_through_the_step_name(self) -> None:
         for style in ("|", ">-"):
@@ -6970,6 +7167,23 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
     ) -> None:
         workflow = self.required_workflow()
         mutations = {
+            "missing GitHub-hosted Linux gate": workflow.replace(
+                '          if [[ "${GITHUB_ACTIONS:-}" != "true" || '
+                '"${RUNNER_OS:-}" != "Linux" || '
+                '"${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then\n'
+                "            echo \"strict live core policy requires a "
+                "GitHub-hosted Linux VM\" >&2\n"
+                "            exit 1\n"
+                "          fi\n",
+                "",
+                1,
+            ),
+            "ambient sudo": workflow.replace(
+                "sudo_tool=/usr/bin/sudo", "sudo_tool=sudo", 1
+            ),
+            "ambient sysctl": workflow.replace(
+                "sysctl_tool=/usr/sbin/sysctl", "sysctl_tool=sysctl", 1
+            ),
             "ambient setfacl": workflow.replace(
                 "acl_tool=/usr/bin/setfacl", "acl_tool=setfacl", 1
             ),
@@ -6984,13 +7198,13 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
                 1,
             ),
             "missing ancestor access ACL removal": workflow.replace(
-                'sudo "$acl_tool" --remove-all --remove-default',
-                'sudo "$acl_tool" --remove-default',
+                '"$sudo_tool" -n "$acl_tool" --remove-all --remove-default',
+                '"$sudo_tool" -n "$acl_tool" --remove-default',
                 1,
             ),
             "missing ancestor default ACL removal": workflow.replace(
-                'sudo "$acl_tool" --remove-all --remove-default',
-                'sudo "$acl_tool" --remove-all',
+                '"$sudo_tool" -n "$acl_tool" --remove-all --remove-default',
+                '"$sudo_tool" -n "$acl_tool" --remove-all',
                 1,
             ),
             "missing trusted tool preflight": workflow.replace(
@@ -7004,6 +7218,27 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             ),
             "POSIX mode is not cleared": workflow.replace(
                 "unset POSIXLY_CORRECT\n", "", 1
+            ),
+            "missing fixed core policy write": workflow.replace(
+                '          "$sudo_tool" -n "$sysctl_tool" --quiet --write '
+                '"kernel.core_pattern=core"\n',
+                "",
+                1,
+            ),
+            "different core policy": workflow.replace(
+                '"kernel.core_pattern=core"',
+                '"kernel.core_pattern=core.%p"',
+                1,
+            ),
+            "missing exact core policy reread": workflow.replace(
+                '          if [[ "$(<"$core_pattern_path")" != "core" ]]; '
+                "then\n"
+                "            echo \"strict core_pattern configuration did "
+                "not stick\" >&2\n"
+                "            exit 1\n"
+                "          fi\n",
+                "",
+                1,
             ),
         }
         for name, mutated in mutations.items():
@@ -45578,8 +45813,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ipc_root_cleanup.close()
             except BaseException as error:
                 cleanup_errors.append(str(error))
-            if cleanup_errors:
-                raise AssertionError("; ".join(cleanup_errors))
+            _finish_strict_live_cleanup(cleanup_errors, core_pattern_bytes)
 
     def test_candidate_cannot_use_runner_environment_for_trusted_source_aba(
         self,
