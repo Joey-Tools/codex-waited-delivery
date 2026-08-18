@@ -4616,55 +4616,90 @@ def _strict_runtime_live_main() -> int:
         backend_validated = False
         realm: dict[str, object] | None = None
         result: unittest.TestResult | None = None
+        terminal_failures: list[_TerminalFailure] = []
         registry = _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()
         try:
-            realm = _strict_runtime_live_owner_realm(registry)
-            suite = unittest.TestSuite(
-                [
-                    TrustedCandidateTestSupervisorRegressionTests(
-                        CI_STRICT_RUNTIME_LIVE_TEST_METHOD
-                    )
-                ]
-            )
-            result = unittest.TextTestRunner(
-                stream=runner_output,
-                verbosity=2,
-            ).run(suite)
-            backend_validated = (
-                _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED is True
-            )
+            try:
+                realm = _strict_runtime_live_owner_realm(registry)
+                suite = unittest.TestSuite(
+                    [
+                        TrustedCandidateTestSupervisorRegressionTests(
+                            CI_STRICT_RUNTIME_LIVE_TEST_METHOD
+                        )
+                    ]
+                )
+                result = unittest.TextTestRunner(
+                    stream=runner_output,
+                    verbosity=2,
+                ).run(suite)
+                backend_validated = (
+                    _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED is True
+                )
+            except BaseException as error:
+                terminal_failures.append(("primary", "suite-execution", error))
         finally:
-            _close_and_verify_trusted_isolation(registry)
-        final_binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
-            candidate_root,
-            candidate_sha,
-            require_clean=True,
+            _capture_terminal_failure(
+                terminal_failures,
+                "integrity",
+                "isolation-cleanup",
+                lambda: _close_and_verify_trusted_isolation(registry),
+            )
+        _capture_terminal_failure(
+            terminal_failures,
+            "integrity",
+            "final-candidate-binding",
+            lambda: _require_exact_terminal_value(
+                _CANDIDATE_SUPPORT.candidate_checkout_binding(
+                    candidate_root,
+                    candidate_sha,
+                    require_clean=True,
+                ),
+                candidate_binding,
+                "strict runtime live candidate binding changed during execution",
+            ),
         )
-        if final_binding != candidate_binding:
-            raise AssertionError(
-                "strict runtime live candidate binding changed during execution"
-            )
-        if _CANDIDATE_SUPPORT._STRICT_SESSION is not None:
-            raise AssertionError(
-                "strict runtime live owner registry remained active after cleanup"
-            )
+        _capture_terminal_failure(
+            terminal_failures,
+            "integrity",
+            "final-active-session",
+            lambda: _require_exact_terminal_value(
+                _CANDIDATE_SUPPORT._STRICT_SESSION,
+                None,
+                "strict runtime live owner registry remained active after cleanup",
+            ),
+        )
+
+        def validate_captured_result() -> None:
+            if result is None or realm is None:
+                raise AssertionError("strict runtime live test did not run")
+            if (
+                result.testsRun != 1
+                or result.failures
+                or result.errors
+                or result.skipped
+                or result.expectedFailures
+                or result.unexpectedSuccesses
+                or not result.wasSuccessful()
+                or not backend_validated
+            ):
+                raise AssertionError(
+                    "strict runtime live test did not complete exactly once without "
+                    "failures or skips: "
+                    + _bounded_failure_text(runner_output.getvalue())
+                )
+
+        _capture_terminal_failure(
+            terminal_failures,
+            "primary",
+            "suite-result",
+            validate_captured_result,
+        )
+        _raise_terminal_failures(
+            "strict runtime live execution and integrity failures",
+            terminal_failures,
+        )
         if result is None or realm is None:
             raise AssertionError("strict runtime live test did not run")
-        if (
-            result.testsRun != 1
-            or result.failures
-            or result.errors
-            or result.skipped
-            or result.expectedFailures
-            or result.unexpectedSuccesses
-            or not result.wasSuccessful()
-            or not backend_validated
-        ):
-            raise AssertionError(
-                "strict runtime live test did not complete exactly once without "
-                "failures or skips: "
-                + _bounded_failure_text(runner_output.getvalue())
-            )
         receipt = {
             "schema_version": 1,
             "status": "completed",
@@ -9057,6 +9092,227 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 )
             )
         )
+
+    def test_strict_live_entry_aggregates_suite_and_terminal_failures(self) -> None:
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        changed_binding = {"candidate_sha": "b" * 40}
+        registry: dict[str, object] = {}
+        final_session = {"closed": False}
+        suite_error = AssertionError("suite primary sentinel")
+        cleanup_error = AssertionError("cleanup sentinel")
+        events: list[str] = []
+
+        def fail_suite() -> None:
+            events.append("suite")
+            _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = True
+            raise suite_error
+
+        def fail_cleanup(selected: Mapping[str, object]) -> None:
+            self.assertIs(selected, registry)
+            events.append("cleanup")
+            raise cleanup_error
+
+        def changed_final_binding(
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            events.append("binding")
+            return changed_binding
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_candidate_binding",
+            return_value=(Path("/candidate"), candidate_sha, binding),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "trusted_isolation_chain_registry",
+            return_value=registry,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_owner_realm",
+            return_value={"uid": 60000, "gid": 60000},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+            side_effect=changed_final_binding,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_close_and_verify_trusted_isolation",
+            side_effect=fail_cleanup,
+        ), mock.patch.object(
+            type(self),
+            CI_STRICT_RUNTIME_LIVE_TEST_METHOD,
+            side_effect=fail_suite,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_SESSION", final_session
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", False
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(_strict_runtime_live_main(), 1)
+
+        self.assertEqual(events, ["suite", "cleanup", "binding"])
+        self.assertEqual(stdout.getvalue(), "")
+        diagnostic = stderr.getvalue()
+        self.assertIn(
+            "order=primary[suite-result],integrity[isolation-cleanup],"
+            "integrity[final-candidate-binding],integrity[final-active-session]",
+            diagnostic,
+        )
+        self.assertIn(
+            "primary[suite-result]=AssertionError: strict runtime live test did "
+            "not complete exactly once",
+            diagnostic,
+        )
+        self.assertIn("cleanup sentinel", diagnostic)
+        self.assertIn("binding changed during execution", diagnostic)
+        self.assertIn("registry remained active after cleanup", diagnostic)
+
+    def test_strict_live_entry_aggregates_raised_suite_execution_failure(
+        self,
+    ) -> None:
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        changed_binding = {"candidate_sha": "b" * 40}
+        registry: dict[str, object] = {}
+        final_session = {"closed": False}
+        suite_execution_error = RuntimeError("suite execution sentinel")
+        cleanup_error = AssertionError("suite execution cleanup sentinel")
+        events: list[str] = []
+
+        def run_suite(_suite: unittest.TestSuite) -> unittest.TestResult:
+            events.append("suite-execution")
+            raise suite_execution_error
+
+        def fail_cleanup(selected: Mapping[str, object]) -> None:
+            self.assertIs(selected, registry)
+            events.append("cleanup")
+            raise cleanup_error
+
+        def changed_final_binding(
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            events.append("binding")
+            return changed_binding
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_candidate_binding",
+            return_value=(Path("/candidate"), candidate_sha, binding),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "trusted_isolation_chain_registry",
+            return_value=registry,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_owner_realm",
+            side_effect=lambda _registry: events.append("realm")
+            or {"uid": 60000, "gid": 60000},
+        ), mock.patch.object(
+            unittest.TextTestRunner,
+            "run",
+            side_effect=run_suite,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+            side_effect=changed_final_binding,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_close_and_verify_trusted_isolation",
+            side_effect=fail_cleanup,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_SESSION", final_session
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", False
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(_strict_runtime_live_main(), 1)
+
+        self.assertEqual(
+            events,
+            ["realm", "suite-execution", "cleanup", "binding"],
+        )
+        self.assertEqual(stdout.getvalue(), "")
+        diagnostic = stderr.getvalue()
+        self.assertIn(
+            "order=primary[suite-execution],primary[suite-result],"
+            "integrity[isolation-cleanup],integrity[final-candidate-binding],"
+            "integrity[final-active-session]",
+            diagnostic,
+        )
+        self.assertIn("suite execution sentinel", diagnostic)
+        self.assertIn("suite execution cleanup sentinel", diagnostic)
+        self.assertIn("binding changed during execution", diagnostic)
+        self.assertIn("registry remained active after cleanup", diagnostic)
+
+    def test_strict_live_cleanup_failure_still_runs_terminal_checks(self) -> None:
+        candidate_sha = "a" * 40
+        binding = {"candidate_sha": candidate_sha}
+        registry: dict[str, object] = {}
+        cleanup_error = AssertionError("cleanup-only sentinel")
+        events: list[str] = []
+        result = unittest.TestResult()
+        result.testsRun = 1
+        result.wasSuccessful = mock.Mock(
+            side_effect=lambda: events.append("result") or True
+        )
+
+        def run_suite(_suite: unittest.TestSuite) -> unittest.TestResult:
+            events.append("suite")
+            return result
+
+        def fail_cleanup(selected: Mapping[str, object]) -> None:
+            self.assertIs(selected, registry)
+            events.append("cleanup")
+            raise cleanup_error
+
+        def final_binding(
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            events.append("binding")
+            return binding
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_candidate_binding",
+            return_value=(Path("/candidate"), candidate_sha, binding),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "trusted_isolation_chain_registry",
+            return_value=registry,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_strict_runtime_live_owner_realm",
+            return_value={"uid": 60000, "gid": 60000},
+        ), mock.patch.object(
+            unittest.TextTestRunner,
+            "run",
+            side_effect=run_suite,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "candidate_checkout_binding",
+            side_effect=final_binding,
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_close_and_verify_trusted_isolation",
+            side_effect=fail_cleanup,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", True
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(_strict_runtime_live_main(), 1)
+
+        self.assertEqual(events, ["suite", "cleanup", "binding", "result"])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("AssertionError: cleanup-only sentinel", stderr.getvalue())
 
     def test_strict_live_entry_suppresses_runner_temp_filesystem_context(
         self,
