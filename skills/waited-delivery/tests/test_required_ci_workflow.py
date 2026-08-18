@@ -17570,6 +17570,830 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
         self.assertEqual(trace, ["register", "bind-marker", "pipe", "recover"])
 
+    def test_registered_sudo_launch_and_cleanup_failures_are_aggregated(
+        self,
+    ) -> None:
+        class UnprintableError(RuntimeError):
+            def __str__(self) -> str:
+                raise ValueError("injected failure rendering error")
+
+        primary = RuntimeError("injected registered launch primary")
+        early_cleanup = RuntimeError("injected process stdin close failure")
+        recovery = RuntimeError("injected registered recovery failure")
+        stdout_output = UnprintableError()
+        stderr_output = RuntimeError(
+            "injected registered stderr output failure"
+        )
+        reap = RuntimeError("injected registered reap failure")
+        trace: list[str] = []
+
+        class UncloseableInput:
+            def close(self) -> None:
+                trace.append("process-stdin-close")
+                raise early_cleanup
+
+        class UnreapableProcess:
+            pid = 73123
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stdin = UncloseableInput()
+
+            def poll(self) -> None:
+                trace.append("poll")
+                return None
+
+            def wait(self, *, timeout: float) -> None:
+                del timeout
+                trace.append("reap")
+                raise reap
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entry_path = root / f"chain-{'a' * 32}.json"
+            session = {
+                "root": root,
+                "entries": root,
+                "controller_path": root / "controller.py",
+                "token": "b" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            process = UnreapableProcess()
+            parent_identity = (
+                os.getpid(),
+                456,
+                os.getpid(),
+                os.getpid(),
+                os.getpid(),
+                (os.getuid(),) * 4,
+            )
+            identities: Iterator[
+                tuple[int, int, int, int, int, tuple[int, int, int, int]]
+            ] = iter((parent_identity,))
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                with tempfile.TemporaryFile() as pidfd_source, contextlib.ExitStack() as patch_stack:
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_register_trusted_root_chain",
+                            return_value=entry_path,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_update_trusted_root_chain",
+                            return_value={},
+                        )
+                    )
+
+                    def process_identity(_path: Path) -> tuple[
+                        int, int, int, int, int, tuple[int, int, int, int]
+                    ]:
+                        try:
+                            return next(identities)
+                        except StopIteration:
+                            raise primary
+
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_process_identity",
+                            side_effect=process_identity,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.subprocess,
+                            "Popen",
+                            return_value=process,
+                        )
+                    )
+
+                    def pipe2_cloexec(_flags: int) -> tuple[int, int]:
+                        read_descriptor, write_descriptor = os.pipe()
+                        os.set_inheritable(read_descriptor, False)
+                        os.set_inheritable(write_descriptor, False)
+                        return read_descriptor, write_descriptor
+
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "pipe2",
+                            side_effect=pipe2_cloexec,
+                            create=True,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "pidfd_open",
+                            side_effect=lambda *_args: os.dup(
+                                pidfd_source.fileno()
+                            ),
+                            create=True,
+                        )
+                    )
+
+                    def fail_recovery(
+                        *_args: object, **_kwargs: object
+                    ) -> None:
+                        trace.append("recover")
+                        raise recovery
+
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_recover_registered_entry",
+                            side_effect=fail_recovery,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_read_registered_bounded_file",
+                            side_effect=(stdout_output, stderr_output),
+                        )
+                    )
+                    with self.assertRaises(AssertionError) as raised:
+                        _CANDIDATE_SUPPORT._run_registered_sudo_under_gate(
+                            ["/usr/bin/true"],
+                            session_id="a" * 32,
+                        )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+        message = str(raised.exception)
+        self.assertIn(str(primary), message)
+        self.assertIn(str(early_cleanup), message)
+        self.assertIn(str(recovery), message)
+        self.assertIn("UnprintableError unprintable", message)
+        self.assertIn("UnprintableError: <unprintable>", message)
+        self.assertIn(str(stderr_output), message)
+        self.assertIn(str(reap), message)
+        self.assertLess(message.index(str(primary)), message.index(str(recovery)))
+        self.assertLess(
+            message.index(str(early_cleanup)), message.index(str(recovery))
+        )
+        self.assertLess(
+            message.index(str(recovery)),
+            message.index("UnprintableError unprintable"),
+        )
+        self.assertLess(
+            message.index("UnprintableError unprintable"),
+            message.index(str(stderr_output)),
+        )
+        self.assertLess(
+            message.index(str(stderr_output)),
+            message.index(str(reap)),
+        )
+        self.assertIsInstance(
+            raised.exception,
+            _CANDIDATE_SUPPORT._RegisteredSudoTerminalFailures,
+        )
+        self.assertEqual(
+            [
+                (role, phase)
+                for role, phase, _error in raised.exception.failures
+            ],
+            [
+                ("primary", "launch"),
+                ("integrity", "process-stdin-close"),
+                ("integrity", "registry-recovery"),
+                ("integrity", "output-validation"),
+                ("integrity", "output-validation"),
+                ("integrity", "outer-reap"),
+            ],
+        )
+        self.assertIs(raised.exception.failures[0][2].__cause__, primary)
+        self.assertIs(
+            raised.exception.failures[1][2].__cause__, early_cleanup
+        )
+        self.assertIs(raised.exception.failures[2][2].__cause__, recovery)
+        self.assertIsInstance(
+            raised.exception.failures[3][2].__cause__, AssertionError
+        )
+        self.assertIs(
+            raised.exception.failures[3][2].registered_sudo_original_cause,
+            stdout_output,
+        )
+        self.assertIs(
+            raised.exception.failures[4][2].__cause__, stderr_output
+        )
+        self.assertIsInstance(
+            raised.exception.failures[5][2].__cause__, AssertionError
+        )
+        self.assertIs(
+            raised.exception.failures[5][2].__cause__.__cause__, reap
+        )
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertEqual(
+            trace,
+            ["process-stdin-close", "recover", "poll", "reap"],
+        )
+
+    def test_registered_sudo_singleton_integrity_detail_is_bounded_and_safe(
+        self,
+    ) -> None:
+        tail = "registered-singleton-tail"
+        cause = RuntimeError(
+            "x" * 5000
+            + "\n::warning title=forged::payload"
+            + "\n##[error]legacy-forged\n"
+            + tail
+        )
+        failure = _CANDIDATE_SUPPORT._registered_sudo_contextual_failure(
+            "strict registered sudo recovery failed",
+            cause,
+        )
+
+        with self.assertRaises(AssertionError) as raised:
+            _CANDIDATE_SUPPORT._raise_registered_sudo_terminal_failures(
+                (("integrity", "registry-recovery", failure),)
+            )
+
+        message = str(raised.exception)
+        self.assertLessEqual(len(message), 1600)
+        self.assertIn(tail, message)
+        self.assertIn("\\x3a\\x3awarning title=forged", message)
+        self.assertIn("\\x23\\x23[error]legacy-forged", message)
+        self.assertNotIn("::warning", message)
+        self.assertNotIn("##[error]", message)
+        rendered_traceback = "".join(
+            traceback.format_exception(raised.exception)
+        )
+        self.assertLessEqual(len(rendered_traceback), 4000)
+        self.assertNotIn("::warning", rendered_traceback)
+        self.assertNotIn("##[error]", rendered_traceback)
+        self.assertIs(
+            raised.exception.registered_sudo_original_cause,
+            cause,
+        )
+
+    def test_registered_sudo_hostile_cause_accessor_cannot_break_aggregation(
+        self,
+    ) -> None:
+        class HostileCause(RuntimeError):
+            def __getattribute__(self, name: str) -> object:
+                if name == "__cause__":
+                    raise RuntimeError("injected hostile cause lookup")
+                return super().__getattribute__(name)
+
+        primary_cause = RuntimeError("primary cause")
+        primary = AssertionError("primary failure")
+        primary.__cause__ = primary_cause
+        hostile = HostileCause("hostile cleanup")
+        cleanup = _CANDIDATE_SUPPORT._registered_sudo_contextual_failure(
+            "strict registered sudo recovery failed",
+            hostile,
+        )
+
+        with self.assertRaises(
+            _CANDIDATE_SUPPORT._RegisteredSudoTerminalFailures
+        ) as raised:
+            _CANDIDATE_SUPPORT._raise_registered_sudo_terminal_failures(
+                (
+                    ("primary", "launch", primary),
+                    ("integrity", "registry-recovery", cleanup),
+                )
+            )
+
+        self.assertIn("primary failure", str(raised.exception))
+        self.assertIn("hostile cleanup", str(raised.exception))
+        self.assertIs(raised.exception.__cause__, primary_cause)
+        self.assertIs(raised.exception.failures[1][2], cleanup)
+
+        with self.assertRaises(AssertionError) as singleton:
+            _CANDIDATE_SUPPORT._raise_registered_sudo_terminal_failures(
+                (("integrity", "registry-recovery", cleanup),)
+            )
+        rendered = "".join(
+            traceback.format_exception(singleton.exception)
+        )
+        self.assertIn("hostile cleanup", rendered)
+        self.assertIs(
+            singleton.exception.registered_sudo_original_cause,
+            hostile,
+        )
+
+    def test_registered_sudo_stateful_cause_renderer_cannot_escape_traceback(
+        self,
+    ) -> None:
+        class StatefulRenderError(RuntimeError):
+            def __init__(self) -> None:
+                super().__init__()
+                self.render_count = 0
+
+            def __str__(self) -> str:
+                self.render_count += 1
+                if self.render_count <= 2:
+                    return "safe staged cause"
+                return (
+                    "x" * 5000
+                    + "\n::warning title=forged::stateful"
+                    + "\n##[error]legacy-stateful"
+                )
+
+        cause = StatefulRenderError()
+        failure = _CANDIDATE_SUPPORT._registered_sudo_contextual_failure(
+            "strict registered sudo recovery failed",
+            cause,
+        )
+
+        with self.assertRaises(AssertionError) as raised:
+            _CANDIDATE_SUPPORT._raise_registered_sudo_terminal_failures(
+                (("integrity", "registry-recovery", failure),)
+            )
+
+        rendered = "".join(traceback.format_exception(raised.exception))
+        self.assertLessEqual(len(rendered), 4000)
+        self.assertNotIn("::warning", rendered)
+        self.assertNotIn("##[error]", rendered)
+        self.assertIs(
+            raised.exception.registered_sudo_original_cause,
+            cause,
+        )
+
+    def test_registered_sudo_hidden_args_cannot_escape_traceback(
+        self,
+    ) -> None:
+        class StatefulValue:
+            def __init__(self) -> None:
+                self.render_count = 0
+
+            def __str__(self) -> str:
+                self.render_count += 1
+                if self.render_count <= 2:
+                    return "safe hidden value"
+                return (
+                    "x" * 5000
+                    + "\n::warning title=forged::hidden-args"
+                    + "\n##[error]legacy-hidden-args"
+                )
+
+        class HiddenArgsError(RuntimeError):
+            __str__ = BaseException.__str__
+
+            @property
+            def args(self) -> tuple[str]:
+                return ("safe exposed args",)
+
+        cause = HiddenArgsError(StatefulValue())
+        failure = _CANDIDATE_SUPPORT._registered_sudo_contextual_failure(
+            "strict registered sudo recovery failed",
+            cause,
+        )
+
+        with self.assertRaises(AssertionError) as raised:
+            _CANDIDATE_SUPPORT._raise_registered_sudo_terminal_failures(
+                (("integrity", "registry-recovery", failure),)
+            )
+
+        rendered = "".join(traceback.format_exception(raised.exception))
+        self.assertLessEqual(len(rendered), 4000)
+        self.assertNotIn("::warning", rendered)
+        self.assertNotIn("##[error]", rendered)
+        self.assertIs(
+            raised.exception.registered_sudo_original_cause,
+            cause,
+        )
+
+    def test_registered_sudo_primary_matrix_precedes_integrity_failures(
+        self,
+    ) -> None:
+        launch = RuntimeError("injected matrix launch failure")
+        timeout = subprocess.TimeoutExpired("registered-sudo", 1)
+        cases = (
+            (
+                "launch",
+                None,
+                launch,
+                None,
+                "launch",
+                "strict registered sudo launch failed: ",
+                launch,
+            ),
+            (
+                "timeout",
+                timeout,
+                None,
+                None,
+                "command-timeout",
+                "strict registered sudo command timed out",
+                timeout,
+            ),
+            (
+                "command-result",
+                None,
+                None,
+                73,
+                "command-result",
+                "strict registered sudo command failed with exit 73: ",
+                None,
+            ),
+        )
+        for (
+            name,
+            timeout_error,
+            launch_error,
+            returncode,
+            expected_phase,
+            expected_message,
+            expected_cause,
+        ) in cases:
+            with self.subTest(name=name):
+                primary_failure = (
+                    _CANDIDATE_SUPPORT._registered_sudo_primary_failure(
+                        timeout_error=timeout_error,
+                        launch_error=launch_error,
+                        diagnostic_phase="registered-command",
+                        launch_stage="communicate",
+                        process_created=True,
+                        returncode=returncode,
+                        stdout=b"",
+                        stderr=b"",
+                    )
+                )
+                self.assertIsNotNone(primary_failure)
+                assert primary_failure is not None
+                recovery_cause = RuntimeError(f"{name} recovery")
+                output_cause = RuntimeError(f"{name} output")
+                reap_cause = RuntimeError(f"{name} reap")
+                reap_failure = AssertionError(
+                    "strict registered outer anchor could not be reaped; "
+                    "state retained"
+                )
+                reap_failure.__cause__ = reap_cause
+                integrity_failures = (
+                    (
+                        "integrity",
+                        "registry-recovery",
+                        _CANDIDATE_SUPPORT._registered_sudo_contextual_failure(
+                            "strict registered sudo recovery failed",
+                            recovery_cause,
+                        ),
+                    ),
+                    (
+                        "integrity",
+                        "output-validation",
+                        _CANDIDATE_SUPPORT._registered_sudo_contextual_failure(
+                            "strict registered sudo output validation failed",
+                            output_cause,
+                        ),
+                    ),
+                    (
+                        "integrity",
+                        "outer-reap",
+                        _CANDIDATE_SUPPORT._registered_sudo_contextual_failure(
+                            "strict registered sudo recovery failed",
+                            reap_failure,
+                        ),
+                    ),
+                )
+
+                with self.assertRaises(
+                    _CANDIDATE_SUPPORT._RegisteredSudoTerminalFailures
+                ) as raised:
+                    _CANDIDATE_SUPPORT._raise_registered_sudo_terminal_failures(
+                        (*integrity_failures, primary_failure)
+                    )
+
+                self.assertEqual(primary_failure[:2], ("primary", expected_phase))
+                if name == "launch":
+                    self.assertTrue(
+                        str(primary_failure[2]).startswith(expected_message)
+                    )
+                else:
+                    self.assertEqual(str(primary_failure[2]), expected_message)
+                self.assertEqual(
+                    [
+                        (role, phase)
+                        for role, phase, _error in raised.exception.failures
+                    ],
+                    [
+                        ("primary", expected_phase),
+                        ("integrity", "registry-recovery"),
+                        ("integrity", "output-validation"),
+                        ("integrity", "outer-reap"),
+                    ],
+                )
+                if expected_cause is None:
+                    self.assertIs(
+                        raised.exception.__cause__, primary_failure[2]
+                    )
+                    self.assertIsNone(primary_failure[2].__cause__)
+                else:
+                    self.assertIs(primary_failure[2].__cause__, expected_cause)
+                    self.assertIs(raised.exception.__cause__, expected_cause)
+
+    def test_registered_sudo_adversarial_primary_traceback_is_safe(
+        self,
+    ) -> None:
+        class AdversarialPrimaryError(RuntimeError):
+            def __str__(self) -> str:
+                return (
+                    "x" * 5000
+                    + "\n::warning title=forged::primary"
+                    + "\n##[error]legacy-primary\nprimary-tail"
+                )
+
+        class AdversarialTimeout(subprocess.TimeoutExpired):
+            def __str__(self) -> str:
+                return (
+                    "y" * 5000
+                    + "\n::warning title=forged::timeout"
+                    + "\n##[error]legacy-timeout\ntimeout-tail"
+                )
+
+        launch = AdversarialPrimaryError()
+        timeout = AdversarialTimeout("registered-sudo", 1)
+        try:
+            try:
+                raise AdversarialPrimaryError()
+            except AdversarialPrimaryError:
+                raise RuntimeError("safe outer launch failure")
+        except RuntimeError as error:
+            contextual_launch = error
+        command_stderr = (
+            b"command-prefix\n::warning title=forged::command\n"
+            b"##[error]legacy-command\ncommand-tail"
+        )
+        cases = (
+            (
+                "launch",
+                None,
+                launch,
+                None,
+                b"",
+                "launch",
+                launch,
+            ),
+            (
+                "timeout",
+                timeout,
+                None,
+                None,
+                b"",
+                "command-timeout",
+                timeout,
+            ),
+            (
+                "launch-context",
+                None,
+                contextual_launch,
+                None,
+                b"",
+                "launch",
+                contextual_launch,
+            ),
+            (
+                "command-result",
+                None,
+                None,
+                73,
+                command_stderr,
+                "command-result",
+                command_stderr,
+            ),
+        )
+        for (
+            name,
+            timeout_error,
+            launch_error,
+            returncode,
+            stderr,
+            expected_phase,
+            original,
+        ) in cases:
+            with self.subTest(name=name):
+                primary_failure = (
+                    _CANDIDATE_SUPPORT._registered_sudo_primary_failure(
+                        timeout_error=timeout_error,
+                        launch_error=launch_error,
+                        diagnostic_phase="registered-command",
+                        launch_stage="communicate",
+                        process_created=True,
+                        returncode=returncode,
+                        stdout=b"",
+                        stderr=stderr,
+                    )
+                )
+                self.assertIsNotNone(primary_failure)
+                assert primary_failure is not None
+                cleanup = _CANDIDATE_SUPPORT._registered_sudo_contextual_failure(
+                    "strict registered sudo recovery failed",
+                    RuntimeError(f"{name} cleanup"),
+                )
+                with self.assertRaises(
+                    _CANDIDATE_SUPPORT._RegisteredSudoTerminalFailures
+                ) as raised:
+                    _CANDIDATE_SUPPORT._raise_registered_sudo_terminal_failures(
+                        (
+                            ("integrity", "registry-recovery", cleanup),
+                            primary_failure,
+                        )
+                    )
+
+                rendered = "".join(
+                    traceback.format_exception(raised.exception)
+                )
+                self.assertLessEqual(len(rendered), 6000)
+                self.assertNotIn("::warning", rendered)
+                self.assertNotIn("##[error]", rendered)
+                self.assertIn("\\x3a\\x3awarning", rendered)
+                self.assertIn("\\x23\\x23[error]", rendered)
+                self.assertEqual(
+                    raised.exception.failures[0][:2],
+                    ("primary", expected_phase),
+                )
+                if name == "command-result":
+                    self.assertIs(
+                        primary_failure[2].registered_sudo_original_stderr,
+                        original,
+                    )
+                    self.assertIs(
+                        raised.exception.__cause__, primary_failure[2]
+                    )
+                else:
+                    self.assertIs(
+                        primary_failure[2].registered_sudo_original_cause,
+                        original,
+                    )
+                    self.assertIsInstance(
+                        primary_failure[2].__cause__, AssertionError
+                    )
+                    self.assertIs(
+                        raised.exception.__cause__,
+                        primary_failure[2].__cause__,
+                    )
+
+    def test_registered_sudo_lone_reap_failure_preserves_legacy_chain(
+        self,
+    ) -> None:
+        reap = RuntimeError("injected registered reap failure")
+
+        class UnreapableSuccessfulProcess:
+            pid = 73123
+            returncode = 0
+            stdin = None
+
+            def poll(self) -> None:
+                return None
+
+            def communicate(self, *, timeout: float) -> None:
+                del timeout
+
+            def wait(self, *, timeout: float) -> None:
+                del timeout
+                raise reap
+
+        def pipe2_cloexec(_flags: int) -> tuple[int, int]:
+            read_descriptor, write_descriptor = os.pipe()
+            os.set_inheritable(read_descriptor, False)
+            os.set_inheritable(write_descriptor, False)
+            return read_descriptor, write_descriptor
+
+        def close_descriptor(descriptor: int) -> None:
+            os.close(descriptor)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            entry_path = root / f"chain-{'a' * 32}.json"
+            session = {
+                "root": root,
+                "entries": root,
+                "controller_path": root / "controller.py",
+                "token": "b" * 32,
+                "target_uid": 60000,
+                "closed": False,
+                "inherited": True,
+                "watchdog_authorized": True,
+            }
+            process = UnreapableSuccessfulProcess()
+            parent_identity = (
+                os.getpid(),
+                456,
+                os.getpid(),
+                os.getpid(),
+                os.getpid(),
+                (os.getuid(),) * 4,
+            )
+            outer_identity = (
+                process.pid,
+                789,
+                os.getpid(),
+                process.pid,
+                process.pid,
+                (os.getuid(),) * 4,
+            )
+            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                with tempfile.TemporaryFile() as pidfd_source, contextlib.ExitStack() as patch_stack:
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_register_trusted_root_chain",
+                            return_value=entry_path,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_update_trusted_root_chain",
+                            return_value={},
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_transition_trusted_root_chain",
+                            return_value={},
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_process_identity",
+                            side_effect=(parent_identity, outer_identity),
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.subprocess,
+                            "Popen",
+                            return_value=process,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "pipe2",
+                            side_effect=pipe2_cloexec,
+                            create=True,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.os,
+                            "pidfd_open",
+                            side_effect=lambda *_args: os.dup(
+                                pidfd_source.fileno()
+                            ),
+                            create=True,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_release_wrapper_barrier",
+                            side_effect=close_descriptor,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_read_registered_wrapper_ready",
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_release_registered_wrapper_continuation",
+                            side_effect=close_descriptor,
+                        )
+                    )
+                    patch_stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_recover_registered_entry",
+                        )
+                    )
+                    with self.assertRaises(AssertionError) as raised:
+                        _CANDIDATE_SUPPORT._run_registered_sudo_under_gate(
+                            ["/usr/bin/true"],
+                            session_id="a" * 32,
+                        )
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+        self.assertEqual(
+            str(raised.exception),
+            "strict registered sudo recovery failed: strict registered outer "
+            "anchor could not be reaped; state retained",
+        )
+        self.assertIsInstance(raised.exception.__cause__, AssertionError)
+        self.assertEqual(
+            str(raised.exception.__cause__),
+            "strict registered outer anchor could not be reaped; state retained",
+        )
+        self.assertIs(raised.exception.__cause__.__cause__, reap)
+
     def test_registered_sudo_launch_failure_reports_bounded_sanitized_output(
         self,
     ) -> None:

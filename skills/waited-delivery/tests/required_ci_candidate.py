@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import base64
 import binascii
+import builtins
 import ctypes
 import errno
 import fcntl
@@ -15723,6 +15724,260 @@ _REGISTERED_SUDO_LAUNCH_STAGES = (
     "communicate",
 )
 
+_RegisteredSudoTerminalFailure = tuple[str, str, BaseException]
+_REGISTERED_SUDO_INTEGRITY_PHASES = (
+    "control-fd-close",
+    "process-stdin-close",
+    "input-file-close",
+    "registry-recovery",
+    "output-validation",
+    "stdout-close",
+    "stderr-close",
+    "outer-poll",
+    "outer-reap",
+    "outer-pidfd-close",
+)
+_REGISTERED_SUDO_TRUSTED_BASE_RENDERER_TYPES = (
+    AssertionError,
+    RuntimeError,
+    StopIteration,
+    TypeError,
+    ValueError,
+)
+
+
+def _registered_sudo_exception_cause(
+    error: BaseException,
+) -> BaseException | None:
+    try:
+        cause = BaseException.__getattribute__(error, "__cause__")
+    except BaseException:
+        return None
+    return cause if isinstance(cause, BaseException) else None
+
+
+def _registered_sudo_traceback_predecessor(
+    error: BaseException,
+) -> BaseException | None:
+    cause = _registered_sudo_exception_cause(error)
+    if cause is not None:
+        return cause
+    try:
+        suppress_context = BaseException.__getattribute__(
+            error, "__suppress_context__"
+        )
+        context = BaseException.__getattribute__(error, "__context__")
+    except BaseException:
+        return error
+    if type(suppress_context) is not bool:
+        return error
+    if suppress_context:
+        return None
+    if context is None or isinstance(context, BaseException):
+        return context
+    return error
+
+
+def _registered_sudo_render_value_is_stable(
+    value: object,
+    *,
+    depth: int = 0,
+) -> bool:
+    if type(value) in (str, bytes, int, float, bool, type(None)):
+        return True
+    if type(value) is tuple and depth < 4 and len(value) <= 64:
+        return all(
+            _registered_sudo_render_value_is_stable(item, depth=depth + 1)
+            for item in value
+        )
+    return False
+
+
+def _registered_sudo_traceback_access_is_stable(
+    error: BaseException,
+) -> bool:
+    error_type = type(error)
+    if (
+        error_type.__getattribute__ is not BaseException.__getattribute__
+        or getattr(error_type, "__getattr__", None) is not None
+        or isinstance(
+            error,
+            (getattr(builtins, "BaseExceptionGroup", ()), SyntaxError),
+        )
+    ):
+        return False
+    try:
+        arguments = BaseException.args.__get__(error, BaseException)
+    except BaseException:
+        return False
+    if not _registered_sudo_render_value_is_stable(arguments):
+        return False
+    if error_type in _REGISTERED_SUDO_TRUSTED_BASE_RENDERER_TYPES:
+        if error_type.__str__ is not BaseException.__str__:
+            return False
+    elif error_type is subprocess.TimeoutExpired:
+        try:
+            command = BaseException.__getattribute__(error, "cmd")
+            timeout = BaseException.__getattribute__(error, "timeout")
+        except BaseException:
+            return False
+        if not (
+            _registered_sudo_render_value_is_stable(command)
+            and _registered_sudo_render_value_is_stable(timeout)
+        ):
+            return False
+    else:
+        return False
+    for name in (
+        "__cause__",
+        "__context__",
+        "__suppress_context__",
+        "__traceback__",
+    ):
+        try:
+            exposed = getattr(error, name)
+            stored = BaseException.__getattribute__(error, name)
+        except BaseException:
+            return False
+        if exposed is not stored:
+            return False
+    try:
+        exposed_notes = getattr(error, "__notes__", None)
+        try:
+            stored_notes = BaseException.__getattribute__(error, "__notes__")
+        except AttributeError:
+            stored_notes = None
+    except BaseException:
+        return False
+    if exposed_notes is not stored_notes:
+        return False
+    if stored_notes is not None:
+        if (
+            type(stored_notes) is not list
+            or any(type(note) is not str for note in stored_notes)
+        ):
+            return False
+        rendered_notes = "\n".join(stored_notes)
+        if _bounded_failure_text(rendered_notes, limit=1200) != rendered_notes:
+            return False
+    return True
+
+
+def _registered_sudo_failure_chain_text(
+    error: BaseException,
+    *,
+    limit: int,
+) -> str:
+    chain: list[str] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and len(chain) < 4 and id(current) not in seen:
+        seen.add(id(current))
+        try:
+            message = str(current)
+        except BaseException:
+            message = "<unprintable>"
+        chain.append(f"{type(current).__name__}: {message}")
+        current = _registered_sudo_traceback_predecessor(current)
+    if current is not None:
+        chain.append("<cause-chain-truncated>")
+    return _bounded_failure_text("; cause=".join(chain), limit=limit)
+
+
+def _registered_sudo_cause_chain_is_render_safe(
+    error: BaseException,
+) -> bool:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    depth = 0
+    while current is not None and depth < 4 and id(current) not in seen:
+        if not _registered_sudo_traceback_access_is_stable(current):
+            return False
+        seen.add(id(current))
+        try:
+            rendered = str(current)
+        except BaseException:
+            return False
+        if _bounded_failure_text(rendered, limit=1200) != rendered:
+            return False
+        current = _registered_sudo_traceback_predecessor(current)
+        depth += 1
+    return current is None
+
+
+def _registered_sudo_bind_render_safe_cause(
+    failure: AssertionError,
+    cause: BaseException,
+) -> None:
+    failure.registered_sudo_original_cause = cause
+    if _registered_sudo_cause_chain_is_render_safe(cause):
+        failure.__cause__ = cause
+    else:
+        failure.__cause__ = AssertionError(
+            _registered_sudo_failure_chain_text(cause, limit=1200)
+        )
+
+
+def _registered_sudo_contextual_failure(
+    prefix: str,
+    cause: BaseException,
+) -> AssertionError:
+    try:
+        detail = _bounded_failure_text(str(cause), limit=1200)
+    except BaseException:
+        detail = f"<{type(cause).__name__} unprintable>"
+    failure = AssertionError(f"{prefix}: {detail}")
+    _registered_sudo_bind_render_safe_cause(failure, cause)
+    return failure
+
+
+class _RegisteredSudoTerminalFailures(AssertionError):
+    def __init__(
+        self,
+        context: str,
+        failures: Sequence[_RegisteredSudoTerminalFailure],
+    ) -> None:
+        self.failures = tuple(failures)
+        order = ",".join(
+            f"{role}[{phase}]" for role, phase, _error in self.failures
+        )
+        details: list[str] = []
+        for role, phase, error in self.failures:
+            detail = _registered_sudo_failure_chain_text(error, limit=320)
+            details.append(f"{role}[{phase}]={detail}")
+        super().__init__(
+            f"{context}: order={order}; details=" + "; ".join(details)
+        )
+
+
+def _raise_registered_sudo_terminal_failures(
+    failures: Sequence[_RegisteredSudoTerminalFailure],
+) -> None:
+    ordered_failures = tuple(
+        failure for failure in failures if failure[0] == "primary"
+    ) + tuple(failure for failure in failures if failure[0] != "primary")
+    if not ordered_failures:
+        return
+    if len(ordered_failures) == 1:
+        error = ordered_failures[0][2]
+        cause = _registered_sudo_exception_cause(error)
+        if cause is not None:
+            raise error from cause
+        raise error
+    primary = next(
+        (
+            error
+            for role, _phase, error in ordered_failures
+            if role == "primary"
+        ),
+        ordered_failures[0][2],
+    )
+    primary_cause = _registered_sudo_exception_cause(primary)
+    raise _RegisteredSudoTerminalFailures(
+        "strict registered sudo terminal failures",
+        ordered_failures,
+    ) from (primary if primary_cause is None else primary_cause)
+
 
 def _registered_sudo_launch_failure_details(
     *,
@@ -15748,7 +16003,10 @@ def _registered_sudo_launch_failure_details(
         if type(returncode) is int or returncode is None
         else "<malformed>"
     )
-    error_number = getattr(launch_error, "errno", None)
+    try:
+        error_number = getattr(launch_error, "errno", None)
+    except BaseException:
+        error_number = "<malformed>"
     normalized_errno = (
         error_number
         if type(error_number) is int or error_number is None
@@ -15795,6 +16053,54 @@ def _registered_sudo_launch_failure_details(
         + summary,
         2000,
     )
+
+
+def _registered_sudo_primary_failure(
+    *,
+    timeout_error: subprocess.TimeoutExpired | None,
+    launch_error: BaseException | None,
+    diagnostic_phase: str,
+    launch_stage: str,
+    process_created: bool,
+    returncode: object,
+    stdout: bytes,
+    stderr: bytes,
+) -> _RegisteredSudoTerminalFailure | None:
+    if timeout_error is not None:
+        failure = AssertionError("strict registered sudo command timed out")
+        _registered_sudo_bind_render_safe_cause(failure, timeout_error)
+        return "primary", "command-timeout", failure
+    if launch_error is not None:
+        details = _registered_sudo_launch_failure_details(
+            phase=diagnostic_phase,
+            stage=launch_stage,
+            launch_error=launch_error,
+            process_created=process_created,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        failure = AssertionError(
+            "strict registered sudo launch failed: " + details
+        )
+        _registered_sudo_bind_render_safe_cause(failure, launch_error)
+        return "primary", "launch", failure
+    if not process_created or returncode != 0 or stderr:
+        decoded_stderr = _bounded_failure_text(
+            stderr[:2000].decode("utf-8", errors="replace"),
+            limit=2000,
+        )
+        failure = AssertionError(
+            "strict registered sudo command failed "
+            f"with exit {returncode}: {decoded_stderr}"
+        )
+        failure.registered_sudo_original_stderr = stderr
+        return (
+            "primary",
+            "command-result",
+            failure,
+        )
+    return None
 
 
 def _read_registered_bounded_file(
@@ -16401,13 +16707,27 @@ def _run_registered_sudo_under_gate(
     stderr = b""
     timeout_error: subprocess.TimeoutExpired | None = None
     launch_error: BaseException | None = None
-    recovery_error: BaseException | None = None
-    outer_unreaped = False
+    integrity_failures: dict[str, list[AssertionError]] = {
+        phase: [] for phase in _REGISTERED_SUDO_INTEGRITY_PHASES
+    }
     launch_stage = "register-entry"
 
     def mark_entry_owned() -> None:
         nonlocal entry_owned
         entry_owned = True
+
+    def record_integrity_failure(
+        phase: str,
+        prefix: str,
+        cause: BaseException,
+    ) -> None:
+        if phase not in integrity_failures:
+            raise AssertionError(
+                "strict registered sudo integrity phase is invalid"
+            )
+        integrity_failures[phase].append(
+            _registered_sudo_contextual_failure(prefix, cause)
+        )
 
     try:
         launch_stage = "register-entry"
@@ -16589,14 +16909,45 @@ def _run_registered_sudo_under_gate(
                     os.close(descriptor)
                 except OSError:
                     pass
-        if process is not None and process.stdin is not None:
+                except BaseException as error:
+                    record_integrity_failure(
+                        "control-fd-close",
+                        "strict registered sudo control descriptor close failed",
+                        error,
+                    )
+        process_stdin: IO[bytes] | None = None
+        if process is not None:
             try:
-                process.stdin.close()
+                process_stdin = process.stdin
+            except BaseException as error:
+                record_integrity_failure(
+                    "process-stdin-close",
+                    "strict registered sudo process stdin close failed",
+                    error,
+                )
+        if process_stdin is not None:
+            try:
+                process_stdin.close()
             except (BrokenPipeError, OSError):
                 pass
+            except BaseException as error:
+                record_integrity_failure(
+                    "process-stdin-close",
+                    "strict registered sudo process stdin close failed",
+                    error,
+                )
         if stdin_file is not None:
-            stdin_file.close()
-            stdin_file = None
+            try:
+                stdin_file.close()
+            except BaseException as error:
+                record_integrity_failure(
+                    "input-file-close",
+                    "strict registered sudo input file close failed",
+                    error,
+                )
+            finally:
+                stdin_file = None
+        recovery_failed = False
         if not entry_owned:
             try:
                 entry_owned = _registered_entry_matches_publication_attempt(
@@ -16607,81 +16958,130 @@ def _run_registered_sudo_under_gate(
                     cleanup_execution_root=cleanup_execution_root,
                 )
             except BaseException as error:
-                recovery_error = error
-        if entry_owned and recovery_error is None:
+                recovery_failed = True
+                record_integrity_failure(
+                    "registry-recovery",
+                    "strict registered sudo recovery failed",
+                    error,
+                )
+        if entry_owned and not recovery_failed:
             try:
                 _recover_registered_entry(
                     entry_path, allow_recovery_broker=not recovery_broker
                 )
             except BaseException as error:
-                recovery_error = error
-        if process is not None and process.poll() is None:
+                record_integrity_failure(
+                    "registry-recovery",
+                    "strict registered sudo recovery failed",
+                    error,
+                )
+        should_reap = False
+        if process is not None:
+            try:
+                should_reap = process.poll() is None
+            except BaseException as error:
+                should_reap = True
+                record_integrity_failure(
+                    "outer-poll",
+                    "strict registered sudo outer status validation failed",
+                    error,
+                )
+        if process is not None and should_reap:
             try:
                 process.wait(timeout=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS)
             except BaseException as error:
-                outer_unreaped = True
-                if recovery_error is None:
-                    recovery_error = AssertionError(
-                        "strict registered outer anchor could not be reaped; "
-                        "state retained"
-                    )
-                    recovery_error.__cause__ = error
-        if outer_unreaped and recovery_error is None:
-            recovery_error = AssertionError(
-                "strict registered outer anchor could not be reaped; state retained"
-            )
-        if outer_pidfd is not None:
-            os.close(outer_pidfd)
-    output_error: BaseException | None = None
-    try:
-        if stdout_file is None or stderr_file is None:
-            if launch_error is None:
-                raise AssertionError(
-                    "strict registered sudo output files were not acquired"
+                reap_error = AssertionError(
+                    "strict registered outer anchor could not be reaped; "
+                    "state retained"
                 )
+                reap_error.__cause__ = error
+                record_integrity_failure(
+                    "outer-reap",
+                    "strict registered sudo recovery failed",
+                    reap_error,
+                )
+        if outer_pidfd is not None:
+            try:
+                os.close(outer_pidfd)
+            except BaseException as error:
+                record_integrity_failure(
+                    "outer-pidfd-close",
+                    "strict registered sudo outer pidfd close failed",
+                    error,
+                )
+    if (
+        (stdout_file is None or stderr_file is None)
+        and launch_error is None
+    ):
+        record_integrity_failure(
+            "output-validation",
+            "strict registered sudo output validation failed",
+            AssertionError(
+                "strict registered sudo output files were not acquired"
+            ),
+        )
+    for output_file, description in (
+        (stdout_file, "stdout"),
+        (stderr_file, "stderr"),
+    ):
+        if output_file is None:
+            continue
+        try:
+            output = _read_registered_bounded_file(
+                output_file, description, output_limit
+            )
+        except BaseException as error:
+            record_integrity_failure(
+                "output-validation",
+                "strict registered sudo output validation failed",
+                error,
+            )
         else:
-            stdout = _read_registered_bounded_file(
-                stdout_file, "stdout", output_limit
-            )
-            stderr = _read_registered_bounded_file(
-                stderr_file, "stderr", output_limit
-            )
-    except BaseException as error:
-        output_error = error
-    finally:
-        if stdout_file is not None:
+            if description == "stdout":
+                stdout = output
+            else:
+                stderr = output
+    if stdout_file is not None:
+        try:
             stdout_file.close()
-        if stderr_file is not None:
+        except BaseException as error:
+            record_integrity_failure(
+                "stdout-close",
+                "strict registered sudo stdout close failed",
+                error,
+            )
+    if stderr_file is not None:
+        try:
             stderr_file.close()
-    if recovery_error is not None:
-        raise AssertionError(
-            f"strict registered sudo recovery failed: {recovery_error}"
-        ) from recovery_error
-    if output_error is not None:
-        raise AssertionError(
-            f"strict registered sudo output validation failed: {output_error}"
-        ) from output_error
-    if timeout_error is not None:
-        raise AssertionError("strict registered sudo command timed out") from timeout_error
-    if launch_error is not None:
-        details = _registered_sudo_launch_failure_details(
-            phase=diagnostic_phase,
-            stage=launch_stage,
-            launch_error=launch_error,
-            process_created=process is not None,
-            returncode=(None if process is None else process.returncode),
-            stdout=stdout,
-            stderr=stderr,
+        except BaseException as error:
+            record_integrity_failure(
+                "stderr-close",
+                "strict registered sudo stderr close failed",
+                error,
+            )
+    terminal_failures: list[_RegisteredSudoTerminalFailure] = []
+    primary_failure = _registered_sudo_primary_failure(
+        timeout_error=timeout_error,
+        launch_error=launch_error,
+        diagnostic_phase=diagnostic_phase,
+        launch_stage=launch_stage,
+        process_created=process is not None,
+        returncode=None if process is None else process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    if primary_failure is not None:
+        terminal_failures.append(primary_failure)
+    for phase in _REGISTERED_SUDO_INTEGRITY_PHASES:
+        terminal_failures.extend(
+            (
+                "integrity",
+                phase,
+                failure,
+            )
+            for failure in integrity_failures[phase]
         )
-        raise AssertionError(
-            "strict registered sudo launch failed: " + details
-        ) from launch_error
-    if process is None or process.returncode != 0 or stderr:
-        decoded_stderr = stderr[:2000].decode("utf-8", errors="replace")
-        raise AssertionError(
-            "strict registered sudo command failed "
-            f"with exit {None if process is None else process.returncode}: {decoded_stderr}"
-        )
+    _raise_registered_sudo_terminal_failures(terminal_failures)
     return stdout
 
 
