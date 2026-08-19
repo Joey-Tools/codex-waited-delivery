@@ -8798,6 +8798,795 @@ class IsolatedPythonInvocationRegressionTests(unittest.TestCase):
             self.assertFalse(shadow_marker.exists())
 
 
+_STRICT_TARGET_ACCESS_PROGRAM = inspect.cleandoc(
+    r'''
+    import ctypes
+    from compression import zstd
+    import errno
+    import fcntl
+    import json
+    import os
+    from pathlib import Path
+    import resource
+    import signal
+    import socket
+    import stat
+    import struct
+    import subprocess
+    import sys
+    import termios
+    import time
+
+    if len(sys.argv) != 10:
+        raise SystemExit(90)
+    explicit_root = Path(sys.argv[1])
+    surface_roots = tuple(Path(value) for value in sys.argv[2:6])
+    socket_path = Path(__REQUIRED_CI_SOCKET_PATH__)
+    fifo_path = Path(__REQUIRED_CI_FIFO_PATH__)
+    trusted_git = __REQUIRED_CI_GIT_PATH__
+    rw_hint_path = Path(__REQUIRED_CI_RW_HINT_PATH__)
+    sysv_key = int(sys.argv[6])
+    trusted_relative = Path(sys.argv[7])
+    host_ipc_namespace = sys.argv[8]
+    mqueue_name = sys.argv[9]
+    candidate_path = Path(__file__)
+    candidate_root = next(
+        parent for parent in candidate_path.parents
+        if parent.name == "candidate-code"
+    )
+    trusted_control = (
+        candidate_root.parent / "trusted-control" / trusted_relative
+    )
+
+    try:
+        candidate_path.write_bytes(b"candidate mutation\n")
+    except PermissionError:
+        write_status = "write-denied"
+    else:
+        write_status = "write-allowed"
+    try:
+        trusted_control.read_bytes()
+    except PermissionError:
+        read_status = "read-denied"
+    else:
+        read_status = "read-allowed"
+    stdlib_path = Path(os.__file__)
+    stdlib_status = (
+        "stdlib-readable"
+        if stdlib_path.read_bytes()
+        else "stdlib-empty"
+    )
+    try:
+        with stdlib_path.open("ab"):
+            pass
+    except PermissionError:
+        stdlib_write_status = "stdlib-write-denied"
+    else:
+        stdlib_write_status = "stdlib-write-allowed"
+    try:
+        with Path(sys.executable).open("ab"):
+            pass
+    except PermissionError:
+        interpreter_write_status = "interpreter-write-denied"
+    else:
+        interpreter_write_status = "interpreter-write-allowed"
+
+    workspace_marker = Path.cwd() / "workspace-write"
+    runtime_marker = Path(os.environ["TMPDIR"]) / "runtime-write"
+    explicit_marker = explicit_root / "allowed-write"
+    for marker, payload in (
+        (workspace_marker, "workspace\n"),
+        (runtime_marker, "runtime\n"),
+        (explicit_marker, "explicit\n"),
+    ):
+        marker.write_text(payload, encoding="utf-8")
+        if marker.read_text(encoding="utf-8") != payload:
+            raise SystemExit(91)
+    allowed_writes = {
+        "explicit": explicit_marker.read_text(encoding="utf-8"),
+        "runtime": runtime_marker.read_text(encoding="utf-8"),
+        "workspace": workspace_marker.read_text(encoding="utf-8"),
+    }
+
+    private_markers = {}
+    for index, root in enumerate(surface_roots):
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        name = (
+            "posix-shm-private-marker"
+            if index == 2
+            else "candidate-private-marker"
+        )
+        marker = root / name
+        marker.write_text("private\n", encoding="utf-8")
+        private_markers[str(marker)] = marker.read_text(
+            encoding="utf-8"
+        )
+
+    go_marker = explicit_root / "candidate-go"
+    ready_marker = explicit_root / "host-ipc-ready"
+    go_marker.write_text("go\n", encoding="utf-8")
+    deadline = time.monotonic() + 15.0
+    while not ready_marker.exists():
+        if time.monotonic() >= deadline:
+            raise SystemExit(92)
+        time.sleep(0.01)
+    if ready_marker.read_text(encoding="utf-8") != "ready\n":
+        raise SystemExit(92)
+    socket_metadata = socket_path.lstat()
+    fifo_metadata = fifo_path.lstat()
+    post_seal_nodes_visible = (
+        stat.S_ISSOCK(socket_metadata.st_mode)
+        and stat.S_IMODE(socket_metadata.st_mode) == 0o666
+        and stat.S_ISFIFO(fifo_metadata.st_mode)
+        and stat.S_IMODE(fifo_metadata.st_mode) == 0o666
+    )
+    if not post_seal_nodes_visible:
+        raise SystemExit(92)
+
+    def operation_errno(operation):
+        try:
+            operation()
+        except OSError as error:
+            return error.errno
+        return 0
+
+    limits_descriptor = os.open(
+        "/proc/self/limits",
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        limits_bytes = os.read(limits_descriptor, 65537)
+    finally:
+        os.close(limits_descriptor)
+    if not limits_bytes or len(limits_bytes) > 65536:
+        raise SystemExit(92)
+    limits_lines = limits_bytes.decode("ascii").splitlines()
+    core_limit_rows = [
+        line.split()
+        for line in limits_lines
+        if line.startswith("Max core file size ")
+    ]
+    if len(core_limit_rows) != 1:
+        raise SystemExit(92)
+    core_limit_fields = core_limit_rows[0]
+    if core_limit_fields[-3:] != ["1", "1", "bytes"]:
+        raise SystemExit(92)
+    core_limits = core_limit_fields[-3:]
+
+    core_pattern_descriptor = os.open(
+        "/proc/sys/kernel/core_pattern",
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        core_pattern_bytes = os.read(
+            core_pattern_descriptor, 4097
+        )
+    finally:
+        os.close(core_pattern_descriptor)
+    if not core_pattern_bytes or len(core_pattern_bytes) > 4096:
+        raise SystemExit(92)
+    core_pattern = core_pattern_bytes.decode("ascii")
+    if core_pattern.endswith("\n"):
+        core_pattern = core_pattern[:-1]
+    if (
+        not core_pattern
+        or "\n" in core_pattern
+        or "\r" in core_pattern
+        or "\x00" in core_pattern
+    ):
+        raise SystemExit(92)
+    if core_pattern.startswith("|"):
+        raise SystemExit(92)
+    elif (
+        core_pattern in {".", ".."}
+        or "/" in core_pattern
+        or not all(
+            0x21 <= ord(character) <= 0x7E
+            for character in core_pattern
+        )
+    ):
+        raise SystemExit(92)
+    setrlimit_errno = operation_errno(
+        lambda: resource.setrlimit(
+            resource.RLIMIT_CORE, (0, 0)
+        )
+    )
+    prlimit_errno = operation_errno(
+        lambda: resource.prlimit(
+            0, resource.RLIMIT_CORE, (0, 0)
+        )
+    )
+
+    crash_root = explicit_root / "core-crash"
+    crash_root.mkdir(mode=0o700)
+    crash = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            "import ctypes; ctypes.string_at(0)",
+        ],
+        check=False,
+        cwd=crash_root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+    core_files = []
+    for core_file in sorted(crash_root.iterdir()):
+        core_metadata = core_file.lstat()
+        if (
+            not stat.S_ISREG(core_metadata.st_mode)
+            or core_metadata.st_nlink != 1
+            or core_metadata.st_size > 1
+        ):
+            raise SystemExit(92)
+        core_files.append(
+            {"name": core_file.name, "size": core_metadata.st_size}
+        )
+    if len(core_files) > 1:
+        raise SystemExit(92)
+    core_returncode = crash.returncode
+
+    def pathname_socket_operation():
+        candidate_socket = socket.socket(
+            socket.AF_UNIX, socket.SOCK_STREAM
+        )
+        try:
+            candidate_socket.connect(str(socket_path))
+            candidate_socket.sendall(b"socket")
+        finally:
+            candidate_socket.close()
+
+    def socketpair_operation():
+        first, second = socket.socketpair()
+        try:
+            first.sendall(b"pair")
+        finally:
+            first.close()
+            second.close()
+
+    def fifo_operation():
+        descriptor = os.open(
+            fifo_path, os.O_WRONLY | os.O_NONBLOCK
+        )
+        try:
+            os.write(descriptor, b"fifo")
+        finally:
+            os.close(descriptor)
+
+    def fifo_read_operation():
+        descriptor = os.open(
+            fifo_path, os.O_RDONLY | os.O_NONBLOCK
+        )
+        try:
+            os.read(descriptor, 64)
+        finally:
+            os.close(descriptor)
+
+    socket_errno = operation_errno(pathname_socket_operation)
+    socketpair_errno = operation_errno(socketpair_operation)
+    fifo_errno = operation_errno(fifo_operation)
+    fifo_read_errno = operation_errno(fifo_read_operation)
+
+    ipc_root = socket_path.parent
+    candidate_create = ipc_root / "candidate-create"
+    candidate_directory = ipc_root / "candidate-directory"
+    candidate_symlink = ipc_root / "candidate-symlink"
+    candidate_rename = ipc_root / "candidate-renamed.sock"
+
+    def ipc_create_operation():
+        descriptor = os.open(
+            candidate_create,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        os.close(descriptor)
+
+    ipc_policy = {
+        "chmod": operation_errno(lambda: ipc_root.chmod(0o700)),
+        "create": operation_errno(ipc_create_operation),
+        "list": operation_errno(lambda: tuple(ipc_root.iterdir())),
+        "mkdir": operation_errno(
+            lambda: candidate_directory.mkdir(mode=0o700)
+        ),
+        "rename": operation_errno(
+            lambda: socket_path.rename(candidate_rename)
+        ),
+        "symlink": operation_errno(
+            lambda: candidate_symlink.symlink_to(socket_path.name)
+        ),
+    }
+
+    link_source = explicit_root / "link-source"
+    link_target = explicit_root / "link-target"
+    link_source.write_text("source\n", encoding="utf-8")
+    link_errno = operation_errno(
+        lambda: os.link(link_source, link_target)
+    )
+
+    rw_hint_descriptor = os.open(
+        rw_hint_path,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        rw_hint_before = fcntl.fcntl(
+            rw_hint_descriptor, 1035, bytes(8)
+        )
+        selected_hint = (
+            4 if struct.unpack("=Q", rw_hint_before)[0] == 5 else 5
+        )
+        rw_hint_set_errno = operation_errno(
+            lambda: fcntl.fcntl(
+                rw_hint_descriptor,
+                1036,
+                struct.pack("=Q", selected_hint),
+            )
+        )
+    finally:
+        os.close(rw_hint_descriptor)
+
+    ioctl_read, ioctl_write = os.pipe()
+    try:
+        tcgets_errno = operation_errno(
+            lambda: fcntl.ioctl(
+                ioctl_read,
+                termios.TCGETS,
+                bytearray(64),
+                True,
+            )
+        )
+        arbitrary_ioctl_errno = operation_errno(
+            lambda: fcntl.ioctl(
+                ioctl_read,
+                0x12345678,
+                bytearray(64),
+                True,
+            )
+        )
+    finally:
+        os.close(ioctl_read)
+        os.close(ioctl_write)
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    libc.shmget.argtypes = (
+        ctypes.c_int,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    )
+    libc.shmget.restype = ctypes.c_int
+
+    machine = os.uname().machine
+    syscall_numbers = {
+        "x86_64": (272, 435, 250, 425, 321),
+        "aarch64": (97, 435, 219, 425, 280),
+    }.get(machine)
+    if syscall_numbers is None:
+        raise SystemExit(93)
+
+    def syscall_errno(number, *arguments):
+        ctypes.set_errno(0)
+        result = libc.syscall(number, *arguments)
+        return 0 if result >= 0 else ctypes.get_errno()
+
+    (
+        unshare_number,
+        clone3_number,
+        keyctl_number,
+        io_uring_number,
+        bpf_number,
+    ) = syscall_numbers
+    unshare_errno = syscall_errno(unshare_number, 0x08000000)
+    clone3_errno = syscall_errno(clone3_number, 0, 0)
+    keyctl_errno = syscall_errno(keyctl_number, 0, 0, 0, 0, 0)
+    io_uring_errno = syscall_errno(io_uring_number, 1, 0)
+    bpf_errno = syscall_errno(bpf_number, 0x7FFFFFFF, 0, 0)
+
+    ctypes.set_errno(0)
+    observed_shmid = libc.shmget(sysv_key, 0, 0)
+    sysv_lookup_errno = (
+        0 if observed_shmid >= 0 else ctypes.get_errno()
+    )
+    private_shmid = -1
+    if sysv_lookup_errno == errno.ENOENT:
+        ctypes.set_errno(0)
+        private_shmid = libc.shmget(
+            sysv_key,
+            4096,
+            0o1000 | 0o2000 | 0o600,
+        )
+        if private_shmid < 0:
+            raise OSError(
+                ctypes.get_errno(), "private shmget failed"
+            )
+
+    candidate_ipc_namespace = os.readlink("/proc/self/ns/ipc")
+    mqueue_created = False
+    if candidate_ipc_namespace != host_ipc_namespace:
+        libc.mq_open.argtypes = (
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+        )
+        libc.mq_open.restype = ctypes.c_int
+        libc.mq_close.argtypes = (ctypes.c_int,)
+        libc.mq_close.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        queue = libc.mq_open(
+            mqueue_name.encode("ascii"),
+            os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC,
+            0o600,
+            None,
+        )
+        if queue < 0:
+            raise OSError(
+                ctypes.get_errno(), "private mq_open failed"
+            )
+        if libc.mq_close(queue) != 0:
+            raise OSError(
+                ctypes.get_errno(), "private mq_close failed"
+            )
+        mqueue_created = True
+
+    subprocess_result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            "print('subprocess-ok')",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if subprocess_result.stdout != "subprocess-ok\n":
+        raise SystemExit("subprocess-output")
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            "raise SystemExit(0)",
+        ],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with open("/dev/null", "rb", buffering=0) as null_read:
+        if null_read.read(1) != b"":
+            raise SystemExit("devnull-read")
+    with open("/dev/null", "wb", buffering=0) as null_write:
+        if null_write.write(b"x") != 1:
+            raise SystemExit("devnull-write")
+
+    def devzero_operation():
+        descriptor = os.open(
+            "/dev/zero", os.O_RDONLY | os.O_CLOEXEC
+        )
+        os.close(descriptor)
+
+    devzero_errno = operation_errno(devzero_operation)
+
+    entrypoint_usage = {}
+    for name in (
+        "waited_delivery_bridge.py",
+        "waited_delivery_hook_adapter.py",
+    ):
+        entrypoint = candidate_path.with_name(name)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(entrypoint),
+                "--help",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        first_line = completed.stdout.splitlines()[:1]
+        expected_prefix = f"usage: {name} "
+        failure = (
+            "stderr" if completed.stderr else
+            "size" if len(completed.stdout.encode("utf-8")) > 65536 else
+            "line" if len(first_line) != 1 else
+            "prefix" if not first_line[0].startswith(expected_prefix) else
+            None
+        )
+        if failure is not None:
+            raise SystemExit(f"entrypoint-help:{name}:{failure}")
+        entrypoint_usage[name] = first_line[0]
+
+    zstd_payload = b"required-ci-zstd-round-trip\n" * 32
+    zstd_encoded = zstd.compress(zstd_payload)
+    if (
+        not zstd_encoded
+        or zstd.decompress(zstd_encoded) != zstd_payload
+    ):
+        raise SystemExit("zstd-roundtrip")
+
+    git_root = explicit_root / "git-fixture"
+    os.environ["GIT_OPTIONAL_LOCKS"] = "0"
+    git_prefix = [
+        trusted_git,
+        "--no-pager",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        str(git_root),
+    ]
+
+    def run_git(arguments):
+        completed = subprocess.run(
+            [*git_prefix, *arguments],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        if (
+            len(completed.stdout) > 65536
+            or len(completed.stderr) > 65536
+            or completed.stderr
+        ):
+            raise SystemExit("git-output")
+        return completed.stdout
+
+    git_head = run_git(
+        ["rev-parse", "--verify", "HEAD^{commit}"]
+    ).decode("ascii").strip()
+    git_status = run_git(
+        ["status", "--porcelain=v1", "--untracked-files=no"]
+    ).decode("utf-8")
+    git_tree = run_git(
+        ["ls-tree", "--name-only", "HEAD"]
+    ).decode("utf-8")
+    git_archive = run_git(["archive", "--format=tar", "HEAD"])
+    git_blob = run_git(
+        ["cat-file", "blob", "HEAD:tracked.txt"]
+    ).decode("utf-8")
+
+    status = {}
+    with open("/proc/self/status", encoding="ascii") as status_file:
+        for line in status_file:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                status[key] = value.strip()
+
+    mount_records = []
+    with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+        for line in mountinfo:
+            fields = line.split()
+            separator = fields.index("-")
+            mount_records.append({
+                "id": int(fields[0]),
+                "mountpoint": fields[4],
+                "options": fields[5].split(","),
+                "filesystem": fields[separator + 1],
+                "source": fields[separator + 2],
+            })
+    if any(
+        record["mountpoint"]
+        in {
+            "/tmp/required-ci-alias-probe-source",
+            "/tmp/required-ci-alias-probe-target",
+        }
+        for record in mount_records
+    ):
+        raise SystemExit(94)
+    dev_shm_mounts = [
+        record
+        for record in mount_records
+        if record["mountpoint"] == "/dev/shm"
+        and record["filesystem"] == "tmpfs"
+        and record["source"] == "required-ci-private"
+        and "rw" in record["options"]
+        and "nodev" in record["options"]
+    ]
+    if len(dev_shm_mounts) != 1:
+        raise SystemExit(94)
+    dev_shm_mount = dev_shm_mounts[0]
+
+    null_descriptor = os.open(
+        "/dev/null",
+        getattr(os, "O_PATH")
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC,
+    )
+    try:
+        null_metadata = os.fstat(null_descriptor)
+    finally:
+        os.close(null_descriptor)
+    devnull_mounts = [
+        record
+        for record in mount_records
+        if record["mountpoint"] == "/dev/null"
+        and "ro" in record["options"]
+        and "nodev" not in record["options"]
+    ]
+    if (
+        len(devnull_mounts) != 1
+        or not stat.S_ISCHR(null_metadata.st_mode)
+    ):
+        raise SystemExit(94)
+    devnull_mount = devnull_mounts[0]
+    devnull_device = {
+        "gid": null_metadata.st_gid,
+        "major": os.major(null_metadata.st_rdev),
+        "minor": os.minor(null_metadata.st_rdev),
+        "mode": stat.S_IMODE(null_metadata.st_mode),
+        "uid": null_metadata.st_uid,
+    }
+
+    sysctls = {}
+    for path in (
+        "/proc/sys/kernel/shmmax",
+        "/proc/sys/kernel/shmall",
+        "/proc/sys/kernel/shmmni",
+        "/proc/sys/kernel/msgmax",
+        "/proc/sys/kernel/msgmnb",
+        "/proc/sys/kernel/msgmni",
+        "/proc/sys/kernel/sem",
+        "/proc/sys/fs/mqueue/queues_max",
+        "/proc/sys/fs/mqueue/msg_max",
+        "/proc/sys/fs/mqueue/msgsize_max",
+        "/proc/sys/fs/mqueue/msg_default",
+        "/proc/sys/fs/mqueue/msgsize_default",
+    ):
+        sysctls[path] = " ".join(
+            Path(path).read_text(encoding="ascii").split()
+        )
+
+    result = {
+        "allowed_writes": allowed_writes,
+        "arbitrary_ioctl_errno": arbitrary_ioctl_errno,
+        "bpf_errno": bpf_errno,
+        "dev_shm_mount": dev_shm_mount,
+        "devnull_device": devnull_device,
+        "devnull_mount": devnull_mount,
+        "devnull_subprocess": True,
+        "devzero_errno": devzero_errno,
+        "entrypoint_usage": entrypoint_usage,
+        "fifo_errno": fifo_errno,
+        "fifo_read_errno": fifo_read_errno,
+        "ids": [
+            os.getuid(),
+            os.geteuid(),
+            os.getgid(),
+            os.getegid(),
+        ],
+        "interpreter_write_status": interpreter_write_status,
+        "ipc_namespace": candidate_ipc_namespace,
+        "io_uring_errno": io_uring_errno,
+        "ipc_root_policy": ipc_policy,
+        "git": {
+            "archive_size": len(git_archive),
+            "blob": git_blob,
+            "head": git_head,
+            "status": git_status,
+            "tree": git_tree,
+        },
+        "keyctl_errno": keyctl_errno,
+        "link_errno": link_errno,
+        "clone3_errno": clone3_errno,
+        "core_files": core_files,
+        "core_limits": core_limits,
+        "core_pattern": core_pattern,
+        "core_returncode": core_returncode,
+        "mqueue_created": mqueue_created,
+        "mqueue_visible": Path(
+            "/dev/mqueue", mqueue_name[1:]
+        ).exists(),
+        "mount_namespace": os.readlink("/proc/self/ns/mnt"),
+        "no_new_privs": status.get("NoNewPrivs"),
+        "post_seal_nodes_visible": post_seal_nodes_visible,
+        "prlimit_errno": prlimit_errno,
+        "private_markers": private_markers,
+        "read_status": read_status,
+        "rw_hint_before": rw_hint_before.hex(),
+        "rw_hint_set_errno": rw_hint_set_errno,
+        "runtime": sys.executable,
+        "seccomp": status.get("Seccomp"),
+        "seccomp_filters": status.get("Seccomp_filters"),
+        "setrlimit_errno": setrlimit_errno,
+        "socket_errno": socket_errno,
+        "socketpair_errno": socketpair_errno,
+        "stdlib_status": stdlib_status,
+        "stdlib_write_status": stdlib_write_status,
+        "subprocess": subprocess_result.stdout,
+        "sysctls": sysctls,
+        "sysv_private_created": private_shmid >= 0,
+        "sysv_lookup_errno": sysv_lookup_errno,
+        "tcgets_errno": tcgets_errno,
+        "unshare_errno": unshare_errno,
+        "version": ".".join(map(str, sys.version_info[:3])),
+        "write_status": write_status,
+        "zstd": {
+            "compressed_size": len(zstd_encoded),
+            "payload_size": len(zstd_payload),
+        },
+    }
+    print(json.dumps(result, sort_keys=True))
+    final_checks = {
+        "ids": result["ids"]
+        != [os.getuid(), os.getuid(), os.getgid(), os.getgid()],
+        "write": write_status != "write-denied",
+        "read": read_status != "read-denied",
+        "stdlib-read": stdlib_status != "stdlib-readable",
+        "stdlib-write": stdlib_write_status != "stdlib-write-denied",
+        "interpreter-write": interpreter_write_status
+        != "interpreter-write-denied",
+        "private-markers": set(private_markers.values()) != {"private\n"},
+        "socket": socket_errno != errno.EACCES,
+        "socketpair": socketpair_errno != errno.EACCES,
+        "fifo-write": fifo_errno != errno.EACCES,
+        "fifo-read": fifo_read_errno != errno.EACCES,
+        "ipc-policy": ipc_policy
+        != {
+            "chmod": errno.EPERM,
+            "create": errno.EACCES,
+            "list": errno.EACCES,
+            "mkdir": errno.EACCES,
+            "rename": errno.EACCES,
+            "symlink": errno.EACCES,
+        },
+        "link": link_errno != errno.EACCES,
+        "unshare": unshare_errno != errno.EACCES,
+        "clone3": clone3_errno != errno.ENOSYS,
+        "core-limits": core_limits != ["1", "1", "bytes"],
+        "core-returncode": core_returncode != -signal.SIGSEGV,
+        "core-files": len(core_files) > 1,
+        "setrlimit": setrlimit_errno != errno.EACCES,
+        "prlimit": prlimit_errno != errno.EACCES,
+        "keyctl": keyctl_errno != errno.EACCES,
+        "io-uring": io_uring_errno != errno.EACCES,
+        "tcgets": tcgets_errno != errno.EACCES,
+        "arbitrary-ioctl": arbitrary_ioctl_errno != errno.EACCES,
+        "bpf": bpf_errno != errno.EACCES,
+        "devzero": devzero_errno != errno.EACCES,
+        "devnull-mountpoint": devnull_mount["mountpoint"] != "/dev/null",
+        "devnull-readonly": "ro" not in devnull_mount["options"],
+        "devnull-nodev": "nodev" in devnull_mount["options"],
+        "devnull-device": devnull_device
+        != {
+            "gid": 0,
+            "major": 1,
+            "minor": 3,
+            "mode": 0o666,
+            "uid": 0,
+        },
+        "rw-hint": rw_hint_set_errno != errno.EACCES,
+        "sysv-lookup": sysv_lookup_errno != errno.ENOENT,
+        "sysv-private": private_shmid < 0,
+        "mqueue-create": not mqueue_created,
+        "mqueue-visible": not result["mqueue_visible"],
+        "subprocess": subprocess_result.stdout != "subprocess-ok\n",
+        "git-status": bool(git_status),
+        "git-tree": git_tree != "tracked.txt\n",
+        "git-blob": git_blob != "tracked\n",
+        "git-head": len(git_head) != 40,
+        "git-archive": not git_archive,
+    }
+    failed_checks = [name for name, failed in final_checks.items() if failed]
+    if failed_checks:
+        print("final-checks=" + ",".join(failed_checks), file=sys.stderr)
+        raise SystemExit(95)
+    '''
+)
+
+
 class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     @staticmethod
     def root_command_config(**updates: object) -> dict[str, object]:
@@ -26585,8 +27374,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         host_read_source = inspect.getsource(
             _CANDIDATE_SUPPORT._strict_host_read_root_bindings
         )
-        live_source = inspect.getsource(
-            type(self)._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read
+        live_source = "\n".join(
+            (
+                _STRICT_TARGET_ACCESS_PROGRAM,
+                inspect.getsource(
+                    type(self)._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read
+                ),
+            )
         )
 
         def check(source: str, included: tuple[str, ...], excluded: tuple[str, ...] = ()) -> None:
@@ -26602,7 +27396,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         ), ("LANDLOCK_ACCESS_FS_IOCTL_DEV", "LANDLOCK_ACCESS_FS_READ_DIR", '("/proc/self/fdinfo", "directory")', '("/proc", "directory")', "FS_IOC_"))
         check(host_read_source, ('Path("/usr/lib") / multiarch', 'Path("/etc/ld.so.preload").lstat()', 'system_stdlib / "lib-dynload"', 'trusted_git.parent != Path("/usr/bin")'), ('Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',))
         check(candidate_source, ("read_network_interfaces(network_interface_fd)", 'status.get("Seccomp") != "2"', "Seccomp_filters", '"/proc/self/limits"'), ("os.listdir(trusted_root)", 'os.listdir("/sys/class/net")', "socket.if_nameindex", "resource.getrlimit"))
-        check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")', "relative_path.name != runner_path.name", "TRUSTED_CONTENT_ROOT / relative_path"), ('f"/proc/self/fdinfo/',))
+        check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")', "relative_path.name != runner_path.name", "TRUSTED_CONTENT_ROOT / relative_path", '"final-checks="'), ('f"/proc/self/fdinfo/',))
         install = next(node for node in ast.parse(bootstrap_source).body if isinstance(node, ast.FunctionDef) and node.name == "install_candidate_seccomp_filter")
         call = next(node for node in install.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "architecture" for target in node.targets)).value
         for value, kind in ((call, ast.Call), (call.func, ast.Attribute), (call.func.value, ast.Dict)):
@@ -47496,790 +48290,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     candidate_content_root
                     / "skills/waited-delivery/scripts/waited_delivery_runner.py"
                 )
-                candidate_source = inspect.cleandoc(
-                        r'''
-                        import ctypes
-                        from compression import zstd
-                        import errno
-                        import fcntl
-                        import json
-                        import os
-                        from pathlib import Path
-                        import resource
-                        import signal
-                        import socket
-                        import stat
-                        import struct
-                        import subprocess
-                        import sys
-                        import termios
-                        import time
-
-                        if len(sys.argv) != 10:
-                            raise SystemExit(90)
-                        explicit_root = Path(sys.argv[1])
-                        surface_roots = tuple(Path(value) for value in sys.argv[2:6])
-                        socket_path = Path(__REQUIRED_CI_SOCKET_PATH__)
-                        fifo_path = Path(__REQUIRED_CI_FIFO_PATH__)
-                        trusted_git = __REQUIRED_CI_GIT_PATH__
-                        rw_hint_path = Path(__REQUIRED_CI_RW_HINT_PATH__)
-                        sysv_key = int(sys.argv[6])
-                        trusted_relative = Path(sys.argv[7])
-                        host_ipc_namespace = sys.argv[8]
-                        mqueue_name = sys.argv[9]
-                        candidate_path = Path(__file__)
-                        candidate_root = next(
-                            parent for parent in candidate_path.parents
-                            if parent.name == "candidate-code"
-                        )
-                        trusted_control = (
-                            candidate_root.parent / "trusted-control" / trusted_relative
-                        )
-
-                        try:
-                            candidate_path.write_bytes(b"candidate mutation\n")
-                        except PermissionError:
-                            write_status = "write-denied"
-                        else:
-                            write_status = "write-allowed"
-                        try:
-                            trusted_control.read_bytes()
-                        except PermissionError:
-                            read_status = "read-denied"
-                        else:
-                            read_status = "read-allowed"
-                        stdlib_path = Path(os.__file__)
-                        stdlib_status = (
-                            "stdlib-readable"
-                            if stdlib_path.read_bytes()
-                            else "stdlib-empty"
-                        )
-                        try:
-                            with stdlib_path.open("ab"):
-                                pass
-                        except PermissionError:
-                            stdlib_write_status = "stdlib-write-denied"
-                        else:
-                            stdlib_write_status = "stdlib-write-allowed"
-                        try:
-                            with Path(sys.executable).open("ab"):
-                                pass
-                        except PermissionError:
-                            interpreter_write_status = "interpreter-write-denied"
-                        else:
-                            interpreter_write_status = "interpreter-write-allowed"
-
-                        workspace_marker = Path.cwd() / "workspace-write"
-                        runtime_marker = Path(os.environ["TMPDIR"]) / "runtime-write"
-                        explicit_marker = explicit_root / "allowed-write"
-                        for marker, payload in (
-                            (workspace_marker, "workspace\n"),
-                            (runtime_marker, "runtime\n"),
-                            (explicit_marker, "explicit\n"),
-                        ):
-                            marker.write_text(payload, encoding="utf-8")
-                            if marker.read_text(encoding="utf-8") != payload:
-                                raise SystemExit(91)
-                        allowed_writes = {
-                            "explicit": explicit_marker.read_text(encoding="utf-8"),
-                            "runtime": runtime_marker.read_text(encoding="utf-8"),
-                            "workspace": workspace_marker.read_text(encoding="utf-8"),
-                        }
-
-                        private_markers = {}
-                        for index, root in enumerate(surface_roots):
-                            root.mkdir(mode=0o700, parents=True, exist_ok=True)
-                            name = (
-                                "posix-shm-private-marker"
-                                if index == 2
-                                else "candidate-private-marker"
-                            )
-                            marker = root / name
-                            marker.write_text("private\n", encoding="utf-8")
-                            private_markers[str(marker)] = marker.read_text(
-                                encoding="utf-8"
-                            )
-
-                        go_marker = explicit_root / "candidate-go"
-                        ready_marker = explicit_root / "host-ipc-ready"
-                        go_marker.write_text("go\n", encoding="utf-8")
-                        deadline = time.monotonic() + 15.0
-                        while not ready_marker.exists():
-                            if time.monotonic() >= deadline:
-                                raise SystemExit(92)
-                            time.sleep(0.01)
-                        if ready_marker.read_text(encoding="utf-8") != "ready\n":
-                            raise SystemExit(92)
-                        socket_metadata = socket_path.lstat()
-                        fifo_metadata = fifo_path.lstat()
-                        post_seal_nodes_visible = (
-                            stat.S_ISSOCK(socket_metadata.st_mode)
-                            and stat.S_IMODE(socket_metadata.st_mode) == 0o666
-                            and stat.S_ISFIFO(fifo_metadata.st_mode)
-                            and stat.S_IMODE(fifo_metadata.st_mode) == 0o666
-                        )
-                        if not post_seal_nodes_visible:
-                            raise SystemExit(92)
-
-                        def operation_errno(operation):
-                            try:
-                                operation()
-                            except OSError as error:
-                                return error.errno
-                            return 0
-
-                        limits_descriptor = os.open(
-                            "/proc/self/limits",
-                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        )
-                        try:
-                            limits_bytes = os.read(limits_descriptor, 65537)
-                        finally:
-                            os.close(limits_descriptor)
-                        if not limits_bytes or len(limits_bytes) > 65536:
-                            raise SystemExit(92)
-                        limits_lines = limits_bytes.decode("ascii").splitlines()
-                        core_limit_rows = [
-                            line.split()
-                            for line in limits_lines
-                            if line.startswith("Max core file size ")
-                        ]
-                        if len(core_limit_rows) != 1:
-                            raise SystemExit(92)
-                        core_limit_fields = core_limit_rows[0]
-                        if core_limit_fields[-3:] != ["1", "1", "bytes"]:
-                            raise SystemExit(92)
-                        core_limits = core_limit_fields[-3:]
-
-                        core_pattern_descriptor = os.open(
-                            "/proc/sys/kernel/core_pattern",
-                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        )
-                        try:
-                            core_pattern_bytes = os.read(
-                                core_pattern_descriptor, 4097
-                            )
-                        finally:
-                            os.close(core_pattern_descriptor)
-                        if not core_pattern_bytes or len(core_pattern_bytes) > 4096:
-                            raise SystemExit(92)
-                        core_pattern = core_pattern_bytes.decode("ascii")
-                        if core_pattern.endswith("\n"):
-                            core_pattern = core_pattern[:-1]
-                        if (
-                            not core_pattern
-                            or "\n" in core_pattern
-                            or "\r" in core_pattern
-                            or "\x00" in core_pattern
-                        ):
-                            raise SystemExit(92)
-                        if core_pattern.startswith("|"):
-                            raise SystemExit(92)
-                        elif (
-                            core_pattern in {".", ".."}
-                            or "/" in core_pattern
-                            or not all(
-                                0x21 <= ord(character) <= 0x7E
-                                for character in core_pattern
-                            )
-                        ):
-                            raise SystemExit(92)
-                        setrlimit_errno = operation_errno(
-                            lambda: resource.setrlimit(
-                                resource.RLIMIT_CORE, (0, 0)
-                            )
-                        )
-                        prlimit_errno = operation_errno(
-                            lambda: resource.prlimit(
-                                0, resource.RLIMIT_CORE, (0, 0)
-                            )
-                        )
-
-                        crash_root = explicit_root / "core-crash"
-                        crash_root.mkdir(mode=0o700)
-                        crash = subprocess.run(
-                            [
-                                sys.executable,
-                                "-I",
-                                "-B",
-                                "-c",
-                                "import ctypes; ctypes.string_at(0)",
-                            ],
-                            check=False,
-                            cwd=crash_root,
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=5,
-                        )
-                        core_files = []
-                        for core_file in sorted(crash_root.iterdir()):
-                            core_metadata = core_file.lstat()
-                            if (
-                                not stat.S_ISREG(core_metadata.st_mode)
-                                or core_metadata.st_nlink != 1
-                                or core_metadata.st_size > 1
-                            ):
-                                raise SystemExit(92)
-                            core_files.append(
-                                {"name": core_file.name, "size": core_metadata.st_size}
-                            )
-                        if len(core_files) > 1:
-                            raise SystemExit(92)
-                        core_returncode = crash.returncode
-
-                        def pathname_socket_operation():
-                            candidate_socket = socket.socket(
-                                socket.AF_UNIX, socket.SOCK_STREAM
-                            )
-                            try:
-                                candidate_socket.connect(str(socket_path))
-                                candidate_socket.sendall(b"socket")
-                            finally:
-                                candidate_socket.close()
-
-                        def socketpair_operation():
-                            first, second = socket.socketpair()
-                            try:
-                                first.sendall(b"pair")
-                            finally:
-                                first.close()
-                                second.close()
-
-                        def fifo_operation():
-                            descriptor = os.open(
-                                fifo_path, os.O_WRONLY | os.O_NONBLOCK
-                            )
-                            try:
-                                os.write(descriptor, b"fifo")
-                            finally:
-                                os.close(descriptor)
-
-                        def fifo_read_operation():
-                            descriptor = os.open(
-                                fifo_path, os.O_RDONLY | os.O_NONBLOCK
-                            )
-                            try:
-                                os.read(descriptor, 64)
-                            finally:
-                                os.close(descriptor)
-
-                        socket_errno = operation_errno(pathname_socket_operation)
-                        socketpair_errno = operation_errno(socketpair_operation)
-                        fifo_errno = operation_errno(fifo_operation)
-                        fifo_read_errno = operation_errno(fifo_read_operation)
-
-                        ipc_root = socket_path.parent
-                        candidate_create = ipc_root / "candidate-create"
-                        candidate_directory = ipc_root / "candidate-directory"
-                        candidate_symlink = ipc_root / "candidate-symlink"
-                        candidate_rename = ipc_root / "candidate-renamed.sock"
-
-                        def ipc_create_operation():
-                            descriptor = os.open(
-                                candidate_create,
-                                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                                0o600,
-                            )
-                            os.close(descriptor)
-
-                        ipc_policy = {
-                            "chmod": operation_errno(lambda: ipc_root.chmod(0o700)),
-                            "create": operation_errno(ipc_create_operation),
-                            "list": operation_errno(lambda: tuple(ipc_root.iterdir())),
-                            "mkdir": operation_errno(
-                                lambda: candidate_directory.mkdir(mode=0o700)
-                            ),
-                            "rename": operation_errno(
-                                lambda: socket_path.rename(candidate_rename)
-                            ),
-                            "symlink": operation_errno(
-                                lambda: candidate_symlink.symlink_to(socket_path.name)
-                            ),
-                        }
-
-                        link_source = explicit_root / "link-source"
-                        link_target = explicit_root / "link-target"
-                        link_source.write_text("source\n", encoding="utf-8")
-                        link_errno = operation_errno(
-                            lambda: os.link(link_source, link_target)
-                        )
-
-                        rw_hint_descriptor = os.open(
-                            rw_hint_path,
-                            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                        )
-                        try:
-                            rw_hint_before = fcntl.fcntl(
-                                rw_hint_descriptor, 1035, bytes(8)
-                            )
-                            selected_hint = (
-                                4 if struct.unpack("=Q", rw_hint_before)[0] == 5 else 5
-                            )
-                            rw_hint_set_errno = operation_errno(
-                                lambda: fcntl.fcntl(
-                                    rw_hint_descriptor,
-                                    1036,
-                                    struct.pack("=Q", selected_hint),
-                                )
-                            )
-                        finally:
-                            os.close(rw_hint_descriptor)
-
-                        ioctl_read, ioctl_write = os.pipe()
-                        try:
-                            tcgets_errno = operation_errno(
-                                lambda: fcntl.ioctl(
-                                    ioctl_read,
-                                    termios.TCGETS,
-                                    bytearray(64),
-                                    True,
-                                )
-                            )
-                            arbitrary_ioctl_errno = operation_errno(
-                                lambda: fcntl.ioctl(
-                                    ioctl_read,
-                                    0x12345678,
-                                    bytearray(64),
-                                    True,
-                                )
-                            )
-                        finally:
-                            os.close(ioctl_read)
-                            os.close(ioctl_write)
-
-                        libc = ctypes.CDLL(None, use_errno=True)
-                        libc.syscall.restype = ctypes.c_long
-                        libc.shmget.argtypes = (
-                            ctypes.c_int,
-                            ctypes.c_size_t,
-                            ctypes.c_int,
-                        )
-                        libc.shmget.restype = ctypes.c_int
-
-                        machine = os.uname().machine
-                        syscall_numbers = {
-                            "x86_64": (272, 435, 250, 425, 321),
-                            "aarch64": (97, 435, 219, 425, 280),
-                        }.get(machine)
-                        if syscall_numbers is None:
-                            raise SystemExit(93)
-
-                        def syscall_errno(number, *arguments):
-                            ctypes.set_errno(0)
-                            result = libc.syscall(number, *arguments)
-                            return 0 if result >= 0 else ctypes.get_errno()
-
-                        (
-                            unshare_number,
-                            clone3_number,
-                            keyctl_number,
-                            io_uring_number,
-                            bpf_number,
-                        ) = syscall_numbers
-                        unshare_errno = syscall_errno(unshare_number, 0x08000000)
-                        clone3_errno = syscall_errno(clone3_number, 0, 0)
-                        keyctl_errno = syscall_errno(keyctl_number, 0, 0, 0, 0, 0)
-                        io_uring_errno = syscall_errno(io_uring_number, 1, 0)
-                        bpf_errno = syscall_errno(bpf_number, 0x7FFFFFFF, 0, 0)
-
-                        ctypes.set_errno(0)
-                        observed_shmid = libc.shmget(sysv_key, 0, 0)
-                        sysv_lookup_errno = (
-                            0 if observed_shmid >= 0 else ctypes.get_errno()
-                        )
-                        private_shmid = -1
-                        if sysv_lookup_errno == errno.ENOENT:
-                            ctypes.set_errno(0)
-                            private_shmid = libc.shmget(
-                                sysv_key,
-                                4096,
-                                0o1000 | 0o2000 | 0o600,
-                            )
-                            if private_shmid < 0:
-                                raise OSError(
-                                    ctypes.get_errno(), "private shmget failed"
-                                )
-
-                        candidate_ipc_namespace = os.readlink("/proc/self/ns/ipc")
-                        mqueue_created = False
-                        if candidate_ipc_namespace != host_ipc_namespace:
-                            libc.mq_open.argtypes = (
-                                ctypes.c_char_p,
-                                ctypes.c_int,
-                                ctypes.c_uint,
-                                ctypes.c_void_p,
-                            )
-                            libc.mq_open.restype = ctypes.c_int
-                            libc.mq_close.argtypes = (ctypes.c_int,)
-                            libc.mq_close.restype = ctypes.c_int
-                            ctypes.set_errno(0)
-                            queue = libc.mq_open(
-                                mqueue_name.encode("ascii"),
-                                os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC,
-                                0o600,
-                                None,
-                            )
-                            if queue < 0:
-                                raise OSError(
-                                    ctypes.get_errno(), "private mq_open failed"
-                                )
-                            if libc.mq_close(queue) != 0:
-                                raise OSError(
-                                    ctypes.get_errno(), "private mq_close failed"
-                                )
-                            mqueue_created = True
-
-                        subprocess_result = subprocess.run(
-                            [
-                                sys.executable,
-                                "-I",
-                                "-B",
-                                "-c",
-                                "print('subprocess-ok')",
-                            ],
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                        )
-                        if subprocess_result.stdout != "subprocess-ok\n":
-                            raise SystemExit("subprocess-output")
-                        subprocess.run(
-                            [
-                                sys.executable,
-                                "-I",
-                                "-B",
-                                "-c",
-                                "raise SystemExit(0)",
-                            ],
-                            check=True,
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                        with open("/dev/null", "rb", buffering=0) as null_read:
-                            if null_read.read(1) != b"":
-                                raise SystemExit("devnull-read")
-                        with open("/dev/null", "wb", buffering=0) as null_write:
-                            if null_write.write(b"x") != 1:
-                                raise SystemExit("devnull-write")
-
-                        def devzero_operation():
-                            descriptor = os.open(
-                                "/dev/zero", os.O_RDONLY | os.O_CLOEXEC
-                            )
-                            os.close(descriptor)
-
-                        devzero_errno = operation_errno(devzero_operation)
-
-                        entrypoint_usage = {}
-                        for name in (
-                            "waited_delivery_bridge.py",
-                            "waited_delivery_hook_adapter.py",
-                        ):
-                            entrypoint = candidate_path.with_name(name)
-                            completed = subprocess.run(
-                                [
-                                    sys.executable,
-                                    "-I",
-                                    "-B",
-                                    str(entrypoint),
-                                    "--help",
-                                ],
-                                check=True,
-                                capture_output=True,
-                                text=True,
-                                timeout=5,
-                            )
-                            first_line = completed.stdout.splitlines()[:1]
-                            expected_prefix = f"usage: {name} "
-                            failure = (
-                                "stderr" if completed.stderr else
-                                "size" if len(completed.stdout.encode("utf-8")) > 65536 else
-                                "line" if len(first_line) != 1 else
-                                "prefix" if not first_line[0].startswith(expected_prefix) else
-                                None
-                            )
-                            if failure is not None:
-                                raise SystemExit(f"entrypoint-help:{name}:{failure}")
-                            entrypoint_usage[name] = first_line[0]
-
-                        zstd_payload = b"required-ci-zstd-round-trip\n" * 32
-                        zstd_encoded = zstd.compress(zstd_payload)
-                        if (
-                            not zstd_encoded
-                            or zstd.decompress(zstd_encoded) != zstd_payload
-                        ):
-                            raise SystemExit("zstd-roundtrip")
-
-                        git_root = explicit_root / "git-fixture"
-                        os.environ["GIT_OPTIONAL_LOCKS"] = "0"
-                        git_prefix = [
-                            trusted_git,
-                            "--no-pager",
-                            "-c",
-                            "core.hooksPath=/dev/null",
-                            "-c",
-                            "core.attributesFile=/dev/null",
-                            "-c",
-                            "core.fsmonitor=false",
-                            "-C",
-                            str(git_root),
-                        ]
-
-                        def run_git(arguments):
-                            completed = subprocess.run(
-                                [*git_prefix, *arguments],
-                                check=True,
-                                capture_output=True,
-                                timeout=5,
-                            )
-                            if (
-                                len(completed.stdout) > 65536
-                                or len(completed.stderr) > 65536
-                                or completed.stderr
-                            ):
-                                raise SystemExit("git-output")
-                            return completed.stdout
-
-                        git_head = run_git(
-                            ["rev-parse", "--verify", "HEAD^{commit}"]
-                        ).decode("ascii").strip()
-                        git_status = run_git(
-                            ["status", "--porcelain=v1", "--untracked-files=no"]
-                        ).decode("utf-8")
-                        git_tree = run_git(
-                            ["ls-tree", "--name-only", "HEAD"]
-                        ).decode("utf-8")
-                        git_archive = run_git(["archive", "--format=tar", "HEAD"])
-                        git_blob = run_git(
-                            ["cat-file", "blob", "HEAD:tracked.txt"]
-                        ).decode("utf-8")
-
-                        status = {}
-                        with open("/proc/self/status", encoding="ascii") as status_file:
-                            for line in status_file:
-                                if ":" in line:
-                                    key, value = line.split(":", 1)
-                                    status[key] = value.strip()
-
-                        mount_records = []
-                        with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
-                            for line in mountinfo:
-                                fields = line.split()
-                                separator = fields.index("-")
-                                mount_records.append({
-                                    "id": int(fields[0]),
-                                    "mountpoint": fields[4],
-                                    "options": fields[5].split(","),
-                                    "filesystem": fields[separator + 1],
-                                    "source": fields[separator + 2],
-                                })
-                        if any(
-                            record["mountpoint"]
-                            in {
-                                "/tmp/required-ci-alias-probe-source",
-                                "/tmp/required-ci-alias-probe-target",
-                            }
-                            for record in mount_records
-                        ):
-                            raise SystemExit(94)
-                        dev_shm_mounts = [
-                            record
-                            for record in mount_records
-                            if record["mountpoint"] == "/dev/shm"
-                            and record["filesystem"] == "tmpfs"
-                            and record["source"] == "required-ci-private"
-                            and "rw" in record["options"]
-                            and "nodev" in record["options"]
-                        ]
-                        if len(dev_shm_mounts) != 1:
-                            raise SystemExit(94)
-                        dev_shm_mount = dev_shm_mounts[0]
-
-                        null_descriptor = os.open(
-                            "/dev/null",
-                            getattr(os, "O_PATH")
-                            | os.O_NOFOLLOW
-                            | os.O_CLOEXEC,
-                        )
-                        try:
-                            null_metadata = os.fstat(null_descriptor)
-                        finally:
-                            os.close(null_descriptor)
-                        devnull_mounts = [
-                            record
-                            for record in mount_records
-                            if record["mountpoint"] == "/dev/null"
-                            and "ro" in record["options"]
-                            and "nodev" not in record["options"]
-                        ]
-                        if (
-                            len(devnull_mounts) != 1
-                            or not stat.S_ISCHR(null_metadata.st_mode)
-                        ):
-                            raise SystemExit(94)
-                        devnull_mount = devnull_mounts[0]
-                        devnull_device = {
-                            "gid": null_metadata.st_gid,
-                            "major": os.major(null_metadata.st_rdev),
-                            "minor": os.minor(null_metadata.st_rdev),
-                            "mode": stat.S_IMODE(null_metadata.st_mode),
-                            "uid": null_metadata.st_uid,
-                        }
-
-                        sysctls = {}
-                        for path in (
-                            "/proc/sys/kernel/shmmax",
-                            "/proc/sys/kernel/shmall",
-                            "/proc/sys/kernel/shmmni",
-                            "/proc/sys/kernel/msgmax",
-                            "/proc/sys/kernel/msgmnb",
-                            "/proc/sys/kernel/msgmni",
-                            "/proc/sys/kernel/sem",
-                            "/proc/sys/fs/mqueue/queues_max",
-                            "/proc/sys/fs/mqueue/msg_max",
-                            "/proc/sys/fs/mqueue/msgsize_max",
-                            "/proc/sys/fs/mqueue/msg_default",
-                            "/proc/sys/fs/mqueue/msgsize_default",
-                        ):
-                            sysctls[path] = " ".join(
-                                Path(path).read_text(encoding="ascii").split()
-                            )
-
-                        result = {
-                            "allowed_writes": allowed_writes,
-                            "arbitrary_ioctl_errno": arbitrary_ioctl_errno,
-                            "bpf_errno": bpf_errno,
-                            "dev_shm_mount": dev_shm_mount,
-                            "devnull_device": devnull_device,
-                            "devnull_mount": devnull_mount,
-                            "devnull_subprocess": True,
-                            "devzero_errno": devzero_errno,
-                            "entrypoint_usage": entrypoint_usage,
-                            "fifo_errno": fifo_errno,
-                            "fifo_read_errno": fifo_read_errno,
-                            "ids": [
-                                os.getuid(),
-                                os.geteuid(),
-                                os.getgid(),
-                                os.getegid(),
-                            ],
-                            "interpreter_write_status": interpreter_write_status,
-                            "ipc_namespace": candidate_ipc_namespace,
-                            "io_uring_errno": io_uring_errno,
-                            "ipc_root_policy": ipc_policy,
-                            "git": {
-                                "archive_size": len(git_archive),
-                                "blob": git_blob,
-                                "head": git_head,
-                                "status": git_status,
-                                "tree": git_tree,
-                            },
-                            "keyctl_errno": keyctl_errno,
-                            "link_errno": link_errno,
-                            "clone3_errno": clone3_errno,
-                            "core_files": core_files,
-                            "core_limits": core_limits,
-                            "core_pattern": core_pattern,
-                            "core_returncode": core_returncode,
-                            "mqueue_created": mqueue_created,
-                            "mqueue_visible": Path(
-                                "/dev/mqueue", mqueue_name[1:]
-                            ).exists(),
-                            "mount_namespace": os.readlink("/proc/self/ns/mnt"),
-                            "no_new_privs": status.get("NoNewPrivs"),
-                            "post_seal_nodes_visible": post_seal_nodes_visible,
-                            "prlimit_errno": prlimit_errno,
-                            "private_markers": private_markers,
-                            "read_status": read_status,
-                            "rw_hint_before": rw_hint_before.hex(),
-                            "rw_hint_set_errno": rw_hint_set_errno,
-                            "runtime": sys.executable,
-                            "seccomp": status.get("Seccomp"),
-                            "seccomp_filters": status.get("Seccomp_filters"),
-                            "setrlimit_errno": setrlimit_errno,
-                            "socket_errno": socket_errno,
-                            "socketpair_errno": socketpair_errno,
-                            "stdlib_status": stdlib_status,
-                            "stdlib_write_status": stdlib_write_status,
-                            "subprocess": subprocess_result.stdout,
-                            "sysctls": sysctls,
-                            "sysv_private_created": private_shmid >= 0,
-                            "sysv_lookup_errno": sysv_lookup_errno,
-                            "tcgets_errno": tcgets_errno,
-                            "unshare_errno": unshare_errno,
-                            "version": ".".join(map(str, sys.version_info[:3])),
-                            "write_status": write_status,
-                            "zstd": {
-                                "compressed_size": len(zstd_encoded),
-                                "payload_size": len(zstd_payload),
-                            },
-                        }
-                        print(json.dumps(result, sort_keys=True))
-                        if (
-                            result["ids"]
-                            != [os.getuid(), os.getuid(), os.getgid(), os.getgid()]
-                            or write_status != "write-denied"
-                            or read_status != "read-denied"
-                            or stdlib_status != "stdlib-readable"
-                            or stdlib_write_status != "stdlib-write-denied"
-                            or interpreter_write_status
-                            != "interpreter-write-denied"
-                            or set(private_markers.values()) != {"private\n"}
-                            or socket_errno != errno.EACCES
-                            or socketpair_errno != errno.EACCES
-                            or fifo_errno != errno.EACCES
-                            or fifo_read_errno != errno.EACCES
-                            or ipc_policy
-                            != {
-                                "chmod": errno.EPERM,
-                                "create": errno.EACCES,
-                                "list": errno.EACCES,
-                                "mkdir": errno.EACCES,
-                                "rename": errno.EACCES,
-                                "symlink": errno.EACCES,
-                            }
-                            or link_errno != errno.EACCES
-                            or unshare_errno != errno.EACCES
-                            or clone3_errno != errno.ENOSYS
-                            or core_limits != ["1", "1", "bytes"]
-                            or core_returncode != -signal.SIGSEGV
-                            or len(core_files) > 1
-                            or setrlimit_errno != errno.EACCES
-                            or prlimit_errno != errno.EACCES
-                            or keyctl_errno != errno.EACCES
-                            or io_uring_errno != errno.EACCES
-                            or tcgets_errno != errno.EACCES
-                            or arbitrary_ioctl_errno != errno.EACCES
-                            or bpf_errno != errno.EACCES
-                            or devzero_errno != errno.EACCES
-                            or devnull_mount["mountpoint"] != "/dev/null"
-                            or "ro" not in devnull_mount["options"]
-                            or "nodev" in devnull_mount["options"]
-                            or devnull_device
-                            != {
-                                "gid": 0,
-                                "major": 1,
-                                "minor": 3,
-                                "mode": 0o666,
-                                "uid": 0,
-                            }
-                            or rw_hint_set_errno != errno.EACCES
-                            or sysv_lookup_errno != errno.ENOENT
-                            or private_shmid < 0
-                            or not mqueue_created
-                            or not result["mqueue_visible"]
-                            or subprocess_result.stdout != "subprocess-ok\n"
-                            or git_status
-                            or git_tree != "tracked.txt\n"
-                            or git_blob != "tracked\n"
-                            or len(git_head) != 40
-                            or not git_archive
-                        ):
-                            raise SystemExit(95)
-                        '''
-                    )
+                candidate_source = _STRICT_TARGET_ACCESS_PROGRAM
                 candidate_source = candidate_source.replace(
                     "__REQUIRED_CI_SOCKET_PATH__", repr(str(socket_path))
                 ).replace(
