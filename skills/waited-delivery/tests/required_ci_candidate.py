@@ -19444,7 +19444,9 @@ def _discover_prepared_outer(
         return None
     if type(marker) is not str or launcher_parent is None:
         raise AssertionError("strict prepared outer recovery binding is malformed")
-    _parse_root_chain_identity(launcher_parent, "registered launcher parent")
+    launcher = _parse_root_chain_identity(
+        launcher_parent, "registered launcher parent"
+    )
     marker_bytes = marker.encode("ascii")
     matches: list[list[int]] = []
     try:
@@ -19461,6 +19463,7 @@ def _discover_prepared_outer(
             or identity[0] != identity[3]
             or identity[0] != identity[4]
             or identity[5] != (os.getuid(),) * 4
+            or identity[1] < launcher[1]
         ):
             continue
         try:
@@ -22212,6 +22215,7 @@ def _watchdog_client_inventory(
     registry_token: str,
     *,
     runner_uid: int | None = None,
+    minimum_start_time: int | None = None,
     excluded_identity: tuple[
         int, int, int, int, int, tuple[int, int, int, int]
     ]
@@ -22220,6 +22224,13 @@ def _watchdog_client_inventory(
     selected_runner_uid = os.getuid() if runner_uid is None else runner_uid
     if (
         type(selected_runner_uid) is not int
+        or (
+            minimum_start_time is not None
+            and (
+                type(minimum_start_time) is not int
+                or minimum_start_time < 0
+            )
+        )
         or (
             excluded_identity is not None
             and (
@@ -22258,6 +22269,10 @@ def _watchdog_client_inventory(
                 and _strict_owner_loss_watchdog_binding_matches(
                     identity, excluded_identity
                 )
+            )
+            or (
+                minimum_start_time is not None
+                and identity[1] < minimum_start_time
             )
         ):
             continue
@@ -22303,6 +22318,7 @@ def _strict_owner_loss_registered_clients_are_quiescent(
             registry_path,
             registry_token,
             runner_uid=runner_uid,
+            minimum_start_time=watchdog_identity[1],
             excluded_identity=watchdog_identity,
         )
         if inventory:
@@ -22334,6 +22350,7 @@ def _watchdog_close_runner_clients(
         inventory = _watchdog_client_inventory(
             registry_path,
             registry_token,
+            minimum_start_time=watchdog_identity[1],
             excluded_identity=watchdog_identity,
         )
         if not inventory:

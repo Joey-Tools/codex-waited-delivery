@@ -11767,42 +11767,18 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(result["status"], "incomplete")
         self.assertIn("watchdog is unauthorized", result["error"])
 
-    def test_watchdog_client_inventory_fails_closed_when_environment_is_unreadable(
-        self,
-    ) -> None:
-        identity = (321, 654, 321, 321, 321, (os.getuid(),) * 4)
-        with mock.patch.object(
-            _CANDIDATE_SUPPORT.Path,
-            "iterdir",
-            return_value=iter((Path("/proc/321"),)),
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_process_identity",
-            return_value=identity,
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT.Path,
-            "read_bytes",
-            side_effect=PermissionError(errno.EACCES, "injected denial"),
-        ), self.assertRaisesRegex(
-            AssertionError, "client environment is unreadable"
-        ):
-            _CANDIDATE_SUPPORT._watchdog_client_inventory(
-                Path("/tmp/entries"), "f" * 32
-            )
-
     def test_watchdog_client_inventory_tracks_exact_live_registry_client(
         self,
     ) -> None:
+        s = _CANDIDATE_SUPPORT
         runner_uid = os.getuid()
         registry_path = Path("/tmp/entries")
         registry_token = "a" * 32
         client_environment = dict(os.environ)
-        client_environment[_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV] = str(
+        client_environment[s._ISOLATION_REGISTRY_ENV] = str(
             registry_path
         )
-        client_environment[
-            _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV
-        ] = registry_token
+        client_environment[s._ISOLATION_REGISTRY_TOKEN_ENV] = registry_token
         client_source = textwrap.dedent(
             f"""
             import json
@@ -11811,10 +11787,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
             print(json.dumps({{
                 "registry": os.environ[
-                    {_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV!r}
+                    {s._ISOLATION_REGISTRY_ENV!r}
                 ],
                 "token": os.environ[
-                    {_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV!r}
+                    {s._ISOLATION_REGISTRY_TOKEN_ENV!r}
                 ],
                 "uid": os.getuid(),
             }}), flush=True)
@@ -11832,7 +11808,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         try:
             assert client.stdout is not None
             ready = json.loads(
-                _CANDIDATE_SUPPORT._read_watchdog_line(
+                s._read_watchdog_line(
                     client.stdout, 5, "client fixture readiness"
                 )
             )
@@ -11853,21 +11829,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             proc_environment = b"\0".join(
                 (
                     (
-                        f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV}="
+                        f"{s._ISOLATION_REGISTRY_ENV}="
                         f"{ready['registry']}"
                     ).encode("ascii"),
                     (
-                        f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV}="
+                        f"{s._ISOLATION_REGISTRY_TOKEN_ENV}="
                         f"{ready['token']}"
                     ).encode("ascii"),
                 )
             )
 
-            def process_identity(
-                process_path: Path,
-            ) -> tuple[
-                int, int, int, int, int, tuple[int, int, int, int]
-            ] | None:
+            def process_identity(process_path):
                 if (
                     process_path == client_path
                     and client.poll() is None
@@ -11875,25 +11847,25 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     return client_identity
                 return None
 
-            def read_environment(environment_path: Path) -> bytes:
+            def read_environment(environment_path):
                 self.assertEqual(environment_path, client_path / "environ")
                 return proc_environment
 
             with mock.patch.object(
-                _CANDIDATE_SUPPORT.Path,
+                s.Path,
                 "iterdir",
                 side_effect=lambda: iter((client_path,)),
             ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+                s,
                 "_process_identity",
                 side_effect=process_identity,
             ), mock.patch.object(
-                _CANDIDATE_SUPPORT.Path,
+                s.Path,
                 "read_bytes",
                 autospec=True,
                 side_effect=read_environment,
             ) as read_client_environment:
-                inventory = _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                inventory = s._watchdog_client_inventory(
                     registry_path,
                     registry_token,
                     runner_uid=runner_uid,
@@ -11903,7 +11875,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 )
 
                 parent_inventory = (
-                    _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                    s._watchdog_client_inventory(
                         registry_path.parent,
                         registry_token,
                         runner_uid=runner_uid,
@@ -11915,7 +11887,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 client.communicate(timeout=5)
                 self.assertIsNotNone(client.returncode)
                 self.assertEqual(
-                    _CANDIDATE_SUPPORT._watchdog_client_inventory(
+                    s._watchdog_client_inventory(
                         registry_path,
                         registry_token,
                         runner_uid=runner_uid,
@@ -11930,11 +11902,14 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 client.communicate(timeout=5)
 
     def test_watchdog_clients_require_the_expected_registry_token(self) -> None:
+        s = _CANDIDATE_SUPPORT
+        p = mock.patch.object
         runner_uid = os.getuid()
         registry_path = Path("/tmp/entries")
         expected_token = "a" * 32
         wrong_token = "b" * 32
         watchdog_pid = os.getpid()
+        older_pid = watchdog_pid + 50_000
         client_pid = watchdog_pid + 100_000
         watchdog_identity = (
             watchdog_pid,
@@ -11952,75 +11927,124 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             client_pid,
             (runner_uid,) * 4,
         )
+        older_identity = (
+            older_pid,
+            100,
+            watchdog_pid,
+            older_pid,
+            older_pid,
+            (runner_uid,) * 4,
+        )
+        older_path = Path("/proc") / str(older_pid)
         client_path = Path("/proc") / str(client_pid)
         wrong_token_environment = b"\0".join(
             (
                 (
-                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV}="
+                    f"{s._ISOLATION_REGISTRY_ENV}="
                     f"{registry_path}"
                 ).encode("ascii"),
                 (
-                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV}="
+                    f"{s._ISOLATION_REGISTRY_TOKEN_ENV}="
                     f"{wrong_token}"
                 ).encode("ascii"),
             )
         )
 
-        def process_identity(
-            process_path: Path,
-        ) -> tuple[int, int, int, int, int, tuple[int, int, int, int]] | None:
+        def process_identity(process_path):
             if process_path.name == str(watchdog_pid):
                 return watchdog_identity
+            if process_path.name == str(older_pid):
+                return older_identity
             if process_path.name == str(client_pid):
                 return client_identity
             return None
 
-        with mock.patch.object(
-            _CANDIDATE_SUPPORT.Path,
+        def read_environment(path):
+            if path == older_path / "environ":
+                raise PermissionError(errno.EACCES, "injected older denial")
+            self.assertEqual(path, client_path / "environ")
+            return wrong_token_environment
+
+        with p(
+            s.Path,
             "iterdir",
-            side_effect=lambda: iter((client_path,)),
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
+            side_effect=lambda: iter((older_path, client_path)),
+        ), p(
+            s,
             "_process_identity",
             side_effect=process_identity,
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT.Path,
+        ), p(
+            s.Path,
             "read_bytes",
-            return_value=wrong_token_environment,
-        ) as read_environment, mock.patch.object(
-            _CANDIDATE_SUPPORT, "_root_signal_host_identity"
-        ) as signal_client, mock.patch.object(
-            _CANDIDATE_SUPPORT.time,
+            autospec=True,
+            side_effect=read_environment,
+        ) as read_environment, p(
+            s, "_root_signal_host_identity"
+        ) as signal_client, p(
+            s.time,
             "monotonic",
             side_effect=(0.0, 0.0, 0.1, 0.2, 6.0),
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT.time, "sleep"
+        ), p(
+            s.time, "sleep"
         ) as sleep:
-            _CANDIDATE_SUPPORT._watchdog_close_runner_clients(
+            s._watchdog_close_runner_clients(
                 registry_path, expected_token
             )
             signal_client.assert_not_called()
 
-            inventory = _CANDIDATE_SUPPORT._watchdog_client_inventory(
+            inventory = s._watchdog_client_inventory(
                 registry_path,
                 expected_token,
                 runner_uid=runner_uid,
+                minimum_start_time=watchdog_identity[1],
                 excluded_identity=watchdog_identity,
             )
             self.assertEqual(inventory, {})
 
-            _CANDIDATE_SUPPORT._strict_owner_loss_registered_clients_are_quiescent(
+            s._strict_owner_loss_registered_clients_are_quiescent(
                 registry_path,
                 expected_token,
                 runner_uid,
                 watchdog_identity,
             )
+            older_identity = (*older_identity[:1], 101, *older_identity[2:])
+            with self.assertRaisesRegex(AssertionError, "environment is unreadable"):
+                s._watchdog_client_inventory(
+                    registry_path, expected_token, minimum_start_time=101
+                )
 
         signal_client.assert_not_called()
-        self.assertEqual(read_environment.call_count, 7)
+        self.assertEqual(read_environment.call_count, 8)
         self.assertEqual(sleep.call_count, 4)
 
+        marker = f"required-ci-outer-{expected_token}"
+        paths = (Path("/proc/1"), Path("/proc/2"))
+        older_start = [100]
+
+        def identity(path):
+            pid = int(path.name)
+            return (pid, older_start[0] if pid == 1 else 101, 0, pid, pid, (runner_uid,) * 4)
+
+        def open_cmdline(path, *_args, **_kwargs):
+            if path.parent == paths[0]:
+                raise PermissionError(errno.EACCES, "injected older denial")
+            return io.BytesIO(marker.encode("ascii") + b"\0")
+
+        document = {"outer_marker": marker, "launcher_parent": [1, 101, 1, 1]}
+        with p(Path, "iterdir", return_value=paths), p(
+            s, "_process_identity", side_effect=identity
+        ), p(Path, "open", autospec=True, side_effect=open_cmdline):
+            self.assertEqual(
+                s._discover_prepared_outer(document),
+                [2, 101, 2, 2],
+            )
+            older_start[0] = 101
+            with self.assertRaisesRegex(AssertionError, "command line is unreadable"):
+                s._discover_prepared_outer(document)
+
     def test_watchdog_clients_require_the_expected_registry_path(self) -> None:
+        s = _CANDIDATE_SUPPORT
+        p = mock.patch.object
         runner_uid = os.getuid()
         registry_path = Path("/tmp/entries")
         wrong_registry_path = Path("/tmp/other-entries")
@@ -12044,55 +12068,45 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             (runner_uid,) * 4,
         )
         client_path = Path("/proc") / str(client_pid)
-        wrong_path_environment = b"\0".join(
-            (
-                (
-                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV}="
-                    f"{wrong_registry_path}"
-                ).encode("ascii"),
-                (
-                    f"{_CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV}="
-                    f"{expected_token}"
-                ).encode("ascii"),
-            )
-        )
+        wrong_path_environment = (
+            f"{s._ISOLATION_REGISTRY_ENV}={wrong_registry_path}\0"
+            f"{s._ISOLATION_REGISTRY_TOKEN_ENV}={expected_token}"
+        ).encode("ascii")
 
-        def process_identity(
-            process_path: Path,
-        ) -> tuple[int, int, int, int, int, tuple[int, int, int, int]] | None:
+        def process_identity(process_path):
             if process_path.name == str(watchdog_pid):
                 return watchdog_identity
             if process_path.name == str(client_pid):
                 return client_identity
             return None
 
-        with mock.patch.object(
-            _CANDIDATE_SUPPORT.Path,
+        with p(
+            s.Path,
             "iterdir",
             side_effect=lambda: iter((client_path,)),
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
+        ), p(
+            s,
             "_process_identity",
             side_effect=process_identity,
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT.Path,
+        ), p(
+            s.Path,
             "read_bytes",
             return_value=wrong_path_environment,
-        ) as read_environment, mock.patch.object(
-            _CANDIDATE_SUPPORT, "_root_signal_host_identity"
-        ) as signal_client, mock.patch.object(
-            _CANDIDATE_SUPPORT.time,
+        ) as read_environment, p(
+            s, "_root_signal_host_identity"
+        ) as signal_client, p(
+            s.time,
             "monotonic",
             side_effect=(0.0, 0.0, 0.1, 0.2, 6.0),
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT.time, "sleep"
+        ), p(
+            s.time, "sleep"
         ) as sleep:
-            _CANDIDATE_SUPPORT._watchdog_close_runner_clients(
+            s._watchdog_close_runner_clients(
                 registry_path, expected_token
             )
             signal_client.assert_not_called()
 
-            inventory = _CANDIDATE_SUPPORT._watchdog_client_inventory(
+            inventory = s._watchdog_client_inventory(
                 registry_path,
                 expected_token,
                 runner_uid=runner_uid,
@@ -12100,7 +12114,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
             self.assertEqual(inventory, {})
 
-            _CANDIDATE_SUPPORT._strict_owner_loss_registered_clients_are_quiescent(
+            s._strict_owner_loss_registered_clients_are_quiescent(
                 registry_path,
                 expected_token,
                 runner_uid,
@@ -24667,12 +24681,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             metadata = os.fstat(root_fd)
             try:
                 identity = (metadata.st_dev, metadata.st_ino)
-                diagnostic = s._outer_owner_retained_cleanup_state(root_fd, identity, str(retained["session_id"]))
+                state = s._outer_owner_retained_cleanup_state
+                sid = str(retained["session_id"])
+                diagnostic = state(root_fd, identity, sid)
                 suffix = ",failure=prepared-command-unreadable"
                 baseline = retained | {"state": "outer-bound", "outer": [1, 2, 1, 1]}
-                for changed, expected in ((baseline, "entry=outer-bound,outer=true,quota=intended"), (baseline | {"outer": []}, "entry=unreadable,outer=unreadable,quota=intended"), (baseline | {"session_id": "f" * 32}, "entry=unreadable,outer=unreadable,quota=intended"), (baseline | {"schema_version": 3}, "entry=unreadable,outer=unreadable,quota=intended"), (baseline | {"extra": True}, "entry=unreadable,outer=unreadable,quota=intended")):
+                unreadable = "entry=unreadable,outer=unreadable,quota=intended"
+                for changed, expected in ((baseline, "entry=outer-bound,outer=true,quota=intended"), (baseline | {"outer": []}, unreadable), (baseline | {"session_id": "f" * 32}, unreadable), (baseline | {"schema_version": 3}, unreadable), (baseline | {"extra": True}, unreadable)):
                     s._write_chain_registry_entry(entry, changed, create=False)
-                    self.assertEqual(s._outer_owner_retained_cleanup_state(root_fd, identity, str(retained["session_id"])), expected + suffix)
+                    self.assertEqual(state(root_fd, identity, sid), expected + suffix)
             finally:
                 os.close(root_fd)
             self.assertEqual(diagnostic, "entry=prepared,outer=false,quota=intended" + suffix)
@@ -26565,14 +26582,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         check(host_read_source, ('Path("/usr/lib") / multiarch', 'Path("/etc/ld.so.preload").lstat()', 'system_stdlib / "lib-dynload"', 'trusted_git.parent != Path("/usr/bin")'), ('Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',))
         check(candidate_source, ("read_network_interfaces(network_interface_fd)", 'status.get("Seccomp") != "2"', "Seccomp_filters", '"/proc/self/limits"'), ("os.listdir(trusted_root)", 'os.listdir("/sys/class/net")', "socket.if_nameindex", "resource.getrlimit"))
         check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")'), ('f"/proc/self/fdinfo/',))
-        install_function = next(node for node in ast.parse(bootstrap_source).body if isinstance(node, ast.FunctionDef) and node.name == "install_candidate_seccomp_filter")
-        architecture_assignment = next(node for node in install_function.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "architecture" for target in node.targets))
-        architecture_call = architecture_assignment.value
-        self.assertIsInstance(architecture_call, ast.Call)
-        architecture_get = architecture_call.func
-        self.assertIsInstance(architecture_get, ast.Attribute)
-        architecture_mapping = architecture_get.value
-        self.assertIsInstance(architecture_mapping, ast.Dict)
+        install = next(node for node in ast.parse(bootstrap_source).body if isinstance(node, ast.FunctionDef) and node.name == "install_candidate_seccomp_filter")
+        call = next(node for node in install.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "architecture" for target in node.targets)).value
+        for value, kind in ((call, ast.Call), (call.func, ast.Attribute), (call.func.value, ast.Dict)):
+            self.assertIsInstance(value, kind)
+        architecture_mapping = call.func.value
         architectures = {ast.literal_eval(key): ast.literal_eval(value) for key, value in zip(architecture_mapping.keys, architecture_mapping.values, strict=True)}
         self.assertEqual(architectures["x86_64"][3], 302)
         self.assertNotIn(302, architectures["x86_64"][4])
@@ -39530,6 +39544,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         physical_parent / "entries",
                         "b" * 32,
                         runner_uid=runner_uid,
+                        minimum_start_time=watchdog_identity[1],
                         excluded_identity=watchdog_identity,
                     ),
                 )
@@ -46423,6 +46438,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     str(marker["registry_token"]),
                     runner_uid=os.getuid(),
                     excluded_identity=watchdog_identity,
+                    minimum_start_time=watchdog_identity[1],
                 ),
                 {},
             )
