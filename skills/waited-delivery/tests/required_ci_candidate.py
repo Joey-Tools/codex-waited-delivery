@@ -3846,6 +3846,7 @@ def candidate_fixture_directory(prefix: str) -> tempfile.TemporaryDirectory[str]
 
 
 _ROOT_CONTROLLER_RECEIPT_PREFIX = "REQUIRED_CI_ROOT_CONTROLLER:"
+_ROOT_HANDSHAKE_RECEIPT_PREFIX = "REQUIRED_CI_ROOT_HANDSHAKE:"
 _ROOT_TARGET_ACTIVE_PREFIX = "REQUIRED_CI_ROOT_TARGET_ACTIVE:"
 _TARGET_ACTIVE_MARKER_PREFIX = "REQUIRED_CI_TARGET_ACTIVE:"
 _ROOT_CLEANUP_RECEIPT_PREFIX = "REQUIRED_CI_ROOT_CLEANUP:"
@@ -6823,7 +6824,10 @@ def _read_root_controller_handshake(
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != 0
         or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or (
+            (not data and (not allow_empty or stat.S_IMODE(metadata.st_mode) != 0o400))
+            or (data and stat.S_IMODE(metadata.st_mode) != 0o600)
+        )
         or (selected.st_dev, selected.st_ino)
         != (metadata.st_dev, metadata.st_ino)
         or (reselected.st_dev, reselected.st_ino)
@@ -6840,6 +6844,55 @@ def _read_root_controller_handshake(
             "strict root controller handshake is malformed"
         ) from error
     return _validated_root_controller_handshake_document(document)
+
+
+def _root_handshake_inspection_main(
+    entry_value: str,
+    uid_value: str,
+    token_value: str,
+    session_id: str,
+) -> int:
+    try:
+        if os.getuid() != 0 or os.geteuid() != 0:
+            raise AssertionError("strict root handshake inspector is not root")
+        _bind_root_controller_parent()
+        uid = _parse_internal_identity("handshake UID", uid_value)
+        entry = _load_chain_registry_entry(
+            Path(entry_value),
+            expected_token=token_value,
+            expected_target_uid=uid,
+            expected_recovery_controller=Path(__file__).resolve(strict=True),
+        )
+        path_value = entry.get("handshake_path")
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+            or Path(entry_value).name != f"chain-{session_id}.json"
+            or entry.get("session_id") != session_id
+            or entry.get("state") != "closed"
+            or type(path_value) is not str
+        ):
+            raise AssertionError("strict root handshake entry is not closed")
+        path = Path(path_value)
+        handshake = _read_root_controller_handshake(path)
+        if (
+            handshake.get("session_id") != entry.get("session_id")
+            or handshake.get("target_uid") != uid
+        ):
+            raise AssertionError("strict root handshake entry binding changed")
+        receipt = {
+            "status": "complete",
+            "handshake": handshake,
+        }
+    except BaseException as error:
+        receipt = {
+            "status": "incomplete",
+            "error": f"{type(error).__name__}: {error}",
+        }
+    print(
+        _ROOT_HANDSHAKE_RECEIPT_PREFIX
+        + json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    )
+    return 0
 
 
 def _assert_root_completion_sentinel(
@@ -9669,6 +9722,7 @@ def _root_controller_main(config_value: str) -> int:
             "schema_version": 1,
             "status": "completed",
             "nonce": nonce,
+            "resource_scope": resource_scope,
             "returncode": returncode,
             "timed_out": timed_out,
             "process_leak_observed": bool(observed),
@@ -9771,18 +9825,29 @@ def _root_cleanup_main(
             expected_target_uid=uid,
             expected_recovery_controller=Path(__file__).resolve(strict=True),
         )
-        if entry.get("target_uid") != uid or entry.get("state") != "closing":
+        if entry.get("target_uid") != uid or entry.get("state") not in (
+            "closing",
+            "deleting",
+        ):
             raise AssertionError("strict root cleanup UID binding is invalid")
-        outer = _parse_root_chain_identity(
-            entry.get("outer"), "registered outer session"
+        outer_value = entry.get("outer")
+        outer = (
+            None
+            if outer_value is None
+            else _parse_root_chain_identity(
+                outer_value, "registered outer session"
+            )
         )
-        if outer[0] != outer[2] or outer[0] != outer[3]:
+        if outer is not None and (
+            outer[0] != outer[2] or outer[0] != outer[3]
+        ):
             raise AssertionError("strict registered outer session is not unique")
         errors: list[BaseException] = []
         observed: set[tuple[int, int]] = set()
         host_observed_count = 0
         try:
-            host_observed_count = _root_close_registered_host_session(outer)
+            if outer is not None:
+                host_observed_count = _root_close_registered_host_session(outer)
         except BaseException as error:
             errors.append(error)
         try:
@@ -9812,6 +9877,7 @@ def _root_cleanup_main(
             "uid": uid,
             "observed_count": len(observed),
             "host_observed_count": host_observed_count,
+            "scope_cleanup_status": "complete",
         }
     except BaseException as error:
         receipt = {
@@ -19269,6 +19335,7 @@ def _mark_trusted_root_chain_closed(
     entry_path: Path,
     *,
     recovery_profile: str = "-",
+    scope_cleanup_proven: bool = False,
 ) -> dict[str, object]:
     with _chain_registry_lock(entry_path):
         document = _load_chain_registry_entry(entry_path)
@@ -19296,10 +19363,13 @@ def _mark_trusted_root_chain_closed(
         if outer_value is not None:
             outer = _parse_root_chain_identity(outer_value, "registered outer")
             _stable_host_session_zero(outer)
-        if _registered_scope_requires_cleanup(document):
-            raise AssertionError(
-                "strict systemd scope remains active after cleanup"
-            )
+        if scope_cleanup_proven:
+            if document.get("handshake_path") is None:
+                raise AssertionError(
+                    "strict systemd scope cleanup proof has no handshake"
+                )
+        elif _registered_scope_requires_cleanup(document):
+            raise AssertionError("strict systemd scope remains active after cleanup")
         _stable_uid_zero(int(document["target_uid"]))
         if recovery_profile == "-":
             _cleanup_registered_execution_root(entry_path, document)
@@ -19425,7 +19495,10 @@ def _recover_registered_entry(
                 raise AssertionError(
                     "strict registered host session lost its generation anchor"
                 )
-        broker_required = bool(session_inventory)
+        scope_cleanup_proven = False
+        broker_required = bool(session_inventory) or (
+            document.get("handshake_path") is not None
+        )
         if not broker_required:
             broker_required = _registered_scope_requires_cleanup(document)
         if broker_required:
@@ -19439,10 +19512,15 @@ def _recover_registered_entry(
             _invoke_registered_session_cleanup(
                 recovery_controller, entry_path, int(document["target_uid"])
             )
+            scope_cleanup_proven = document.get("handshake_path") is not None
         if recovery_profile == "-":
-            return _mark_trusted_root_chain_closed(entry_path)
+            return _mark_trusted_root_chain_closed(
+                entry_path, scope_cleanup_proven=scope_cleanup_proven
+            )
         return _mark_trusted_root_chain_closed(
-            entry_path, recovery_profile=recovery_profile
+            entry_path,
+            recovery_profile=recovery_profile,
+            scope_cleanup_proven=scope_cleanup_proven,
         )
 
 
@@ -25054,6 +25132,44 @@ def _invoke_strict_controller(
     return receipt
 
 
+def _invoke_root_handshake_inspection(
+    controller_path: Path,
+    entry_path: Path,
+    target_uid: int,
+    token: str,
+    session_id: str,
+) -> dict[str, object]:
+    output = _run_registered_sudo(
+        [
+            str(_STRICT_PRIMITIVES["python"]),
+            *_ROOT_PYTHON_ARGUMENTS,
+            str(controller_path),
+            "--isolation-root-handshake",
+            str(entry_path),
+            str(target_uid),
+            token,
+            session_id,
+        ]
+    )
+    expected_prefix = _ROOT_HANDSHAKE_RECEIPT_PREFIX.encode("ascii")
+    if not output.startswith(expected_prefix) or output.count(b"\n") != 1:
+        raise AssertionError("strict root handshake receipt is malformed")
+    try:
+        receipt = json.loads(output[len(expected_prefix) :])
+    except json.JSONDecodeError as error:
+        raise AssertionError("strict root handshake receipt is malformed") from error
+    if type(receipt) is not dict or set(receipt) != {"status", "handshake"}:
+        detail = receipt.get("error") if isinstance(receipt, dict) else "invalid"
+        raise AssertionError(
+            f"strict root handshake inspection did not complete: {detail}"
+        )
+    if receipt.get("status") != "complete":
+        raise AssertionError("strict root handshake inspection was incomplete")
+    return _validated_root_controller_handshake_document(
+        receipt.get("handshake")
+    )
+
+
 def _invoke_registered_session_cleanup(
     controller_path: Path, entry_path: Path, target_uid: int
 ) -> None:
@@ -25080,7 +25196,24 @@ def _invoke_registered_session_cleanup(
         receipt = json.loads(output[len(expected_prefix) :])
     except json.JSONDecodeError as error:
         raise AssertionError("strict registered cleanup receipt is malformed") from error
-    if type(receipt) is not dict or receipt.get("status") != "complete":
+    if (
+        type(receipt) is not dict
+        or set(receipt)
+        != {
+            "status",
+            "uid",
+            "observed_count",
+            "host_observed_count",
+            "scope_cleanup_status",
+        }
+        or receipt.get("status") != "complete"
+        or receipt.get("uid") != target_uid
+        or receipt.get("scope_cleanup_status") != "complete"
+        or any(
+            type(receipt.get(field)) is not int or int(receipt[field]) < 0
+            for field in ("observed_count", "host_observed_count")
+        )
+    ):
         raise AssertionError(
             "strict registered cleanup did not complete: "
             f"{receipt.get('error') if isinstance(receipt, dict) else 'invalid'}"
@@ -26263,7 +26396,29 @@ def _validate_strict_inner_controller_fault_result(
     handshake_path = snapshot.get("handshake_path")
     if not isinstance(handshake_path, Path):
         raise AssertionError("strict fault probe handshake path is malformed")
-    handshake = _read_root_controller_handshake(handshake_path)
+    session = _active_strict_session()
+    entries = session.get("entries")
+    controller_path = session.get("controller_path")
+    token = session.get("token")
+    target_uid = int(_strict_realm()["uid"])
+    if (
+        not isinstance(entries, Path)
+        or not isinstance(controller_path, Path)
+        or type(token) is not str
+    ):
+        raise AssertionError("strict fault probe registry is malformed")
+    entry_path = entries / f"chain-{session_id}.json"
+    document = _load_chain_registry_entry(entry_path)
+    if (
+        document.get("state") != "closed"
+        or document.get("handshake_path") != str(handshake_path)
+    ):
+        raise AssertionError("strict fault probe handshake entry changed")
+    handshake = _invoke_root_handshake_inspection(
+        controller_path, entry_path, target_uid, token, session_id
+    )
+    if handshake.get("session_id") != session_id:
+        raise AssertionError("strict fault probe handshake session changed")
     resource_scope = _validated_strict_inner_fault_scope(
         handshake, fault_point
     )
@@ -26274,17 +26429,9 @@ def _validate_strict_inner_controller_fault_result(
     )
     if handshake.get("phase") != expected_phase:
         raise AssertionError("strict fault probe handshake phase is wrong")
-    session = _active_strict_session()
-    entries = session.get("entries")
-    if not isinstance(entries, Path):
-        raise AssertionError("strict fault probe registry is malformed")
-    document = _load_chain_registry_entry(
-        entries / f"chain-{session_id}.json"
-    )
     outer = document.get("outer")
     if (
-        document.get("state") != "closed"
-        or type(outer) is not list
+        type(outer) is not list
         or len(outer) != 4
         or any(type(value) is not int for value in outer)
         or _host_session_inventory(outer[3])
@@ -26970,6 +27117,12 @@ if __name__ == "__main__":
         raise SystemExit(_outer_owner_fault_probe_main(sys.argv[2:]))
     if len(sys.argv) == 3 and sys.argv[1] == "--isolation-root-controller":
         raise SystemExit(_root_controller_main(sys.argv[2]))
+    if len(sys.argv) == 6 and sys.argv[1] == "--isolation-root-handshake":
+        raise SystemExit(
+            _root_handshake_inspection_main(
+                sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+            )
+        )
     if len(sys.argv) == 5 and sys.argv[1] == "--isolation-cleanup":
         raise SystemExit(
             _root_cleanup_main(sys.argv[2], sys.argv[3], sys.argv[4])

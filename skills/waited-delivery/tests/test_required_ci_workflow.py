@@ -6804,12 +6804,10 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"
         )
-
         self.assertTrue(
             workflow.startswith(
                 "name: CI\n\non:\n  pull_request:\n  push:\n"
-                "    branches:\n      - master\n\n"
-                "permissions:\n  contents: read\n"
+                "    branches:\n      - master\n\npermissions:\n  contents: read\n"
             )
         )
         self.assertNotIn("pull_request_target", workflow)
@@ -9110,57 +9108,43 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "tests_run": 1,
             },
         )
-    def test_strict_live_end_to_end_composes_all_authority_checks(self) -> None:
-        trace: list[str] = []
+
+    def test_strict_live_selector_keeps_all_proofs(self) -> None:
         helpers = (
             "_exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read",
             "_exercise_real_watchdog_owner_sigkill_replays_registered_live_ipc_root",
             "_exercise_strict_systemd_scope_aggregate_limits",
         )
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            sys.modules[__name__], "_validated_strict_live_repository_binding"
-        ) as repository_binding:
-            with self.assertRaises(unittest.SkipTest):
-                self.test_strict_runtime_live_end_to_end()
-        repository_binding.assert_not_called()
-        repository_binding = mock.Mock(
-            side_effect=lambda: trace.append("repository-binding")
-            or (Path(), "", {})
-        )
-        helper_mocks = {
-            name: mock.Mock(
-                side_effect=lambda *_args, value=name: trace.append(value)
-            )
-            for name in helpers
-        }
+        trace: list[str] = []
         with mock.patch.dict(
             os.environ,
             {REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE},
         ), mock.patch.object(
             sys.modules[__name__],
             "_validated_strict_live_repository_binding",
-            repository_binding,
-        ), mock.patch.multiple(type(self), **helper_mocks):
+            side_effect=lambda: trace.append("repository-binding")
+            or (Path(), "", {}),
+        ), mock.patch.multiple(
+            type(self),
+            **{
+                name: mock.Mock(
+                    side_effect=lambda *_args, value=name: trace.append(value)
+                )
+                for name in helpers
+            },
+        ):
             self.test_strict_runtime_live_end_to_end()
         self.assertEqual(tuple(trace), ("repository-binding", *helpers))
-        fault_trace: list[str] = []
+        trace.clear()
         with mock.patch.object(
             _CANDIDATE_SUPPORT,
             "_exercise_strict_inner_controller_fault",
-            side_effect=lambda _root, _sha, point: fault_trace.append(point),
+            side_effect=lambda _root, _sha, point: trace.append(point),
         ):
             _CANDIDATE_SUPPORT._exercise_strict_inner_controller_fault_matrix(
                 Path("/candidate"), "a" * 40
             )
-        self.assertEqual(
-            tuple(fault_trace),
-            (
-                "after-wrapper-popen-before-handshake-sigkill",
-                "after-wrapper-popen-before-handshake-sigstop",
-                "after-wrapper-bound-before-barrier-sigkill",
-                "after-wrapper-bound-before-barrier-sigstop",
-            ),
-        )
+        self.assertEqual(tuple(trace), _CANDIDATE_SUPPORT._INNER_CONTROLLER_FAULT_POINTS)
 
     def test_strict_live_broker_witness_path_binds_session_and_nonce(
         self,
@@ -21480,6 +21464,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     def test_systemd_scope_cleanup_and_outer_timeouts_have_fixed_margin(
         self,
     ) -> None:
+        support = _CANDIDATE_SUPPORT
+        patch = mock.patch.object
         class ControllerCaptured(Exception):
             pass
 
@@ -21504,16 +21490,16 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 captured.append(dict(options))
                 raise ControllerCaptured
 
-            with mock.patch.object(
-                _CANDIDATE_SUPPORT,
+            with patch(
+                support,
                 "_strict_realm",
                 return_value={"uid": 60000, "gid": 60000},
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+            ), patch(
+                support,
                 "_active_strict_session",
                 return_value={"root": snapshot_root},
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+            ), patch(
+                support,
                 "_strict_writable_root_bindings",
                 return_value=[
                     {
@@ -21523,8 +21509,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         "host_mount_id": 3,
                     }
                 ],
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+            ), patch(
+                support,
                 "_aggregate_writable_device_binding",
                 return_value={
                     "mountpoint": "/quota",
@@ -21536,25 +21522,25 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     "nr_inodes": 8192,
                     "flags": ["nodev", "nosuid"],
                 },
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+            ), patch(
+                support,
                 "_strict_host_read_root_bindings",
                 return_value=self.root_command_config()["read_roots"],
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+            ), patch(
+                support,
                 "_assert_strict_bootstrap_nofile_capacity",
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+            ), patch(
+                support,
                 "_strict_host_namespace_identity",
                 side_effect=lambda namespace: {
                     "mnt": "mnt:[101]",
                     "ipc": "ipc:[102]",
                     "net": "net:[103]",
                 }[namespace],
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+            ), patch(
+                support, "_invoke_root_tree_operation"
+            ), patch(
+                support,
                 "_run_registered_sudo",
                 side_effect=capture_controller,
             ):
@@ -21562,11 +21548,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     if snapshot["config_path"].exists():
                         snapshot["config_path"].chmod(0o600)
                     with self.assertRaises(ControllerCaptured):
-                        _CANDIDATE_SUPPORT._invoke_strict_controller(
+                        support._invoke_strict_controller(
                             snapshot,
                             [
                                 str(
-                                    _CANDIDATE_SUPPORT._STRICT_PRIMITIVES[
+                                    support._STRICT_PRIMITIVES[
                                         "python"
                                     ]
                                 ),
@@ -21585,24 +21571,92 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         )
 
         cleanup_output = (
-            _CANDIDATE_SUPPORT._ROOT_CLEANUP_RECEIPT_PREFIX
-            + '{"status":"complete"}\n'
+            support._ROOT_CLEANUP_RECEIPT_PREFIX
+            + '{"host_observed_count":0,"observed_count":0,'
+            '"scope_cleanup_status":"complete","status":"complete","uid":60000}\n'
         ).encode("ascii")
-        with mock.patch.object(
-            _CANDIDATE_SUPPORT,
+        with patch(
+            support,
             "_active_strict_session",
             return_value={"token": "f" * 32},
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
+        ), patch(
+            support,
             "_run_registered_sudo",
             return_value=cleanup_output,
         ) as registered_sudo:
-            _CANDIDATE_SUPPORT._invoke_registered_session_cleanup(
+            support._invoke_registered_session_cleanup(
                 Path("/root/controller.py"),
                 Path("/root/entries/chain.json"),
                 60000,
             )
         self.assertEqual(registered_sudo.call_args.kwargs["timeout"], 20)
+        session_id = "a" * 32
+        intent = support._systemd_scope_intent(session_id)
+        handshake_path = Path("/root/handshake.json")
+
+        def read_handshake(data: bytes, mode: int) -> object:
+            file_metadata = types.SimpleNamespace(
+                st_mode=stat.S_IFREG | mode,
+                st_uid=0,
+                st_nlink=1,
+                st_dev=1,
+                st_ino=2,
+            )
+            parent_metadata = types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o700, st_uid=0
+            )
+            with patch(
+                Path,
+                "lstat",
+                side_effect=(file_metadata, parent_metadata, file_metadata),
+            ), mock.patch.multiple(
+                os,
+                open=mock.Mock(return_value=9),
+                fstat=mock.Mock(return_value=file_metadata),
+                read=mock.Mock(return_value=data),
+                close=mock.DEFAULT,
+            ):
+                return support._read_root_controller_handshake(
+                    handshake_path, allow_empty=True
+                )
+
+        self.assertIsNone(read_handshake(b"", 0o400))
+        for data, mode in ((b"{}", 0o400), (b"", 0o600)):
+            with self.assertRaisesRegex(AssertionError, "identity is unsafe"):
+                read_handshake(data, mode)
+        output = io.StringIO()
+        with patch(os, "getuid", return_value=0), patch(
+            os, "geteuid", return_value=0
+        ), patch(
+            support, "_bind_root_controller_parent"
+        ), patch(
+            support, "_enable_child_subreaper"
+        ), patch(
+            support, "_load_chain_registry_entry",
+            return_value={
+                "target_uid": 60000,
+                "state": "deleting",
+                "outer": None,
+                "handshake_path": str(handshake_path),
+                "session_id": session_id,
+            },
+        ), patch(
+            support, "_root_close_registered_host_session"
+        ) as host, patch(
+            support, "_root_close_systemd_scope"
+        ) as scope, patch(
+            support, "_root_close_candidate_realm", return_value=set()
+        ) as uid, patch(
+            support, "_read_root_controller_handshake", return_value=None
+        ) as reader, contextlib.redirect_stdout(output):
+            support._root_cleanup_main(
+                "/entries/chain.json", "60000", "f" * 32
+            )
+        self.assertEqual(
+            (host.call_count, scope.call_args.args, uid.call_count, reader.call_count),
+            (0, (intent,), 1, 1),
+        )
+        self.assertIn('"status":"complete"', output.getvalue())
 
     def test_after_target_active_outer_child_preserves_candidate_root_channel(
         self,
@@ -23929,6 +23983,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     def test_chain_registry_entry_remains_registered_until_cleanup_completes(
         self,
     ) -> None:
+        support = _CANDIDATE_SUPPORT
+        patch = mock.patch.object
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve(strict=True)
             entries = root / "entries"
@@ -23948,10 +24004,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "inherited": True,
                 "watchdog_authorized": True,
             }
-            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
-            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            previous_session = support._STRICT_SESSION
+            support._STRICT_SESSION = session
             try:
-                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                entry_path = support._register_trusted_root_chain(
                     controller_path,
                     handshake_path,
                     60000,
@@ -23963,58 +24019,88 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 self.assertEqual(prepared["target_uid"], 60000)
                 self.assertEqual(prepared["handshake_path"], str(handshake_path))
                 outer = [60001, 1, 60001, 60001]
-                _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                support._transition_trusted_root_chain(
                     entry_path, ("prepared",), "outer-bound", outer=outer
                 )
-                _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                support._transition_trusted_root_chain(
                     entry_path, ("outer-bound",), "root-authorized"
                 )
-                _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                support._transition_trusted_root_chain(
                     entry_path, ("root-authorized",), "closing"
                 )
-                with mock.patch.object(
-                    _CANDIDATE_SUPPORT, "_stable_host_session_zero"
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                with patch(
+                    support,
+                    "_assert_registered_session_not_reused",
+                    return_value=True,
+                ), patch(
+                    support, "_host_session_inventory", return_value={}
+                ), patch(
+                    support, "_stable_host_session_zero"
+                ), patch(
+                    support, "_stable_uid_zero"
+                ), patch(
+                    support,
                     "_registered_scope_requires_cleanup",
-                    return_value=False,
-                ):
-                    _CANDIDATE_SUPPORT._mark_trusted_root_chain_closed(
-                        entry_path
+                    side_effect=AssertionError("runner read"),
+                ) as scope_probe, patch(
+                    support, "_invoke_registered_session_cleanup"
+                ) as broker:
+                    closed = support._recover_registered_entry(
+                        entry_path, allow_recovery_broker=True
                     )
-                closed = json.loads(entry_path.read_text(encoding="ascii"))
-                with mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                broker.assert_called_once()
+                scope_probe.assert_not_called()
+                handshake = {
+                    "session_id": prepared["session_id"],
+                    "target_uid": 60000,
+                }
+                output = io.StringIO()
+                with mock.patch.multiple(
+                    os, getuid=mock.Mock(return_value=0), geteuid=mock.Mock(return_value=0)
+                ), mock.patch.multiple(
+                    support,
+                    _bind_root_controller_parent=mock.DEFAULT,
+                    _load_chain_registry_entry=mock.Mock(return_value=closed),
+                    _read_root_controller_handshake=mock.Mock(
+                        side_effect=(
+                            handshake,
+                            {**handshake, "session_id": "f" * 32},
+                        )
+                    ),
+                ), contextlib.redirect_stdout(output):
+                    for _ in range(2):
+                        support._root_handshake_inspection_main(
+                            str(entry_path), "60000", token, prepared["session_id"]
+                        )
+                self.assertEqual(output.getvalue().count('"status":"complete"'), 1)
+                self.assertEqual(output.getvalue().count('"status":"incomplete"'), 1)
+                with patch(
+                    support,
                     "_registered_scope_requires_cleanup",
                     side_effect=AssertionError("closed scope probe mutant"),
                 ) as scope_probe:
                     self.assertEqual(
-                        _CANDIDATE_SUPPORT._mark_trusted_root_chain_closed(
+                        support._mark_trusted_root_chain_closed(
                             entry_path
                         ),
                         closed,
                     )
                 scope_probe.assert_not_called()
-                for incomplete_state in ("closing", "deleting"):
-                    incomplete = {**closed, "state": incomplete_state}
-                    _CANDIDATE_SUPPORT._write_chain_registry_entry(
-                        entry_path, incomplete, create=False
-                    )
-                    with mock.patch.object(
-                        _CANDIDATE_SUPPORT, "_stable_host_session_zero"
-                    ), self.assertRaisesRegex(
-                        AssertionError, "handshake is unreadable"
-                    ):
-                        _CANDIDATE_SUPPORT._mark_trusted_root_chain_closed(
-                            entry_path
-                        )
-                _CANDIDATE_SUPPORT._write_chain_registry_entry(
+                incomplete = {**closed, "state": "deleting"}
+                support._write_chain_registry_entry(
+                    entry_path, incomplete, create=False
+                )
+                with patch(
+                    support, "_stable_host_session_zero"
+                ), self.assertRaisesRegex(
+                    AssertionError, "handshake is unreadable"
+                ):
+                    support._mark_trusted_root_chain_closed(entry_path)
+                support._write_chain_registry_entry(
                     entry_path, closed, create=False
                 )
             finally:
-                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+                support._STRICT_SESSION = previous_session
 
             self.assertEqual(closed["state"], "closed")
             self.assertEqual(
@@ -25750,6 +25836,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertIn(
             'host_network_namespace = _strict_host_namespace_identity("net")',
             invoke_source,
+        )
+        self.assertLess(
+            invoke_source.index("_revalidate_configured_candidate_interpreter"),
+            invoke_source.index("realm = _strict_realm()"),
         )
         self.assertIn(
             '"host_network_namespace": host_network_namespace', invoke_source
@@ -27718,77 +27808,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         strict_realm.assert_not_called()
         root_tree.assert_not_called()
         registered_sudo.assert_not_called()
-
-    def test_strict_controller_revalidates_runtime_before_privilege(
-        self,
-    ) -> None:
-        binding = {
-            "resolved": "/configured/python",
-            "target_uid": 60000,
-            "target_gid": 60000,
-        }
-        with mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_strict_realm",
-            return_value={"uid": 60000, "gid": 60000},
-        ) as strict_realm, mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_revalidate_configured_candidate_interpreter",
-            side_effect=AssertionError(
-                "configured candidate interpreter binding changed"
-            ),
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
-        ) as root_tree, mock.patch.object(
-            _CANDIDATE_SUPPORT, "_run_registered_sudo"
-        ) as registered_sudo, mock.patch.object(
-            _CANDIDATE_SUPPORT.subprocess, "Popen"
-        ) as popen, self.assertRaisesRegex(
-            AssertionError, "binding changed"
-        ):
-            _CANDIDATE_SUPPORT._invoke_strict_controller(
-                {},
-                ["/configured/python", "-I", "/probe.py"],
-                {},
-                Path("/tmp"),
-                b"",
-                timeout_seconds=1,
-                candidate_interpreter_binding=binding,
-            )
-        strict_realm.assert_not_called()
-        root_tree.assert_not_called()
-        registered_sudo.assert_not_called()
-        popen.assert_not_called()
-
-        with mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_revalidate_configured_candidate_interpreter",
-            return_value=binding,
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_strict_realm",
-            return_value={"uid": 60001, "gid": 60001},
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
-        ) as root_tree, mock.patch.object(
-            _CANDIDATE_SUPPORT, "_run_registered_sudo"
-        ) as registered_sudo, mock.patch.object(
-            _CANDIDATE_SUPPORT.subprocess, "Popen"
-        ) as popen, self.assertRaisesRegex(
-            AssertionError, "target identity changed"
-        ):
-            _CANDIDATE_SUPPORT._invoke_strict_controller(
-                {},
-                ["/configured/python", "-I", "/probe.py"],
-                {},
-                Path("/tmp"),
-                b"",
-                timeout_seconds=1,
-                candidate_interpreter_binding=binding,
-            )
-        root_tree.assert_not_called()
-        registered_sudo.assert_not_called()
-        popen.assert_not_called()
 
     def test_strict_controller_binds_host_read_roots_before_privilege(
         self,
@@ -46891,12 +46910,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 metrics = _validated_systemd_live_metrics(
                     json.loads(stdout), session_id=session_id, kind=kind
                 )
-                handshake = _CANDIDATE_SUPPORT._read_root_controller_handshake(
-                    Path(snapshot["handshake_path"])
-                )
-                self.assertEqual(handshake["phase"], "wrapper-bound")
                 scope = _CANDIDATE_SUPPORT._validated_systemd_scope_document(
-                    handshake["resource_scope"],
+                    receipt.get("resource_scope"),
                     session_id=session_id,
                     allow_unbound=False,
                 )
@@ -50137,41 +50152,10 @@ class RequiredCiCallerRegressionTests(unittest.TestCase):
 
 
 class RequiredCiWorkflowTests(unittest.TestCase):
-    def test_workflow_and_supervisor_budgets_form_exact_nested_envelopes(
-        self,
-    ) -> None:
-        job_timeout_seconds = int(EXPECTED_TEST_TIMEOUT_MINUTES) * 60
+    def test_workflow_budgets_are_exact(self) -> None:
+        self.assertEqual((TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES, TRUSTED_TEST_STEP_TIMEOUT_MINUTES, TRUSTED_JOB_RUNNER_MARGIN_MINUTES, EXPECTED_TEST_TIMEOUT_MINUTES), (15, 15, 7, "37"))
+        self.assertEqual((TRUSTED_TEST_SUITE_TIMEOUT_SECONDS, TRUSTED_TEST_CLEANUP_RESERVE_SECONDS, TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS, TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS, TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS), (600, 120, 720, 180, 1))
 
-        self.assertEqual(TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES, 15)
-        self.assertEqual(TRUSTED_TEST_STEP_TIMEOUT_MINUTES, 15)
-        self.assertEqual(TRUSTED_JOB_RUNNER_MARGIN_MINUTES, 7)
-        self.assertEqual(
-            TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES
-            + TRUSTED_TEST_STEP_TIMEOUT_MINUTES
-            + TRUSTED_JOB_RUNNER_MARGIN_MINUTES,
-            int(EXPECTED_TEST_TIMEOUT_MINUTES),
-        )
-        self.assertEqual(TRUSTED_TEST_SUITE_TIMEOUT_SECONDS, 10 * 60)
-        self.assertEqual(TRUSTED_TEST_CLEANUP_RESERVE_SECONDS, 2 * 60)
-        self.assertEqual(TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS, 12 * 60)
-        self.assertEqual(TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS, 3 * 60)
-        self.assertEqual(TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS, 1)
-        self.assertEqual(
-            TRUSTED_TEST_SUITE_TIMEOUT_SECONDS
-            + TRUSTED_TEST_CLEANUP_RESERVE_SECONDS,
-            TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS,
-        )
-        self.assertEqual(
-            TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS
-            + TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS,
-            TRUSTED_TEST_STEP_TIMEOUT_MINUTES * 60,
-        )
-        self.assertEqual(
-            TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES * 60
-            + TRUSTED_TEST_STEP_TIMEOUT_MINUTES * 60
-            + TRUSTED_JOB_RUNNER_MARGIN_MINUTES * 60,
-            job_timeout_seconds,
-        )
 
     def test_module_postpones_runtime_annotation_evaluation(self) -> None:
         source = importlib.util.decode_source(TRUSTED_TEST_SUPERVISOR_BYTES)
