@@ -47986,7 +47986,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             text=True,
                         )
                         if subprocess_result.stdout != "subprocess-ok\n":
-                            raise SystemExit(96)
+                            raise SystemExit("subprocess-output")
                         subprocess.run(
                             [
                                 sys.executable,
@@ -48002,10 +48002,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         )
                         with open("/dev/null", "rb", buffering=0) as null_read:
                             if null_read.read(1) != b"":
-                                raise SystemExit(96)
+                                raise SystemExit("devnull-read")
                         with open("/dev/null", "wb", buffering=0) as null_write:
                             if null_write.write(b"x") != 1:
-                                raise SystemExit(96)
+                                raise SystemExit("devnull-write")
 
                         def devzero_operation():
                             descriptor = os.open(
@@ -48042,7 +48042,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                 or len(first_line) != 1
                                 or not first_line[0].startswith(expected_prefix)
                             ):
-                                raise SystemExit(96)
+                                raise SystemExit("entrypoint-help")
                             entrypoint_usage[name] = first_line[0]
 
                         zstd_payload = b"required-ci-zstd-round-trip\n" * 32
@@ -48051,7 +48051,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             not zstd_encoded
                             or zstd.decompress(zstd_encoded) != zstd_payload
                         ):
-                            raise SystemExit(96)
+                            raise SystemExit("zstd-roundtrip")
 
                         git_root = explicit_root / "git-fixture"
                         os.environ["GIT_OPTIONAL_LOCKS"] = "0"
@@ -48080,7 +48080,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                 or len(completed.stderr) > 65536
                                 or completed.stderr
                             ):
-                                raise SystemExit(96)
+                                raise SystemExit("git-output")
                             return completed.stdout
 
                         git_head = run_git(
