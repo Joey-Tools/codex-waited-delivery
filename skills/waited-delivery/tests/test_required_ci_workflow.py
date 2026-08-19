@@ -20465,6 +20465,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             authority["cgroup_mount_inventory"] = root_inventory
 
             binding = validate()
+            try:
+                mount_record["source"] = "cgroup2"
+                self.assertEqual(validate(), binding)
+            finally:
+                mount_record["source"] = "cgroup"
             metadata = scope_path.lstat()
             self.assertEqual(
                 binding,

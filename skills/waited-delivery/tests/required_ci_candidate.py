@@ -7818,7 +7818,7 @@ def _open_validated_cgroup2_scope(
         }
         or record.get("mountpoint") != cgroup_root
         or record.get("filesystem") != "cgroup2"
-        or record.get("source") != "cgroup"
+        or record.get("source") not in ("cgroup", "cgroup2")
         or type(record.get("mount_id")) is not int
         or int(record["mount_id"]) <= 0
         or type(record.get("major_minor")) is not tuple
