@@ -1960,11 +1960,24 @@ def _candidate_workspace_archive_sources(
                 return record
             size = len(record)
 
+    def pax_path(data: bytes) -> bytes:
+        prefix = f"{len(data)} path=".encode("ascii")
+        if (
+            not data.startswith(prefix)
+            or not data.endswith(b"\n")
+            or len(data) == len(prefix) + 1
+        ):
+            raise AssertionError(
+                "candidate workspace archive extended header is malformed"
+            )
+        return data[len(prefix) : -1]
+
     if not archive_output or len(archive_output) % 512 != 0:
         raise AssertionError("candidate workspace archive framing is malformed")
     offset = 0
     saw_global_header = False
     saw_end = False
+    pending_extended_path: tuple[bytes, bytes] | None = None
     while offset < len(archive_output):
         header = archive_output[offset : offset + 512]
         if len(header) != 512:
@@ -1986,6 +1999,10 @@ def _candidate_workspace_archive_sources(
             ):
                 raise AssertionError(
                     "candidate workspace archive framing is malformed"
+                )
+            if pending_extended_path is not None:
+                raise AssertionError(
+                    "candidate workspace archive extended header is dangling"
                 )
             saw_end = True
             break
@@ -2024,6 +2041,7 @@ def _candidate_workspace_archive_sources(
         if type_flag == b"g":
             if (
                 saw_global_header
+                or pending_extended_path is not None
                 or offset != 0
                 or raw_name != b"pax_global_header"
                 or mode != 0o666
@@ -2035,19 +2053,48 @@ def _candidate_workspace_archive_sources(
             saw_global_header = True
             offset = padded_end
             continue
+        if type_flag == b"x":
+            extended_name = re.fullmatch(
+                rb"([0-9a-f]{40})\.paxheader", raw_name
+            )
+            if (
+                not saw_global_header
+                or pending_extended_path is not None
+                or mode != 0o666
+                or extended_name is None
+            ):
+                raise AssertionError(
+                    "candidate workspace archive extended header is malformed"
+                )
+            pending_extended_path = (
+                pax_path(data),
+                extended_name.group(1),
+            )
+            offset = padded_end
+            continue
         if not saw_global_header or type_flag not in (b"0", b"5"):
             raise AssertionError(
                 "candidate workspace archive member type is unsupported"
             )
+        extended_oid: bytes | None = None
+        if pending_extended_path is not None:
+            raw_path, extended_oid = pending_extended_path
+            if raw_name != extended_oid + b".data":
+                raise AssertionError(
+                    "candidate workspace archive extended header binding is malformed"
+                )
+            pending_extended_path = None
+        else:
+            raw_path = raw_name
         if type_flag == b"5":
-            if not raw_name.endswith(b"/"):
+            if not raw_path.endswith(b"/"):
                 raise AssertionError(
                     "candidate workspace archive directory is malformed"
                 )
-            raw_name = raw_name[:-1]
-        elif raw_name.endswith(b"/"):
+            raw_path = raw_path[:-1]
+        elif raw_path.endswith(b"/"):
             raise AssertionError("candidate workspace archive file is malformed")
-        relative_path = _candidate_workspace_path(raw_name)
+        relative_path = _candidate_workspace_path(raw_path)
         if relative_path in observed_names:
             raise AssertionError(
                 "candidate workspace archive member is duplicated or extended"
@@ -2072,6 +2119,10 @@ def _candidate_workspace_archive_sources(
                     "candidate workspace archive file is not in the Git tree"
                 )
             oid, expected_size, executable = expected
+            if extended_oid is not None and extended_oid != oid.encode("ascii"):
+                raise AssertionError(
+                    "candidate workspace archive extended header binding is malformed"
+                )
             if size != expected_size or mode != (0o755 if executable else 0o644):
                 raise AssertionError(
                     "candidate workspace archive file policy changed"
@@ -2082,6 +2133,10 @@ def _candidate_workspace_archive_sources(
                 )
             sources[relative_path] = (data, executable)
         offset = padded_end
+    if pending_extended_path is not None:
+        raise AssertionError(
+            "candidate workspace archive extended header is dangling"
+        )
     if not saw_global_header or not saw_end:
         raise AssertionError("candidate workspace archive framing is malformed")
     if set(sources) != set(tree_inventory):

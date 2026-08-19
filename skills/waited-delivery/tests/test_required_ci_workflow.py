@@ -9533,15 +9533,12 @@ _STRICT_TARGET_ACCESS_PROGRAM = inspect.cleandoc(
         "socketpair": socketpair_errno != errno.EACCES,
         "fifo-write": fifo_errno != errno.EACCES,
         "fifo-read": fifo_read_errno != errno.EACCES,
-        "ipc-policy": ipc_policy
-        != {
-            "chmod": errno.EPERM,
-            "create": errno.EACCES,
-            "list": errno.EACCES,
-            "mkdir": errno.EACCES,
-            "rename": errno.EACCES,
-            "symlink": errno.EACCES,
-        },
+        "ipc-chmod": ipc_policy["chmod"] != errno.EROFS,
+        "ipc-create": ipc_policy["create"] != errno.EROFS,
+        "ipc-list": ipc_policy["list"] != errno.EACCES,
+        "ipc-mkdir": ipc_policy["mkdir"] != errno.EROFS,
+        "ipc-rename": ipc_policy["rename"] != errno.EROFS,
+        "ipc-symlink": ipc_policy["symlink"] != errno.EROFS,
         "link": link_errno != errno.EACCES,
         "unshare": unshare_errno != errno.EACCES,
         "clone3": clone3_errno != errno.ENOSYS,
@@ -10844,6 +10841,44 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             raise AssertionError("tar fixture checksum is out of range")
         header[148:156] = encoded_checksum
         mutated[header_offset : header_offset + 512] = header
+        return bytes(mutated)
+
+    @staticmethod
+    def pax_record(key: bytes, value: bytes) -> bytes:
+        body = b" " + key + b"=" + value + b"\n"
+        size = len(body) + 1
+        while True:
+            record = str(size).encode("ascii") + body
+            if len(record) == size:
+                return record
+            size = len(record)
+
+    @classmethod
+    def replace_tar_data(
+        cls,
+        archive_output: bytes,
+        header_offset: int,
+        replacement: bytes,
+    ) -> bytes:
+        header = archive_output[header_offset : header_offset + 512]
+        old_size = int(header[124:136].rstrip(b"\0 "), 8)
+        old_padded_size = ((old_size + 511) // 512) * 512
+        new_padded_size = ((len(replacement) + 511) // 512) * 512
+        if old_padded_size != new_padded_size:
+            raise AssertionError("tar fixture replacement changes block framing")
+        mutated = bytearray(
+            cls.mutate_tar_header(
+                archive_output,
+                header_offset,
+                124,
+                136,
+                f"{len(replacement):011o}\0".encode("ascii"),
+            )
+        )
+        data_offset = header_offset + 512
+        mutated[data_offset : data_offset + old_padded_size] = (
+            replacement + b"\0" * (old_padded_size - len(replacement))
+        )
         return bytes(mutated)
 
     def test_private_local_binding_uses_git_checkout_root(self) -> None:
@@ -32638,6 +32673,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             (candidate_root / "README.md").write_text(
                 "candidate archive\n", encoding="utf-8"
             )
+            long_directory = "p" * 156
+            long_relative_path = Path(long_directory) / "payload.txt"
+            long_path = candidate_root / long_relative_path
+            long_path.parent.mkdir()
+            long_path.write_bytes(b"long archive path\n")
             candidate_sha = self.initialize_candidate_checkout(candidate_root)
             object_format, inventory, archive_output = (
                 self.candidate_workspace_archive_fixture(
@@ -32657,6 +32697,42 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 tree_inventory=inventory,
             )
             self.assertEqual(valid[Path("README.md")], (b"candidate archive\n", False))
+            self.assertEqual(
+                valid[long_relative_path], (b"long archive path\n", False)
+            )
+
+            directory_path = (long_directory + "/").encode("ascii")
+            file_path = long_relative_path.as_posix().encode("ascii")
+            directory_record = self.pax_record(b"path", directory_path)
+            file_record = self.pax_record(b"path", file_path)
+            directory_pax_offset = archive_output.index(directory_record) - 512
+            file_pax_offset = archive_output.index(file_record) - 512
+            directory_member_offset = (
+                directory_pax_offset
+                + 512
+                + ((len(directory_record) + 511) // 512) * 512
+            )
+            file_member_offset = (
+                file_pax_offset
+                + 512
+                + ((len(file_record) + 511) // 512) * 512
+            )
+            for pax_offset, member_offset, member_type in (
+                (directory_pax_offset, directory_member_offset, b"5"),
+                (file_pax_offset, file_member_offset, b"0"),
+            ):
+                self.assertEqual(pax_offset % 512, 0)
+                self.assertEqual(archive_output[pax_offset + 156 : pax_offset + 157], b"x")
+                pax_name = archive_output[pax_offset : pax_offset + 100].split(b"\0", 1)[0]
+                self.assertRegex(pax_name, rb"\A[0-9a-f]{40}\.paxheader\Z")
+                self.assertEqual(
+                    archive_output[member_offset : member_offset + 100].split(b"\0", 1)[0],
+                    pax_name[:40] + b".data",
+                )
+                self.assertEqual(
+                    archive_output[member_offset + 156 : member_offset + 157],
+                    member_type,
+                )
             original_candidate_git = _CANDIDATE_SUPPORT._run_candidate_git
             with mock.patch.object(
                 _CANDIDATE_SUPPORT,
@@ -32681,7 +32757,180 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
             mutated_data = bytearray(archive_output)
             mutated_data[readme.offset_data] ^= 1
+            long_oid = inventory[long_relative_path][0].encode("ascii")
+            alternate_oid_lead = b"0" if long_oid[:1] != b"0" else b"1"
+            tree_oid_drift = self.mutate_tar_header(
+                archive_output,
+                file_pax_offset,
+                0,
+                1,
+                alternate_oid_lead,
+            )
+            tree_oid_drift = self.mutate_tar_header(
+                tree_oid_drift,
+                file_member_offset,
+                0,
+                1,
+                alternate_oid_lead,
+            )
+            duplicate_path_records = file_record + file_record
+            dangling_end = file_pax_offset + 512 + (
+                (len(file_record) + 511) // 512
+            ) * 512
+            dangling_size = (
+                (
+                    dangling_end
+                    + 1024
+                    + _CANDIDATE_SUPPORT._CANDIDATE_WORKSPACE_TAR_RECORD_BYTES
+                    - 1
+                )
+                // _CANDIDATE_SUPPORT._CANDIDATE_WORKSPACE_TAR_RECORD_BYTES
+                * _CANDIDATE_SUPPORT._CANDIDATE_WORKSPACE_TAR_RECORD_BYTES
+            )
+            dangling_pax = archive_output[:dangling_end] + b"\0" * (
+                dangling_size - dangling_end
+            )
             cases = (
+                (
+                    "pax-mode",
+                    self.mutate_tar_header(
+                        archive_output,
+                        file_pax_offset,
+                        100,
+                        108,
+                        b"0000644\0",
+                    ),
+                    "extended header",
+                ),
+                (
+                    "pax-name",
+                    self.mutate_tar_header(
+                        archive_output,
+                        file_pax_offset,
+                        0,
+                        1,
+                        b"g",
+                    ),
+                    "extended header",
+                ),
+                (
+                    "pax-length",
+                    self.replace_tar_data(
+                        archive_output,
+                        file_pax_offset,
+                        b"0" + file_record[1:],
+                    ),
+                    "extended header",
+                ),
+                (
+                    "pax-duplicate-path",
+                    self.replace_tar_data(
+                        archive_output,
+                        file_pax_offset,
+                        duplicate_path_records,
+                    ),
+                    "extended header",
+                ),
+                (
+                    "pax-unknown-key",
+                    self.replace_tar_data(
+                        archive_output,
+                        file_pax_offset,
+                        self.pax_record(b"size", b"0"),
+                    ),
+                    "extended header",
+                ),
+                (
+                    "pax-consecutive",
+                    self.mutate_tar_header(
+                        archive_output,
+                        file_member_offset,
+                        156,
+                        157,
+                        b"x",
+                    ),
+                    "extended header",
+                ),
+                (
+                    "pax-unknown-member",
+                    self.mutate_tar_header(
+                        archive_output,
+                        file_member_offset,
+                        156,
+                        157,
+                        b"2",
+                    ),
+                    "member type is unsupported",
+                ),
+                (
+                    "pax-oid-drift",
+                    self.mutate_tar_header(
+                        archive_output,
+                        file_member_offset,
+                        0,
+                        1,
+                        alternate_oid_lead,
+                    ),
+                    "extended header",
+                ),
+                ("pax-tree-oid-drift", tree_oid_drift, "extended header"),
+                (
+                    "pax-path-drift",
+                    self.replace_tar_data(
+                        archive_output,
+                        file_pax_offset,
+                        self.pax_record(b"path", b"missing.txt"),
+                    ),
+                    "not in the Git tree",
+                ),
+                (
+                    "pax-path-alias",
+                    self.replace_tar_data(
+                        archive_output,
+                        file_pax_offset,
+                        self.pax_record(b"path", b"./" + file_path),
+                    ),
+                    "path is unsafe",
+                ),
+                (
+                    "pax-file-slash",
+                    self.replace_tar_data(
+                        archive_output,
+                        file_pax_offset,
+                        self.pax_record(b"path", file_path + b"/"),
+                    ),
+                    "file is malformed",
+                ),
+                (
+                    "pax-directory-no-slash",
+                    self.replace_tar_data(
+                        archive_output,
+                        directory_pax_offset,
+                        self.pax_record(b"path", directory_path[:-1]),
+                    ),
+                    "directory is malformed",
+                ),
+                (
+                    "pax-directory-drift",
+                    self.replace_tar_data(
+                        archive_output,
+                        directory_pax_offset,
+                        self.pax_record(b"path", b"missing/"),
+                    ),
+                    "directory is unexpected",
+                ),
+                (
+                    "pax-directory-type-drift",
+                    self.mutate_tar_header(
+                        archive_output,
+                        directory_member_offset,
+                        156,
+                        157,
+                        b"0",
+                    ),
+                    "file is malformed",
+                ),
+                ("pax-dangling", dangling_pax, "extended header"),
                 (
                     "blob",
                     bytes(mutated_data),
@@ -48414,12 +48663,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 self.assertEqual(
                     result["ipc_root_policy"],
                     {
-                        "chmod": errno.EPERM,
-                        "create": errno.EACCES,
+                        "chmod": errno.EROFS,
+                        "create": errno.EROFS,
                         "list": errno.EACCES,
-                        "mkdir": errno.EACCES,
-                        "rename": errno.EACCES,
-                        "symlink": errno.EACCES,
+                        "mkdir": errno.EROFS,
+                        "rename": errno.EROFS,
+                        "symlink": errno.EROFS,
                     },
                 )
                 self.assertEqual(result["link_errno"], errno.EACCES)
