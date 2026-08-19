@@ -4276,6 +4276,7 @@ NAMESPACE_READ_PATHS = (
     ("/proc/self/status", "file"),
     ("/proc/self/limits", "file"),
     ("/proc/self/mountinfo", "file"),
+    ("/proc/self/cgroup", "file"),
     ("/proc/sys/kernel/core_pattern", "file"),
     ("/proc/sys/kernel/cap_last_cap", "file"),
     *((path, "file") for path, _ in IPC_SYSCTLS),
