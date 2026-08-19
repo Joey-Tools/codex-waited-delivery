@@ -3413,13 +3413,32 @@ _bounded_failure_text = _CANDIDATE_SUPPORT._bounded_failure_text
 _TerminalFailure = tuple[str, str, BaseException]
 
 
+class _OrderedTextTestResult(unittest.TextTestResult):
+    first_problem = None
+
+    def addError(self, test, err) -> None:
+        super().addError(test, err)
+        if self.first_problem is None:
+            self.first_problem = "error", self.errors[-1][1]
+
+    def addFailure(self, test, err) -> None:
+        super().addFailure(test, err)
+        if self.first_problem is None:
+            self.first_problem = "failure", self.failures[-1][1]
+
+
 def _first_unittest_failure_text(result: unittest.TestResult) -> str:
-    for kind, failures in (("failure", result.failures), ("error", result.errors)):
-        if failures:
-            traceback = failures[0][1]
-            detail = traceback.rstrip("\n").rsplit("\n", 1)[-1] or "empty traceback"
-            return _bounded_failure_text(f"{kind}: {detail}", limit=88)
-    return ""
+    problem = getattr(result, "first_problem", None)
+    if problem is None:
+        for kind, failures in (("failure", result.failures), ("error", result.errors)):
+            if failures:
+                problem = kind, failures[0][1]
+                break
+    if problem is None:
+        return ""
+    kind, traceback = problem
+    detail = traceback.rstrip("\n").rsplit("\n", 1)[-1] or "empty traceback"
+    return _bounded_failure_text(f"{kind}: {detail}", limit=88)
 
 
 class _RequiredCITerminalFailures(AssertionError):
@@ -4844,6 +4863,7 @@ def _strict_runtime_live_main() -> int:
                 result = unittest.TextTestRunner(
                     stream=runner_output,
                     verbosity=2,
+                    resultclass=_OrderedTextTestResult,
                 ).run(suite)
                 backend_validated = (
                     _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED is True
@@ -10140,7 +10160,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("did not complete exactly once", stderr.getvalue())
 
-    def test_strict_live_entry_rejects_failure_after_cleanup(self) -> None:
+    def test_strict_live_entry_preserves_first_error_before_teardown_failure(
+        self,
+    ) -> None:
         candidate_sha = "a" * 40
         binding = {"candidate_sha": candidate_sha}
         registry: dict[str, object] = {}
@@ -10192,30 +10214,44 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             type(self),
             CI_STRICT_RUNTIME_LIVE_TEST_METHOD,
             side_effect=AssertionError(terminal_failure),
-        ), mock.patch.object(
+        ) as live_test, mock.patch.object(
+            type(self),
+            "tearDown",
+        ) as teardown, mock.patch.object(
             _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
         ), mock.patch.object(
             _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", True
         ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             self.assertEqual(_strict_runtime_live_main(), 1)
+            failure_output = stderr.getvalue()
+            stderr.seek(0)
+            stderr.truncate()
+            live_test.side_effect = RuntimeError("first unittest error")
+            teardown.side_effect = AssertionError("later teardown failure")
+            self.assertEqual(_strict_runtime_live_main(), 1)
+            ordered_output = stderr.getvalue()
 
-        cleanup.assert_called_once_with(registry)
+        self.assertEqual(cleanup.call_count, 2)
+        cleanup.assert_called_with(registry)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("did not complete exactly once", stderr.getvalue())
-        self.assertIn("first=failure:", stderr.getvalue())
-        self.assertIn("...[middle truncated]...", stderr.getvalue())
-        self.assertIn('"returncode":127', stderr.getvalue())
-        self.assertIn('"process_leak_observed":false', stderr.getvalue())
-        self.assertIn("terminal-cause", stderr.getvalue())
+        self.assertIn("did not complete exactly once", failure_output)
+        self.assertIn("first=failure:", failure_output)
+        self.assertIn("...[middle truncated]...", failure_output)
+        self.assertIn('"returncode":127', failure_output)
+        self.assertIn('"process_leak_observed":false', failure_output)
+        self.assertIn("terminal-cause", failure_output)
+        self.assertIn("first=error: RuntimeError: first unittest error", ordered_output)
+        self.assertIn("later teardown failure", ordered_output)
+        self.assertNotIn("first=failure:", ordered_output)
         self.assertTrue(
             all(
                 not line.lstrip().startswith("::")
-                for line in stderr.getvalue().split("\n")
+                for line in failure_output.split("\n")
             )
         )
         self.assertFalse(
             any(
-                character in stderr.getvalue()
+                character in failure_output
                 for character in (
                     "\r",
                     "\x1b",
@@ -27415,6 +27451,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 inspect.getsource(
                     type(self)._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read
                 ),
+                inspect.getsource(
+                    type(self)._exercise_real_watchdog_owner_sigkill_replays_registered_live_ipc_root
+                ),
             )
         )
 
@@ -27431,7 +27470,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         ), ("LANDLOCK_ACCESS_FS_IOCTL_DEV", "LANDLOCK_ACCESS_FS_READ_DIR", '("/proc/self/fdinfo", "directory")', '("/proc", "directory")', "FS_IOC_"))
         check(host_read_source, ('Path("/usr/lib") / multiarch', 'Path("/etc/ld.so.preload").lstat()', 'system_stdlib / "lib-dynload"', 'trusted_git.parent != Path("/usr/bin")'), ('Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',))
         check(candidate_source, ("read_network_interfaces(network_interface_fd)", 'status.get("Seccomp") != "2"', "Seccomp_filters", '"/proc/self/limits"'), ("os.listdir(trusted_root)", 'os.listdir("/sys/class/net")', "socket.if_nameindex", "resource.getrlimit"))
-        check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")', "relative_path.name != runner_path.name", "TRUSTED_CONTENT_ROOT / relative_path", '"final-checks="'), ('f"/proc/self/fdinfo/',))
+        check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")', "relative_path.name != runner_path.name", "TRUSTED_CONTENT_ROOT / relative_path", '"final-checks="', "real_write.__globals__", "__wrapped__.__globals__", 'support["_register_trusted_root_chain"]', 'support_globals["_write_chain_registry_entry"]'), ('f"/proc/self/fdinfo/',))
         install = next(node for node in ast.parse(bootstrap_source).body if isinstance(node, ast.FunctionDef) and node.name == "install_candidate_seccomp_filter")
         call = next(node for node in install.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "architecture" for target in node.targets)).value
         for value, kind in ((call, ast.Call), (call.func, ast.Attribute), (call.func.value, ast.Dict)):
@@ -47077,6 +47116,14 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             support = runpy.run_path(sys.argv[1])
             registry = support["trusted_isolation_chain_registry"]()
             real_write = support["_write_chain_registry_entry"]
+            support_globals = real_write.__globals__
+            if (
+                support["_registered_live_host_ipc_root"].__wrapped__.__globals__
+                is not support_globals
+                or support["_register_trusted_root_chain"].__globals__
+                is not support_globals
+            ):
+                raise AssertionError("captured support globals are split")
 
             def pause_before_trusted_import(
                 path,
@@ -47170,7 +47217,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     published_callback=published_callback,
                 )
 
-            support["_write_chain_registry_entry"] = pause_before_trusted_import
+            support_globals["_write_chain_registry_entry"] = (
+                pause_before_trusted_import
+            )
             with support["_registered_live_host_ipc_root"]():
                 raise AssertionError(
                     "strict live IPC root reached the target before the crash seam"
