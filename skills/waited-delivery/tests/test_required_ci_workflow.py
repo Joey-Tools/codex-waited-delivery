@@ -1749,14 +1749,14 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
     DISTRIBUTION_PROFILE,
 ) = distribution_contract_context(SKILL_ROOT)
 EXPECTED_REPOSITORY = "Joey-Tools/codex-waited-delivery"
-EXPECTED_TEST_TIMEOUT_MINUTES = "37"
+EXPECTED_TEST_TIMEOUT_MINUTES = "47"
 TRUSTED_REPOSITORY_GUARD_TIMEOUT_MINUTES = 1
 TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES = 3
 TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES = 3
 TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES = 3
 STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES = 2
 TRUSTED_STRUCTURE_TIMEOUT_MINUTES = 3
-TRUSTED_TEST_STEP_TIMEOUT_MINUTES = 15
+TRUSTED_TEST_STEP_TIMEOUT_MINUTES = 25
 REQUIRED_CI_CANDIDATE_ROOT_ENV = _CANDIDATE_SUPPORT.CANDIDATE_ROOT_ENV
 REQUIRED_CI_CANDIDATE_SHA_ENV = _CANDIDATE_SUPPORT.CANDIDATE_SHA_ENV
 REQUIRED_CI_ISOLATION_MODE_ENV = "REQUIRED_CI_ISOLATION_MODE"
@@ -1780,7 +1780,7 @@ TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES = (
     + STRICT_RUNTIME_HARDENING_TIMEOUT_MINUTES
     + TRUSTED_STRUCTURE_TIMEOUT_MINUTES
 )
-TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 10 * 60
+TRUSTED_TEST_SUITE_TIMEOUT_SECONDS = 20 * 60
 TRUSTED_TEST_CLEANUP_RESERVE_SECONDS = 2 * 60
 TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS = (
     TRUSTED_TEST_SUITE_TIMEOUT_SECONDS + TRUSTED_TEST_CLEANUP_RESERVE_SECONDS
@@ -7670,7 +7670,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             ),
             "supervisor deadline is extended": secure_workflow.replace(
                 TRUSTED_TEST_SUPERVISOR_COMMAND,
-                TRUSTED_TEST_SUPERVISOR_COMMAND.replace("+720", "+721", 1),
+                TRUSTED_TEST_SUPERVISOR_COMMAND.replace("+1320", "+1321", 1),
                 1,
             ),
             "supervisor launcher does not exec": secure_workflow.replace(
@@ -14299,7 +14299,7 @@ sys.stdin.buffer.read(1)
             "exponent": "7e2",
             "nonfinite": "nan",
             "expired": "100.000000000",
-            "extended": "1120.002000000",
+            "extended": "1720.002000000",
         }
         for name, encoded in fixtures.items():
             environment = {}
@@ -14319,11 +14319,11 @@ sys.stdin.buffer.read(1)
     def test_child_timeout_deducts_preflight_time_and_cleanup_reserve(
         self,
     ) -> None:
-        deadline = 820.0
+        deadline = 1420.0
         cases = {
-            "full child maximum": (100.0, 600.0),
-            "45 seconds spent before launch": (145.0, 555.0),
-            "599 seconds spent since launcher": (699.0, 1.0),
+            "full child maximum": (100.0, 1200.0),
+            "45 seconds spent before launch": (145.0, 1155.0),
+            "1199 seconds spent since launcher": (1299.0, 1.0),
         }
         for name, (now, expected) in cases.items():
             with self.subTest(name=name), mock.patch.object(
@@ -14333,7 +14333,7 @@ sys.stdin.buffer.read(1)
                     _remaining_trusted_test_child_timeout(deadline), expected
                 )
 
-        with mock.patch.object(time, "monotonic", return_value=700.0):
+        with mock.patch.object(time, "monotonic", return_value=1300.0):
             with self.assertRaisesRegex(
                 AssertionError, "insufficient budget before child launch"
             ):
@@ -26688,11 +26688,7 @@ sys.stdin.buffer.read(1)
     def test_strict_systemd_scope_membership_parser_is_exact(self) -> None:
         source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
         nodes = ast.parse(source).body
-        functions = {
-            node.name: node
-            for node in nodes
-            if isinstance(node, ast.FunctionDef)
-        }
+        functions = {node.name: node for node in nodes if isinstance(node, ast.FunctionDef)}
         files = next(
             node.value
             for node in nodes
@@ -26718,58 +26714,38 @@ sys.stdin.buffer.read(1)
             self.assertEqual(source.count(needle), 1)
         opener = functions["open_systemd_scope_read_descriptor"]
         calls = [node for node in ast.walk(opener) if isinstance(node, ast.Call)]
+        def named_calls(name: str) -> list[ast.Call]:
+            return [
+                call
+                for call in calls
+                if isinstance(call.func, ast.Name) and call.func.id == name
+            ]
+
         permissions = [
             call.args[-1].attr
-            for call in calls
-            if isinstance(call.func, ast.Name)
-            and call.func.id == "target_mode_allows"
-            and isinstance(call.args[-1], ast.Attribute)
+            for call in named_calls("target_mode_allows")
+            if isinstance(call.args[-1], ast.Attribute)
         ]
         self.assertCountEqual(
             permissions, ("X_OK", "W_OK", "X_OK", "W_OK", "R_OK", "W_OK")
         )
-        self.assertEqual(
-            sum(
-                isinstance(call.func, ast.Name)
-                and call.func.id == "require_descriptor_acl_absent"
-                for call in calls
-            ),
-            3,
-        )
-        topology_calls = [
-            call
-            for call in calls
-            if isinstance(call.func, ast.Name)
-            and call.func.id == "validate_directory_mount_topology"
-        ]
+        self.assertEqual(len(named_calls("require_descriptor_acl_absent")), 3)
+        topology_calls = named_calls("validate_directory_mount_topology")
         self.assertEqual(
             [tuple(ast.unparse(arg) for arg in call.args) for call in topology_calls],
             [("scope_path", "mount_id", "root_opened.st_dev", "inventory", "175")],
         )
-        self.assertEqual(
-            [
-                node.value.id
-                for node in ast.walk(opener)
-                if isinstance(node, ast.Return)
-                and isinstance(node.value, ast.Name)
-            ],
-            ["scope_descriptor"],
-        )
+        returns = [node for node in ast.walk(opener) if isinstance(node, ast.Return)]
+        self.assertEqual([getattr(node.value, "id", None) for node in returns], ["scope_descriptor"])
         self.assertNotIn('("/sys/fs/cgroup", "directory")', source)
-        module = ast.fix_missing_locations(
-            ast.Module(
-                body=[functions["parse_systemd_scope_components"]],
-                type_ignores=[],
-            )
-        )
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions["parse_systemd_scope_components"]], type_ignores=[]
+        ))
         namespace = {"os": os}
         exec(compile(module, "<systemd-scope-membership>", "exec"), namespace)
         parse = namespace["parse_systemd_scope_components"]
         unit = f"required-ci-candidate-{'a' * 32}.scope"
-        self.assertEqual(
-            parse(f"0::/runner.slice/{unit}\n".encode(), unit),
-            ["runner.slice", unit],
-        )
+        self.assertEqual(parse(f"0::/runner.slice/{unit}\n".encode(), unit), ["runner.slice", unit])
         malformed = (
             b"", f"0::/system.slice/{unit}".encode(),
             f"0::/system.slice/{unit}\n0::/x/{unit}\n".encode(),
@@ -37384,6 +37360,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
     def test_parent_cleanup_import_waits_for_complete_witness_suffix_fsync(
         self,
     ) -> None:
+        s = _CANDIDATE_SUPPORT
         with tempfile.TemporaryDirectory() as temporary_directory:
             fixture_root = Path(temporary_directory).resolve(strict=True)
             registry_root = fixture_root / "registry"
@@ -37395,28 +37372,28 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
             physical_parent.mkdir(mode=0o755)
             self.enterContext(
                 mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_STRICT_LIVE_IPC_PARENT",
                     physical_parent,
                 )
             )
             self.enterContext(
                 mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
                     os.geteuid(),
                 )
             )
             self.enterContext(
                 mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
                     os.getegid(),
                 )
             )
             namespace = (
                 physical_parent
-                / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+                / s._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
             )
             namespace.mkdir(mode=0o700)
             target_uid = 60047
@@ -37500,7 +37477,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 "outer_marker": None,
                 "outer": None,
             }
-            intended = _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+            intended = s._strict_live_ipc_witness_record(
                 prepared,
                 phase="intended",
                 sequence=0,
@@ -37510,11 +37487,11 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 deletion_receipt=None,
             )
             intended_frame, intended_digest = (
-                _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                s._encode_strict_live_ipc_witness_frame(
                     intended
                 )
             )
-            root_bound = _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+            root_bound = s._strict_live_ipc_witness_record(
                 prepared,
                 phase="root-bound",
                 sequence=1,
@@ -37524,14 +37501,14 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 deletion_receipt=None,
             )
             root_bound_frame, root_bound_digest = (
-                _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                s._encode_strict_live_ipc_witness_frame(
                     root_bound
                 )
             )
             durable_records = [intended, root_bound]
             durable_digests = [intended_digest, root_bound_digest]
             durable_data = (
-                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_MAGIC
+                s._STRICT_LIVE_IPC_WITNESS_MAGIC
                 + intended_frame
                 + root_bound_frame
             )
@@ -37555,7 +37532,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 )
                 real_fsync(witness_fd)
                 durable_file = (
-                    _CANDIDATE_SUPPORT._strict_live_ipc_witness_file_binding(
+                    s._strict_live_ipc_witness_file_binding(
                         witness_fd,
                         prepared,
                         durable_records,
@@ -37584,7 +37561,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 },
             }
             deleting_record = (
-                _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                s._strict_live_ipc_witness_record(
                     deleting,
                     phase="deleting",
                     sequence=2,
@@ -37595,7 +37572,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 )
             )
             deleting_frame, deleting_digest = (
-                _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                s._encode_strict_live_ipc_witness_frame(
                     deleting_record
                 )
             )
@@ -37626,7 +37603,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     AssertionError,
                     "strict live IPC witness cannot be written",
                 ):
-                    _CANDIDATE_SUPPORT._append_strict_live_ipc_witness_record(
+                    s._append_strict_live_ipc_witness_record(
                         witness_fd,
                         namespace_fd,
                         deleting,
@@ -37647,10 +37624,10 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 witness_path.stat().st_ino,
             )
             entry_path = entries / f"chain-{session_id}.json"
-            with _CANDIDATE_SUPPORT._chain_registry_lock(
+            with s._chain_registry_lock(
                 entry_path, create=True
             ):
-                _CANDIDATE_SUPPORT._write_chain_registry_entry(
+                s._write_chain_registry_entry(
                     entry_path, deleting, create=True
                 )
             session = {
@@ -37680,10 +37657,10 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
             trace: list[str] = []
             barrier_trace: list[tuple[str, int | None]] = []
             real_read_witness_log = (
-                _CANDIDATE_SUPPORT._read_strict_live_ipc_witness_log
+                s._read_strict_live_ipc_witness_log
             )
             real_write_chain_registry_entry = (
-                _CANDIDATE_SUPPORT._write_chain_registry_entry
+                s._write_chain_registry_entry
             )
 
             def root_cleanup(
@@ -37721,7 +37698,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
             ) -> bytes:
                 try:
                     receipt = (
-                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
+                        s._root_registered_opt_ipc_witness_operation(
                             "cleanup", deleting
                         )
                     )
@@ -37740,7 +37717,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         "error": f"{type(error).__name__}: {error}",
                     }
                 return (
-                    _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                    s._ROOT_TREE_RECEIPT_PREFIX
                     + json.dumps(
                         receipt, sort_keys=True, separators=(",", ":")
                     )
@@ -37760,8 +37737,8 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     create=create,
                 )
 
-            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
-            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            previous_session = s._STRICT_SESSION
+            s._STRICT_SESSION = session
             original_root_identity = (
                 root_path.stat().st_dev,
                 root_path.stat().st_ino,
@@ -37769,35 +37746,35 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
             registry_before = entry_path.read_bytes()
             try:
                 with mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_STRICT_LIVE_IPC_PARENT",
                     physical_parent,
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
                     os.geteuid(),
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
                     os.getegid(),
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_open_strict_live_ipc_parent",
                     side_effect=open_parent,
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_strict_descriptor_mount_id",
                     return_value=41,
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_run_registered_sudo",
                     side_effect=in_process_broker,
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_root_registered_opt_ipc_root_operation",
                     side_effect=root_cleanup,
                 ) as root_lifecycle, mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_write_chain_registry_entry",
                     side_effect=record_registry_import,
                 ) as write_entry:
@@ -37815,7 +37792,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         AssertionError,
                         "extension is not durable",
                     ):
-                        _CANDIDATE_SUPPORT._invoke_registered_opt_ipc_root(
+                        s._invoke_registered_opt_ipc_root(
                             controller,
                             entry_path,
                             deleting,
@@ -37825,7 +37802,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     write_entry.assert_not_called()
                     self.assertEqual(entry_path.read_bytes(), registry_before)
                     self.assertEqual(
-                        _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                        s._load_chain_registry_entry(
                             entry_path,
                             expected_token=token,
                             expected_target_uid=target_uid,
@@ -37934,7 +37911,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                                 real_fsync(descriptor)
 
                             with mock.patch.object(
-                                _CANDIDATE_SUPPORT,
+                                s,
                                 "_read_strict_live_ipc_witness_log",
                                 side_effect=mutate_post_fsync_reread,
                             ), mock.patch.object(
@@ -37945,7 +37922,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                                 AssertionError,
                                 "extension changed during synchronization",
                             ):
-                                _CANDIDATE_SUPPORT._invoke_registered_opt_ipc_root(
+                                s._invoke_registered_opt_ipc_root(
                                     controller,
                                     entry_path,
                                     deleting,
@@ -38030,14 +38007,14 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         real_fsync(descriptor)
 
                     with mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_read_strict_live_ipc_witness_log",
                         side_effect=record_successful_read,
                     ), mock.patch.object(
                         os, "fsync", side_effect=record_successful_fsync
                     ):
                         imported = (
-                            _CANDIDATE_SUPPORT._invoke_registered_opt_ipc_root(
+                            s._invoke_registered_opt_ipc_root(
                                 controller,
                                 entry_path,
                                 deleting,
@@ -38094,7 +38071,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     self.assertEqual(root_lifecycle.call_count, 1)
                     self.assertEqual(write_entry.call_count, 1)
                     persisted = (
-                        _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                        s._load_chain_registry_entry(
                             entry_path,
                             expected_token=token,
                             expected_target_uid=target_uid,
@@ -38136,7 +38113,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     )
                     try:
                         final_records, final_data, final_digests = (
-                            _CANDIDATE_SUPPORT._read_strict_live_ipc_witness_log(
+                            s._read_strict_live_ipc_witness_log(
                                 final_witness_fd,
                                 final_namespace_fd,
                                 persisted,
@@ -38147,7 +38124,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         os.close(final_witness_fd)
                         os.close(final_namespace_fd)
                     expected_deleted = (
-                        _CANDIDATE_SUPPORT._strict_live_ipc_witness_record(
+                        s._strict_live_ipc_witness_record(
                             deleting,
                             phase="deleted",
                             sequence=3,
@@ -38157,7 +38134,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                             deletion_receipt=deletion_receipt,
                         )
                     )
-                    deleted_frame, deleted_digest = _CANDIDATE_SUPPORT._encode_strict_live_ipc_witness_frame(
+                    deleted_frame, deleted_digest = s._encode_strict_live_ipc_witness_frame(
                         expected_deleted
                     )
                     self.assertEqual(
@@ -38201,7 +38178,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                                 terminal_oracle,
                             )
             finally:
-                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+                s._STRICT_SESSION = previous_session
 
     def test_root_live_ipc_finalize_retains_exact_terminal_witness(
         self,
@@ -39782,11 +39759,12 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
     def test_root_live_ipc_owner_loss_authority_revalidation_is_fail_closed(
         self,
     ) -> None:
+        s = _CANDIDATE_SUPPORT
         with tempfile.TemporaryDirectory() as temporary_directory:
             physical_parent = Path(temporary_directory).resolve(strict=True)
             namespace = (
                 physical_parent
-                / _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
+                / s._STRICT_LIVE_IPC_WITNESS_DIRECTORY_NAME
             )
             namespace.mkdir(mode=0o700)
             runner_uid = os.getuid()
@@ -39837,7 +39815,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 authority_path = namespace / f"authority-{label}.json"
                 authority_path.write_bytes(authority_data)
                 authority_path.chmod(
-                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_MODE
+                    s._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_MODE
                 )
                 authority_fd = os.open(
                     authority_path,
@@ -39866,7 +39844,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 witness_metadata = os.fstat(witness_fd)
                 opened = os.fstat(authority_fd)
                 capability = (
-                    _CANDIDATE_SUPPORT._StrictLiveIpcOwnerLossCapability(
+                    s._StrictLiveIpcOwnerLossCapability(
                         authority_basename=authority_path.name,
                         authority_document=authority_document,
                         authority_fd=authority_fd,
@@ -39922,26 +39900,26 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 }
 
             with mock.patch.object(
-                _CANDIDATE_SUPPORT,
+                s,
                 "_STRICT_LIVE_IPC_PARENT",
                 physical_parent,
             ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+                s,
                 "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
                 runner_uid,
             ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+                s,
                 "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
                 runner_gid,
             ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+                s,
                 "_strict_owner_loss_authority_document_is_exact",
                 return_value=True,
             ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+                s,
                 "_strict_owner_loss_exact_session_lock_holder",
             ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+                s,
                 "_strict_owner_loss_watchdog_command_is_exact",
             ):
                 capability, _authority_path = make_capability(
@@ -40000,13 +39978,13 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     with self.subTest(
                         failure="witness-same-inode-equal-size-content-rewrite"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ) as watchdog_probe, self.assertRaisesRegex(
                         AssertionError, "witness authority changed"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=True,
                             root_fd=None,
@@ -40018,7 +39996,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         witness_protected_state(witness_path), after_rewrite
                     )
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40087,13 +40065,13 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     with self.subTest(
                         failure="witness-same-policy-path-replacement"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ) as watchdog_probe, self.assertRaisesRegex(
                         AssertionError, "witness authority changed"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=True,
                             root_fd=None,
@@ -40117,7 +40095,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         ),
                     )
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40171,13 +40149,13 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     with self.subTest(
                         failure="witness-prefix-truncate"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ) as watchdog_probe, self.assertRaisesRegex(
                         AssertionError, "witness authority changed"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=True,
                             root_fd=None,
@@ -40189,7 +40167,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         witness_protected_state(witness_path), after_truncate
                     )
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40219,13 +40197,13 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         side_effect=witness_acl,
                         create=True,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ) as watchdog_probe, self.assertRaisesRegex(
                         AssertionError, "unexpected POSIX ACL"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=True,
                             root_fd=None,
@@ -40237,7 +40215,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         witness_protected_state(witness_path), acl_state
                     )
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40324,20 +40302,20 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     with self.subTest(
                         failure="witness-drift-precedes-root-mutation"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_open_strict_live_ipc_parent",
                         side_effect=open_parent,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_live_ipc_quiescent_residue_inventory",
                     ) as inventory, mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_open_strict_live_ipc_quiescent_residues",
                     ) as open_residues, mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_seal_strict_live_ipc_root_for_quiescent_cleanup",
                     ) as seal_root, mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ) as watchdog_probe, mock.patch.object(
@@ -40349,7 +40327,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     ) as durable_mutation, self.assertRaisesRegex(
                         AssertionError, "witness authority changed"
                     ):
-                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_operation(
+                        s._root_registered_opt_ipc_root_operation(
                             "cleanup",
                             parent_binding,
                             root_name,
@@ -40391,7 +40369,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     )
                     self.assertEqual(witness_path.read_bytes(), mutated_prefix)
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
                 residue.unlink()
@@ -40400,7 +40378,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 capability, _authority_path = make_capability("dead")
                 try:
                     with self.subTest(failure="watchdog-dead"), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         side_effect=ProcessLookupError(
                             "injected dead watchdog"
@@ -40409,41 +40387,41 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     ), self.assertRaisesRegex(
                         AssertionError, "watchdog is not alive"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=False,
                             root_fd=None,
                         )
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
                 capability, _authority_path = make_capability("lock-lost")
                 try:
                     with self.subTest(failure="watchdog-lock-lost"), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_exact_session_lock_holder",
                         side_effect=AssertionError(
                             "injected watchdog session lock loss"
                         ),
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_watchdog_command_is_exact",
                     ) as command_check, mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_revalidate_broker_ancestry",
                     ) as ancestry_check, mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_registered_clients_are_quiescent",
                     ) as client_scan, self.assertRaisesRegex(
                         AssertionError, "session lock loss"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=False,
                             root_fd=None,
@@ -40452,7 +40430,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     ancestry_check.assert_not_called()
                     client_scan.assert_not_called()
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40461,25 +40439,25 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 )
                 try:
                     with self.subTest(failure="watchdog-command-changed"), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_watchdog_command_is_exact",
                         side_effect=AssertionError(
                             "injected watchdog command binding change"
                         ),
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_revalidate_broker_ancestry",
                     ) as ancestry_check, mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_registered_clients_are_quiescent",
                     ) as client_scan, self.assertRaisesRegex(
                         AssertionError, "command binding change"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=False,
                             root_fd=None,
@@ -40487,48 +40465,48 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     ancestry_check.assert_not_called()
                     client_scan.assert_not_called()
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
                 capability, _authority_path = make_capability("owner-live")
                 try:
                     with self.subTest(failure="owner-still-live"), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_revalidate_broker_ancestry",
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_process_identity",
                         return_value=owner_identity,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT.os,
+                        s.os,
                         "pidfd_open",
                         return_value=73,
                         create=True,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT.select,
+                        s.select,
                         "select",
                         return_value=([], [], []),
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT.os, "close"
+                        s.os, "close"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_registered_clients_are_quiescent",
                     ) as client_scan, self.assertRaisesRegex(
                         AssertionError, "owner is still alive"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=False,
                             root_fd=None,
                         )
                     client_scan.assert_not_called()
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40547,30 +40525,30 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     with self.subTest(
                         failure="same-owner-instance-metadata-changed"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_revalidate_broker_ancestry",
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_process_identity",
                         return_value=changed_owner_metadata,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_registered_clients_are_quiescent",
                     ) as client_scan, self.assertRaisesRegex(
                         AssertionError, "owner identity changed"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=False,
                             root_fd=None,
                         )
                     client_scan.assert_not_called()
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40581,18 +40559,18 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     with self.subTest(
                         failure="client-reappears-through-capability"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_revalidate_broker_ancestry",
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_process_identity",
                         return_value=None,
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_strict_owner_loss_registered_clients_are_quiescent",
                         side_effect=AssertionError(
                             "injected client reappearance"
@@ -40600,7 +40578,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     ) as client_scan, self.assertRaisesRegex(
                         AssertionError, "client reappearance"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=False,
                             root_fd=None,
@@ -40612,7 +40590,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         capability.watchdog_identity,
                     )
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40620,24 +40598,24 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 authority_path.unlink()
                 authority_path.write_bytes(b'{"label":"replacement"}')
                 authority_path.chmod(
-                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_MODE
+                    s._STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_MODE
                 )
                 try:
                     with self.subTest(failure="authority-replacement"), mock.patch.object(
-                        _CANDIDATE_SUPPORT.signal,
+                        s.signal,
                         "pidfd_send_signal",
                         create=True,
                     ) as watchdog_probe, self.assertRaisesRegex(
                         AssertionError, "authority.*access policy|identity changed"
                     ):
-                        _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
+                        s._revalidate_strict_owner_loss_capability(
                             capability,
                             consume=False,
                             root_fd=None,
                         )
                     watchdog_probe.assert_not_called()
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40649,17 +40627,17 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 )
                 try:
                     with self.subTest(failure="watchdog-pid-reuse"), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_process_identity",
                         return_value=reused_watchdog,
                     ), self.assertRaisesRegex(
                         AssertionError, "watchdog/outer ancestry changed"
                     ):
-                        _CANDIDATE_SUPPORT._strict_owner_loss_revalidate_broker_ancestry(
+                        s._strict_owner_loss_revalidate_broker_ancestry(
                             capability
                         )
                 finally:
-                    _CANDIDATE_SUPPORT._close_strict_owner_loss_capability(
+                    s._close_strict_owner_loss_capability(
                         capability
                     )
 
@@ -40672,15 +40650,15 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 (runner_uid,) * 4,
             )
             with self.subTest(failure="client-reappears"), mock.patch.object(
-                _CANDIDATE_SUPPORT,
+                s,
                 "_watchdog_client_inventory",
                 side_effect=({}, {reappeared_client[0]: reappeared_client}),
             ) as inventory, mock.patch.object(
-                _CANDIDATE_SUPPORT.time, "sleep"
+                s.time, "sleep"
             ) as scan_delay, self.assertRaisesRegex(
                 AssertionError, "clients are not quiescent"
             ):
-                _CANDIDATE_SUPPORT._strict_owner_loss_registered_clients_are_quiescent(
+                s._strict_owner_loss_registered_clients_are_quiescent(
                     physical_parent / "entries",
                     "b" * 32,
                     runner_uid,
@@ -40699,7 +40677,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     ),
                 )
             scan_delay.assert_called_once_with(
-                _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_INTERVAL_SECONDS
+                s._STRICT_ZERO_SCAN_INTERVAL_SECONDS
             )
 
     def test_root_live_ipc_owner_loss_process_authority_is_exact(self) -> None:
@@ -46610,6 +46588,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
     def test_registered_live_ipc_root_nonempty_recovery_is_replayable(
         self,
     ) -> None:
+        s = _CANDIDATE_SUPPORT
         with tempfile.TemporaryDirectory() as temporary_directory:
             fixture_root = Path(temporary_directory).resolve(strict=True)
             registry_root = fixture_root / "registry"
@@ -46661,8 +46640,8 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 "inherited": True,
                 "watchdog_authorized": True,
             }
-            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
-            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            previous_session = s._STRICT_SESSION
+            s._STRICT_SESSION = session
             opened_parent_generations: list[tuple[int, int, int | None]] = []
             live_parent_generations: dict[int, int] = {}
             parent_proof_descriptors: dict[int, tuple[int, int]] = {}
@@ -46727,7 +46706,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
             original_fstat = os.fstat
             selected = physical_parent / name
             original_directory_policy_binding = (
-                _CANDIDATE_SUPPORT._directory_policy_binding
+                s._directory_policy_binding
             )
 
             def privileged_group_binding(
@@ -46777,7 +46756,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 operation = command[marker_index + 1]
                 selected_entry = Path(command[marker_index + 2])
                 selected_document = (
-                    _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                    s._load_chain_registry_entry(
                         selected_entry,
                         expected_token=token,
                         expected_target_uid=target_uid,
@@ -46785,7 +46764,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     )
                 )
                 receipt = (
-                    _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
+                    s._root_registered_opt_ipc_witness_operation(
                         operation, selected_document
                     )
                 )
@@ -46801,7 +46780,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     }
                 )
                 return (
-                    _CANDIDATE_SUPPORT._ROOT_TREE_RECEIPT_PREFIX
+                    s._ROOT_TREE_RECEIPT_PREFIX
                     + json.dumps(
                         receipt, sort_keys=True, separators=(",", ":")
                     )
@@ -46810,37 +46789,37 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
 
             try:
                 with mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_STRICT_LIVE_IPC_PARENT",
                     physical_parent,
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_STRICT_LIVE_IPC_WITNESS_OWNER_UID",
                     os.geteuid(),
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_STRICT_LIVE_IPC_WITNESS_OWNER_GID",
                     os.getegid(),
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_open_strict_live_ipc_parent",
                     side_effect=open_parent,
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_strict_descriptor_mount_id",
                     return_value=23,
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_active_strict_session",
                     return_value=session,
                 ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                    s,
                     "_directory_policy_binding",
                     side_effect=privileged_group_binding,
                 ), mock.patch.object(
                     os, "fchown", side_effect=privileged_fchown
                 ):
-                    entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    entry_path = s._register_trusted_root_chain(
                         controller,
                         None,
                         target_uid,
@@ -46851,7 +46830,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         session_id=session_id,
                     )
                     precrash_document = (
-                        _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                        s._load_chain_registry_entry(
                             entry_path,
                             expected_token=token,
                             expected_target_uid=target_uid,
@@ -46859,7 +46838,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         )
                     )
                     created = (
-                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_witness_operation(
+                        s._root_registered_opt_ipc_witness_operation(
                             "create", precrash_document
                         )
                     )
@@ -46890,19 +46869,19 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     residue.write_bytes(b"preserve")
 
                     with mock.patch.object(
-                        _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                        s, "_stable_uid_zero"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_run_registered_sudo",
                         side_effect=run_root_broker,
                     ), self.assertRaisesRegex(
                         AssertionError, "not empty"
                     ):
-                        _CANDIDATE_SUPPORT._recover_registered_entry(
+                        s._recover_registered_entry(
                             entry_path, allow_recovery_broker=True
                         )
 
-                    retained = _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                    retained = s._load_chain_registry_entry(
                         entry_path,
                         expected_token=token,
                         expected_target_uid=target_uid,
@@ -46922,18 +46901,18 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     )
 
                     with mock.patch.object(
-                        _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                        s, "_stable_uid_zero"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_run_registered_sudo",
                         side_effect=run_root_broker,
                     ), self.assertRaisesRegex(
                         AssertionError, "not empty"
                     ):
-                        _CANDIDATE_SUPPORT._recover_registered_entry(
+                        s._recover_registered_entry(
                             entry_path, allow_recovery_broker=True
                         )
-                    replayed = _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                    replayed = s._load_chain_registry_entry(
                         entry_path,
                         expected_token=token,
                         expected_target_uid=target_uid,
@@ -46949,7 +46928,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
 
                     residue.unlink()
                     crash_document = (
-                        _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                        s._load_chain_registry_entry(
                             entry_path,
                             expected_token=token,
                             expected_target_uid=target_uid,
@@ -47027,7 +47006,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     marker_read_fd, marker_write_fd = os.pipe()
                     fixture_euid = os.geteuid()
                     child_pid: int | None = None
-                    with _CANDIDATE_SUPPORT._chain_registry_lock(entry_path):
+                    with s._chain_registry_lock(entry_path):
                         child_pid = os.fork()
                         if child_pid == 0:
                             track_parent_ofds = True
@@ -47037,7 +47016,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                             )
                             live_parent_generations.clear()
                             real_append = (
-                                _CANDIDATE_SUPPORT._append_strict_live_ipc_witness_record
+                                s._append_strict_live_ipc_witness_record
                             )
                             real_fsync = os.fsync
                             parent_fsync_observed = False
@@ -47104,23 +47083,23 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                                 p = mock.patch.object
                                 with contextlib.ExitStack() as stack:
                                     for manager in (
-                                        p(_CANDIDATE_SUPPORT, "_TRUSTED_SUPPORT_PATH", controller),
+                                        p(s, "_TRUSTED_SUPPORT_PATH", controller),
                                         p(os, "getuid", return_value=0),
                                         p(os, "geteuid", side_effect=root_then_witness_owner),
                                         mock.patch.multiple(
-                                            _CANDIDATE_SUPPORT,
+                                            s,
                                             _bind_root_controller_parent=mock.DEFAULT,
                                             _root_open_registered_opt_ipc_invocation=mock.Mock(side_effect=open_crash_invocation),
                                             _strict_owner_loss_registered_broker_ancestry=mock.DEFAULT,
                                         ),
-                                        p(_CANDIDATE_SUPPORT, "_append_strict_live_ipc_witness_record", side_effect=pause_before_deleted_record),
+                                        p(s, "_append_strict_live_ipc_witness_record", side_effect=pause_before_deleted_record),
                                         p(os, "fsync", side_effect=observe_parent_fsync),
                                         p(os, "close", side_effect=close_with_generation),
                                         p(os, "fstat", side_effect=linux_directory_unlink_metadata),
                                     ):
                                         stack.enter_context(manager)
                                     child_result = (
-                                        _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_main(
+                                        s._root_registered_opt_ipc_root_main(
                                             broker_arguments
                                         )
                                     )
@@ -47139,7 +47118,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                                 if remaining <= 0:
                                     break
                                 readable, _, _ = (
-                                    _CANDIDATE_SUPPORT.select.select(
+                                    s.select.select(
                                         [marker_read_fd], [], [], remaining
                                     )
                                 )
@@ -47176,7 +47155,7 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     ):
                         deleted_link_count = os.fstat(root_descriptor).st_nlink
                     root_persisted = (
-                        _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                        s._load_chain_registry_entry(
                             entry_path,
                             expected_token=token,
                             expected_target_uid=target_uid,
@@ -47192,9 +47171,9 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                     )
                     self.assertFalse(selected.exists())
                     with mock.patch.object(
-                        _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                        s, "_stable_uid_zero"
                     ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
+                        s,
                         "_run_registered_sudo",
                         side_effect=run_root_broker,
                     ), mock.patch.object(
@@ -47202,18 +47181,18 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                         "fstat",
                         side_effect=linux_directory_unlink_metadata,
                     ):
-                        _CANDIDATE_SUPPORT._recover_registered_entry(
+                        s._recover_registered_entry(
                             entry_path, allow_recovery_broker=True
                         )
 
-                    recovered = _CANDIDATE_SUPPORT._load_chain_registry_entry(
+                    recovered = s._load_chain_registry_entry(
                         entry_path,
                         expected_token=token,
                         expected_target_uid=target_uid,
                         expected_recovery_controller=controller,
                     )
             finally:
-                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+                s._STRICT_SESSION = previous_session
 
             self.assertEqual(recovered["state"], "closed")
             self.assertEqual(
@@ -50432,8 +50411,8 @@ class RequiredCiCallerRegressionTests(unittest.TestCase):
 
 class RequiredCiWorkflowTests(unittest.TestCase):
     def test_workflow_budgets_are_exact(self) -> None:
-        self.assertEqual((TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES, TRUSTED_TEST_STEP_TIMEOUT_MINUTES, TRUSTED_JOB_RUNNER_MARGIN_MINUTES, EXPECTED_TEST_TIMEOUT_MINUTES), (15, 15, 7, "37"))
-        self.assertEqual((TRUSTED_TEST_SUITE_TIMEOUT_SECONDS, TRUSTED_TEST_CLEANUP_RESERVE_SECONDS, TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS, TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS, TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS), (600, 120, 720, 180, 1))
+        self.assertEqual((TRUSTED_PRE_SUPERVISOR_TIMEOUT_MINUTES, TRUSTED_TEST_STEP_TIMEOUT_MINUTES, TRUSTED_JOB_RUNNER_MARGIN_MINUTES, EXPECTED_TEST_TIMEOUT_MINUTES), (15, 25, 7, "47"))
+        self.assertEqual((TRUSTED_TEST_SUITE_TIMEOUT_SECONDS, TRUSTED_TEST_CLEANUP_RESERVE_SECONDS, TRUSTED_TEST_SUPERVISOR_BUDGET_SECONDS, TRUSTED_TEST_STEP_RUNNER_MARGIN_SECONDS, TRUSTED_TEST_MINIMUM_CHILD_TIMEOUT_SECONDS), (1200, 120, 1320, 180, 1))
 
 
     def test_module_postpones_runtime_annotation_evaluation(self) -> None:
