@@ -4430,9 +4430,10 @@ def _require_strict_workflow_mode() -> None:
         )
 
 
-def _strict_runtime_live_candidate_binding(
+def _validated_strict_live_repository_binding(
 ) -> tuple[Path, str, dict[str, object]]:
     _require_strict_workflow_mode()
+    split_child = _trusted_test_child_invocation()
     if DISTRIBUTION_PROFILE != "canonical":
         raise AssertionError(
             "strict runtime live evidence requires the canonical repository layout"
@@ -4445,43 +4446,39 @@ def _strict_runtime_live_candidate_binding(
         raise AssertionError(
             "strict runtime live evidence requires a GitHub-hosted Linux runner"
         )
-    inherited = [
-        name for name in CI_STRICT_RUNTIME_LIVE_FORBIDDEN_ENV if name in os.environ
-    ]
-    if inherited:
-        raise AssertionError(
-            "strict runtime live evidence requires a fresh owner environment"
-        )
-    if (
-        _CANDIDATE_SUPPORT._STRICT_SESSION is not None
-        or _CANDIDATE_SUPPORT._STRICT_REALM is not None
-        or _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED is not False
-    ):
-        raise AssertionError(
-            "strict runtime live evidence requires fresh isolation state"
-        )
     workspace_value = os.environ.get("GITHUB_WORKSPACE")
     if workspace_value is None:
         raise AssertionError(
             "strict runtime live evidence requires the GitHub workspace binding"
         )
-    workspace = Path(workspace_value)
-    try:
-        canonical_workspace = workspace.resolve(strict=True)
-    except OSError as error:
-        raise AssertionError(
-            "strict runtime live GitHub workspace is unreadable"
-        ) from error
-    if (
-        not workspace.is_absolute()
-        or workspace.is_symlink()
-        or canonical_workspace != workspace
-        or canonical_workspace != REPO_ROOT
-        or TRUSTED_REPO_ROOT != REPO_ROOT
-    ):
-        raise AssertionError(
-            "strict runtime live evidence requires the canonical checkout root"
+    if split_child:
+        split_error = (
+            "strict runtime live evidence requires canonical split checkout roots"
         )
+        try:
+            candidate_root = required_ci_repository_root(TRUSTED_REPO_ROOT)
+        except AssertionError as error:
+            raise AssertionError(split_error) from error
+        if REPO_ROOT != TRUSTED_REPO_ROOT:
+            raise AssertionError(split_error)
+    else:
+        candidate_root = REPO_ROOT
+        workspace = Path(workspace_value)
+        try:
+            canonical_workspace = workspace.resolve(strict=True)
+        except OSError as error:
+            raise AssertionError(
+                "strict runtime live GitHub workspace is unreadable"
+            ) from error
+        if (
+            canonical_workspace != workspace
+            or canonical_workspace != candidate_root
+            or TRUSTED_REPO_ROOT != candidate_root
+            or REQUIRED_CI_CANDIDATE_ROOT_ENV in os.environ
+        ):
+            raise AssertionError(
+                "strict runtime live evidence requires the canonical checkout root"
+            )
     candidate_sha_value = os.environ.get(REQUIRED_CI_CANDIDATE_SHA_ENV)
     github_sha_value = os.environ.get("GITHUB_SHA")
     if candidate_sha_value is None or github_sha_value is None:
@@ -4499,18 +4496,43 @@ def _strict_runtime_live_candidate_binding(
             "strict runtime live candidate SHA must equal GITHUB_SHA"
         )
     expected_sha, require_clean = _CANDIDATE_SUPPORT.expected_candidate_sha(
-        REPO_ROOT
+        candidate_root
     )
     if expected_sha != candidate_sha or require_clean is not True:
         raise AssertionError(
             "strict runtime live candidate authority is not frozen"
         )
     binding = _CANDIDATE_SUPPORT.candidate_checkout_binding(
-        REPO_ROOT,
+        candidate_root,
         candidate_sha,
         require_clean=True,
     )
-    return REPO_ROOT, candidate_sha, binding
+    return candidate_root, candidate_sha, binding
+
+
+def _strict_runtime_live_candidate_binding(
+) -> tuple[Path, str, dict[str, object]]:
+    _require_strict_workflow_mode()
+    if _trusted_test_child_invocation():
+        raise AssertionError(
+            "strict runtime live fresh-owner entry must be standalone"
+        )
+    inherited = [
+        name for name in CI_STRICT_RUNTIME_LIVE_FORBIDDEN_ENV if name in os.environ
+    ]
+    if inherited:
+        raise AssertionError(
+            "strict runtime live evidence requires a fresh owner environment"
+        )
+    if (
+        _CANDIDATE_SUPPORT._STRICT_SESSION is not None
+        or _CANDIDATE_SUPPORT._STRICT_REALM is not None
+        or _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED is not False
+    ):
+        raise AssertionError(
+            "strict runtime live evidence requires fresh isolation state"
+        )
+    return _validated_strict_live_repository_binding()
 
 
 def _strict_runtime_live_owner_realm(
@@ -8842,62 +8864,91 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "        pass\n"
         )
 
+    @staticmethod
+    @contextlib.contextmanager
+    def strict_live_fixture(
+        workspace: Path, sha: str, *, split: bool
+    ) -> Iterator[None]:
+        trusted = workspace / ".required-ci" if split else workspace
+        candidate = workspace / ".candidate" if split else workspace
+        if split:
+            trusted.mkdir()
+            candidate.mkdir()
+        environment = dict(
+            GITHUB_ACTIONS="true",
+            GITHUB_SHA=sha,
+            GITHUB_WORKSPACE=str(workspace),
+            RUNNER_ENVIRONMENT="github-hosted",
+            RUNNER_OS="Linux",
+        )
+        environment[REQUIRED_CI_CANDIDATE_SHA_ENV] = sha
+        environment[REQUIRED_CI_ISOLATION_MODE_ENV] = REQUIRED_CI_ISOLATION_MODE
+        if split:
+            environment[REQUIRED_CI_CANDIDATE_ROOT_ENV] = str(candidate)
+            environment.update(
+                zip(
+                    LOCAL_SUPERVISOR_ISOLATION_ENV[1:],
+                    ("60000", "60000", "19", "/registry/entries", "b" * 32),
+                )
+            )
+        argv = ["test", *([TRUSTED_TEST_CHILD_FLAG, str(trusted)] if split else [])]
+        with mock.patch.dict(
+            os.environ, environment, clear=True
+        ), mock.patch.object(sys, "argv", argv), mock.patch.multiple(
+            sys.modules[__name__],
+            DISTRIBUTION_PROFILE="canonical",
+            REPO_ROOT=trusted,
+            TRUSTED_REPO_ROOT=trusted,
+        ), mock.patch.multiple(
+            _CANDIDATE_SUPPORT,
+            _STRICT_SESSION={"active": True} if split else None,
+            _STRICT_REALM={"uid": 60000, "gid": 60000} if split else None,
+            _STRICT_BACKEND_VALIDATED=split,
+            expected_candidate_sha=mock.Mock(return_value=(sha, True)),
+            candidate_checkout_binding=mock.Mock(return_value={}),
+        ):
+            yield
+
     def test_strict_live_binding_requires_exact_fresh_github_checkout(
         self,
     ) -> None:
-        candidate_sha = "a" * 40
-        binding = {"candidate_sha": candidate_sha}
+        sha = "a" * 40
         with tempfile.TemporaryDirectory() as temporary_directory:
-            repo_root = Path(temporary_directory).resolve(strict=True)
-            environment = {
-                "GITHUB_ACTIONS": "true",
-                "GITHUB_SHA": candidate_sha,
-                "GITHUB_WORKSPACE": str(repo_root),
-                REQUIRED_CI_CANDIDATE_SHA_ENV: candidate_sha,
-                REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE,
-                "RUNNER_ENVIRONMENT": "github-hosted",
-                "RUNNER_OS": "Linux",
-            }
-            with mock.patch.dict(
-                os.environ, environment, clear=True
-            ), mock.patch.object(
-                sys.modules[__name__], "DISTRIBUTION_PROFILE", "canonical"
-            ), mock.patch.object(
-                sys.modules[__name__], "REPO_ROOT", repo_root
-            ), mock.patch.object(
-                sys.modules[__name__], "TRUSTED_REPO_ROOT", repo_root
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT, "_STRICT_SESSION", None
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT, "_STRICT_REALM", None
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT, "_STRICT_BACKEND_VALIDATED", False
-            ), mock.patch.object(
-                _CANDIDATE_SUPPORT,
-                "expected_candidate_sha",
-                return_value=(candidate_sha, True),
-            ) as expected_sha, mock.patch.object(
-                _CANDIDATE_SUPPORT,
-                "candidate_checkout_binding",
-                return_value=binding,
-            ) as checkout_binding:
+            repo = Path(temporary_directory).resolve(strict=True)
+            with self.strict_live_fixture(repo, sha, split=False):
                 self.assertEqual(
                     _strict_runtime_live_candidate_binding(),
-                    (repo_root, candidate_sha, binding),
+                    (repo, sha, {}),
                 )
-
-                os.environ[
-                    "REQUIRED_CI_INTERNAL_ISOLATION_WATCHDOG_TOKEN"
-                ] = "b" * 32
+                os.environ["REQUIRED_CI_INTERNAL_ISOLATION_WATCHDOG_TOKEN"] = (
+                    "b" * 32
+                )
                 with self.assertRaisesRegex(
                     AssertionError, "fresh owner environment"
                 ):
                     _strict_runtime_live_candidate_binding()
 
-        expected_sha.assert_called_once_with(repo_root)
-        checkout_binding.assert_called_once_with(
-            repo_root, candidate_sha, require_clean=True
-        )
+    def test_strict_live_repository_binding_accepts_exact_split_roots(
+        self,
+    ) -> None:
+        sha = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory).resolve(strict=True)
+            candidate = workspace / ".candidate"
+            with self.strict_live_fixture(workspace, sha, split=True):
+                self.assertEqual(
+                    _validated_strict_live_repository_binding(),
+                    (candidate, sha, {}),
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "fresh-owner entry must be standalone"
+                ):
+                    _strict_runtime_live_candidate_binding()
+                sys.argv[:] = ["test"]
+                with self.assertRaisesRegex(
+                    AssertionError, "canonical checkout root"
+                ):
+                    _validated_strict_live_repository_binding()
 
     def test_strict_live_entry_runs_exact_fixture_and_closes_before_receipt(
         self,
@@ -9013,15 +9064,32 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "_exercise_real_watchdog_owner_sigkill_replays_registered_live_ipc_root",
             "_exercise_strict_systemd_scope_aggregate_limits",
         )
-        with contextlib.ExitStack() as stack:
-            for name in helpers:
-                stack.enter_context(
-                    mock.patch.object(
-                        type(self), name, side_effect=lambda value=name: trace.append(value)
-                    )
-                )
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            sys.modules[__name__], "_validated_strict_live_repository_binding"
+        ) as repository_binding:
+            with self.assertRaises(unittest.SkipTest):
+                self.test_strict_runtime_live_end_to_end()
+        repository_binding.assert_not_called()
+        repository_binding = mock.Mock(
+            side_effect=lambda: trace.append("repository-binding")
+            or (Path(), "", {})
+        )
+        helper_mocks = {
+            name: mock.Mock(
+                side_effect=lambda *_args, value=name: trace.append(value)
+            )
+            for name in helpers
+        }
+        with mock.patch.dict(
+            os.environ,
+            {REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE},
+        ), mock.patch.object(
+            sys.modules[__name__],
+            "_validated_strict_live_repository_binding",
+            repository_binding,
+        ), mock.patch.multiple(type(self), **helper_mocks):
             self.test_strict_runtime_live_end_to_end()
-        self.assertEqual(tuple(trace), helpers)
+        self.assertEqual(tuple(trace), ("repository-binding", *helpers))
         fault_trace: list[str] = []
         with mock.patch.object(
             _CANDIDATE_SUPPORT,
@@ -32056,6 +32124,34 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             )
         candidate_git.assert_not_called()
 
+    def test_candidate_workspace_total_budget_fits_current_tracked_tree(
+        self,
+    ) -> None:
+        checkout_root = _CANDIDATE_SUPPORT.candidate_repository_root()
+        candidate_sha, _ = (
+            _CANDIDATE_SUPPORT.expected_candidate_sha(checkout_root)
+        )
+        workspace_sources = _CANDIDATE_SUPPORT._candidate_workspace_sources(
+            checkout_root,
+            candidate_sha,
+            _CANDIDATE_SUPPORT._tracked_candidate_script_bytes(
+                checkout_root, candidate_sha
+            ),
+        )
+        tracked_total = sum(
+            len(source) for source, _executable in workspace_sources.values()
+        )
+        headroom = _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_MINIMUM_HEADROOM_BYTES
+        self.assertLessEqual(
+            tracked_total + headroom,
+            _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES,
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES,
+            14 * headroom,
+        )
+        self.assertEqual(headroom, 256 * 1024)
+
     def test_candidate_workspace_directory_budget_precedes_archive_expansion(
         self,
     ) -> None:
@@ -46460,7 +46556,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     stream.close()
             captured_support_stack.close()
 
-    def _exercise_strict_systemd_scope_aggregate_limits(self) -> None:
+    def _exercise_strict_systemd_scope_aggregate_limits(
+        self, candidate_root: Path, candidate_sha: str
+    ) -> None:
         if sys.platform != "linux":
             self.skipTest("strict systemd aggregate probes require Linux")
         self.assertEqual(
@@ -46468,9 +46566,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             REQUIRED_CI_ISOLATION_MODE,
         )
         _CANDIDATE_SUPPORT._ensure_strict_backend()
-        candidate_root, candidate_sha, _binding = (
-            _strict_runtime_live_candidate_binding()
-        )
         source = textwrap.dedent(
             r'''
             import errno
@@ -46730,9 +46825,18 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertNotEqual(process_metrics["unit"], memory_metrics["unit"])
 
     def test_strict_runtime_live_end_to_end(self) -> None:
+        if os.environ.get(REQUIRED_CI_ISOLATION_MODE_ENV) is None:
+            self.skipTest(
+                "strict live evidence runs only under the trusted supervisor"
+            )
+        candidate_root, candidate_sha, _binding = (
+            _validated_strict_live_repository_binding()
+        )
         self._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read()
         self._exercise_real_watchdog_owner_sigkill_replays_registered_live_ipc_root()
-        self._exercise_strict_systemd_scope_aggregate_limits()
+        self._exercise_strict_systemd_scope_aggregate_limits(
+            candidate_root, candidate_sha
+        )
 
     def _exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read(
         self,
