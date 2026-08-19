@@ -23177,6 +23177,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 _CANDIDATE_SUPPORT._wait_outer_owner_watchdog_cleanup(
                     RegistryRoot(),  # type: ignore[arg-type]
                     original_identity,
+                    session_id="a" * 32,
                     watchdog_pidfd=71,
                     bound_descriptor=72,
                     deadline=(
@@ -23255,18 +23256,23 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         )
         fstat.assert_called_once_with(72)
 
-    def test_outer_fault_combined_observer_rejects_terminal_watchdog_with_root(
-        self,
-    ) -> None:
-        error, elapsed, observations, fstat = (
-            self._run_outer_owner_cleanup_observer_fixture(terminal_at=0.0)
+    def test_outer_fault_terminal_errors_include_bound_diagnostic(self) -> None:
+        support = _CANDIDATE_SUPPORT
+        marker = "entry=marker,outer=marker,quota=marker"
+        cases = (
+            ({"terminal_at": 0.0}, "registry root is still present", 0),
+            ({"absent_at": 0.0, "terminal_at": 0.0, "fstat_advance": 40.0}, "completion deadline expired", 1),
+            ({"absent_at": 0.0, "terminal_at": support._OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS}, "terminal cleanup failure", 0),
         )
-
-        self.assertIsNotNone(error)
-        self.assertIn("terminal cleanup failure", str(error))
-        self.assertEqual(elapsed, 0.0)
-        self.assertEqual(observations, [0.0])
-        fstat.assert_not_called()
+        for fixture, expected, fstat_count in cases:
+            with self.subTest(expected=expected), mock.patch.object(
+                support, "_outer_owner_retained_cleanup_state", return_value=marker
+            ) as retained:
+                error, _elapsed, _observations, fstat = self._run_outer_owner_cleanup_observer_fixture(**fixture)
+            self.assertIn(expected, str(error))
+            self.assertIn(marker, str(error))
+            self.assertEqual(fstat.call_count, fstat_count)
+            retained.assert_called_once_with(72, (101, 202), "a" * 32)
 
     def test_outer_fault_combined_observer_rejects_live_path_replacement(
         self,
@@ -23316,26 +23322,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 self.assertIsNotNone(error)
                 self.assertIn(expected, str(error))
                 fstat.assert_called_once_with(72)
-
-    def test_outer_fault_combined_observer_rechecks_deadline_after_fstat(
-        self,
-    ) -> None:
-        error, elapsed, _observations, fstat = (
-            self._run_outer_owner_cleanup_observer_fixture(
-                absent_at=0.0,
-                terminal_at=0.0,
-                fstat_advance=40.0,
-            )
-        )
-
-        self.assertIsNotNone(error)
-        self.assertIn("completion deadline expired", str(error))
-        self.assertGreaterEqual(
-            elapsed,
-            _CANDIDATE_SUPPORT
-            ._OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS,
-        )
-        fstat.assert_called_once_with(72)
 
     def test_registered_sudo_preloads_bounded_stdin_before_active_wait(
         self,
@@ -24564,24 +24550,29 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertEqual(len(list(resources.iterdir())), 1)
             recover.assert_not_called()
             remove.assert_not_called()
-
-
-
-
     def test_parent_registry_retains_recovery_state_on_cleanup_failure(
         self,
     ) -> None:
+        support = _CANDIDATE_SUPPORT
+        patch = mock.patch.object
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve(strict=True)
             entries = root / "entries"
             entries.mkdir(mode=0o700)
-            session_lock = root / ".session.lock"
-            session_lock.write_bytes(b"")
-            session_lock.chmod(0o600)
+            support._write_single_link_file(root / ".session.lock", b"", 0o600)
             controller_path = root / "controller.py"
             controller_path.write_text("pass\n", encoding="utf-8")
-            execution_root = root / "execution"
-            execution_root.mkdir()
+            (root / "execution").mkdir()
+            (root / "trusted-control").mkdir(mode=0o700)
+            quota = root / support._STRICT_WRITABLE_QUOTA_DIRECTORY
+            quota.mkdir(mode=0o700)
+            support._write_writable_quota_binding(
+                root,
+                support._writable_quota_intent_document(
+                    root, quota.lstat(), runner_uid=os.getuid(), runner_gid=os.getgid(), watchdog_token="d" * 32
+                ),
+                create=True,
+            )
             registry = {
                 "root": root,
                 "entries": entries,
@@ -24592,64 +24583,99 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "inherited": True,
                 "watchdog_authorized": True,
             }
-            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
-            _CANDIDATE_SUPPORT._STRICT_SESSION = registry
+            previous_session = support._STRICT_SESSION
+            support._STRICT_SESSION = registry
             try:
-                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                entry_path = support._register_trusted_root_chain(
                     controller_path,
                     None,
                     60000,
-                    execution_root=execution_root,
+                    execution_root=root / "execution",
                 )
-                calls: list[str] = []
+                load = support._load_chain_registry_entry
+                live_kind = support._STRICT_LIVE_IPC_CLEANUP_KIND
+                calls = []
 
                 def fail_recovery(
-                    _entry_path: Path, *, allow_recovery_broker: bool
-                ) -> None:
+                    selected_entry: Path, *, allow_recovery_broker: bool
+                ) -> object:
                     self.assertTrue(allow_recovery_broker)
-                    calls.append("entry")
-                    raise AssertionError("injected entry recovery failure")
+                    if selected_entry == entry_path:
+                        calls.append("entry")
+                        if calls.count("entry") == 1:
+                            return None
+                        raise AssertionError("first" if calls.count("entry") == 2 else "later")
+                    return None
 
                 def cleanup_uid(
                     _selected_controller: Path, _target_uid: int
                 ) -> None:
                     calls.append("uid")
+                    sequence = calls.count("uid")
+                    document = json.loads(entry_path.read_text(encoding="ascii"))
+                    document["state"] = "closed"
+                    document["session_id"] = f"{sequence:032x}"
+                    document["publication_nonce"] = f"{sequence + 16:032x}"
+                    support._write_chain_registry_entry(
+                        entries / f"chain-{sequence:032x}.json",
+                        document,
+                        create=True,
+                    )
 
                 def stable_uid(_target_uid: int) -> None:
                     calls.append("stable")
 
-                with mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                with patch(
+                    support,
                     "_recover_registered_entry",
                     side_effect=fail_recovery,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                ), patch(support, "_STRICT_REGISTRY_ENTRY_LIMIT", 7), patch(
+                    support,
                     "_invoke_root_uid_cleanup",
                     side_effect=cleanup_uid,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
+                ), patch(
+                    support,
                     "_stable_uid_zero",
                     side_effect=stable_uid,
+                ), patch(
+                    support,
+                    "_load_chain_registry_entry",
+                    side_effect=lambda path: load(path) | ({"state": "closed", "cleanup_kind": live_kind} if path == entry_path else {}),
+                ), patch(
+                    support,
+                    "_direct_opt_root_document",
+                    side_effect=lambda _document: {"witness": {"file": {"phase": "owned", "last_record_sha256": ("a" if calls.count("uid") == 1 else "b") * 64}, "retired": {} if calls.count("uid") > 3 else None}},
                 ):
                     with self.assertRaisesRegex(
                         AssertionError, "recovery state retained"
-                    ):
-                        _CANDIDATE_SUPPORT.close_trusted_isolation_chains(
-                            registry
-                        )
+                    ) as caught:
+                        support.close_trusted_isolation_chains(registry)
             finally:
-                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+                support._STRICT_SESSION = previous_session
 
-            self.assertGreaterEqual(calls.count("entry"), 2)
-            self.assertEqual(calls.count("entry"), calls.count("uid"))
-            self.assertEqual(calls.count("uid"), calls.count("stable"))
-            self.assertEqual(
-                calls,
-                ["entry", "uid", "stable"] * calls.count("entry"),
-            )
+            self.assertEqual(calls, ["entry", "uid", "stable"] * 6)
             self.assertTrue(root.is_dir())
             retained = json.loads(entry_path.read_text(encoding="ascii"))
             self.assertEqual(retained["state"], "prepared")
+            self.assertIn("first", str(caught.exception))
+            self.assertNotIn("later", str(caught.exception))
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            metadata = os.fstat(root_fd)
+            try:
+                identity = (metadata.st_dev, metadata.st_ino)
+                diagnostic = support._outer_owner_retained_cleanup_state(root_fd, identity, str(retained["session_id"]))
+                baseline = retained | {"state": "outer-bound", "outer": [1, 2, 1, 1]}
+                for changed, expected in ((baseline, "entry=outer-bound,outer=true,quota=intended"), (baseline | {"outer": []}, "entry=unreadable,outer=unreadable,quota=intended"), (baseline | {"session_id": "f" * 32}, "entry=unreadable,outer=unreadable,quota=intended"), (baseline | {"schema_version": 3}, "entry=unreadable,outer=unreadable,quota=intended"), (baseline | {"extra": True}, "entry=unreadable,outer=unreadable,quota=intended")):
+                    support._write_chain_registry_entry(entry_path, changed, create=False)
+                    self.assertEqual(support._outer_owner_retained_cleanup_state(root_fd, identity, str(retained["session_id"])), expected)
+            finally:
+                os.close(root_fd)
+            self.assertEqual(diagnostic, "entry=prepared,outer=false,quota=intended")
+            self.assertTrue(
+                support._registry_cleanup_obligation_is_terminal(
+                    {"state": "closed", "cleanup_kind": live_kind}, True
+                )
+            )
 
     def test_execution_root_delete_failure_retains_closing_state_for_replay(
         self,
@@ -26516,77 +26542,24 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         host_read_source = inspect.getsource(
             _CANDIDATE_SUPPORT._strict_host_read_root_bindings
         )
+        live_source = inspect.getsource(
+            type(self)._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read
+        )
 
-        self.assertIn("LANDLOCK_MINIMUM_ABI = 4", bootstrap_source)
-        self.assertIn("LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2", bootstrap_source)
-        self.assertIn("LANDLOCK_ACCESS_FS_WRITE_FILE", bootstrap_source)
-        self.assertIn("LANDLOCK_ACCESS_FS_MAKE_FIFO", bootstrap_source)
-        self.assertIn("LANDLOCK_ACCESS_FS_TRUNCATE", bootstrap_source)
-        self.assertNotIn("LANDLOCK_ACCESS_FS_IOCTL_DEV", bootstrap_source)
-        self.assertNotIn("LANDLOCK_ACCESS_FS_READ_DIR", bootstrap_source)
-        self.assertNotIn("os.listdir(trusted_root)", candidate_source)
-        self.assertIn(
-            '"trusted-test-file": "file"', bootstrap_source
-        )
-        self.assertIn(
-            '"system-arch-library": "directory"', bootstrap_source
-        )
-        self.assertIn(
-            'READ_ROOT_PURPOSES.get(document.get("purpose"))',
-            bootstrap_source,
-        )
-        self.assertIn(
-            "handled_access_fs=LANDLOCK_WRITE_ACCESS | LANDLOCK_ACCESS_FS_READ_FILE",
-            bootstrap_source,
-        )
-        self.assertIn(
-            "(descriptor, LANDLOCK_ACCESS_FS_READ_FILE)", bootstrap_source
-        )
-        self.assertIn("for descriptor in read_descriptors", bootstrap_source)
-        self.assertIn(
-            '("/proc/sys/kernel/cap_last_cap", "file")', bootstrap_source
-        )
-        self.assertNotIn(
-            '("/proc/self/fdinfo", "directory")', bootstrap_source
-        )
-        self.assertNotIn('("/proc", "directory")', bootstrap_source)
-        self.assertIn('Path("/usr/lib") / multiarch', host_read_source)
-        self.assertNotIn(
-            'Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',
-            host_read_source,
-        )
-        self.assertIn('Path("/etc/ld.so.preload").lstat()', host_read_source)
-        self.assertIn(
-            'system_stdlib / "lib-dynload"', host_read_source
-        )
-        self.assertIn(
-            'trusted_git.parent != Path("/usr/bin")', host_read_source
-        )
-        self.assertIn('"/dev/null"', bootstrap_source)
-        self.assertIn("os.major(null_metadata.st_rdev) != 1", bootstrap_source)
-        self.assertIn("os.minor(null_metadata.st_rdev) != 3", bootstrap_source)
-        self.assertIn("ctypes.sizeof(LandlockPathBeneathAttr) != 12", bootstrap_source)
-        self.assertIn("0x7E020080", bootstrap_source)
-        self.assertIn("errno.ENOSYS", bootstrap_source)
-        self.assertIn("16, 41, 42", bootstrap_source)
-        self.assertIn("29, 37, 97", bootstrap_source)
-        self.assertIn("321,", bootstrap_source)
-        self.assertIn("280,", bootstrap_source)
-        self.assertIn("160,", bootstrap_source)
-        self.assertIn("164,", bootstrap_source)
-        self.assertIn("302,", bootstrap_source)
-        self.assertIn("261,", bootstrap_source)
-        self.assertIn("prlimit_syscall,", bootstrap_source)
-        self.assertIn(
-            "SockFilter(BPF_JMP_JEQ_K, 0, 5, prlimit_syscall)",
-            bootstrap_source,
-        )
-        self.assertIn(
-            "SockFilter(BPF_LD_W_ABS, 0, 0, 32)", bootstrap_source
-        )
-        self.assertIn(
-            "SockFilter(BPF_LD_W_ABS, 0, 0, 36)", bootstrap_source
-        )
+        def check(source: str, included: tuple[str, ...], excluded: tuple[str, ...] = ()) -> None:
+            for present, contract in ((True, included), (False, excluded)):
+                for needle in contract:
+                    with self.subTest(needle=needle):
+                        (self.assertIn if present else self.assertNotIn)(
+                            needle, source
+                        )
+
+        check(bootstrap_source, (
+            "LANDLOCK_MINIMUM_ABI = 4", "LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2", "LANDLOCK_ACCESS_FS_WRITE_FILE", "LANDLOCK_ACCESS_FS_MAKE_FIFO", "LANDLOCK_ACCESS_FS_TRUNCATE", '"trusted-test-file": "file"', '"system-arch-library": "directory"', 'READ_ROOT_PURPOSES.get(document.get("purpose"))', "handled_access_fs=LANDLOCK_WRITE_ACCESS | LANDLOCK_ACCESS_FS_READ_FILE", "(descriptor, LANDLOCK_ACCESS_FS_READ_FILE)", "for descriptor in read_descriptors", '("/proc/sys/kernel/cap_last_cap", "file")', '"/dev/null"', "os.major(null_metadata.st_rdev) != 1", "os.minor(null_metadata.st_rdev) != 3", "ctypes.sizeof(LandlockPathBeneathAttr) != 12", "0x7E020080", "errno.ENOSYS", "16, 41, 42", "29, 37, 97", "321,", "280,", "160,", "164,", "302,", "261,", "prlimit_syscall,", "SockFilter(BPF_JMP_JEQ_K, 0, 5, prlimit_syscall)", "SockFilter(BPF_LD_W_ABS, 0, 0, 32)", "SockFilter(BPF_LD_W_ABS, 0, 0, 36)", "72,", "25,", "SockFilter(BPF_LD_W_ABS, 0, 0, 24)", "SockFilter(BPF_JMP_JEQ_K, 0, 1, 1036)", *(str(value) for value in (41, 53, 86, 248, 265, 272, 307, 308, 425)),
+        ), ("LANDLOCK_ACCESS_FS_IOCTL_DEV", "LANDLOCK_ACCESS_FS_READ_DIR", '("/proc/self/fdinfo", "directory")', '("/proc", "directory")', "FS_IOC_"))
+        check(host_read_source, ('Path("/usr/lib") / multiarch', 'Path("/etc/ld.so.preload").lstat()', 'system_stdlib / "lib-dynload"', 'trusted_git.parent != Path("/usr/bin")'), ('Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',))
+        check(candidate_source, ("read_network_interfaces(network_interface_fd)", 'status.get("Seccomp") != "2"', "Seccomp_filters", '"/proc/self/limits"'), ("os.listdir(trusted_root)", 'os.listdir("/sys/class/net")', "socket.if_nameindex", "resource.getrlimit"))
+        check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")'), ('f"/proc/self/fdinfo/',))
         install_function = next(
             node
             for node in ast.parse(bootstrap_source).body
@@ -26621,55 +26594,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertNotIn(302, architectures["x86_64"][4])
         self.assertEqual(architectures["aarch64"][3], 261)
         self.assertNotIn(261, architectures["aarch64"][4])
-        self.assertNotIn("FS_IOC_", bootstrap_source)
-        self.assertIn("72,", bootstrap_source)
-        self.assertIn("25,", bootstrap_source)
-        self.assertIn("SockFilter(BPF_LD_W_ABS, 0, 0, 24)", bootstrap_source)
-        self.assertIn("SockFilter(BPF_JMP_JEQ_K, 0, 1, 1036)", bootstrap_source)
-        for syscall_number in (
-            41,
-            53,
-            86,
-            248,
-            265,
-            272,
-            307,
-            308,
-            425,
-        ):
-            self.assertIn(str(syscall_number), bootstrap_source)
-        self.assertNotIn('os.listdir("/sys/class/net")', candidate_source)
-        self.assertIn(
-            "read_network_interfaces(network_interface_fd)", candidate_source
-        )
-        self.assertNotIn("socket.if_nameindex", candidate_source)
-        self.assertIn('status.get("Seccomp") != "2"', candidate_source)
-        self.assertIn("Seccomp_filters", candidate_source)
-        self.assertIn('"/proc/self/limits"', candidate_source)
-        self.assertNotIn("resource.getrlimit", candidate_source)
-        live_source = inspect.getsource(
-            type(self)._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read
-        )
-        self.assertIn("fifo_path, os.O_RDWR | os.O_NONBLOCK", live_source)
-        self.assertIn('fifo_prefill = b"host-fifo-byte"', live_source)
-        self.assertIn("fifo_read_errno = operation_errno", live_source)
-        self.assertIn("readable_roots=(rw_hint_path,)", live_source)
-        self.assertNotIn('f"/proc/self/fdinfo/', live_source)
-        self.assertIn(
-            'record["mountpoint"] == "/dev/shm"', live_source
-        )
-        self.assertIn("len(dev_shm_mounts) != 1", live_source)
-        self.assertIn(
-            'record["mountpoint"] == "/dev/null"', live_source
-        )
-        self.assertIn("len(devnull_mounts) != 1", live_source)
-        self.assertIn(
-            '"/tmp/required-ci-alias-probe-target"', live_source
-        )
-        self.assertIn(
-            'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")',
-            live_source,
-        )
 
     def test_strict_host_ipc_helper_acquisition_failure_reaps_direct_child(
         self,
@@ -28176,64 +28100,45 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     def test_configured_interpreter_policy_is_bound_after_active_session_before_privilege(
         self,
     ) -> None:
-        events: list[str] = []
+        support = _CANDIDATE_SUPPORT
+        events = []
 
-        def active_session() -> dict[str, object]:
-            events.append("active-session")
-            return {}
-
-        def realm() -> dict[str, object]:
-            events.append("realm")
-            return {"uid": 60000, "gid": 60000}
-
-        def reject_binding(_uid: int, _gid: int) -> dict[str, object]:
+        def reject_binding(*_unused: int) -> None:
             events.append("interpreter-binding")
-            raise AssertionError(
-                "configured candidate interpreter access policy is unsafe"
-            )
+            raise AssertionError("access policy is unsafe")
 
-        with mock.patch.object(
-            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_strict_isolation_requested",
-            return_value=True,
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_active_strict_session",
-            side_effect=active_session,
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT, "_strict_realm", side_effect=realm
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_bind_configured_candidate_interpreter",
-            side_effect=reject_binding,
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT, "candidate_repository_root"
-        ) as candidate_root, mock.patch.object(
-            _CANDIDATE_SUPPORT, "_ensure_strict_backend"
-        ) as ensure_backend, mock.patch.object(
-            _CANDIDATE_SUPPORT, "_run_registered_sudo"
-        ) as registered_sudo, mock.patch.object(
-            subprocess, "Popen"
-        ) as popen, mock.patch.dict(
+        blocked = [mock.Mock() for _ in range(4)]
+        with mock.patch.multiple(
+            support,
+            strict_isolation_platform_preflight=mock.Mock(),
+            _strict_isolation_requested=mock.Mock(return_value=True),
+            _active_strict_session=mock.Mock(
+                side_effect=lambda: events.append("active-session") or {}
+            ),
+            _strict_realm=mock.Mock(
+                side_effect=lambda: events.append("realm")
+                or {"uid": 60000, "gid": 60000}
+            ),
+            _bind_configured_candidate_interpreter=mock.Mock(
+                side_effect=reject_binding
+            ),
+            candidate_repository_root=blocked[0],
+            _ensure_strict_backend=blocked[1],
+            _run_registered_sudo=blocked[2],
+        ), mock.patch.object(subprocess, "Popen", blocked[3]), mock.patch.dict(
             os.environ,
             {REQUIRED_CI_CANDIDATE_SHA_ENV: "a" * 40},
             clear=False,
         ):
             with self.assertRaisesRegex(AssertionError, "access policy is unsafe"):
-                _CANDIDATE_SUPPORT._run_candidate_process(
+                support._run_candidate_process(
                     Path("/candidate.py"),
                     [sys.executable, "-I", "/candidate.py"],
                 )
 
-        self.assertEqual(
-            events, ["active-session", "realm", "interpreter-binding"]
-        )
-        candidate_root.assert_not_called()
-        ensure_backend.assert_not_called()
-        registered_sudo.assert_not_called()
-        popen.assert_not_called()
+        self.assertEqual(events, ["active-session", "realm", "interpreter-binding"])
+        for operation in blocked:
+            operation.assert_not_called()
 
     def test_configured_runtime_bootstrap_rejects_version_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

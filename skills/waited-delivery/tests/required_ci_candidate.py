@@ -16748,6 +16748,29 @@ _CHAIN_TRANSITIONS = {
     "deleting": frozenset(("closed",)),
     "closed": frozenset(),
 }
+_CHAIN_ENTRY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "token",
+        "registry_owner_uid",
+        "state",
+        "session_id",
+        "publication_nonce",
+        "target_uid",
+        "controller_path",
+        "recovery_controller_path",
+        "handshake_path",
+        "execution_root",
+        "cleanup_execution_root",
+        "cleanup_kind",
+        "direct_opt_root",
+        "execution_root_deleted",
+        "execution_root_delete_nonce",
+        "launcher_parent",
+        "outer_marker",
+        "outer",
+    }
+)
 
 
 def _load_chain_registry_entry(
@@ -16819,28 +16842,7 @@ def _load_chain_registry_entry(
         raise AssertionError("strict chain registry entry is malformed") from error
     if (
         type(document) is not dict
-        or set(document)
-        != {
-            "schema_version",
-            "token",
-            "registry_owner_uid",
-            "state",
-            "session_id",
-            "publication_nonce",
-            "target_uid",
-            "controller_path",
-            "recovery_controller_path",
-            "handshake_path",
-            "execution_root",
-            "cleanup_execution_root",
-            "cleanup_kind",
-            "direct_opt_root",
-            "execution_root_deleted",
-            "execution_root_delete_nonce",
-            "launcher_parent",
-            "outer_marker",
-            "outer",
-        }
+        or set(document) != _CHAIN_ENTRY_FIELDS
         or type(document.get("schema_version")) is not int
         or document.get("schema_version") != 2
         or document.get("state") not in _CHAIN_STATES
@@ -17332,6 +17334,30 @@ def _writable_quota_manifest_path(root: Path) -> Path:
     return root / "trusted-control" / _STRICT_WRITABLE_QUOTA_BINDING_NAME
 
 
+_WRITABLE_QUOTA_BINDING_FIELDS = frozenset(
+    {
+        "schema_version",
+        "state",
+        "root",
+        "mountpoint",
+        "underlying_device",
+        "underlying_inode",
+        "mounted_device",
+        "mounted_inode",
+        "mount_id",
+        "major_minor",
+        "source",
+        "size_bytes",
+        "nr_inodes",
+        "flags",
+        "children",
+        "runner_uid",
+        "runner_gid",
+        "watchdog_token_sha256",
+    }
+)
+
+
 def _load_writable_quota_binding(root: Path) -> dict[str, object]:
     path = _writable_quota_manifest_path(root)
     descriptor: int | None = None
@@ -17382,29 +17408,9 @@ def _load_writable_quota_binding(root: Path) -> dict[str, object]:
         raise AssertionError(
             "strict writable quota binding is malformed"
         ) from error
-    expected_fields = {
-        "schema_version",
-        "state",
-        "root",
-        "mountpoint",
-        "underlying_device",
-        "underlying_inode",
-        "mounted_device",
-        "mounted_inode",
-        "mount_id",
-        "major_minor",
-        "source",
-        "size_bytes",
-        "nr_inodes",
-        "flags",
-        "children",
-        "runner_uid",
-        "runner_gid",
-        "watchdog_token_sha256",
-    }
     if (
         type(document) is not dict
-        or set(document) != expected_fields
+        or set(document) != _WRITABLE_QUOTA_BINDING_FIELDS
         or document.get("schema_version") != 1
         or document.get("state")
         not in ("intended", "active", "unmounted")
@@ -23607,6 +23613,15 @@ def _cleanup_orphan_resource_roots(
                 )
 
 
+def _registry_cleanup_obligation_is_terminal(
+    document: Mapping[str, object], witness_retired: bool
+) -> bool:
+    return document.get("state") == "closed" and (
+        document.get("cleanup_kind") != _STRICT_LIVE_IPC_CLEANUP_KIND
+        or witness_retired
+    )
+
+
 def _close_trusted_isolation_chains_under_gate(
     registry: Mapping[str, object],
     *,
@@ -23636,6 +23651,7 @@ def _close_trusted_isolation_chains_under_gate(
     ):
         raise AssertionError("strict parent isolation registry is malformed")
     failures: list[str] = []
+    first_failures: list[str] = []
     all_closed = False
     previous_signature: tuple[tuple[object, ...], ...] | None = None
     stalled_rounds = 0
@@ -23676,6 +23692,7 @@ def _close_trusted_isolation_chains_under_gate(
                 )
         except BaseException as error:
             failures = [f"registry inventory: {error}"]
+            first_failures = first_failures or failures
             break
         process_entries: list[Path] = []
         resource_entries: list[Path] = []
@@ -23725,6 +23742,12 @@ def _close_trusted_isolation_chains_under_gate(
                 _load_chain_registry_entry(entry_path)
                 for entry_path in current_entries
             ]
+            terminal = tuple(
+                _registry_cleanup_obligation_is_terminal(
+                    document, witness_status(document)[2]
+                )
+                for document in current_documents
+            )
             signature = tuple(
                 (
                     entry_path.name,
@@ -23734,15 +23757,15 @@ def _close_trusted_isolation_chains_under_gate(
                     document.get("execution_root_deleted") is not None,
                     *witness_status(document),
                 )
-                for entry_path, document in zip(
-                    current_entries, current_documents, strict=True
+                for entry_path, document, is_terminal in zip(
+                    current_entries,
+                    current_documents,
+                    terminal,
+                    strict=True,
                 )
+                if not is_terminal
             )
-            all_closed = all(
-                document.get("state") == "closed"
-                and witness_status(document)[2]
-                for document in current_documents
-            )
+            all_closed = all(terminal)
         except BaseException as error:
             round_failures.append(f"registry final inventory: {error}")
             all_closed = False
@@ -23755,10 +23778,13 @@ def _close_trusted_isolation_chains_under_gate(
         else:
             stalled_rounds = 0
         previous_signature = signature
+        if round_failures and not first_failures:
+            first_failures = list(round_failures)
         failures = round_failures
         if stalled_rounds >= 2:
             break
     if not all_closed or failures:
+        failures = first_failures or failures
         if not failures:
             failures = ["registry did not reach a closed fixpoint"]
         raise AssertionError(
@@ -25390,16 +25416,41 @@ finally:
 '''.strip()
 
 
-def _read_outer_owner_json(path: Path, description: str) -> dict[str, object]:
+def _read_outer_owner_json(
+    path: Path,
+    description: str,
+    *,
+    parent_descriptor: int | None = None,
+) -> dict[str, object]:
+    if parent_descriptor is not None and (
+        type(parent_descriptor) is not int or path != Path(path.name)
+    ):
+        raise AssertionError(
+            f"strict outer owner {description} selector is malformed"
+        )
     descriptor: int | None = None
     try:
         descriptor = os.open(
-            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            path if parent_descriptor is None else path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            **(
+                {}
+                if parent_descriptor is None
+                else {"dir_fd": parent_descriptor}
+            ),
         )
         before = os.fstat(descriptor)
         data = os.read(descriptor, 4097)
         after = os.fstat(descriptor)
-        path_metadata = path.lstat()
+        path_metadata = (
+            path.lstat()
+            if parent_descriptor is None
+            else os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
     except OSError as error:
         raise AssertionError(
             f"strict outer owner {description} is unreadable"
@@ -25844,10 +25895,171 @@ def _pidfd_is_terminal(descriptor: int) -> bool:
     return descriptor in readable
 
 
+def _outer_owner_retained_cleanup_state(
+    bound_descriptor: int, identity: tuple[int, int], session_id: str
+) -> str:
+    if (
+        type(bound_descriptor) is not int
+        or bound_descriptor < 0
+        or type(identity) is not tuple
+        or len(identity) != 2
+        or any(type(value) is not int or value < 0 for value in identity)
+        or re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+    ):
+        raise AssertionError(
+            "strict outer owner retained cleanup selector is malformed"
+        )
+    try:
+        root_metadata = os.fstat(bound_descriptor)
+    except OSError as error:
+        raise AssertionError(
+            "strict outer owner retained registry descriptor is unreadable"
+        ) from error
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or (root_metadata.st_dev, root_metadata.st_ino) != identity
+        or root_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(root_metadata.st_mode) not in (0o700, 0o710)
+    ):
+        raise AssertionError(
+            "strict outer owner retained registry identity changed"
+        )
+
+    def read_document(
+        directory: str, name: str, description: str
+    ) -> dict[str, object]:
+        directory_fd: int | None = None
+        try:
+            directory_fd = os.open(
+                directory,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=bound_descriptor,
+            )
+            opened = os.fstat(directory_fd)
+            selected = os.stat(
+                directory,
+                dir_fd=bound_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (selected.st_dev, selected.st_ino)
+                or opened.st_uid != os.getuid()
+                or selected.st_uid != opened.st_uid
+                or selected.st_gid != opened.st_gid
+                or stat.S_IMODE(opened.st_mode) != 0o700
+                or stat.S_IMODE(selected.st_mode)
+                != stat.S_IMODE(opened.st_mode)
+            ):
+                raise AssertionError(
+                    f"strict outer owner {description} parent is unsafe"
+                )
+            document = _read_outer_owner_json(
+                Path(name),
+                description,
+                parent_descriptor=directory_fd,
+            )
+            reselected = os.stat(
+                directory,
+                dir_fd=bound_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                reselected.st_dev,
+                reselected.st_ino,
+                reselected.st_uid,
+                reselected.st_gid,
+                stat.S_IMODE(reselected.st_mode),
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_uid,
+                opened.st_gid,
+                stat.S_IMODE(opened.st_mode),
+            ):
+                raise AssertionError(
+                    f"strict outer owner {description} parent changed"
+                )
+            return document
+        except OSError as error:
+            raise AssertionError(
+                f"strict outer owner {description} is unreadable"
+            ) from error
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    entry_state = "unreadable"
+    outer_present = "unreadable"
+    try:
+        entry = read_document(
+            "entries",
+            f"chain-{session_id}.json",
+            "retained fault entry",
+        )
+        if (
+            set(entry) != _CHAIN_ENTRY_FIELDS
+            or type(entry.get("schema_version")) is not int
+            or entry.get("schema_version") != 2
+            or entry.get("session_id") != session_id
+            or entry.get("state") not in _CHAIN_STATES
+            or entry.get("registry_owner_uid") != os.getuid()
+            or type(entry.get("target_uid")) is not int
+            or not 50000 <= int(entry["target_uid"]) <= 64999
+        ):
+            raise AssertionError(
+                "strict outer owner retained entry state is malformed"
+            )
+        outer = entry.get("outer")
+        if entry["state"] in ("outer-bound", "root-authorized") and outer is None:
+            raise AssertionError(
+                "strict outer owner retained outer binding is missing"
+            )
+        if outer is not None:
+            parsed_outer = _parse_root_chain_identity(
+                outer, "retained registered outer"
+            )
+            if (
+                parsed_outer[0] != parsed_outer[2]
+                or parsed_outer[0] != parsed_outer[3]
+            ):
+                raise AssertionError(
+                    "strict outer owner retained outer identity is malformed"
+                )
+        entry_state = str(entry["state"])
+        outer_present = "true" if outer is not None else "false"
+    except AssertionError:
+        pass
+    quota_state = "unreadable"
+    try:
+        quota = read_document(
+            "trusted-control",
+            _STRICT_WRITABLE_QUOTA_BINDING_NAME,
+            "retained quota binding",
+        )
+        if (
+            set(quota) != _WRITABLE_QUOTA_BINDING_FIELDS
+            or type(quota.get("schema_version")) is not int
+            or quota.get("schema_version") != 1
+            or quota.get("state") not in ("intended", "active", "unmounted")
+        ):
+            raise AssertionError(
+                "strict outer owner retained quota state is malformed"
+            )
+        quota_state = str(quota["state"])
+    except AssertionError:
+        pass
+    return (
+        f"entry={entry_state},outer={outer_present},quota={quota_state}"
+    )
+
+
 def _wait_outer_owner_watchdog_cleanup(
     root: Path,
     identity: tuple[int, int],
     *,
+    session_id: str,
     watchdog_pidfd: int,
     bound_descriptor: int,
     deadline: float,
@@ -25860,6 +26072,7 @@ def _wait_outer_owner_watchdog_cleanup(
         or any(type(value) is not int or value < 0 for value in identity)
         or type(bound_descriptor) is not int
         or bound_descriptor < 0
+        or re.fullmatch(r"[0-9a-f]{32}", session_id) is None
         or type(deadline) not in (int, float)
         or boundary not in _OUTER_OWNER_FAULT_BOUNDARIES
         or selected_signal not in (signal.SIGKILL, signal.SIGSTOP)
@@ -25870,6 +26083,15 @@ def _wait_outer_owner_watchdog_cleanup(
     context = (
         f"boundary={boundary!r} signal={signal.Signals(selected_signal).name}"
     )
+
+    def retained_state() -> str:
+        try:
+            return _outer_owner_retained_cleanup_state(
+                bound_descriptor, identity, session_id
+            )
+        except BaseException:
+            return "entry=unreadable,outer=unreadable,quota=unreadable"
+
     zero_count = 0
     while True:
         now = time.monotonic()
@@ -25882,7 +26104,7 @@ def _wait_outer_owner_watchdog_cleanup(
                 )
             raise AssertionError(
                 "strict outer owner watchdog terminal cleanup failure "
-                f"({context})"
+                f"({context}); {retained_state()}"
             )
         try:
             metadata = root.lstat()
@@ -25903,7 +26125,8 @@ def _wait_outer_owner_watchdog_cleanup(
             if watchdog_terminal:
                 raise AssertionError(
                     "strict outer owner watchdog terminal cleanup failure: "
-                    f"registry root is still present ({context})"
+                    "registry root is still present "
+                    f"({context}); {retained_state()}"
                 )
         if watchdog_terminal and zero_count >= _STRICT_ZERO_SCAN_COUNT:
             try:
@@ -25926,7 +26149,8 @@ def _wait_outer_owner_watchdog_cleanup(
             if time.monotonic() >= deadline:
                 raise AssertionError(
                     "strict outer owner watchdog terminal cleanup failure: "
-                    f"completion deadline expired ({context})"
+                    "completion deadline expired "
+                    f"({context}); {retained_state()}"
                 )
             return
         time.sleep(
@@ -26332,6 +26556,7 @@ def _probe_independent_outer_owner_fault(
         _wait_outer_owner_watchdog_cleanup(
             registry_root,
             registry_identity,
+            session_id=session_id,
             watchdog_pidfd=watchdog_pidfd,
             bound_descriptor=registry_descriptor,
             deadline=recovery_deadline,
