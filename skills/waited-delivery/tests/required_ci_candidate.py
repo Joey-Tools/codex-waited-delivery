@@ -62,6 +62,15 @@ _STRICT_HOST_READ_ROOT_LIMIT = 32
 _STRICT_BOOTSTRAP_NOFILE_MINIMUM = 64
 _STRICT_BOOTSTRAP_NOFILE_LIMIT = 256
 _STRICT_MOUNTINFO_LIMIT_BYTES = 1024 * 1024
+_STRICT_WRITABLE_QUOTA_DIRECTORY = "candidate-writable"
+_STRICT_WRITABLE_QUOTA_SOURCE = "required-ci-candidate-writable"
+_STRICT_WRITABLE_QUOTA_SIZE_BYTES = 64 * 1024 * 1024
+_STRICT_WRITABLE_QUOTA_INODES = 8192
+_STRICT_WRITABLE_QUOTA_BINDING_NAME = ".candidate-writable.json"
+_STRICT_ROOT_TREE_CLEANUP_SECONDS = 30.0
+_STRICT_ROOT_TREE_ENTRY_LIMIT = 8192
+_STRICT_ROOT_TREE_DEPTH_LIMIT = 64
+_STRICT_ROOT_TREE_LOGICAL_BYTE_LIMIT = _STRICT_WRITABLE_QUOTA_SIZE_BYTES
 _STRICT_NETWORK_INTERFACE_FD = 63
 _STRICT_PRIVATE_SURFACE_PATHS = (
     Path("/tmp"),
@@ -71,6 +80,7 @@ _STRICT_PRIVATE_SURFACE_PATHS = (
 )
 _STRICT_LIVE_IPC_PARENT = Path("/opt")
 _STRICT_LIVE_IPC_CLEANUP_KIND = "direct-opt-root-v1"
+_STRICT_QUOTA_RESOURCE_CLEANUP_KIND = "quota-disposable-v1"
 _STRICT_LIVE_IPC_ROOT_MODE = 0o710
 _STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE = "owner-loss-quiescent-v1"
 _STRICT_LIVE_IPC_OWNER_LOSS_AUTHORITY_KIND = (
@@ -105,6 +115,66 @@ _STRICT_LIVE_IPC_WITNESS_PHASES = (
 _STRICT_LIVE_IPC_OWNER_LOSS_CAPABILITY_SECRET = object()
 _STRICT_LIVE_IPC_OWNER_LOSS_AUTHORIZATION_SECRET = object()
 _STRICT_LIVE_IPC_ROOT_INVOCATION_BINDING_SECRET = object()
+
+
+class _RootTreeBudget:
+    __slots__ = (
+        "deadline",
+        "depth_limit",
+        "entries",
+        "entry_limit",
+        "logical_byte_limit",
+        "logical_bytes",
+    )
+
+    def __init__(
+        self,
+        *,
+        deadline: float,
+        entry_limit: int,
+        depth_limit: int,
+        logical_byte_limit: int,
+    ) -> None:
+        if (
+            type(deadline) is not float
+            or not deadline > 0
+            or type(entry_limit) is not int
+            or entry_limit <= 0
+            or type(depth_limit) is not int
+            or depth_limit < 0
+            or type(logical_byte_limit) is not int
+            or logical_byte_limit < 0
+        ):
+            raise AssertionError("strict root tree budget is malformed")
+        self.deadline = deadline
+        self.entry_limit = entry_limit
+        self.depth_limit = depth_limit
+        self.logical_byte_limit = logical_byte_limit
+        self.entries = 0
+        self.logical_bytes = 0
+
+    def charge(self, *, depth: int, logical_bytes: int) -> None:
+        if time.monotonic() >= self.deadline:
+            raise AssertionError("strict root tree cleanup deadline expired")
+        if type(depth) is not int or depth < 0 or depth > self.depth_limit:
+            raise AssertionError("strict root tree depth limit was exceeded")
+        if type(logical_bytes) is not int or logical_bytes < 0:
+            raise AssertionError("strict root tree logical byte charge is invalid")
+        if self.entries >= self.entry_limit:
+            raise AssertionError("strict root tree entry limit was exceeded")
+        if self.logical_bytes + logical_bytes > self.logical_byte_limit:
+            raise AssertionError("strict root tree logical byte limit was exceeded")
+        self.entries += 1
+        self.logical_bytes += logical_bytes
+
+
+def _new_root_tree_budget() -> _RootTreeBudget:
+    return _RootTreeBudget(
+        deadline=time.monotonic() + _STRICT_ROOT_TREE_CLEANUP_SECONDS,
+        entry_limit=_STRICT_ROOT_TREE_ENTRY_LIMIT,
+        depth_limit=_STRICT_ROOT_TREE_DEPTH_LIMIT,
+        logical_byte_limit=_STRICT_ROOT_TREE_LOGICAL_BYTE_LIMIT,
+    )
 
 
 class _StrictLiveIpcRootInvocationBinding:
@@ -437,6 +507,12 @@ _OUTER_OWNER_FAULT_BOUNDARIES = (
     "after-root-authorized-barrier",
     "after-target-active",
 )
+_INNER_CONTROLLER_FAULT_POINTS = (
+    "after-wrapper-popen-before-handshake-sigkill",
+    "after-wrapper-popen-before-handshake-sigstop",
+    "after-wrapper-bound-before-barrier-sigkill",
+    "after-wrapper-bound-before-barrier-sigstop",
+)
 _STRICT_PRIMITIVES = {
     "sudo": Path("/usr/bin/sudo"),
     "python": Path("/usr/bin/python3"),
@@ -444,7 +520,28 @@ _STRICT_PRIMITIVES = {
     "setpriv": Path("/usr/bin/setpriv"),
     "env": Path("/usr/bin/env"),
     "true": Path("/usr/bin/true"),
+    "systemd-run": Path("/usr/bin/systemd-run"),
+    "systemctl": Path("/usr/bin/systemctl"),
 }
+_STRICT_SYSTEMD_SCOPE_PROFILE = "systemd-v255-cgroup-v2-v1"
+_STRICT_SYSTEMD_SCOPE_PREFIX = "required-ci-candidate-"
+_STRICT_SYSTEMD_SCOPE_MEMORY_HIGH = 768 * 1024 * 1024
+_STRICT_SYSTEMD_SCOPE_MEMORY_MAX = 1024 * 1024 * 1024
+_STRICT_SYSTEMD_SCOPE_TASKS_MAX = 64
+_STRICT_SYSTEMD_SCOPE_CPU_QUOTA_US = 200_000
+_STRICT_SYSTEMD_SCOPE_CPU_PERIOD_US = 100_000
+_STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES = 16 * 1024
+_STRICT_SYSTEMD_VERSION_TIMEOUT_SECONDS = 5.0
+_STRICT_SYSTEMD_PROCESS_COMMAND_LIMIT_BYTES = 1024 * 1024
+_PROC_SUPER_MAGIC = 0x9FA0
+_CGROUP2_SUPER_MAGIC = 0x63677270
+_AT_EMPTY_PATH = 0x1000
+_AT_SYMLINK_NOFOLLOW = 0x100
+_STATX_MNT_ID = 0x1000
+_STRICT_SYSTEMD_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_STRICT_SYSTEMD_SCOPE_CLEANUP_SECONDS = 5.0
+_ROOT_CONTROLLER_CLEANUP_RESERVE_SECONDS = 30.0
+_REGISTERED_RECOVERY_BROKER_TIMEOUT_SECONDS = 20.0
 _ROOT_PYTHON_ARGUMENTS = ("-I", "-B", "-S")
 _CANDIDATE_ENV_KEYS = frozenset(
     {
@@ -817,7 +914,7 @@ _TRUSTED_SUPPORT_SHA256 = hashlib.sha256(_TRUSTED_SUPPORT_SOURCE).hexdigest()
 _STRICT_REALM: dict[str, object] | None = None
 _STRICT_SESSION: dict[str, object] | None = None
 _ABANDONED_REGISTRY_ACQUISITIONS: list[dict[str, object]] = []
-_REGISTERED_FIXTURE_ROOTS: dict[Path, tuple[int, int]] = {}
+_REGISTERED_FIXTURE_ROOTS: dict[Path, dict[str, int]] = {}
 _STRICT_BACKEND_VALIDATED = False
 _STRICT_PLATFORM_VALIDATED = False
 _REGISTRY_GATE_STATE = threading.local()
@@ -2188,7 +2285,91 @@ def strict_isolation_platform_preflight() -> None:
     _probe_pidfd_capability()
     for description, path in _STRICT_PRIMITIVES.items():
         _validate_strict_primitive(path, description)
+    _validate_systemd_scope_runtime_profile()
     _STRICT_PLATFORM_VALIDATED = True
+
+
+def _validated_systemd_version_output(output: bytes) -> int:
+    if (
+        type(output) is not bytes
+        or not output
+        or len(output) > _STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES
+        or not output.endswith(b"\n")
+        or b"\x00" in output
+        or b"\r" in output
+    ):
+        raise AssertionError("strict systemd version output is malformed")
+    try:
+        text = output.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise AssertionError("strict systemd version output is not ASCII") from error
+    lines = text[:-1].split("\n")
+    if (
+        not 1 <= len(lines) <= 64
+        or any(
+            not 1 <= len(line) <= 512
+            or any(not 0x20 <= ord(character) <= 0x7E for character in line)
+            for line in lines
+        )
+    ):
+        raise AssertionError("strict systemd version output lines are malformed")
+    match = re.fullmatch(
+        r"systemd ([0-9]{3})(?: \(([0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127})\))?",
+        lines[0],
+    )
+    if match is None or int(match.group(1), 10) != 255:
+        raise AssertionError("strict systemd major version is not exactly 255")
+    return 255
+
+
+def _run_systemd_version_command(path: Path) -> bytes:
+    if not isinstance(path, Path) or path not in (
+        _STRICT_PRIMITIVES["systemd-run"],
+        _STRICT_PRIMITIVES["systemctl"],
+    ):
+        raise AssertionError("strict systemd version executable is malformed")
+    deadline = time.monotonic() + _STRICT_SYSTEMD_VERSION_TIMEOUT_SECONDS
+    process = subprocess.Popen(
+        [str(path), "--version"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_minimal_supervisor_environment(),
+    )
+    try:
+        stdout, stderr = _drain_candidate_git_pipes(
+            process,
+            output_limit=_STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES,
+            deadline=deadline,
+        )
+        returncode = process.wait(
+            timeout=max(0.01, deadline - time.monotonic())
+        )
+    except BaseException as error:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS)
+        if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+            raise AssertionError("strict systemd version probe timed out") from error
+        if isinstance(error, _CandidateGitOutputLimit):
+            raise AssertionError(
+                "strict systemd version probe output exceeded its fixed limit"
+            ) from error
+        raise
+    if (
+        returncode != 0
+        or stderr
+        or len(stdout) > _STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES
+    ):
+        raise AssertionError("strict systemd version probe failed")
+    return stdout
+
+
+def _validate_systemd_scope_runtime_profile() -> None:
+    for name in ("systemd-run", "systemctl"):
+        _validated_systemd_version_output(
+            _run_systemd_version_command(_STRICT_PRIMITIVES[name])
+        )
 
 
 def _probe_pidfd_capability() -> None:
@@ -3307,6 +3488,71 @@ def _process_instance_matches(
     )
 
 
+def _strict_exact_owner_is_terminal(
+    expected: tuple[int, int, int, int, int, tuple[int, int, int, int]],
+) -> bool:
+    if (
+        type(expected) is not tuple
+        or len(expected) != 6
+        or any(type(value) is not int for value in expected[:5])
+        or type(expected[5]) is not tuple
+        or len(expected[5]) != 4
+        or any(type(value) is not int for value in expected[5])
+    ):
+        raise AssertionError("strict owner identity is malformed")
+    process_path = Path("/proc") / str(expected[0])
+    observed = _process_identity(process_path)
+    if observed is None:
+        return True
+    if observed != expected:
+        raise AssertionError("strict owner identity changed")
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.pidfd_open(expected[0], 0)
+        except ProcessLookupError:
+            recaptured = _process_identity(process_path)
+            if recaptured is None:
+                return True
+            if recaptured != expected:
+                raise AssertionError("strict owner identity changed")
+            raise AssertionError("strict owner pidfd binding is unreadable")
+        except OSError as error:
+            raise AssertionError(
+                "strict owner pidfd binding is unreadable"
+            ) from error
+        signal_reported_terminal = False
+        try:
+            signal.pidfd_send_signal(descriptor, 0, None, 0)
+        except ProcessLookupError:
+            signal_reported_terminal = True
+        except OSError as error:
+            raise AssertionError("strict owner pidfd is unreadable") from error
+        recaptured = _process_identity(process_path)
+        if recaptured is not None and recaptured != expected:
+            raise AssertionError("strict owner identity changed")
+        try:
+            readable, _, _ = select.select([descriptor], [], [], 0)
+        except (OSError, ValueError) as error:
+            raise AssertionError(
+                "strict owner terminal state is unreadable"
+            ) from error
+        terminal = bool(readable)
+        if signal_reported_terminal and not terminal:
+            raise AssertionError("strict owner terminal state is unreadable")
+        if recaptured is None and not terminal:
+            raise AssertionError("strict owner terminal state is unreadable")
+        return terminal
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise AssertionError(
+                    "strict owner pidfd cannot be closed"
+                ) from error
+
+
 def _strict_owner_loss_watchdog_binding_matches(
     observed: tuple[
         int, int, int, int, int, tuple[int, int, int, int]
@@ -3511,17 +3757,72 @@ def _strict_realm() -> dict[str, object]:
 
 class _CandidateFixtureDirectory:
     def __init__(self, prefix: str) -> None:
-        self._temporary = tempfile.TemporaryDirectory(prefix=prefix)
-        self.name = self._temporary.name
-        self._path = Path(self.name).resolve(strict=True)
-        metadata = self._path.lstat()
         if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or metadata.st_nlink < 1
+            type(prefix) is not str
+            or not prefix
+            or len(prefix.encode("utf-8")) > 128
+            or os.path.isabs(prefix)
+            or prefix in (".", "..")
+            or os.sep in prefix
+            or (os.altsep is not None and os.altsep in prefix)
+            or any(ord(character) < 32 or ord(character) == 127 for character in prefix)
         ):
-            raise AssertionError("candidate fixture root identity is unsafe")
-        _REGISTERED_FIXTURE_ROOTS[self._path] = (metadata.st_dev, metadata.st_ino)
+            raise AssertionError("strict candidate fixture prefix is unsafe")
+        session = _active_strict_session()
+        fixture_parent = session.get("fixtures")
+        quota_binding = session.get("quota_binding")
+        target_uid = session.get("target_uid")
+        if (
+            not isinstance(fixture_parent, Path)
+            or type(quota_binding) is not dict
+            or quota_binding.get("state") != "active"
+            or type(quota_binding.get("mounted_device")) is not int
+            or type(quota_binding.get("mount_id")) is not int
+            or type(target_uid) is not int
+        ):
+            raise AssertionError(
+                "strict candidate fixture quota root is unavailable"
+            )
+        parent_metadata = fixture_parent.lstat()
+        created = Path(
+            tempfile.mkdtemp(prefix=prefix, dir=str(fixture_parent))
+        )
+        try:
+            self._path = created.resolve(strict=True)
+            metadata = self._path.lstat()
+            mount_id = _strict_writable_root_mount_binding(self._path)
+            if (
+                self._path.parent != fixture_parent
+                or not self._path.name.startswith(prefix)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_gid != os.getgid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+                or metadata.st_dev != quota_binding["mounted_device"]
+                or mount_id != quota_binding["mount_id"]
+            ):
+                raise AssertionError("candidate fixture root identity is unsafe")
+            binding = {
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "parent_device": parent_metadata.st_dev,
+                "parent_inode": parent_metadata.st_ino,
+                "quota_device": int(quota_binding["mounted_device"]),
+                "quota_mount_id": int(quota_binding["mount_id"]),
+                "runner_uid": os.getuid(),
+                "runner_gid": os.getgid(),
+                "target_uid": target_uid,
+                "target_gid": int(_strict_realm()["gid"]),
+            }
+            _REGISTERED_FIXTURE_ROOTS[self._path] = binding
+        except BaseException:
+            try:
+                created.rmdir()
+            except OSError:
+                pass
+            raise
+        self._temporary = None
+        self.name = str(self._path)
 
     def __enter__(self) -> str:
         return self.name
@@ -3530,13 +3831,11 @@ class _CandidateFixtureDirectory:
         self.cleanup()
 
     def cleanup(self) -> None:
-        identity = _REGISTERED_FIXTURE_ROOTS.pop(self._path, None)
-        if identity is None:
+        binding = _REGISTERED_FIXTURE_ROOTS.get(self._path)
+        if binding is None:
             raise AssertionError("candidate fixture root registration is missing")
-        metadata = self._path.lstat()
-        if (metadata.st_dev, metadata.st_ino) != identity:
-            raise AssertionError("candidate fixture root was replaced")
-        self._temporary.cleanup()
+        _revalidate_registered_fixture_root(self._path, binding)
+        _REGISTERED_FIXTURE_ROOTS.pop(self._path)
 
 
 def candidate_fixture_directory(prefix: str) -> tempfile.TemporaryDirectory[str] | _CandidateFixtureDirectory:
@@ -3550,6 +3849,7 @@ _ROOT_TARGET_ACTIVE_PREFIX = "REQUIRED_CI_ROOT_TARGET_ACTIVE:"
 _TARGET_ACTIVE_MARKER_PREFIX = "REQUIRED_CI_TARGET_ACTIVE:"
 _ROOT_CLEANUP_RECEIPT_PREFIX = "REQUIRED_CI_ROOT_CLEANUP:"
 _ROOT_TREE_RECEIPT_PREFIX = "REQUIRED_CI_ROOT_TREE:"
+_ROOT_QUOTA_RECEIPT_PREFIX = "REQUIRED_CI_ROOT_QUOTA:"
 _CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE = r'''
 import os
 import sys
@@ -3714,7 +4014,7 @@ if required_nofile != bootstrap_nofile_requirement(
 set_bootstrap_nofile_limit(required_nofile)
 
 STRICT_LIMITS = {
-    resource.RLIMIT_NPROC: 64,
+    resource.RLIMIT_NPROC: 4096,
     resource.RLIMIT_CPU: 20,
     resource.RLIMIT_AS: 1073741824,
     resource.RLIMIT_FSIZE: 1048576,
@@ -6214,6 +6514,107 @@ def _atomic_json_document(
             pass
 
 
+def _systemd_scope_unit(session_id: str) -> str:
+    if (
+        type(session_id) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+    ):
+        raise AssertionError("strict systemd scope session identity is malformed")
+    return f"{_STRICT_SYSTEMD_SCOPE_PREFIX}{session_id}.scope"
+
+
+def _systemd_scope_intent(session_id: str) -> dict[str, object]:
+    return {
+        "profile": _STRICT_SYSTEMD_SCOPE_PROFILE,
+        "unit": _systemd_scope_unit(session_id),
+        "control_group": None,
+        "device": None,
+        "inode": None,
+    }
+
+
+def _validated_systemd_scope_document(
+    value: object,
+    *,
+    session_id: str,
+    allow_unbound: bool,
+) -> dict[str, object]:
+    unit = _systemd_scope_unit(session_id)
+    if type(value) is not dict or set(value) != {
+        "profile",
+        "unit",
+        "control_group",
+        "device",
+        "inode",
+    }:
+        raise AssertionError("strict systemd scope document fields are inexact")
+    if value.get("profile") != _STRICT_SYSTEMD_SCOPE_PROFILE or value.get(
+        "unit"
+    ) != unit:
+        raise AssertionError("strict systemd scope intent is inexact")
+    control_group = value.get("control_group")
+    device = value.get("device")
+    inode = value.get("inode")
+    if control_group is None or device is None or inode is None:
+        if not allow_unbound or (control_group, device, inode) != (
+            None,
+            None,
+            None,
+        ):
+            raise AssertionError("strict systemd scope binding is incomplete")
+    elif (
+        type(control_group) is not str
+        or not control_group.startswith("/")
+        or str(PurePosixPath(control_group)) != control_group
+        or PurePosixPath(control_group).name != unit
+        or type(device) is not int
+        or device <= 0
+        or type(inode) is not int
+        or inode <= 0
+    ):
+        raise AssertionError("strict systemd scope binding is malformed")
+    return dict(value)
+
+
+def _systemd_scope_command(
+    session_id: str, wrapper_command: Sequence[str]
+) -> list[str]:
+    unit = _systemd_scope_unit(session_id)
+    if (
+        type(wrapper_command) not in (list, tuple)
+        or not wrapper_command
+        or any(type(argument) is not str or not argument for argument in wrapper_command)
+    ):
+        raise AssertionError("strict systemd wrapper command is malformed")
+    return [
+        str(_STRICT_PRIMITIVES["systemd-run"]),
+        "--system",
+        "--scope",
+        "--quiet",
+        "--collect",
+        "--no-ask-password",
+        "--slice-inherit",
+        "--expand-environment=no",
+        f"--unit={unit}",
+        f"--property=MemoryHigh={_STRICT_SYSTEMD_SCOPE_MEMORY_HIGH}",
+        f"--property=MemoryMax={_STRICT_SYSTEMD_SCOPE_MEMORY_MAX}",
+        "--property=MemorySwapMax=0",
+        f"--property=TasksMax={_STRICT_SYSTEMD_SCOPE_TASKS_MAX}",
+        "--property=CPUQuota=200%",
+        "--property=CPUQuotaPeriodSec=100ms",
+        "--property=OOMPolicy=kill",
+        "--property=KillMode=control-group",
+        "--property=SendSIGKILL=yes",
+        "--property=TimeoutStopSec=5s",
+        "--property=Delegate=no",
+        "--property=MemoryAccounting=yes",
+        "--property=TasksAccounting=yes",
+        "--property=CPUAccounting=yes",
+        "--",
+        *wrapper_command,
+    ]
+
+
 def _write_root_controller_handshake(
     path: Path,
     *,
@@ -6222,6 +6623,8 @@ def _write_root_controller_handshake(
     target_uid: int,
     sudo_parent: tuple[int, int, int, int],
     wrapper: tuple[int, int, int, int] | None,
+    resource_scope: Mapping[str, object],
+    fault_reached: Mapping[str, object] | None = None,
 ) -> None:
     metadata = path.lstat()
     parent_metadata = path.parent.lstat()
@@ -6237,8 +6640,20 @@ def _write_root_controller_handshake(
     ):
         raise AssertionError("strict root controller handshake path is unsafe")
     controller = _root_chain_identity(os.getpid())
+    scope = _validated_systemd_scope_document(
+        resource_scope,
+        session_id=session_id,
+        allow_unbound=wrapper is None,
+    )
+    if wrapper is None and scope["control_group"] is not None:
+        raise AssertionError("strict controller-bound scope is already bound")
+    if wrapper is not None and scope["control_group"] is None:
+        raise AssertionError("strict wrapper-bound scope is not bound")
+    fault = _validated_root_controller_fault_document(
+        fault_reached, session_id=session_id
+    )
     document = {
-        "schema_version": 2,
+        "schema_version": 3,
         "phase": "controller-bound" if wrapper is None else "wrapper-bound",
         "nonce": nonce,
         "session_id": session_id,
@@ -6246,36 +6661,184 @@ def _write_root_controller_handshake(
         "controller": list(controller),
         "sudo_parent": list(sudo_parent),
         "wrapper": None if wrapper is None else list(wrapper),
+        "resource_scope": scope,
+        "fault_reached": fault,
     }
     _atomic_json_document(path, document, expected_owner=0, create=False)
 
 
-def _read_root_controller_handshake(path: Path) -> dict[str, object]:
+def _validated_root_controller_fault_document(
+    value: object, *, session_id: str
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if type(value) is not dict or set(value) != {
+        "point",
+        "wrapper",
+        "resource_scope",
+    }:
+        raise AssertionError("strict root controller fault proof fields are inexact")
+    point = value.get("point")
+    if point not in _INNER_CONTROLLER_FAULT_POINTS:
+        raise AssertionError("strict root controller fault point is inexact")
+    wrapper = _parse_root_chain_identity(value.get("wrapper"), "fault wrapper")
+    scope = _validated_systemd_scope_document(
+        value.get("resource_scope"),
+        session_id=session_id,
+        allow_unbound=False,
+    )
+    return {
+        "point": point,
+        "wrapper": list(wrapper),
+        "resource_scope": scope,
+    }
+
+
+def _validated_root_controller_handshake_document(
+    value: object,
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != {
+        "schema_version",
+        "phase",
+        "nonce",
+        "session_id",
+        "target_uid",
+        "controller",
+        "sudo_parent",
+        "wrapper",
+        "resource_scope",
+        "fault_reached",
+    }:
+        raise AssertionError("strict root controller handshake fields are inexact")
+    phase = value.get("phase")
+    nonce = value.get("nonce")
+    session_id = value.get("session_id")
+    target_uid = value.get("target_uid")
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 3
+        or phase not in ("controller-bound", "wrapper-bound")
+        or type(nonce) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+        or type(session_id) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+        or type(target_uid) is not int
+        or target_uid <= 0
+    ):
+        raise AssertionError("strict root controller handshake values are malformed")
+    controller = _parse_root_chain_identity(
+        value.get("controller"), "controller"
+    )
+    sudo_parent = _parse_root_chain_identity(
+        value.get("sudo_parent"), "sudo parent"
+    )
+    wrapper_value = value.get("wrapper")
+    wrapper = (
+        None
+        if wrapper_value is None
+        else _parse_root_chain_identity(wrapper_value, "wrapper")
+    )
     try:
-        metadata = path.lstat()
-        data = path.read_bytes()
+        scope = _validated_systemd_scope_document(
+            value.get("resource_scope"),
+            session_id=session_id,
+            allow_unbound=phase == "controller-bound",
+        )
+    except AssertionError as error:
+        raise AssertionError(
+            "strict root controller handshake scope is invalid"
+        ) from error
+    fault = _validated_root_controller_fault_document(
+        value.get("fault_reached"), session_id=session_id
+    )
+    if (
+        (phase == "controller-bound" and wrapper is not None)
+        or (phase == "wrapper-bound" and wrapper is None)
+        or (phase == "controller-bound" and scope["control_group"] is not None)
+        or (phase == "wrapper-bound" and scope["control_group"] is None)
+        or (
+            fault is not None
+            and ("before-handshake" in str(fault["point"]))
+            != (phase == "controller-bound")
+        )
+        or (
+            fault is not None
+            and phase == "wrapper-bound"
+            and (
+                fault["wrapper"] != list(wrapper or ())
+                or fault["resource_scope"] != scope
+            )
+        )
+    ):
+        raise AssertionError("strict root controller handshake phase is inconsistent")
+    document = dict(value)
+    document["controller"] = list(controller)
+    document["sudo_parent"] = list(sudo_parent)
+    document["wrapper"] = None if wrapper is None else list(wrapper)
+    document["resource_scope"] = scope
+    document["fault_reached"] = fault
+    return document
+
+
+def _validated_strict_inner_fault_scope(
+    handshake: object, fault_point: str
+) -> dict[str, object]:
+    document = _validated_root_controller_handshake_document(handshake)
+    fault = document.get("fault_reached")
+    if (
+        fault_point not in _INNER_CONTROLLER_FAULT_POINTS
+        or type(fault) is not dict
+        or fault.get("point") != fault_point
+    ):
+        raise AssertionError("strict root controller fault point was not reached")
+    return dict(fault["resource_scope"])
+
+
+def _read_root_controller_handshake(
+    path: Path, *, allow_empty: bool = False
+) -> dict[str, object] | None:
+    descriptor: int | None = None
+    try:
+        selected = path.lstat()
+        parent_metadata = path.parent.lstat()
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        metadata = os.fstat(descriptor)
+        data = os.read(descriptor, 4097)
+        reselected = path.lstat()
     except OSError as error:
         raise AssertionError(
             "strict root controller handshake is unreadable"
         ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if (
         not path.is_absolute()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != 0
+        or parent_metadata.st_mode & 0o077
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != 0
         or metadata.st_nlink != 1
         or stat.S_IMODE(metadata.st_mode) != 0o600
+        or (selected.st_dev, selected.st_ino)
+        != (metadata.st_dev, metadata.st_ino)
+        or (reselected.st_dev, reselected.st_ino)
+        != (metadata.st_dev, metadata.st_ino)
         or len(data) > 4096
     ):
         raise AssertionError("strict root controller handshake identity is unsafe")
+    if not data and allow_empty:
+        return None
     try:
         document = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AssertionError(
             "strict root controller handshake is malformed"
         ) from error
-    if type(document) is not dict:
-        raise AssertionError("strict root controller handshake is not a document")
-    return document
+    return _validated_root_controller_handshake_document(document)
 
 
 def _assert_root_completion_sentinel(
@@ -6654,6 +7217,9 @@ def _root_controller_candidate_command(
     writable_root_bindings = _revalidate_strict_writable_root_bindings(
         config.get("writable_roots")
     )
+    _revalidate_aggregate_writable_device(
+        config.get("aggregate_writable_device"), writable_root_bindings
+    )
     read_root_bindings = _revalidate_strict_host_read_root_bindings(
         config.get("read_roots")
     )
@@ -6814,6 +7380,1809 @@ def _root_wrapper_command(
     ]
 
 
+def _parse_systemctl_scope_properties(data: bytes) -> dict[str, str]:
+    if (
+        type(data) is not bytes
+        or not data
+        or len(data) > _STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES
+        or not data.endswith(b"\n")
+        or b"\x00" in data
+        or b"\r" in data
+    ):
+        raise AssertionError("strict systemd scope properties are malformed")
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise AssertionError(
+            "strict systemd scope properties are malformed"
+        ) from error
+    properties: dict[str, str] = {}
+    for line in text[:-1].split("\n"):
+        if not line or "=" not in line:
+            raise AssertionError("strict systemd scope property is malformed")
+        name, value = line.split("=", 1)
+        if not name or name in properties:
+            raise AssertionError("strict systemd scope property is duplicated")
+        properties[name] = value
+    return properties
+
+
+def _read_systemd_cgroup_file(path: Path, description: str) -> bytes:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise AssertionError(
+                f"strict systemd {description} identity is unsafe"
+            )
+        data = os.read(descriptor, _STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES + 1)
+    except OSError as error:
+        raise AssertionError(
+            f"strict systemd {description} is unreadable"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(data) > _STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES:
+        raise AssertionError(f"strict systemd {description} exceeds its limit")
+    return data
+
+
+def _read_systemd_cgroup_file_at(
+    directory_fd: int,
+    name: str,
+    description: str,
+    *,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+    limit_bytes: int = _STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES,
+    expected_parent_filesystem_magic: int | None = None,
+    expected_parent_mount_id: int | None = None,
+    expected_parent_device: int | None = None,
+) -> bytes:
+    if (
+        type(directory_fd) is not int
+        or directory_fd < 0
+        or type(name) is not str
+        or not name
+        or name in (".", "..")
+        or "/" in name
+        or type(limit_bytes) is not int
+        or not 0 < limit_bytes <= _STRICT_SYSTEMD_PROCESS_COMMAND_LIMIT_BYTES
+    ):
+        raise AssertionError(f"strict systemd {description} selector is malformed")
+    descriptor: int | None = None
+    reselected_fd: int | None = None
+    try:
+        parent_metadata = os.fstat(directory_fd)
+        parent_authority = _kernel_descriptor_mount_authority(directory_fd)
+        parent_magic = (
+            parent_authority[0]
+            if expected_parent_filesystem_magic is None
+            else expected_parent_filesystem_magic
+        )
+        parent_mount_id = (
+            parent_authority[1]
+            if expected_parent_mount_id is None
+            else expected_parent_mount_id
+        )
+        parent_device = (
+            parent_authority[2]
+            if expected_parent_device is None
+            else expected_parent_device
+        )
+        if (
+            type(parent_magic) is not int
+            or type(parent_mount_id) is not int
+            or parent_mount_id <= 0
+            or type(parent_device) is not int
+            or parent_device <= 0
+            or parent_metadata.st_dev != parent_device
+            or parent_authority != (parent_magic, parent_mount_id, parent_device)
+        ):
+            raise AssertionError(
+                f"strict systemd {description} parent authority changed"
+            )
+        selected = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        before_authority = _kernel_descriptor_mount_authority(descriptor)
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(4096, limit_bytes + 1 - size),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > limit_bytes:
+                break
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
+        after_authority = _kernel_descriptor_mount_authority(descriptor)
+        reselected_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+        reselected = os.fstat(reselected_fd)
+        reselected_authority = _kernel_descriptor_mount_authority(reselected_fd)
+        _descriptor_acl_is_absent(descriptor, f"strict systemd {description}")
+        _descriptor_acl_is_absent(
+            reselected_fd, f"strict systemd {description} reselected"
+        )
+    except OSError as error:
+        raise AssertionError(
+            f"strict systemd {description} is unreadable"
+        ) from error
+    finally:
+        for opened_descriptor in (reselected_fd, descriptor):
+            if opened_descriptor is not None:
+                os.close(opened_descriptor)
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink")
+    if (
+        len(data) > limit_bytes
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != expected_owner_uid
+        or before.st_gid != expected_owner_gid
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) & 0o022
+        or before.st_dev != parent_device
+        or (
+            os.major(before.st_dev),
+            os.minor(before.st_dev),
+        ) != (os.major(parent_device), os.minor(parent_device))
+        or any(
+            authority != (parent_magic, parent_mount_id, parent_device)
+            for authority in (
+                before_authority,
+                after_authority,
+                reselected_authority,
+            )
+        )
+        or any(getattr(selected, field) != getattr(before, field) for field in identity_fields)
+        or any(getattr(after, field) != getattr(before, field) for field in identity_fields)
+        or any(getattr(reselected, field) != getattr(before, field) for field in identity_fields)
+    ):
+        raise AssertionError(f"strict systemd {description} identity changed")
+    return data
+
+
+def _encoded_systemd_process_command(command: Sequence[str]) -> bytes:
+    if (
+        type(command) not in (list, tuple)
+        or not command
+        or any(
+            type(argument) is not str or not argument or "\x00" in argument
+            for argument in command
+        )
+    ):
+        raise AssertionError("strict root wrapper command is malformed")
+    encoded = b"\0".join(os.fsencode(argument) for argument in command) + b"\0"
+    if len(encoded) > _STRICT_SYSTEMD_PROCESS_COMMAND_LIMIT_BYTES:
+        raise AssertionError("strict root wrapper command exceeds its fixed limit")
+    return encoded
+
+
+def _read_systemd_process_command_at(
+    process_fd: int,
+    expected_commands: Sequence[Sequence[str]],
+    *,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+    expected_parent_filesystem_magic: int | None = None,
+    expected_parent_mount_id: int | None = None,
+    expected_parent_device: int | None = None,
+    allow_empty: bool = False,
+) -> int:
+    if type(expected_commands) not in (list, tuple) or not expected_commands:
+        raise AssertionError("strict root wrapper command set is malformed")
+    expected = tuple(
+        _encoded_systemd_process_command(command) for command in expected_commands
+    )
+    if len(set(expected)) != len(expected):
+        raise AssertionError("strict root wrapper command set is ambiguous")
+    observed = _read_systemd_cgroup_file_at(
+        process_fd,
+        "cmdline",
+        "wrapper command line",
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+        limit_bytes=max(map(len, expected)),
+        expected_parent_filesystem_magic=expected_parent_filesystem_magic,
+        expected_parent_mount_id=expected_parent_mount_id,
+        expected_parent_device=expected_parent_device,
+    )
+    if allow_empty and not observed:
+        return -1
+    try:
+        return expected.index(observed)
+    except ValueError as error:
+        raise AssertionError("strict systemd wrapper command is inexact") from error
+
+
+def _read_exact_systemd_process_command_at(
+    process_fd: int,
+    expected_command: Sequence[str],
+    *,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+    expected_parent_filesystem_magic: int | None = None,
+    expected_parent_mount_id: int | None = None,
+    expected_parent_device: int | None = None,
+) -> bytes:
+    _read_systemd_process_command_at(
+        process_fd,
+        (expected_command,),
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+        expected_parent_filesystem_magic=expected_parent_filesystem_magic,
+        expected_parent_mount_id=expected_parent_mount_id,
+        expected_parent_device=expected_parent_device,
+    )
+    return _encoded_systemd_process_command(expected_command)
+
+
+def _systemd_process_executable_identity_at(
+    process_fd: int,
+) -> tuple[int, int]:
+    executable_fd: int | None = None
+    try:
+        executable_fd = os.open("exe", os.O_RDONLY | os.O_CLOEXEC, dir_fd=process_fd)
+        metadata = os.fstat(executable_fd)
+    except OSError as error:
+        raise AssertionError("strict systemd process executable is unreadable") from error
+    finally:
+        if executable_fd is not None:
+            os.close(executable_fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise AssertionError("strict systemd process executable identity changed")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _trusted_executable_identity(path: Path) -> tuple[int, int]:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path.resolve(strict=True),
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise AssertionError("strict trusted executable is unreadable") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise AssertionError("strict trusted executable identity is unsafe")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _sample_systemd_process_exec_phase(
+    process_fd: int,
+    initial_command: Sequence[str],
+    final_command: Sequence[str],
+    *,
+    proc_mount_id: int,
+    proc_device: int,
+) -> int | None:
+    allowed_executables = (
+        _trusted_executable_identity(_STRICT_PRIMITIVES["systemd-run"]),
+        _trusted_executable_identity(_STRICT_PRIMITIVES["python"]),
+    )
+    before = _systemd_process_executable_identity_at(process_fd)
+    try:
+        phase = _read_systemd_process_command_at(
+            process_fd,
+            (initial_command, final_command),
+            expected_parent_filesystem_magic=_PROC_SUPER_MAGIC,
+            expected_parent_mount_id=proc_mount_id,
+            expected_parent_device=proc_device,
+            allow_empty=True,
+        )
+    except AssertionError:
+        after = _systemd_process_executable_identity_at(process_fd)
+        if before != after and before in allowed_executables and after in allowed_executables:
+            return None
+        raise
+    after = _systemd_process_executable_identity_at(process_fd)
+    if before != after:
+        if before in allowed_executables and after in allowed_executables:
+            return None
+        raise AssertionError("strict systemd process executable identity changed")
+    if phase == -1:
+        if before in allowed_executables:
+            return None
+        raise AssertionError("strict systemd process executable identity changed")
+    if before != allowed_executables[phase]:
+        raise AssertionError("strict systemd process executable phase changed")
+    return phase
+
+
+class _SystemdScopeLeafDisappeared(Exception):
+    pass
+
+
+@contextmanager
+def _open_validated_cgroup2_scope(
+    cgroup_root: Path,
+    control_group: str,
+    *,
+    mount_record: Mapping[str, object] | None = None,
+    mount_inventory: Mapping[int, Mapping[str, object]] | None = None,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+    expected_descriptor_mount_id: int | None = None,
+    allow_missing_leaf: bool = False,
+) -> Iterator[tuple[int, int, os.stat_result, int, int]]:
+    components = PurePosixPath(control_group).parts
+    if (
+        type(control_group) is not str
+        or not control_group.startswith("/")
+        or len(components) < 2
+        or len(components) > 16
+        or type(allow_missing_leaf) is not bool
+        or any(
+            component in ("", ".", "..")
+            or "/" in component
+            or "\x00" in component
+            or any(ord(character) < 32 or ord(character) == 127 for character in component)
+            for component in components[1:]
+        )
+    ):
+        raise AssertionError("strict systemd ControlGroup path is malformed")
+    record = (
+        _strict_exact_mount_record(cgroup_root)
+        if mount_record is None
+        else dict(mount_record)
+    )
+    inventory = (
+        _strict_mount_inventory()
+        if mount_inventory is None
+        else {key: dict(value) for key, value in mount_inventory.items()}
+    )
+    if (
+        type(record) is not dict
+        or set(record) != {
+            "mount_id",
+            "major_minor",
+            "mountpoint",
+            "options",
+            "filesystem",
+            "source",
+            "super_options",
+        }
+        or record.get("mountpoint") != cgroup_root
+        or record.get("filesystem") != "cgroup2"
+        or record.get("source") != "cgroup"
+        or type(record.get("mount_id")) is not int
+        or int(record["mount_id"]) <= 0
+        or type(record.get("major_minor")) is not tuple
+        or len(record["major_minor"]) != 2
+        or not {"rw", "nosuid", "nodev", "noexec"}.issubset(record.get("options", ()))
+        or "rw" not in record.get("super_options", ())
+    ):
+        raise AssertionError("strict cgroup2 mount authority is inexact")
+    with ExitStack() as stack:
+        root_fd = os.open(
+            cgroup_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        stack.callback(os.close, root_fd)
+        root_metadata = os.fstat(root_fd)
+        selected_root = cgroup_root.lstat()
+        root_authority = _kernel_descriptor_mount_authority(root_fd)
+        descriptor_mount_id = root_authority[1]
+        inventory_record = inventory.get(int(record["mount_id"]))
+        same_device_mount_ids = {
+            mount_id
+            for mount_id, candidate in inventory.items()
+            if candidate.get("major_minor") == record["major_minor"]
+        }
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != expected_owner_uid
+            or root_metadata.st_gid != expected_owner_gid
+            or stat.S_IMODE(root_metadata.st_mode) & 0o022
+            or any(
+                getattr(selected_root, field) != getattr(root_metadata, field)
+                for field in ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid")
+            )
+            or tuple(record["major_minor"])
+            != (os.major(root_metadata.st_dev), os.minor(root_metadata.st_dev))
+            or root_authority[0] != _CGROUP2_SUPER_MAGIC
+            or root_authority[2] != root_metadata.st_dev
+            or descriptor_mount_id != record["mount_id"]
+            or (
+                expected_descriptor_mount_id is not None
+                and descriptor_mount_id != expected_descriptor_mount_id
+            )
+            or type(inventory_record) is not dict
+            or inventory_record.get("mountpoint") != cgroup_root
+            or inventory_record.get("major_minor") != record["major_minor"]
+            or inventory_record.get("root") != "/"
+            or same_device_mount_ids != {record["mount_id"]}
+        ):
+            raise AssertionError("strict cgroup2 root identity or policy changed")
+        _descriptor_acl_is_absent(root_fd, "strict cgroup2 root")
+        chain_paths = {cgroup_root}
+        current_fd = root_fd
+        current_path = cgroup_root
+        scope_metadata = root_metadata
+        protected_fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid")
+        root_binding = tuple(
+            getattr(root_metadata, field) for field in protected_fields
+        )
+        opened_components: list[tuple[int, int, str, tuple[int, ...]]] = []
+        final_index = len(components) - 2
+
+        def revalidate_opened_chain(*, final_absent: bool = False) -> bool:
+            leaf_disappeared = final_absent
+            chain_changed = False
+            final_entry = (
+                opened_components[-1]
+                if len(opened_components) - 1 == final_index
+                else None
+            )
+            if final_entry is not None:
+                parent_fd, child_fd, name, identity = final_entry
+                try:
+                    reselected_leaf = os.stat(
+                        name, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    if not allow_missing_leaf:
+                        raise
+                    leaf_disappeared = True
+                    reselected_leaf = None
+                held_leaf = os.fstat(child_fd)
+                leaf_authority = _kernel_descriptor_mount_authority(child_fd)
+                _descriptor_acl_is_absent(
+                    child_fd, "strict cgroup2 scope chain"
+                )
+                selected_leaf = (
+                    (held_leaf,)
+                    if reselected_leaf is None
+                    else (reselected_leaf, held_leaf)
+                )
+                chain_changed = any(
+                    tuple(
+                        getattr(metadata, field)
+                        for field in protected_fields
+                    )
+                    != identity
+                    for metadata in selected_leaf
+                ) or leaf_authority != root_authority
+            reselected_root = cgroup_root.lstat()
+            held_root = os.fstat(root_fd)
+            _descriptor_acl_is_absent(root_fd, "strict cgroup2 root")
+            chain_changed = chain_changed or any(
+                tuple(
+                    getattr(metadata, field) for field in protected_fields
+                )
+                != root_binding
+                for metadata in (reselected_root, held_root)
+            )
+            nonleaf_entries = (
+                opened_components[:-1]
+                if final_entry is not None
+                else opened_components
+            )
+            for parent_fd, child_fd, name, identity in nonleaf_entries:
+                reselected = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                held = os.fstat(child_fd)
+                held_authority = _kernel_descriptor_mount_authority(child_fd)
+                _descriptor_acl_is_absent(
+                    child_fd, "strict cgroup2 scope chain"
+                )
+                chain_changed = chain_changed or any(
+                    tuple(
+                        getattr(metadata, field)
+                        for field in protected_fields
+                    )
+                    != identity
+                    for metadata in (reselected, held)
+                ) or held_authority != root_authority
+            current_record = (
+                _strict_exact_mount_record(cgroup_root)
+                if mount_record is None
+                else dict(mount_record)
+            )
+            current_inventory = (
+                _strict_mount_inventory()
+                if mount_inventory is None
+                else {
+                    key: dict(value)
+                    for key, value in mount_inventory.items()
+                }
+            )
+            current_inventory_record = current_inventory.get(
+                int(record["mount_id"])
+            )
+            current_aliases = {
+                mount_id
+                for mount_id, candidate in current_inventory.items()
+                if candidate.get("major_minor") == record["major_minor"]
+            }
+            current_nested_mounts = {
+                candidate.get("mountpoint")
+                for candidate in current_inventory.values()
+                if candidate.get("mountpoint") in chain_paths
+                and candidate.get("mountpoint") != cgroup_root
+            }
+            chain_changed = chain_changed or (
+                current_record != record
+                or type(current_inventory_record) is not dict
+                or current_inventory_record.get("mountpoint") != cgroup_root
+                or current_inventory_record.get("major_minor")
+                != record["major_minor"]
+                or current_inventory_record.get("root") != "/"
+                or current_aliases != {record["mount_id"]}
+                or current_nested_mounts
+                or _kernel_descriptor_mount_authority(root_fd)
+                != root_authority
+            )
+            if chain_changed:
+                raise AssertionError(
+                    "strict cgroup2 scope chain identity changed"
+                )
+            return leaf_disappeared
+
+        for index, component in enumerate(components[1:]):
+            try:
+                selected_component = os.stat(
+                    component, dir_fd=current_fd, follow_symlinks=False
+                )
+            except FileNotFoundError as error:
+                if allow_missing_leaf and index == final_index:
+                    revalidate_opened_chain(final_absent=True)
+                    raise _SystemdScopeLeafDisappeared from error
+                raise
+            try:
+                child_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError as error:
+                if allow_missing_leaf and index == final_index:
+                    revalidate_opened_chain(final_absent=True)
+                    raise _SystemdScopeLeafDisappeared from error
+                raise
+            stack.callback(os.close, child_fd)
+            scope_metadata = os.fstat(child_fd)
+            child_authority = _kernel_descriptor_mount_authority(child_fd)
+            try:
+                reselected_component = os.stat(
+                    component, dir_fd=current_fd, follow_symlinks=False
+                )
+            except FileNotFoundError as error:
+                if allow_missing_leaf and index == final_index:
+                    revalidate_opened_chain(final_absent=True)
+                    raise _SystemdScopeLeafDisappeared from error
+                raise
+            opened_components.append(
+                (
+                    current_fd,
+                    child_fd,
+                    component,
+                    tuple(
+                        getattr(scope_metadata, field)
+                        for field in protected_fields
+                    ),
+                )
+            )
+            current_path /= component
+            chain_paths.add(current_path)
+            if (
+                not stat.S_ISDIR(scope_metadata.st_mode)
+                or scope_metadata.st_uid != expected_owner_uid
+                or scope_metadata.st_gid != expected_owner_gid
+                or stat.S_IMODE(scope_metadata.st_mode) & 0o022
+                or scope_metadata.st_dev != root_metadata.st_dev
+                or child_authority != root_authority
+                or any(
+                    getattr(selected_component, field)
+                    != getattr(scope_metadata, field)
+                    for field in protected_fields
+                )
+                or any(
+                    getattr(reselected_component, field)
+                    != getattr(scope_metadata, field)
+                    for field in protected_fields
+                )
+            ):
+                raise AssertionError("strict cgroup2 scope chain policy changed")
+            _descriptor_acl_is_absent(child_fd, "strict cgroup2 scope chain")
+            current_fd = child_fd
+        nested_mounts = {
+            record_value.get("mountpoint")
+            for record_value in inventory.values()
+            if record_value.get("mountpoint") in chain_paths
+            and record_value.get("mountpoint") != cgroup_root
+        }
+        if nested_mounts:
+            raise AssertionError("strict cgroup2 scope chain crosses a nested mount")
+        body_error: BaseException | None = None
+        try:
+            yield (
+                root_fd,
+                current_fd,
+                scope_metadata,
+                int(record["mount_id"]),
+                root_metadata.st_dev,
+            )
+        except BaseException as error:
+            body_error = error
+        leaf_disappeared = revalidate_opened_chain()
+        if leaf_disappeared:
+            raise _SystemdScopeLeafDisappeared from body_error
+        if body_error is not None:
+            raise body_error
+
+
+def _validated_systemd_scope_binding(
+    unit: str,
+    wrapper_pid: int,
+    *,
+    systemctl_output: bytes,
+    proc_cgroup: bytes,
+    cgroup_root: Path = _STRICT_SYSTEMD_CGROUP_ROOT,
+    cgroup_mount_record: Mapping[str, object] | None = None,
+    cgroup_mount_inventory: Mapping[int, Mapping[str, object]] | None = None,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+    cgroup_descriptor_mount_id: int | None = None,
+) -> dict[str, object]:
+    match = re.fullmatch(
+        rf"{re.escape(_STRICT_SYSTEMD_SCOPE_PREFIX)}([0-9a-f]{{32}})\.scope",
+        unit,
+    ) if type(unit) is str else None
+    if match is None or _systemd_scope_unit(match.group(1)) != unit:
+        raise AssertionError("strict systemd scope unit is malformed")
+    if type(wrapper_pid) is not int or wrapper_pid <= 0:
+        raise AssertionError("strict systemd scope wrapper PID is malformed")
+    parsed_properties = _parse_systemctl_scope_properties(systemctl_output)
+    control_group = parsed_properties.get("ControlGroup")
+    if (
+        type(control_group) is not str
+        or not control_group.startswith("/")
+        or PurePosixPath(control_group).name != unit
+    ):
+        raise AssertionError("strict systemd scope ControlGroup is malformed")
+    expected_properties = {
+        "Id": unit,
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "ControlGroup": control_group,
+        "MemoryHigh": str(_STRICT_SYSTEMD_SCOPE_MEMORY_HIGH),
+        "MemoryMax": str(_STRICT_SYSTEMD_SCOPE_MEMORY_MAX),
+        "MemorySwapMax": "0",
+        "TasksMax": str(_STRICT_SYSTEMD_SCOPE_TASKS_MAX),
+        "CPUQuotaPerSecUSec": "2s",
+        "CPUQuotaPeriodUSec": "100ms",
+        "OOMPolicy": "kill",
+        "KillMode": "control-group",
+        "SendSIGKILL": "yes",
+        "TimeoutStopUSec": "5s",
+        "Delegate": "no",
+        "MemoryAccounting": "yes",
+        "TasksAccounting": "yes",
+        "CPUAccounting": "yes",
+    }
+    if parsed_properties != expected_properties:
+        raise AssertionError("strict systemd scope properties are inexact")
+    expected_proc_cgroup = f"0::{control_group}\n".encode("ascii")
+    if proc_cgroup != expected_proc_cgroup:
+        raise AssertionError("strict systemd scope process membership is inexact")
+    expected_files = {
+        "cgroup.type": b"domain\n",
+        "cgroup.procs": f"{wrapper_pid}\n".encode("ascii"),
+        "cgroup.events": b"populated 1\nfrozen 0\n",
+        "memory.high": f"{_STRICT_SYSTEMD_SCOPE_MEMORY_HIGH}\n".encode("ascii"),
+        "memory.max": f"{_STRICT_SYSTEMD_SCOPE_MEMORY_MAX}\n".encode("ascii"),
+        "memory.swap.max": b"0\n",
+        "pids.max": f"{_STRICT_SYSTEMD_SCOPE_TASKS_MAX}\n".encode("ascii"),
+        "cpu.max": (
+            f"{_STRICT_SYSTEMD_SCOPE_CPU_QUOTA_US} "
+            f"{_STRICT_SYSTEMD_SCOPE_CPU_PERIOD_US}\n"
+        ).encode("ascii"),
+    }
+    with _open_validated_cgroup2_scope(
+        cgroup_root,
+        control_group,
+        mount_record=cgroup_mount_record,
+        mount_inventory=cgroup_mount_inventory,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+        expected_descriptor_mount_id=cgroup_descriptor_mount_id,
+    ) as (
+        root_fd,
+        scope_fd,
+        scope_metadata,
+        scope_mount_id,
+        scope_device,
+    ):
+        controllers = _read_systemd_cgroup_file_at(
+            root_fd,
+            "cgroup.controllers",
+            "controller inventory",
+            expected_owner_uid=expected_owner_uid,
+            expected_owner_gid=expected_owner_gid,
+            expected_parent_filesystem_magic=_CGROUP2_SUPER_MAGIC,
+            expected_parent_mount_id=scope_mount_id,
+            expected_parent_device=scope_device,
+        )
+        try:
+            controller_names = controllers.decode("ascii").strip().split()
+        except UnicodeDecodeError as error:
+            raise AssertionError(
+                "strict cgroup2 controller inventory is malformed"
+            ) from error
+        if (
+            len(controller_names) != len(set(controller_names))
+            or not {"cpu", "memory", "pids"}.issubset(controller_names)
+        ):
+            raise AssertionError("strict cgroup2 controllers are unavailable")
+        for _ in range(2):
+            for name, expected in expected_files.items():
+                if _read_systemd_cgroup_file_at(
+                    scope_fd,
+                    name,
+                    name,
+                    expected_owner_uid=expected_owner_uid,
+                    expected_owner_gid=expected_owner_gid,
+                    expected_parent_filesystem_magic=_CGROUP2_SUPER_MAGIC,
+                    expected_parent_mount_id=scope_mount_id,
+                    expected_parent_device=scope_device,
+                ) != expected:
+                    raise AssertionError(f"strict systemd scope {name} is inexact")
+    return {
+        "profile": _STRICT_SYSTEMD_SCOPE_PROFILE,
+        "unit": unit,
+        "control_group": control_group,
+        "device": scope_metadata.st_dev,
+        "inode": scope_metadata.st_ino,
+    }
+
+
+_SYSTEMD_SCOPE_SHOW_PROPERTIES = (
+    "Id",
+    "LoadState",
+    "ActiveState",
+    "ControlGroup",
+    "MemoryHigh",
+    "MemoryMax",
+    "MemorySwapMax",
+    "TasksMax",
+    "CPUQuotaPerSecUSec",
+    "CPUQuotaPeriodUSec",
+    "OOMPolicy",
+    "KillMode",
+    "SendSIGKILL",
+    "TimeoutStopUSec",
+    "Delegate",
+    "MemoryAccounting",
+    "TasksAccounting",
+    "CPUAccounting",
+)
+_SYSTEMD_SCOPE_CLEANUP_SHOW_PROPERTIES = (
+    *_SYSTEMD_SCOPE_SHOW_PROPERTIES[:3],
+    "SubState",
+    *_SYSTEMD_SCOPE_SHOW_PROPERTIES[3:],
+)
+
+
+def _root_systemctl(
+    arguments: Sequence[str], *, timeout_seconds: float
+) -> tuple[int, bytes, bytes]:
+    if (
+        type(arguments) not in (list, tuple)
+        or not arguments
+        or any(type(argument) is not str or not argument for argument in arguments)
+        or type(timeout_seconds) not in (int, float)
+        or timeout_seconds <= 0
+    ):
+        raise AssertionError("strict systemctl invocation is malformed")
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            [str(_STRICT_PRIMITIVES["systemctl"]), "--system", *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            env=_minimal_supervisor_environment(),
+        )
+        try:
+            returncode = process.wait(timeout=float(timeout_seconds))
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait(timeout=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS)
+            raise AssertionError("strict systemctl invocation timed out") from error
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read(_STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES + 1)
+        stderr = stderr_file.read(_STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES + 1)
+    if (
+        len(stdout) > _STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES
+        or len(stderr) > _STRICT_SYSTEMD_SCOPE_OUTPUT_LIMIT_BYTES
+    ):
+        raise AssertionError("strict systemctl output exceeds its fixed limit")
+    return returncode, stdout, stderr
+
+
+def _process_identity_from_proc_fd(
+    process_fd: int,
+    pid: int,
+    *,
+    proc_mount_id: int,
+    proc_device: int,
+) -> tuple[int, int, int, int, int, tuple[int, int, int, int]]:
+    status_data = _read_systemd_cgroup_file_at(
+        process_fd,
+        "status",
+        "wrapper status",
+        expected_parent_filesystem_magic=_PROC_SUPER_MAGIC,
+        expected_parent_mount_id=proc_mount_id,
+        expected_parent_device=proc_device,
+    )
+    stat_data = _read_systemd_cgroup_file_at(
+        process_fd,
+        "stat",
+        "wrapper stat",
+        expected_parent_filesystem_magic=_PROC_SUPER_MAGIC,
+        expected_parent_mount_id=proc_mount_id,
+        expected_parent_device=proc_device,
+    )
+    try:
+        status_text = status_data.decode("ascii")
+        stat_text = stat_data.decode("ascii")
+        uid_lines = [
+            line for line in status_text.splitlines() if line.startswith("Uid:")
+        ]
+        if len(uid_lines) != 1:
+            raise ValueError("UID line")
+        uids = tuple(int(value) for value in uid_lines[0].split()[1:])
+        suffix = stat_text.rsplit(")", 1)[1].split()
+        identity = (
+            pid,
+            int(suffix[19]),
+            int(suffix[1]),
+            int(suffix[2]),
+            int(suffix[3]),
+            uids,
+        )
+    except (IndexError, UnicodeDecodeError, ValueError) as error:
+        raise AssertionError("strict root wrapper identity is malformed") from error
+    if len(uids) != 4:
+        raise AssertionError("strict root wrapper UID identity is malformed")
+    return identity
+
+
+@contextmanager
+def _open_validated_root_wrapper_process(
+    pid: int,
+    expected_wrapper: tuple[int, int, int, int],
+) -> Iterator[
+    tuple[
+        int,
+        tuple[int, int, int, int, int, tuple[int, int, int, int]],
+        int,
+        int,
+        int,
+    ]
+]:
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or type(expected_wrapper) is not tuple
+        or len(expected_wrapper) != 4
+        or expected_wrapper[0] != pid
+    ):
+        raise AssertionError("strict root wrapper binding is malformed")
+    proc_root = Path("/proc")
+    record = _strict_exact_mount_record(proc_root)
+    inventory = _strict_mount_inventory()
+    root_fd: int | None = None
+    process_fd: int | None = None
+    pidfd: int | None = None
+    try:
+        root_fd = os.open(
+            proc_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        root_metadata = os.fstat(root_fd)
+        selected_root = proc_root.lstat()
+        root_authority = _kernel_descriptor_mount_authority(root_fd)
+        descriptor_mount_id = root_authority[1]
+        inventory_record = (
+            inventory.get(int(record["mount_id"]))
+            if type(record) is dict
+            and type(record.get("mount_id")) is int
+            else None
+        )
+        process_path = proc_root / str(pid)
+        process_chain_mount_ids = {
+            mount_id
+            for mount_id, candidate in inventory.items()
+            if isinstance(candidate.get("mountpoint"), Path)
+            and _strict_path_at_or_below(candidate["mountpoint"], proc_root)
+            and _strict_path_at_or_below(
+                process_path, candidate["mountpoint"]
+            )
+        }
+        if (
+            type(record) is not dict
+            or set(record) != {
+                "mount_id",
+                "major_minor",
+                "mountpoint",
+                "options",
+                "filesystem",
+                "source",
+                "super_options",
+            }
+            or record.get("filesystem") != "proc"
+            or record.get("source") != "proc"
+            or record.get("mountpoint") != proc_root
+            or tuple(record.get("major_minor", ()))
+            != (os.major(root_metadata.st_dev), os.minor(root_metadata.st_dev))
+            or root_authority[0] != _PROC_SUPER_MAGIC
+            or root_authority[2] != root_metadata.st_dev
+            or root_metadata.st_uid != 0
+            or stat.S_IMODE(root_metadata.st_mode) & 0o022
+            or (selected_root.st_dev, selected_root.st_ino)
+            != (root_metadata.st_dev, root_metadata.st_ino)
+            or descriptor_mount_id != record.get("mount_id")
+            or type(inventory_record) is not dict
+            or inventory_record.get("mountpoint") != proc_root
+            or inventory_record.get("major_minor") != record.get("major_minor")
+            or process_chain_mount_ids != {record.get("mount_id")}
+        ):
+            raise AssertionError("strict procfs authority is inexact")
+        selected = os.stat(str(pid), dir_fd=root_fd, follow_symlinks=False)
+        process_fd = os.open(
+            str(pid),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_fd,
+        )
+        opened = os.fstat(process_fd)
+        process_authority = _kernel_descriptor_mount_authority(process_fd)
+        reselected = os.stat(str(pid), dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != 0
+            or stat.S_IMODE(opened.st_mode) & 0o022
+            or (selected.st_dev, selected.st_ino) != (opened.st_dev, opened.st_ino)
+            or (reselected.st_dev, reselected.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or process_authority != root_authority
+        ):
+            raise AssertionError("strict root wrapper proc identity changed")
+        proc_mount_id = int(record["mount_id"])
+        proc_device = root_metadata.st_dev
+        identity = _process_identity_from_proc_fd(
+            process_fd,
+            pid,
+            proc_mount_id=proc_mount_id,
+            proc_device=proc_device,
+        )
+        if (
+            _registered_process_binding(identity) != list(expected_wrapper)
+            or identity[5] != (0, 0, 0, 0)
+        ):
+            raise AssertionError("strict root wrapper generation changed")
+        pidfd = os.pidfd_open(pid, 0)
+        if (
+            _process_identity_from_proc_fd(
+                process_fd,
+                pid,
+                proc_mount_id=proc_mount_id,
+                proc_device=proc_device,
+            )
+            != identity
+            or select.select([pidfd], [], [], 0)[0]
+        ):
+            raise AssertionError("strict root wrapper identity changed")
+        yield process_fd, identity, pidfd, proc_mount_id, proc_device
+        reselected_root = proc_root.lstat()
+        if (
+            (reselected_root.st_dev, reselected_root.st_ino)
+            != (root_metadata.st_dev, root_metadata.st_ino)
+            or _kernel_descriptor_mount_authority(root_fd) != root_authority
+            or _kernel_descriptor_mount_authority(process_fd) != root_authority
+            or _process_identity_from_proc_fd(
+                process_fd,
+                pid,
+                proc_mount_id=proc_mount_id,
+                proc_device=proc_device,
+            )
+            != identity
+            or select.select([pidfd], [], [], 0)[0]
+        ):
+            raise AssertionError("strict root wrapper identity changed")
+    except OSError as error:
+        raise AssertionError("strict root wrapper proc binding is unreadable") from error
+    finally:
+        for descriptor in (pidfd, process_fd, root_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def _validated_running_systemd_scope(
+    unit: str,
+    wrapper_pid: int,
+    *,
+    expected_wrapper: tuple[int, int, int, int],
+    expected_command: Sequence[str],
+) -> dict[str, object]:
+    session_id = _systemd_scope_session_id(unit)
+    initial_command = _systemd_scope_command(session_id, expected_command)
+    with _open_validated_root_wrapper_process(
+        wrapper_pid, expected_wrapper
+    ) as (
+        process_fd,
+        process_identity,
+        pidfd,
+        proc_mount_id,
+        proc_device,
+    ):
+        deadline = time.monotonic() + _STRICT_WATCHDOG_TIMEOUT_SECONDS
+        last_error: BaseException | None = None
+        while time.monotonic() < deadline:
+            if (
+                _process_identity_from_proc_fd(
+                    process_fd,
+                    wrapper_pid,
+                    proc_mount_id=proc_mount_id,
+                    proc_device=proc_device,
+                )
+                != process_identity
+                or select.select([pidfd], [], [], 0)[0]
+            ):
+                raise AssertionError("strict root wrapper identity changed")
+            command_phase = _sample_systemd_process_exec_phase(
+                process_fd,
+                initial_command,
+                expected_command,
+                proc_mount_id=proc_mount_id,
+                proc_device=proc_device,
+            )
+            if command_phase in (None, 0):
+                time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
+                continue
+            try:
+                returncode, output, _ = _root_systemctl(
+                    [
+                        "show",
+                        "--no-pager",
+                        f"--property={','.join(_SYSTEMD_SCOPE_SHOW_PROPERTIES)}",
+                        unit,
+                    ],
+                    timeout_seconds=max(0.01, deadline - time.monotonic()),
+                )
+                if returncode != 0:
+                    raise AssertionError("strict systemd scope is not active")
+            except AssertionError as error:
+                last_error = error
+                time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
+                continue
+            proc_cgroup = _read_systemd_cgroup_file_at(
+                process_fd,
+                "cgroup",
+                "wrapper cgroup membership",
+                expected_parent_filesystem_magic=_PROC_SUPER_MAGIC,
+                expected_parent_mount_id=proc_mount_id,
+                expected_parent_device=proc_device,
+            )
+            if (
+                _process_identity_from_proc_fd(
+                    process_fd,
+                    wrapper_pid,
+                    proc_mount_id=proc_mount_id,
+                    proc_device=proc_device,
+                )
+                != process_identity
+                or select.select([pidfd], [], [], 0)[0]
+            ):
+                raise AssertionError("strict root wrapper identity changed")
+            try:
+                return _validated_systemd_scope_binding(
+                    unit,
+                    wrapper_pid,
+                    systemctl_output=output,
+                    proc_cgroup=proc_cgroup,
+                )
+            except AssertionError as error:
+                last_error = error
+                time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
+    raise AssertionError(
+        f"strict systemd scope did not become bound: {last_error}"
+    )
+
+
+def _bind_scope_write_handshake_release(
+    handshake_path: Path,
+    *,
+    nonce: str,
+    session_id: str,
+    target_uid: int,
+    sudo_parent: tuple[int, int, int, int],
+    wrapper: tuple[int, int, int, int],
+    wrapper_pid: int,
+    barrier_fd: int,
+    resource_scope: Mapping[str, object],
+    wrapper_command: Sequence[str],
+    fault_point: str | None = None,
+    after_handshake: Callable[[], None] | None = None,
+) -> dict[str, object]:
+    intent = _validated_systemd_scope_document(
+        resource_scope, session_id=session_id, allow_unbound=True
+    )
+    if intent["control_group"] is not None:
+        raise AssertionError("strict systemd scope intent is already bound")
+    bound = _validated_running_systemd_scope(
+        str(intent["unit"]),
+        wrapper_pid,
+        expected_wrapper=wrapper,
+        expected_command=wrapper_command,
+    )
+    bound = _validated_systemd_scope_document(
+        bound, session_id=session_id, allow_unbound=False
+    )
+    if fault_point is not None and (
+        fault_point not in _INNER_CONTROLLER_FAULT_POINTS
+        or "before-handshake" in fault_point
+    ):
+        raise AssertionError("strict wrapper-bound fault point is invalid")
+    _write_root_controller_handshake(
+        handshake_path,
+        nonce=nonce,
+        session_id=session_id,
+        target_uid=target_uid,
+        sudo_parent=sudo_parent,
+        wrapper=wrapper,
+        resource_scope=bound,
+        fault_reached=(
+            None
+            if fault_point is None
+            else {
+                "point": fault_point,
+                "wrapper": list(wrapper),
+                "resource_scope": bound,
+            }
+        ),
+    )
+    if after_handshake is not None:
+        after_handshake()
+    _release_wrapper_barrier(barrier_fd)
+    return bound
+
+
+def _systemd_scope_session_id(unit: object) -> str:
+    match = (
+        re.fullmatch(
+            rf"{re.escape(_STRICT_SYSTEMD_SCOPE_PREFIX)}([0-9a-f]{{32}})\.scope",
+            unit,
+        )
+        if type(unit) is str
+        else None
+    )
+    if match is None:
+        raise AssertionError("strict systemd scope unit is malformed")
+    return match.group(1)
+
+
+def _scope_deadline_timeout(deadline: float) -> float:
+    if type(deadline) not in (int, float):
+        raise AssertionError("strict systemd scope deadline is malformed")
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise AssertionError("strict systemd scope cleanup timed out")
+    return remaining
+
+
+def _systemd_scope_cgroup_path(
+    resource_scope: Mapping[str, object], cgroup_root: Path
+) -> Path | None:
+    control_group = resource_scope.get("control_group")
+    if control_group is None:
+        return None
+    if (
+        type(control_group) is not str
+        or not control_group.startswith("/")
+        or str(PurePosixPath(control_group)) != control_group
+        or PurePosixPath(control_group).name != resource_scope["unit"]
+    ):
+        raise AssertionError("strict systemd scope cgroup path is malformed")
+    return cgroup_root / control_group[1:]
+
+
+@contextmanager
+def _open_bound_systemd_scope(
+    resource_scope: Mapping[str, object],
+    cgroup_root: Path,
+    *,
+    mount_record: Mapping[str, object] | None = None,
+    mount_inventory: Mapping[int, Mapping[str, object]] | None = None,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+    expected_descriptor_mount_id: int | None = None,
+    allow_missing_leaf: bool = False,
+) -> Iterator[tuple[int, int, int, int]]:
+    session_id = _systemd_scope_session_id(resource_scope.get("unit"))
+    selected = _validated_systemd_scope_document(
+        resource_scope, session_id=session_id, allow_unbound=False
+    )
+    with _open_validated_cgroup2_scope(
+        cgroup_root,
+        str(selected["control_group"]),
+        mount_record=mount_record,
+        mount_inventory=mount_inventory,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+        expected_descriptor_mount_id=expected_descriptor_mount_id,
+        allow_missing_leaf=allow_missing_leaf,
+    ) as (root_fd, scope_fd, metadata, mount_id, device):
+        if (metadata.st_dev, metadata.st_ino) != (
+            selected["device"],
+            selected["inode"],
+        ):
+            raise AssertionError("strict systemd scope binding identity changed")
+        yield root_fd, scope_fd, mount_id, device
+
+
+def _bound_systemd_scope_present(
+    resource_scope: Mapping[str, object],
+    cgroup_root: Path,
+    *,
+    mount_record: Mapping[str, object] | None = None,
+    mount_inventory: Mapping[int, Mapping[str, object]] | None = None,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+    expected_descriptor_mount_id: int | None = None,
+) -> bool:
+    try:
+        with _open_bound_systemd_scope(
+            resource_scope,
+            cgroup_root,
+            mount_record=mount_record,
+            mount_inventory=mount_inventory,
+            expected_owner_uid=expected_owner_uid,
+            expected_owner_gid=expected_owner_gid,
+            expected_descriptor_mount_id=expected_descriptor_mount_id,
+            allow_missing_leaf=True,
+        ):
+            return True
+    except _SystemdScopeLeafDisappeared:
+        return False
+    except OSError as error:
+        raise AssertionError("strict systemd scope path is unreadable") from error
+
+
+def _query_systemd_scope_lifecycle(
+    unit: str, *, deadline: float
+) -> dict[str, str] | None:
+    returncode, output, stderr = _root_systemctl(
+        [
+            "show",
+            "--no-pager",
+            f"--property={','.join(_SYSTEMD_SCOPE_CLEANUP_SHOW_PROPERTIES)}",
+            unit,
+        ],
+        timeout_seconds=_scope_deadline_timeout(deadline),
+    )
+    state = _parse_systemctl_scope_properties(output)
+    missing = {
+        "Id": unit,
+        "LoadState": "not-found",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "ControlGroup": "",
+    }
+    if (
+        returncode != 0
+        or stderr
+        or set(state) != set(_SYSTEMD_SCOPE_CLEANUP_SHOW_PROPERTIES)
+    ):
+        raise AssertionError("strict systemd scope lifecycle is unreadable")
+    if all(state.get(name) == value for name, value in missing.items()):
+        return None
+    control_group = state.get("ControlGroup")
+    lifecycle = (state.get("ActiveState"), state.get("SubState"))
+    expected_static = {
+        "Id": unit,
+        "LoadState": "loaded",
+        "MemoryHigh": str(_STRICT_SYSTEMD_SCOPE_MEMORY_HIGH),
+        "MemoryMax": str(_STRICT_SYSTEMD_SCOPE_MEMORY_MAX),
+        "MemorySwapMax": "0",
+        "TasksMax": str(_STRICT_SYSTEMD_SCOPE_TASKS_MAX),
+        "CPUQuotaPerSecUSec": "2s",
+        "CPUQuotaPeriodUSec": "100ms",
+        "OOMPolicy": "kill",
+        "KillMode": "control-group",
+        "SendSIGKILL": "yes",
+        "TimeoutStopUSec": "5s",
+        "Delegate": "no",
+        "MemoryAccounting": "yes",
+        "TasksAccounting": "yes",
+        "CPUAccounting": "yes",
+    }
+    if (
+        any(state.get(name) != value for name, value in expected_static.items())
+        or lifecycle
+        not in {
+            ("active", "running"),
+            ("active", "abandoned"),
+            ("deactivating", "stop-sigterm"),
+            ("deactivating", "stop-sigkill"),
+            ("inactive", "dead"),
+            ("failed", "failed"),
+        }
+        or type(control_group) is not str
+        or (
+            bool(control_group)
+            and (
+                not control_group.startswith("/")
+                or str(PurePosixPath(control_group)) != control_group
+                or PurePosixPath(control_group).name != unit
+            )
+        )
+        or (lifecycle == ("active", "running") and not control_group)
+    ):
+        raise AssertionError("strict systemd scope lifecycle is unreadable")
+    return state
+
+
+def _validated_systemd_scope_cleanup_path(
+    resource_scope: Mapping[str, object],
+    control_group: str,
+    *,
+    cgroup_root: Path = _STRICT_SYSTEMD_CGROUP_ROOT,
+) -> dict[str, object]:
+    session_id = _systemd_scope_session_id(resource_scope.get("unit"))
+    selected = _validated_systemd_scope_document(
+        resource_scope,
+        session_id=session_id,
+        allow_unbound=True,
+    )
+    unit = str(selected["unit"])
+    if (
+        type(control_group) is not str
+        or not control_group.startswith("/")
+        or str(PurePosixPath(control_group)) != control_group
+        or PurePosixPath(control_group).name != unit
+        or (
+            selected["control_group"] is not None
+            and selected["control_group"] != control_group
+        )
+    ):
+        raise AssertionError("strict systemd scope cleanup path changed")
+    observed = {
+        "profile": _STRICT_SYSTEMD_SCOPE_PROFILE,
+        "unit": unit,
+        "control_group": control_group,
+        "device": None,
+        "inode": None,
+    }
+    expected_files = {
+        "cgroup.type": b"domain\n",
+        "memory.high": f"{_STRICT_SYSTEMD_SCOPE_MEMORY_HIGH}\n".encode("ascii"),
+        "memory.max": f"{_STRICT_SYSTEMD_SCOPE_MEMORY_MAX}\n".encode("ascii"),
+        "memory.swap.max": b"0\n",
+        "pids.max": f"{_STRICT_SYSTEMD_SCOPE_TASKS_MAX}\n".encode("ascii"),
+        "cpu.max": (
+            f"{_STRICT_SYSTEMD_SCOPE_CPU_QUOTA_US} "
+            f"{_STRICT_SYSTEMD_SCOPE_CPU_PERIOD_US}\n"
+        ).encode("ascii"),
+    }
+    with _open_validated_cgroup2_scope(
+        cgroup_root, control_group, allow_missing_leaf=True
+    ) as (root_fd, scope_fd, metadata, mount_id, device):
+        observed.update(device=metadata.st_dev, inode=metadata.st_ino)
+        observed = _validated_systemd_scope_document(
+            observed, session_id=session_id, allow_unbound=False
+        )
+        if selected["control_group"] is not None and observed != selected:
+            raise AssertionError("strict systemd scope binding identity changed")
+        controllers = _read_systemd_cgroup_file_at(
+            root_fd,
+            "cgroup.controllers",
+            "controller inventory",
+            expected_parent_filesystem_magic=_CGROUP2_SUPER_MAGIC,
+            expected_parent_mount_id=mount_id,
+            expected_parent_device=device,
+        )
+        try:
+            controller_names = controllers.decode("ascii").strip().split()
+        except UnicodeDecodeError as error:
+            raise AssertionError(
+                "strict cgroup2 controller inventory is malformed"
+            ) from error
+        if (
+            len(controller_names) != len(set(controller_names))
+            or not {"cpu", "memory", "pids"}.issubset(controller_names)
+        ):
+            raise AssertionError("strict cgroup2 controllers are unavailable")
+        for _ in range(2):
+            for name, value in expected_files.items():
+                if _read_systemd_cgroup_file_at(
+                    scope_fd,
+                    name,
+                    name,
+                    expected_parent_filesystem_magic=_CGROUP2_SUPER_MAGIC,
+                    expected_parent_mount_id=mount_id,
+                    expected_parent_device=device,
+                ) != value:
+                    raise AssertionError(
+                        f"strict systemd scope cleanup {name} is inexact"
+                    )
+        events = _read_systemd_cgroup_file_at(
+            scope_fd,
+            "cgroup.events",
+            "cgroup.events",
+            expected_parent_filesystem_magic=_CGROUP2_SUPER_MAGIC,
+            expected_parent_mount_id=mount_id,
+            expected_parent_device=device,
+        )
+        _parse_systemd_scope_events(events)
+        procs = _read_systemd_cgroup_file_at(
+            scope_fd,
+            "cgroup.procs",
+            "cgroup.procs",
+            expected_parent_filesystem_magic=_CGROUP2_SUPER_MAGIC,
+            expected_parent_mount_id=mount_id,
+            expected_parent_device=device,
+        )
+        try:
+            members = [int(value) for value in procs.decode("ascii").splitlines()]
+        except (UnicodeDecodeError, ValueError) as error:
+            raise AssertionError("strict systemd scope members are malformed") from error
+        if (
+            len(members) != len(set(members))
+            or any(pid <= 0 for pid in members)
+            or os.getpid() in members
+        ):
+            raise AssertionError("strict systemd scope members are malformed")
+    return observed
+
+
+def _systemd_scope_population(
+    resource_scope: Mapping[str, object],
+    *,
+    cgroup_root: Path = _STRICT_SYSTEMD_CGROUP_ROOT,
+) -> int:
+    with _open_bound_systemd_scope(
+        resource_scope, cgroup_root, allow_missing_leaf=True
+    ) as (_, scope_fd, mount_id, device):
+        return _parse_systemd_scope_events(
+            _read_systemd_cgroup_file_at(
+                scope_fd,
+                "cgroup.events",
+                "cgroup.events",
+                expected_parent_filesystem_magic=_CGROUP2_SUPER_MAGIC,
+                expected_parent_mount_id=mount_id,
+                expected_parent_device=device,
+            )
+        )
+
+
+def _systemd_scope_cleanup_observation(
+    resource_scope: Mapping[str, object],
+    *,
+    deadline: float,
+    cgroup_root: Path = _STRICT_SYSTEMD_CGROUP_ROOT,
+) -> tuple[str, dict[str, object] | None, int | None]:
+    session_id = _systemd_scope_session_id(resource_scope.get("unit"))
+    selected = _validated_systemd_scope_document(
+        resource_scope, session_id=session_id, allow_unbound=True
+    )
+    manager = _query_systemd_scope_lifecycle(
+        str(selected["unit"]), deadline=deadline
+    )
+    if manager is None:
+        lifecycle = "absent"
+        control_group = selected["control_group"]
+    else:
+        lifecycle = manager["ActiveState"]
+        control_group = manager["ControlGroup"]
+    if not control_group:
+        return lifecycle, None, None
+    try:
+        bound = _validated_systemd_scope_cleanup_path(
+            selected, str(control_group), cgroup_root=cgroup_root
+        )
+        populated = _systemd_scope_population(
+            bound, cgroup_root=cgroup_root
+        )
+    except _SystemdScopeLeafDisappeared:
+        return lifecycle, None, None
+    return lifecycle, bound, populated
+
+
+def _systemd_scope_cleanup_status(
+    resource_scope: Mapping[str, object],
+    *,
+    deadline: float,
+    cgroup_root: Path = _STRICT_SYSTEMD_CGROUP_ROOT,
+) -> dict[str, object] | None:
+    lifecycle, bound, _ = _systemd_scope_cleanup_observation(
+        resource_scope, deadline=deadline, cgroup_root=cgroup_root
+    )
+    if lifecycle == "absent" and bound is None:
+        return None
+    if bound is not None:
+        return bound
+    session_id = _systemd_scope_session_id(resource_scope.get("unit"))
+    return _validated_systemd_scope_document(
+        resource_scope, session_id=session_id, allow_unbound=True
+    )
+
+
+def _root_kill_systemd_scope(
+    resource_scope: Mapping[str, object],
+    *,
+    deadline: float,
+    cgroup_root: Path = _STRICT_SYSTEMD_CGROUP_ROOT,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+) -> None:
+    _scope_deadline_timeout(deadline)
+    kill_fd: int | None = None
+    reselected_fd: int | None = None
+    try:
+        with _open_bound_systemd_scope(
+            resource_scope, cgroup_root, allow_missing_leaf=True
+        ) as (_, scope_fd, mount_id, device):
+            selected = os.stat(
+                "cgroup.kill", dir_fd=scope_fd, follow_symlinks=False
+            )
+            kill_fd = os.open(
+                "cgroup.kill",
+                os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=scope_fd,
+            )
+            before = os.fstat(kill_fd)
+            before_authority = _kernel_descriptor_mount_authority(kill_fd)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != expected_owner_uid
+                or before.st_gid != expected_owner_gid
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) & 0o022
+                or before.st_dev != device
+                or before_authority != (
+                    _CGROUP2_SUPER_MAGIC,
+                    mount_id,
+                    device,
+                )
+                or (selected.st_dev, selected.st_ino)
+                != (before.st_dev, before.st_ino)
+                or os.write(kill_fd, b"1") != 1
+            ):
+                raise AssertionError("strict systemd scope kill identity is unsafe")
+            after = os.fstat(kill_fd)
+            after_authority = _kernel_descriptor_mount_authority(kill_fd)
+            reselected_fd = os.open(
+                "cgroup.kill",
+                os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=scope_fd,
+            )
+            reselected = os.fstat(reselected_fd)
+            reselected_authority = _kernel_descriptor_mount_authority(
+                reselected_fd
+            )
+            if any(
+                (metadata.st_dev, metadata.st_ino, metadata.st_mode)
+                != (before.st_dev, before.st_ino, before.st_mode)
+                for metadata in (after, reselected)
+            ) or any(
+                authority != (_CGROUP2_SUPER_MAGIC, mount_id, device)
+                for authority in (after_authority, reselected_authority)
+            ):
+                raise AssertionError("strict systemd scope kill identity changed")
+    except OSError as error:
+        raise AssertionError("strict systemd scope cannot be killed") from error
+    finally:
+        for descriptor in (reselected_fd, kill_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def _parse_systemd_scope_events(data: bytes) -> int:
+    if data == b"populated 0\nfrozen 0\n":
+        return 0
+    if data == b"populated 1\nfrozen 0\n":
+        return 1
+    raise AssertionError("strict systemd scope events are malformed")
+
+
+def _wait_systemd_scope_zero(
+    resource_scope: Mapping[str, object],
+    *,
+    deadline: float,
+    cgroup_root: Path = _STRICT_SYSTEMD_CGROUP_ROOT,
+    expected_owner_uid: int = 0,
+    expected_owner_gid: int = 0,
+) -> None:
+    while True:
+        _scope_deadline_timeout(deadline)
+        with _open_bound_systemd_scope(
+            resource_scope, cgroup_root
+        ) as (_, scope_fd, mount_id, device):
+            populated = _parse_systemd_scope_events(
+                _read_systemd_cgroup_file_at(
+                    scope_fd,
+                    "cgroup.events",
+                    "cgroup.events",
+                    expected_owner_uid=expected_owner_uid,
+                    expected_owner_gid=expected_owner_gid,
+                    expected_parent_filesystem_magic=_CGROUP2_SUPER_MAGIC,
+                    expected_parent_mount_id=mount_id,
+                    expected_parent_device=device,
+                )
+            )
+        if populated == 0:
+            return
+        time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
+
+
+def _systemd_scope_stop(unit: object, *, deadline: float) -> None:
+    _systemd_scope_session_id(unit)
+    returncode, _, _ = _root_systemctl(
+        ["stop", str(unit)], timeout_seconds=_scope_deadline_timeout(deadline)
+    )
+    if returncode != 0:
+        raise AssertionError("strict systemd scope stop failed")
+
+
+def _systemd_scope_reset_failed(unit: object, *, deadline: float) -> None:
+    _systemd_scope_session_id(unit)
+    returncode, _, _ = _root_systemctl(
+        ["reset-failed", str(unit)],
+        timeout_seconds=_scope_deadline_timeout(deadline),
+    )
+    if returncode != 0:
+        raise AssertionError("strict systemd scope reset failed")
+
+
+def _wait_systemd_scope_absent(
+    resource_scope: Mapping[str, object],
+    *,
+    deadline: float,
+    cgroup_root: Path = _STRICT_SYSTEMD_CGROUP_ROOT,
+) -> None:
+    session_id = _systemd_scope_session_id(resource_scope.get("unit"))
+    selected = _validated_systemd_scope_document(
+        resource_scope, session_id=session_id, allow_unbound=True
+    )
+    while True:
+        _scope_deadline_timeout(deadline)
+        lifecycle = _query_systemd_scope_lifecycle(
+            str(selected["unit"]), deadline=deadline
+        )
+        path_absent = selected["control_group"] is None or not (
+            _bound_systemd_scope_present(selected, cgroup_root)
+        )
+        if lifecycle is None and path_absent:
+            return
+        time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
+
+
+def _root_close_systemd_scope(
+    resource_scope: Mapping[str, object],
+    *,
+    deadline: float,
+    cgroup_root: Path = _STRICT_SYSTEMD_CGROUP_ROOT,
+) -> None:
+    session_id = _systemd_scope_session_id(resource_scope.get("unit"))
+    selected = _validated_systemd_scope_document(
+        resource_scope,
+        session_id=session_id,
+        allow_unbound=True,
+    )
+    options: dict[str, object] = {"deadline": deadline}
+    if cgroup_root != _STRICT_SYSTEMD_CGROUP_ROOT:
+        options["cgroup_root"] = cgroup_root
+    killed = False
+    stop_sent = False
+    reset_sent = False
+    manager_absent_seen = False
+    pending: tuple[str, dict[str, object] | None, int | None] | None = None
+
+    def observe() -> tuple[str, dict[str, object] | None, int | None]:
+        _scope_deadline_timeout(deadline)
+        return _systemd_scope_cleanup_observation(selected, **options)
+
+    def is_terminal(
+        observation: tuple[str, dict[str, object] | None, int | None],
+    ) -> bool:
+        return observation == ("absent", None, None)
+
+    while True:
+        if pending is None:
+            lifecycle, bound, populated = observe()
+        else:
+            lifecycle, bound, populated = pending
+            pending = None
+        if lifecycle not in (
+            "active",
+            "deactivating",
+            "inactive",
+            "failed",
+            "absent",
+        ):
+            raise AssertionError("strict systemd scope lifecycle changed")
+        if manager_absent_seen and lifecycle != "absent":
+            raise AssertionError("strict systemd scope manager state reappeared")
+        manager_absent_seen = manager_absent_seen or lifecycle == "absent"
+        if is_terminal((lifecycle, bound, populated)):
+            return
+        if bound is not None:
+            if (
+                selected["control_group"] is not None
+                and bound != selected
+            ):
+                raise AssertionError(
+                    "strict systemd scope binding identity changed"
+                )
+            selected = bound
+            if populated not in (0, 1):
+                raise AssertionError(
+                    "strict systemd scope population is malformed"
+                )
+            if not killed:
+                try:
+                    _root_kill_systemd_scope(selected, **options)
+                except _SystemdScopeLeafDisappeared:
+                    time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
+                    continue
+                killed = True
+            if populated == 1:
+                time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
+                continue
+        elif populated is not None:
+            raise AssertionError("strict systemd scope population is detached")
+        if lifecycle == "active" and not stop_sent:
+            try:
+                _systemd_scope_stop(selected["unit"], deadline=deadline)
+            except AssertionError:
+                pending = observe()
+                if is_terminal(pending):
+                    return
+                if pending[0] == "absent":
+                    stop_sent = True
+                    continue
+                raise
+            stop_sent = True
+        elif lifecycle == "failed" and not reset_sent:
+            try:
+                _systemd_scope_reset_failed(
+                    selected["unit"], deadline=deadline
+                )
+            except AssertionError:
+                pending = observe()
+                if is_terminal(pending):
+                    return
+                if pending[0] == "absent":
+                    reset_sent = True
+                    continue
+                raise
+            reset_sent = True
+        time.sleep(_STRICT_ZERO_SCAN_INTERVAL_SECONDS)
+
+
 def _release_wrapper_barrier(barrier_fd: int) -> None:
     try:
         if os.write(barrier_fd, b"G") != 1:
@@ -6891,6 +9260,7 @@ def _root_controller_main(config_value: str) -> int:
     ] | None = None
     active_owner_pidfd: int | None = None
     active_published = False
+    resource_scope: dict[str, object] | None = None
     try:
         if os.geteuid() != 0 or os.getuid() != 0:
             raise AssertionError("strict root controller did not start as root")
@@ -7002,6 +9372,7 @@ def _root_controller_main(config_value: str) -> int:
                 active_probe[0], nonce, active_probe[1]
             )
         target_uid = uid
+        resource_scope = _systemd_scope_intent(session_id)
         if type(handshake_value) is not str:
             raise AssertionError("strict root controller handshake selector is malformed")
         handshake_path = Path(handshake_value)
@@ -7012,6 +9383,7 @@ def _root_controller_main(config_value: str) -> int:
             target_uid=uid,
             sudo_parent=sudo_parent,
             wrapper=None,
+            resource_scope=resource_scope,
         )
         if type(cwd_value) is not str or not Path(cwd_value).is_absolute():
             raise AssertionError("strict root controller cwd is malformed")
@@ -7038,12 +9410,13 @@ def _root_controller_main(config_value: str) -> int:
         mount_readiness_read_fd, mount_readiness_write_fd = os.pipe2(
             os.O_CLOEXEC
         )
-        command = _root_wrapper_command(
+        wrapper_command = _root_wrapper_command(
             config,
             controller_identity,
             barrier_read_fd,
             mount_readiness_write_fd,
         )
+        command = _systemd_scope_command(session_id, wrapper_command)
         output_directory = tempfile.TemporaryDirectory(
             prefix="required-ci-root-output-"
         )
@@ -7078,23 +9451,52 @@ def _root_controller_main(config_value: str) -> int:
                 raise AssertionError(
                     "strict root wrapper identity is invalid"
                 )
-            if fault_point == "after-wrapper-popen-before-handshake-sigkill":
-                signal.raise_signal(signal.SIGKILL)
-            if fault_point == "after-wrapper-popen-before-handshake-sigstop":
-                signal.raise_signal(signal.SIGSTOP)
-            _write_root_controller_handshake(
+            if fault_point is not None and "before-handshake" in fault_point:
+                fault_scope = _validated_running_systemd_scope(
+                    str(resource_scope["unit"]),
+                    process.pid,
+                    expected_wrapper=wrapper_identity,
+                    expected_command=wrapper_command,
+                )
+                _write_root_controller_handshake(
+                    handshake_path,
+                    nonce=nonce,
+                    session_id=session_id,
+                    target_uid=uid,
+                    sudo_parent=sudo_parent,
+                    wrapper=None,
+                    resource_scope=resource_scope,
+                    fault_reached={
+                        "point": fault_point,
+                        "wrapper": list(wrapper_identity),
+                        "resource_scope": fault_scope,
+                    },
+                )
+                signal.raise_signal(
+                    signal.SIGKILL
+                    if fault_point.endswith("sigkill")
+                    else signal.SIGSTOP
+                )
+            def after_scope_handshake() -> None:
+                if fault_point == "after-wrapper-bound-before-barrier-sigkill":
+                    signal.raise_signal(signal.SIGKILL)
+                if fault_point == "after-wrapper-bound-before-barrier-sigstop":
+                    signal.raise_signal(signal.SIGSTOP)
+
+            resource_scope = _bind_scope_write_handshake_release(
                 handshake_path,
                 nonce=nonce,
                 session_id=session_id,
                 target_uid=uid,
                 sudo_parent=sudo_parent,
                 wrapper=wrapper_identity,
+                wrapper_pid=process.pid,
+                barrier_fd=barrier_write_fd,
+                resource_scope=resource_scope,
+                wrapper_command=wrapper_command,
+                fault_point=fault_point,
+                after_handshake=after_scope_handshake,
             )
-            if fault_point == "after-wrapper-bound-before-barrier-sigkill":
-                signal.raise_signal(signal.SIGKILL)
-            if fault_point == "after-wrapper-bound-before-barrier-sigstop":
-                signal.raise_signal(signal.SIGSTOP)
-            _release_wrapper_barrier(barrier_write_fd)
             barrier_write_fd = None
             if mount_readiness_read_fd is None:
                 raise AssertionError(
@@ -7172,6 +9574,7 @@ def _root_controller_main(config_value: str) -> int:
     except BaseException as error:
         failure = error
     finally:
+        cleanup_errors: list[BaseException] = []
         try:
             if process is not None and process.poll() is None:
                 if wrapper_pidfd is None:
@@ -7180,56 +9583,77 @@ def _root_controller_main(config_value: str) -> int:
                     )
                 _signal_process_pidfd(wrapper_pidfd, signal.SIGKILL)
                 process.wait(timeout=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        try:
+            if resource_scope is not None:
+                _root_close_systemd_scope(
+                    resource_scope,
+                    deadline=(
+                        time.monotonic()
+                        + _STRICT_WATCHDOG_TIMEOUT_SECONDS
+                    ),
+                )
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        try:
             if target_uid is not None:
                 observed.update(_root_close_candidate_realm(target_uid))
         except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            cleanup_failure = AssertionError(
+                "; ".join(
+                    f"{type(error).__name__}: {error}"
+                    for error in cleanup_errors
+                )
+            )
             if failure is None:
-                failure = cleanup_error
+                failure = cleanup_failure
             else:
                 failure = AssertionError(
-                    f"{failure}; cleanup failed: {cleanup_error}"
+                    f"{failure}; cleanup failed: {cleanup_failure}"
                 )
-        finally:
-            if active_published and active_probe is not None:
-                try:
-                    if active_owner_pidfd is None:
-                        raise AssertionError(
-                            "strict root active owner pidfd is missing"
-                        )
-                    terminal, _, _ = select.select(
-                        [active_owner_pidfd], [], [], 0
+        if active_published and active_probe is not None:
+            try:
+                if active_owner_pidfd is None:
+                    raise AssertionError(
+                        "strict root active owner pidfd is missing"
                     )
-                    if (
-                        not terminal
-                        and _process_identity(
-                            Path("/proc") / str(active_probe[2][0])
-                        )
-                        == active_probe[2]
-                    ):
-                        _mark_root_active_completed(
-                            active_probe[0], nonce, active_probe[1]
-                        )
-                except BaseException as completion_error:
-                    if failure is None:
-                        failure = completion_error
-                    else:
-                        failure = AssertionError(
-                            f"{failure}; active completion marking failed: "
-                            f"{completion_error}"
-                        )
-            for descriptor in (
-                barrier_read_fd,
-                barrier_write_fd,
-                mount_readiness_read_fd,
-                mount_readiness_write_fd,
-                wrapper_pidfd,
-                active_owner_pidfd,
-            ):
-                if descriptor is not None:
-                    try:
-                        os.close(descriptor)
-                    except OSError:
-                        pass
+                terminal, _, _ = select.select(
+                    [active_owner_pidfd], [], [], 0
+                )
+                if (
+                    not terminal
+                    and _process_identity(
+                        Path("/proc") / str(active_probe[2][0])
+                    )
+                    == active_probe[2]
+                ):
+                    _mark_root_active_completed(
+                        active_probe[0], nonce, active_probe[1]
+                    )
+            except BaseException as completion_error:
+                if failure is None:
+                    failure = completion_error
+                else:
+                    failure = AssertionError(
+                        f"{failure}; active completion marking failed: "
+                        f"{completion_error}"
+                    )
+        for descriptor in (
+            barrier_read_fd,
+            barrier_write_fd,
+            mount_readiness_read_fd,
+            mount_readiness_write_fd,
+            wrapper_pidfd,
+            active_owner_pidfd,
+        ):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
     if failure is None:
         if stdout_path is None or stderr_path is None:
             failure = AssertionError("strict root controller output paths are missing")
@@ -7280,6 +9704,55 @@ def _parse_root_chain_identity(
     return value[0], value[1], value[2], value[3]
 
 
+def _registered_entry_resource_scope(
+    document: Mapping[str, object],
+) -> dict[str, object] | None:
+    handshake_value = document.get("handshake_path")
+    if handshake_value is None:
+        return None
+    session_id = document.get("session_id")
+    target_uid = document.get("target_uid")
+    if (
+        type(handshake_value) is not str
+        or not Path(handshake_value).is_absolute()
+        or type(session_id) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+        or type(target_uid) is not int
+    ):
+        raise AssertionError("strict registered scope binding is malformed")
+    handshake = _read_root_controller_handshake(
+        Path(handshake_value), allow_empty=True
+    )
+    if handshake is None:
+        return _systemd_scope_intent(session_id)
+    if (
+        handshake.get("session_id") != session_id
+        or handshake.get("target_uid") != target_uid
+    ):
+        raise AssertionError("strict registered scope handshake changed")
+    return _validated_systemd_scope_document(
+        handshake.get("resource_scope"),
+        session_id=session_id,
+        allow_unbound=handshake.get("phase") == "controller-bound",
+    )
+
+
+def _registered_scope_requires_cleanup(
+    document: Mapping[str, object],
+) -> bool:
+    resource_scope = _registered_entry_resource_scope(document)
+    if resource_scope is None:
+        return False
+    deadline = time.monotonic() + _STRICT_WATCHDOG_TIMEOUT_SECONDS
+    status = _systemd_scope_cleanup_status(resource_scope, deadline=deadline)
+    return status is not None or (
+        resource_scope["control_group"] is not None
+        and _bound_systemd_scope_present(
+            resource_scope, _STRICT_SYSTEMD_CGROUP_ROOT
+        )
+    )
+
+
 def _root_cleanup_main(
     entry_value: str, uid_value: str, token_value: str
 ) -> int:
@@ -7304,8 +9777,35 @@ def _root_cleanup_main(
         )
         if outer[0] != outer[2] or outer[0] != outer[3]:
             raise AssertionError("strict registered outer session is not unique")
-        observed = _root_close_candidate_realm(uid)
-        host_observed_count = _root_close_registered_host_session(outer)
+        errors: list[BaseException] = []
+        observed: set[tuple[int, int]] = set()
+        host_observed_count = 0
+        try:
+            host_observed_count = _root_close_registered_host_session(outer)
+        except BaseException as error:
+            errors.append(error)
+        try:
+            resource_scope = _registered_entry_resource_scope(entry)
+            if resource_scope is not None:
+                _root_close_systemd_scope(
+                    resource_scope,
+                    deadline=(
+                        time.monotonic()
+                        + _STRICT_WATCHDOG_TIMEOUT_SECONDS
+                    ),
+                )
+        except BaseException as error:
+            errors.append(error)
+        try:
+            observed.update(_root_close_candidate_realm(uid))
+        except BaseException as error:
+            errors.append(error)
+        if errors:
+            raise AssertionError(
+                "; ".join(
+                    f"{type(error).__name__}: {error}" for error in errors
+                )
+            )
         receipt = {
             "status": "complete",
             "uid": uid,
@@ -7340,7 +9840,15 @@ def _root_fd_tree_operation(
     owner_uid: int,
     owner_gid: int,
     profile: str,
+    *,
+    budget: _RootTreeBudget | None = None,
+    depth: int = 0,
 ) -> None:
+    selected_budget = _new_root_tree_budget() if budget is None else budget
+    if time.monotonic() >= selected_budget.deadline:
+        raise AssertionError("strict root tree cleanup deadline expired")
+    if depth > selected_budget.depth_limit:
+        raise AssertionError("strict root tree depth limit was exceeded")
     try:
         directory_mode, file_mode, executable_mode, prune_unsafe = (
             _ROOT_TREE_MODE_PROFILES[profile]
@@ -7348,134 +9856,198 @@ def _root_fd_tree_operation(
     except KeyError as error:
         raise AssertionError("strict root tree profile is invalid") from error
     try:
-        names = sorted(os.listdir(directory_fd))
+        entries = os.scandir(directory_fd)
     except OSError as error:
         raise AssertionError("strict root tree cannot be enumerated") from error
-    for name in names:
-        if not name or name in (".", "..") or "/" in name:
-            raise AssertionError("strict root tree entry name is invalid")
-        try:
-            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            if prune_unsafe:
-                continue
-            raise AssertionError("strict root tree entry disappeared")
-        if stat.S_ISDIR(metadata.st_mode):
+    with entries:
+        for entry in entries:
+            name = entry.name
+            if not name or name in (".", "..") or "/" in name:
+                raise AssertionError("strict root tree entry name is invalid")
             try:
-                child_fd = os.open(
-                    name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=directory_fd,
-                )
-                opened = os.fstat(child_fd)
-            except OSError as error:
-                raise AssertionError("strict root tree directory changed") from error
-            try:
-                if (opened.st_dev, opened.st_ino) != (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                ):
-                    raise AssertionError("strict root tree directory was replaced")
-                _root_fd_tree_operation(child_fd, owner_uid, owner_gid, profile)
-                os.fchown(child_fd, owner_uid, owner_gid)
-                os.fchmod(child_fd, directory_mode)
-            finally:
-                os.close(child_fd)
-            continue
-        if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
-            try:
-                child_fd = os.open(
-                    name,
-                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=directory_fd,
-                )
-                opened = os.fstat(child_fd)
-            except OSError as error:
-                raise AssertionError("strict root tree file changed") from error
-            try:
-                if (
-                    not stat.S_ISREG(opened.st_mode)
-                    or opened.st_nlink != 1
-                    or (opened.st_dev, opened.st_ino)
-                    != (metadata.st_dev, metadata.st_ino)
-                ):
-                    raise AssertionError("strict root tree file was replaced")
-                mode = executable_mode if opened.st_mode & 0o111 else file_mode
-                os.fchown(child_fd, owner_uid, owner_gid)
-                os.fchmod(child_fd, mode)
-            finally:
-                os.close(child_fd)
-            continue
-        if not prune_unsafe:
-            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
-                raise AssertionError("strict root tree file has a hardlink alias")
-            raise AssertionError("strict root tree contains a non-ordinary entry")
-        try:
-            os.unlink(name, dir_fd=directory_fd)
-        except OSError as error:
-            raise AssertionError("strict root tree unsafe entry cannot be removed") from error
-    os.fchown(directory_fd, owner_uid, owner_gid)
-    os.fchmod(directory_fd, directory_mode)
-
-
-def _root_fd_delete_contents(directory_fd: int) -> None:
-    os.fchown(directory_fd, 0, 0)
-    os.fchmod(directory_fd, 0o500)
-    try:
-        names = sorted(os.listdir(directory_fd))
-    except OSError as error:
-        raise AssertionError("strict root cleanup tree cannot be enumerated") from error
-    for name in names:
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISDIR(metadata.st_mode):
-            child_fd = os.open(
-                name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=directory_fd,
-            )
-            try:
-                opened = os.fstat(child_fd)
-                if (opened.st_dev, opened.st_ino) != (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                ):
-                    raise AssertionError("strict root cleanup directory was replaced")
-                os.fchown(child_fd, 0, 0)
-                os.fchmod(child_fd, 0o500)
-                _root_fd_delete_contents(child_fd)
-                selected = os.stat(
+                metadata = os.stat(
                     name, dir_fd=directory_fd, follow_symlinks=False
                 )
-                if (selected.st_dev, selected.st_ino) != (
-                    opened.st_dev,
-                    opened.st_ino,
-                ):
-                    raise AssertionError(
-                        "strict root cleanup directory changed before unlink"
+            except FileNotFoundError:
+                if prune_unsafe:
+                    continue
+                raise AssertionError("strict root tree entry disappeared")
+            selected_budget.charge(
+                depth=depth + 1,
+                logical_bytes=(
+                    metadata.st_size if stat.S_ISREG(metadata.st_mode) else 0
+                ),
+            )
+            if stat.S_ISDIR(metadata.st_mode):
+                try:
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        dir_fd=directory_fd,
                     )
-                os.rmdir(name, dir_fd=directory_fd)
-                deleted = os.fstat(child_fd)
-                if (
-                    (deleted.st_dev, deleted.st_ino)
-                    != (opened.st_dev, opened.st_ino)
-                    or deleted.st_nlink != 0
-                ):
+                    opened = os.fstat(child_fd)
+                except OSError as error:
                     raise AssertionError(
-                        "strict root cleanup directory unlink is unproved"
+                        "strict root tree directory changed"
+                    ) from error
+                try:
+                    if (opened.st_dev, opened.st_ino) != (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                    ):
+                        raise AssertionError(
+                            "strict root tree directory was replaced"
+                        )
+                    _root_fd_tree_operation(
+                        child_fd,
+                        owner_uid,
+                        owner_gid,
+                        profile,
+                        budget=selected_budget,
+                        depth=depth + 1,
                     )
-            except OSError as error:
+                    os.fchown(child_fd, owner_uid, owner_gid)
+                    os.fchmod(child_fd, directory_mode)
+                finally:
+                    os.close(child_fd)
+                continue
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                try:
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=directory_fd,
+                    )
+                    opened = os.fstat(child_fd)
+                except OSError as error:
+                    raise AssertionError("strict root tree file changed") from error
+                try:
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or opened.st_nlink != 1
+                        or (opened.st_dev, opened.st_ino)
+                        != (metadata.st_dev, metadata.st_ino)
+                        or opened.st_size != metadata.st_size
+                    ):
+                        raise AssertionError("strict root tree file was replaced")
+                    mode = (
+                        executable_mode if opened.st_mode & 0o111 else file_mode
+                    )
+                    os.fchown(child_fd, owner_uid, owner_gid)
+                    os.fchmod(child_fd, mode)
+                finally:
+                    os.close(child_fd)
+                continue
+            if not prune_unsafe:
+                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
+                    raise AssertionError(
+                        "strict root tree file has a hardlink alias"
+                    )
                 raise AssertionError(
-                    "strict root cleanup directory cannot be removed"
-                ) from error
-            finally:
-                os.close(child_fd)
-        else:
+                    "strict root tree contains a non-ordinary entry"
+                )
             try:
                 os.unlink(name, dir_fd=directory_fd)
             except OSError as error:
                 raise AssertionError(
-                    "strict root cleanup entry cannot be removed"
+                    "strict root tree unsafe entry cannot be removed"
                 ) from error
+    os.fchown(directory_fd, owner_uid, owner_gid)
+    os.fchmod(directory_fd, directory_mode)
+
+
+def _root_fd_delete_contents(
+    directory_fd: int,
+    *,
+    budget: _RootTreeBudget | None = None,
+    depth: int = 0,
+) -> None:
+    selected_budget = _new_root_tree_budget() if budget is None else budget
+    if time.monotonic() >= selected_budget.deadline:
+        raise AssertionError("strict root tree cleanup deadline expired")
+    if depth > selected_budget.depth_limit:
+        raise AssertionError("strict root tree depth limit was exceeded")
+    os.fchown(directory_fd, 0, 0)
+    os.fchmod(directory_fd, 0o500)
+    try:
+        entries = os.scandir(directory_fd)
+    except OSError as error:
+        raise AssertionError("strict root cleanup tree cannot be enumerated") from error
+    with entries:
+        for entry in entries:
+            name = entry.name
+            if not name or name in (".", "..") or "/" in name:
+                raise AssertionError("strict root cleanup entry name is invalid")
+            metadata = os.stat(
+                name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            selected_budget.charge(
+                depth=depth + 1,
+                logical_bytes=(
+                    metadata.st_size if stat.S_ISREG(metadata.st_mode) else 0
+                ),
+            )
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                    ):
+                        raise AssertionError(
+                            "strict root cleanup directory was replaced"
+                        )
+                    os.fchown(child_fd, 0, 0)
+                    os.fchmod(child_fd, 0o500)
+                    _root_fd_delete_contents(
+                        child_fd,
+                        budget=selected_budget,
+                        depth=depth + 1,
+                    )
+                    selected = os.stat(
+                        name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (selected.st_dev, selected.st_ino) != (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ):
+                        raise AssertionError(
+                            "strict root cleanup directory changed before unlink"
+                        )
+                    os.rmdir(name, dir_fd=directory_fd)
+                    deleted = os.fstat(child_fd)
+                    if (
+                        (deleted.st_dev, deleted.st_ino)
+                        != (opened.st_dev, opened.st_ino)
+                        or deleted.st_nlink != 0
+                    ):
+                        raise AssertionError(
+                            "strict root cleanup directory unlink is unproved"
+                        )
+                except OSError as error:
+                    raise AssertionError(
+                        "strict root cleanup directory cannot be removed"
+                    ) from error
+                finally:
+                    os.close(child_fd)
+            else:
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except OSError as error:
+                    raise AssertionError(
+                        "strict root cleanup entry cannot be removed"
+                    ) from error
 
 
 def _open_bound_tree_root(
@@ -8339,10 +10911,7 @@ def _revalidate_strict_owner_loss_authorization(
         str(authority_registry.get("watchdog_token")),
     )
     _strict_owner_loss_revalidate_broker_ancestry(value)
-    observed_owner = _process_identity(
-        Path("/proc") / str(value.owner_identity[0])
-    )
-    if _process_instance_matches(observed_owner, value.owner_identity):
+    if not _strict_exact_owner_is_terminal(value.owner_identity):
         raise AssertionError(
             "strict live IPC owner-loss cleanup owner is still alive"
         )
@@ -8551,10 +11120,7 @@ def _revalidate_strict_owner_loss_capability(
         str(authority_registry.get("watchdog_token")),
     )
     _strict_owner_loss_revalidate_broker_ancestry(value)
-    observed_owner = _process_identity(
-        Path("/proc") / str(value.owner_identity[0])
-    )
-    if _process_instance_matches(observed_owner, value.owner_identity):
+    if not _strict_exact_owner_is_terminal(value.owner_identity):
         raise AssertionError(
             "strict live IPC owner-loss cleanup owner is still alive"
         )
@@ -8722,6 +11288,31 @@ def _root_strict_owner_loss_cleanup_authorization(
                 "strict owner-loss registry root policy is unsafe"
             )
         runner_gid = int(root_registry_binding["gid"])
+        registry_entries_path = registry_root_path / "entries"
+        try:
+            entries_fd = os.open(
+                "entries",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=registry_root_fd,
+            )
+            recaptured_registry_binding = _directory_policy_binding(
+                registry_entries_path,
+                entries_fd,
+                description="strict owner-loss registry entries",
+            )
+        except OSError as error:
+            raise AssertionError(
+                "strict owner-loss registry entries binding is unreadable"
+            ) from error
+        if (
+            recaptured_registry_binding != dict(registry_binding)
+            or recaptured_registry_binding["uid"] != runner_uid
+            or recaptured_registry_binding["mode"] != 0o700
+            or entry_path.parent != registry_entries_path
+        ):
+            raise AssertionError(
+                "strict owner-loss registry entries binding changed"
+            )
         watchdog_token = _strict_owner_loss_watchdog_token(
             registry_root_fd,
             registry_root_path,
@@ -8788,7 +11379,8 @@ def _root_strict_owner_loss_cleanup_authorization(
             authority_document.get("runner_uid") != runner_uid
             or authority_document.get("runner_gid") != runner_gid
             or authority_registry.get("root") != root_registry_binding
-            or authority_registry.get("entries") != dict(registry_binding)
+            or authority_registry.get("entries")
+            != recaptured_registry_binding
             or authority_registry.get("session_lock") != lock_binding
             or authority_registry.get("token") != registry_token
             or authority_registry.get("watchdog_token") != watchdog_token
@@ -8850,12 +11442,7 @@ def _root_strict_owner_loss_cleanup_authorization(
                 ),
                 watchdog_identity,
             )
-            or _process_instance_matches(
-                _process_identity(
-                    Path("/proc") / str(owner_identity[0])
-                ),
-                owner_identity,
-            )
+            or not _strict_exact_owner_is_terminal(owner_identity)
         ):
             raise AssertionError(
                 "strict live IPC owner-loss authority is not currently usable"
@@ -13828,6 +16415,70 @@ def _invoke_root_tree_operation(
     return receipt
 
 
+def _invoke_root_quota_operation(
+    controller_path: Path,
+    operation: str,
+    root: Path,
+) -> dict[str, object]:
+    if operation not in ("create", "destroy"):
+        raise AssertionError("strict writable quota operation is invalid")
+    session = _quota_acquisition_session(operation)
+    target_uid = session.get("target_uid")
+    watchdog_token = session.get("watchdog_token")
+    if type(target_uid) is not int or type(watchdog_token) is not str:
+        raise AssertionError("strict writable quota authority is malformed")
+    metadata = root.lstat()
+    output = _run_registered_sudo(
+        [
+            str(_STRICT_PRIMITIVES["python"]),
+            *_ROOT_PYTHON_ARGUMENTS,
+            str(controller_path),
+            "--isolation-quota",
+            operation,
+            str(root),
+            str(metadata.st_dev),
+            str(metadata.st_ino),
+            str(os.getuid()),
+            str(os.getgid()),
+            str(target_uid),
+            watchdog_token,
+        ],
+        execution_root=root,
+        diagnostic_phase="root-tree",
+        quota_acquisition_operation=operation,
+    )
+    expected_prefix = _ROOT_QUOTA_RECEIPT_PREFIX.encode("ascii")
+    if not output.startswith(expected_prefix) or output.count(b"\n") != 1:
+        raise AssertionError("strict writable quota broker receipt is malformed")
+    try:
+        receipt = json.loads(output[len(expected_prefix) :])
+    except json.JSONDecodeError as error:
+        raise AssertionError(
+            "strict writable quota broker receipt is malformed"
+        ) from error
+    if (
+        type(receipt) is not dict
+        or receipt.get("status") != "complete"
+        or receipt.get("operation") != operation
+        or type(receipt.get("binding")) is not dict
+    ):
+        raise AssertionError(
+            "strict writable quota broker did not complete: "
+            f"{receipt.get('error') if isinstance(receipt, dict) else 'invalid'}"
+        )
+    expected_state = {
+        "create": "active",
+        "destroy": "unmounted",
+    }[operation]
+    binding = receipt["binding"]
+    if binding.get("state") != expected_state:
+        raise AssertionError(
+            "strict writable quota broker returned the wrong state"
+        )
+    session["quota_binding"] = binding
+    return receipt
+
+
 def _root_uid_cleanup_main(uid_value: str) -> int:
     try:
         if os.getuid() != 0 or os.geteuid() != 0:
@@ -14169,16 +16820,30 @@ def _load_chain_registry_entry(
         )
         or (
             document.get("cleanup_execution_root") is True
+            and cleanup_kind == _STRICT_QUOTA_RESOURCE_CLEANUP_KIND
+            and direct_opt_root is not None
+        )
+        or (
+            document.get("cleanup_execution_root") is True
             and cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND
             and type(direct_opt_root) is not dict
         )
         or (
             document.get("cleanup_execution_root") is True
             and cleanup_kind
-            not in ("sealed-resource-v1", _STRICT_LIVE_IPC_CLEANUP_KIND)
+            not in (
+                "sealed-resource-v1",
+                _STRICT_LIVE_IPC_CLEANUP_KIND,
+                _STRICT_QUOTA_RESOURCE_CLEANUP_KIND,
+            )
         )
         or cleanup_kind
-        not in (None, "sealed-resource-v1", _STRICT_LIVE_IPC_CLEANUP_KIND)
+        not in (
+            None,
+            "sealed-resource-v1",
+            _STRICT_LIVE_IPC_CLEANUP_KIND,
+            _STRICT_QUOTA_RESOURCE_CLEANUP_KIND,
+        )
     ):
         raise AssertionError("strict chain registry cleanup binding is invalid")
     if cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND:
@@ -14246,6 +16911,34 @@ def _load_chain_registry_entry(
                         != direct_root["inode"]
                     )
                 )
+            )
+        elif cleanup_kind == _STRICT_QUOTA_RESOURCE_CLEANUP_KIND:
+            execution_root = document["execution_root"]
+            invalid_deletion_receipt = (
+                type(deletion_receipt) is not dict
+                or set(deletion_receipt)
+                != {
+                    "kind",
+                    "device",
+                    "inode",
+                    "parent_device",
+                    "parent_inode",
+                    "name",
+                    "quota_device",
+                    "quota_mount_id",
+                    "retained_until_unmount",
+                }
+                or deletion_receipt.get("kind") != "quota-retained-v1"
+                or deletion_receipt.get("device")
+                != execution_root.get("device")
+                or deletion_receipt.get("inode")
+                != execution_root.get("inode")
+                or type(deletion_receipt.get("parent_device")) is not int
+                or type(deletion_receipt.get("parent_inode")) is not int
+                or type(deletion_receipt.get("name")) is not str
+                or type(deletion_receipt.get("quota_device")) is not int
+                or type(deletion_receipt.get("quota_mount_id")) is not int
+                or deletion_receipt.get("retained_until_unmount") is not True
             )
         else:
             invalid_deletion_receipt = (
@@ -14361,6 +17054,31 @@ def _decode_strict_mountinfo_path(value: str) -> Path:
     return path
 
 
+def _assert_procfs_control_file_authority(descriptor: int) -> None:
+    root_fd: int | None = None
+    try:
+        root_fd = os.open(
+            "/proc",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        root_metadata = os.fstat(root_fd)
+        root_authority = _kernel_descriptor_mount_authority(root_fd)
+        file_authority = _kernel_descriptor_mount_authority(descriptor)
+    except OSError as error:
+        raise AssertionError("strict procfs authority is unreadable") from error
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        or stat.S_IMODE(root_metadata.st_mode) & 0o022
+        or root_authority[0] != _PROC_SUPER_MAGIC
+        or file_authority != root_authority
+    ):
+        raise AssertionError("strict procfs authority is inexact")
+
+
 def _strict_mount_inventory() -> dict[int, dict[str, object]]:
     descriptor: int | None = None
     try:
@@ -14368,6 +17086,7 @@ def _strict_mount_inventory() -> dict[int, dict[str, object]]:
             "/proc/self/mountinfo",
             os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
         )
+        _assert_procfs_control_file_authority(descriptor)
         chunks: list[bytes] = []
         size = 0
         while True:
@@ -14452,6 +17171,709 @@ def _strict_mount_inventory() -> dict[int, dict[str, object]]:
     return inventory
 
 
+def _strict_exact_mount_record(path: Path) -> dict[str, object] | None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            "/proc/self/mountinfo",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        _assert_procfs_control_file_authority(descriptor)
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(65536, _STRICT_MOUNTINFO_LIMIT_BYTES + 1 - size),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > _STRICT_MOUNTINFO_LIMIT_BYTES:
+                raise AssertionError(
+                    "strict host mount topology exceeds its fixed limit"
+                )
+    except OSError as error:
+        raise AssertionError(
+            "strict host mount topology is unreadable"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
+        lines = b"".join(chunks).decode(
+            "utf-8", errors="surrogateescape"
+        ).splitlines()
+    except UnicodeError as error:
+        raise AssertionError("strict host mount topology is malformed") from error
+    matches: list[dict[str, object]] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 10 or "-" not in fields:
+            raise AssertionError("strict host mount topology is malformed")
+        separator = fields.index("-")
+        if separator < 6 or len(fields) != separator + 4:
+            raise AssertionError("strict host mount topology is malformed")
+        mountpoint = _decode_strict_mountinfo_path(fields[4])
+        if mountpoint != path:
+            continue
+        try:
+            major_value, minor_value = fields[2].split(":", 1)
+            record = {
+                "mount_id": int(fields[0]),
+                "major_minor": (int(major_value), int(minor_value)),
+                "mountpoint": mountpoint,
+                "options": frozenset(fields[5].split(",")),
+                "filesystem": fields[separator + 1],
+                "source": fields[separator + 2],
+                "super_options": frozenset(
+                    fields[separator + 3].split(",")
+                ),
+            }
+        except ValueError as error:
+            raise AssertionError(
+                "strict host mount topology is malformed"
+            ) from error
+        matches.append(record)
+    if len(matches) > 1:
+        raise AssertionError("strict quota mountpoint has multiple visible mounts")
+    return None if not matches else matches[0]
+
+
+def _writable_quota_manifest_path(root: Path) -> Path:
+    return root / "trusted-control" / _STRICT_WRITABLE_QUOTA_BINDING_NAME
+
+
+def _load_writable_quota_binding(root: Path) -> dict[str, object]:
+    path = _writable_quota_manifest_path(root)
+    descriptor: int | None = None
+    try:
+        parent_metadata = path.parent.lstat()
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        before = os.fstat(descriptor)
+        data = os.read(descriptor, 4097)
+        after = os.fstat(descriptor)
+        selected = path.lstat()
+    except OSError as error:
+        raise AssertionError(
+            "strict writable quota binding is unreadable"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_nlink",
+        "st_size",
+    )
+    if (
+        not path.is_absolute()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_mode & 0o077
+        or any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable_fields
+        )
+        or (before.st_dev, before.st_ino) != (selected.st_dev, selected.st_ino)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_size != len(data)
+        or len(data) > 4096
+    ):
+        raise AssertionError("strict writable quota binding is unsafe")
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AssertionError(
+            "strict writable quota binding is malformed"
+        ) from error
+    expected_fields = {
+        "schema_version",
+        "state",
+        "root",
+        "mountpoint",
+        "underlying_device",
+        "underlying_inode",
+        "mounted_device",
+        "mounted_inode",
+        "mount_id",
+        "major_minor",
+        "source",
+        "size_bytes",
+        "nr_inodes",
+        "flags",
+        "children",
+        "runner_uid",
+        "runner_gid",
+        "watchdog_token_sha256",
+    }
+    if (
+        type(document) is not dict
+        or set(document) != expected_fields
+        or document.get("schema_version") != 1
+        or document.get("state")
+        not in ("intended", "active", "unmounted")
+        or document.get("root") != str(root)
+        or document.get("mountpoint")
+        != str(root / _STRICT_WRITABLE_QUOTA_DIRECTORY)
+        or type(document.get("underlying_device")) is not int
+        or document.get("underlying_device") < 0
+        or type(document.get("underlying_inode")) is not int
+        or document.get("underlying_inode") <= 0
+        or document.get("source") != _STRICT_WRITABLE_QUOTA_SOURCE
+        or document.get("size_bytes") != _STRICT_WRITABLE_QUOTA_SIZE_BYTES
+        or document.get("nr_inodes") != _STRICT_WRITABLE_QUOTA_INODES
+        or document.get("flags") != ["nodev", "nosuid"]
+        or document.get("children")
+        != [".tombstones", "fixtures", "resources"]
+        or type(document.get("runner_uid")) is not int
+        or document.get("runner_uid") < 0
+        or type(document.get("runner_gid")) is not int
+        or document.get("runner_gid") < 0
+        or type(document.get("watchdog_token_sha256")) is not str
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(document.get("watchdog_token_sha256"))
+        )
+        is None
+        or parent_metadata.st_uid != document.get("runner_uid")
+        or before.st_uid != document.get("runner_uid")
+        or before.st_gid != document.get("runner_gid")
+    ):
+        raise AssertionError("strict writable quota binding is malformed")
+    if document["state"] == "active":
+        if (
+            type(document.get("mounted_device")) is not int
+            or type(document.get("mounted_inode")) is not int
+            or type(document.get("mount_id")) is not int
+            or type(document.get("major_minor")) is not list
+            or len(document["major_minor"]) != 2
+            or any(type(value) is not int for value in document["major_minor"])
+        ):
+            raise AssertionError("strict writable quota binding is malformed")
+    elif any(
+        document.get(field) is not None
+        for field in ("mounted_device", "mounted_inode", "mount_id", "major_minor")
+    ):
+        raise AssertionError("strict writable quota binding is malformed")
+    return document
+
+
+def _writable_quota_intent_document(
+    root: Path,
+    underlying: os.stat_result,
+    *,
+    runner_uid: int,
+    runner_gid: int,
+    watchdog_token: str,
+) -> dict[str, object]:
+    if (
+        type(runner_uid) is not int
+        or runner_uid < 0
+        or type(runner_gid) is not int
+        or runner_gid < 0
+        or re.fullmatch(r"[0-9a-f]{32}", watchdog_token) is None
+    ):
+        raise AssertionError("strict writable quota intent is malformed")
+    return {
+        "schema_version": 1,
+        "state": "intended",
+        "root": str(root),
+        "mountpoint": str(root / _STRICT_WRITABLE_QUOTA_DIRECTORY),
+        "underlying_device": underlying.st_dev,
+        "underlying_inode": underlying.st_ino,
+        "mounted_device": None,
+        "mounted_inode": None,
+        "mount_id": None,
+        "major_minor": None,
+        "source": _STRICT_WRITABLE_QUOTA_SOURCE,
+        "size_bytes": _STRICT_WRITABLE_QUOTA_SIZE_BYTES,
+        "nr_inodes": _STRICT_WRITABLE_QUOTA_INODES,
+        "flags": ["nodev", "nosuid"],
+        "children": [".tombstones", "fixtures", "resources"],
+        "runner_uid": runner_uid,
+        "runner_gid": runner_gid,
+        "watchdog_token_sha256": hashlib.sha256(
+            watchdog_token.encode("ascii")
+        ).hexdigest(),
+    }
+
+
+def _write_writable_quota_binding(
+    root: Path,
+    document: Mapping[str, object],
+    *,
+    create: bool,
+) -> None:
+    _atomic_json_document(
+        _writable_quota_manifest_path(root),
+        document,
+        expected_owner=int(document["runner_uid"]),
+        expected_file_owner=int(document["runner_uid"]),
+        expected_file_group=int(document["runner_gid"]),
+        expected_file_mode=0o600,
+        create=create,
+    )
+
+
+def _prepare_writable_quota_intent(
+    root: Path,
+    *,
+    runner_uid: int,
+    runner_gid: int,
+    watchdog_token: str,
+) -> dict[str, object]:
+    quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+    control = _writable_quota_manifest_path(root).parent
+    try:
+        root_metadata = root.lstat()
+        control_metadata = control.lstat()
+        underlying = quota.lstat()
+    except OSError as error:
+        raise AssertionError(
+            "strict writable quota intent paths are unreadable"
+        ) from error
+    if (
+        not root.is_absolute()
+        or root.resolve(strict=True) != root
+        or quota.resolve(strict=True) != quota
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != runner_uid
+        or not stat.S_ISDIR(control_metadata.st_mode)
+        or control_metadata.st_uid != runner_uid
+        or stat.S_IMODE(control_metadata.st_mode) != 0o700
+        or not stat.S_ISDIR(underlying.st_mode)
+        or underlying.st_uid != runner_uid
+        or underlying.st_gid != runner_gid
+        or stat.S_IMODE(underlying.st_mode) != 0o700
+        or _strict_exact_mount_record(quota) is not None
+        or any(quota.iterdir())
+    ):
+        raise AssertionError("strict writable quota intent paths are unsafe")
+    document = _writable_quota_intent_document(
+        root,
+        underlying,
+        runner_uid=runner_uid,
+        runner_gid=runner_gid,
+        watchdog_token=watchdog_token,
+    )
+    _write_writable_quota_binding(root, document, create=True)
+    if _load_writable_quota_binding(root) != document:
+        raise AssertionError("strict writable quota intent did not persist exactly")
+    return document
+
+
+def _strict_tmpfs_numeric_option(
+    options: object, name: str, *, allow_size_suffix: bool
+) -> int:
+    if not isinstance(options, (set, frozenset)):
+        raise AssertionError("strict tmpfs quota options are malformed")
+    prefix = f"{name}="
+    values = [
+        str(option)[len(prefix) :]
+        for option in options
+        if isinstance(option, str) and option.startswith(prefix)
+    ]
+    if len(values) != 1:
+        raise AssertionError(f"strict tmpfs {name} option is inexact")
+    value = values[0]
+    multiplier = 1
+    if allow_size_suffix and value and value[-1].lower() in "kmgtpe":
+        suffix = "kmgtpe".index(value[-1].lower()) + 1
+        multiplier = 1024**suffix
+        value = value[:-1]
+    if not value.isdecimal() or str(int(value)) != value:
+        raise AssertionError(f"strict tmpfs {name} option is malformed")
+    return int(value) * multiplier
+
+
+def _validate_strict_tmpfs_quota_record(
+    record: Mapping[str, object], mounted_device: int
+) -> None:
+    options = record.get("options")
+    super_options = record.get("super_options")
+    if (
+        record.get("filesystem") != "tmpfs"
+        or record.get("source") != _STRICT_WRITABLE_QUOTA_SOURCE
+        or not isinstance(options, (set, frozenset))
+        or not {"rw", "nosuid", "nodev"}.issubset(options)
+        or "noexec" in options
+        or record.get("major_minor")
+        != (os.major(mounted_device), os.minor(mounted_device))
+        or _strict_tmpfs_numeric_option(
+            super_options, "size", allow_size_suffix=True
+        )
+        != _STRICT_WRITABLE_QUOTA_SIZE_BYTES
+        or _strict_tmpfs_numeric_option(
+            super_options, "nr_inodes", allow_size_suffix=False
+        )
+        != _STRICT_WRITABLE_QUOTA_INODES
+    ):
+        raise AssertionError("strict writable quota mount policy is invalid")
+
+
+def _validated_writable_quota_underlay(
+    root: Path, document: Mapping[str, object]
+) -> os.stat_result:
+    quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+    metadata = quota.lstat()
+    if (
+        _strict_exact_mount_record(quota) is not None
+        or not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino)
+        != (
+            document.get("underlying_device"),
+            document.get("underlying_inode"),
+        )
+        or metadata.st_uid != document.get("runner_uid")
+        or metadata.st_gid != document.get("runner_gid")
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or any(quota.iterdir())
+    ):
+        raise AssertionError("strict writable quota underlay identity changed")
+    return metadata
+
+
+def _validated_active_unmounted_quota_window(
+    root: Path, document: Mapping[str, object]
+) -> tuple[Path, Path, Path, Path, dict[str, object]]:
+    if document.get("state") != "active":
+        raise AssertionError(
+            "strict writable quota unmounted window is not active"
+        )
+    _validated_writable_quota_underlay(root, document)
+    quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+    return (
+        quota,
+        quota / "resources",
+        quota / "fixtures",
+        quota / ".tombstones",
+        dict(document),
+    )
+
+
+def _validated_partial_writable_quota_mount(
+    root: Path, document: Mapping[str, object]
+) -> tuple[os.stat_result, dict[str, object]]:
+    quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+    record = _strict_exact_mount_record(quota)
+    metadata = quota.lstat()
+    if record is None:
+        raise AssertionError("strict writable quota mount is absent")
+    _validate_strict_tmpfs_quota_record(record, metadata.st_dev)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != document.get("runner_uid")
+        or metadata.st_gid != document.get("runner_gid")
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise AssertionError("strict writable quota mount identity is unsafe")
+    return metadata, record
+
+
+def _validated_writable_quota_paths(
+    root: Path,
+    *,
+    target_gid: int | None = None,
+    binding: Mapping[str, object] | None = None,
+) -> tuple[Path, Path, Path, Path, dict[str, object]]:
+    document = (
+        _load_writable_quota_binding(root)
+        if binding is None
+        else dict(binding)
+    )
+    quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+    resources = quota / "resources"
+    fixtures = quota / "fixtures"
+    tombstones = quota / ".tombstones"
+    record = _strict_exact_mount_record(quota)
+    quota_metadata = quota.lstat()
+    filesystem = os.statvfs(quota)
+    paths = (quota, resources, fixtures, tombstones)
+    metadata = [path.lstat() for path in paths]
+    runner_uid = document.get("runner_uid")
+    runner_gid = document.get("runner_gid")
+    quota_policy = (
+        quota_metadata.st_uid == runner_uid
+        and quota_metadata.st_gid == runner_gid
+        and stat.S_IMODE(quota_metadata.st_mode) == 0o700
+    )
+    resources_policy = (
+        metadata[1].st_uid == runner_uid
+        and (
+            (
+                metadata[1].st_gid == runner_gid
+                and stat.S_IMODE(metadata[1].st_mode) == 0o700
+            )
+            or (
+                target_gid is not None
+                and metadata[1].st_gid == target_gid
+                and stat.S_IMODE(metadata[1].st_mode) == 0o710
+            )
+        )
+    )
+    fixtures_policy = (
+        metadata[2].st_uid == runner_uid
+        and metadata[2].st_gid == runner_gid
+        and stat.S_IMODE(metadata[2].st_mode) == 0o700
+    )
+    tombstone_policy = (
+        (
+            metadata[3].st_uid == runner_uid
+            and metadata[3].st_gid == runner_gid
+            and stat.S_IMODE(metadata[3].st_mode) == 0o700
+        )
+        or (
+            metadata[3].st_uid == 0
+            and metadata[3].st_gid == runner_gid
+            and stat.S_IMODE(metadata[3].st_mode) == 0o710
+        )
+    )
+    if record is not None:
+        _validate_strict_tmpfs_quota_record(record, quota_metadata.st_dev)
+    if (
+        document.get("state") != "active"
+        or record is None
+        or record["mount_id"] != document.get("mount_id")
+        or list(record["major_minor"]) != document.get("major_minor")
+        or (quota_metadata.st_dev, quota_metadata.st_ino)
+        != (document.get("mounted_device"), document.get("mounted_inode"))
+        or any(not stat.S_ISDIR(item.st_mode) for item in metadata)
+        or any(item.st_dev != quota_metadata.st_dev for item in metadata)
+        or not quota_policy
+        or not resources_policy
+        or not fixtures_policy
+        or not tombstone_policy
+        or filesystem.f_frsize <= 0
+        or filesystem.f_blocks <= 0
+        or filesystem.f_blocks * filesystem.f_frsize
+        > _STRICT_WRITABLE_QUOTA_SIZE_BYTES
+        or filesystem.f_files <= 0
+        or filesystem.f_files > _STRICT_WRITABLE_QUOTA_INODES
+    ):
+        raise AssertionError("strict writable quota session binding is invalid")
+    return quota, resources, fixtures, tombstones, document
+
+
+def _validated_writable_quota_acquisition(
+    root: Path,
+    watchdog_token: str,
+    *,
+    allow_pre_active: bool,
+    allow_active_unmounted_window: bool = False,
+    target_gid: int | None = None,
+) -> tuple[Path, Path, Path, Path, dict[str, object]]:
+    document = _load_writable_quota_binding(root)
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", watchdog_token) is None
+        or document.get("watchdog_token_sha256")
+        != hashlib.sha256(watchdog_token.encode("ascii")).hexdigest()
+    ):
+        raise AssertionError("strict writable quota acquisition token changed")
+    state = document.get("state")
+    if state == "active":
+        quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+        if (
+            allow_active_unmounted_window
+            and _strict_exact_mount_record(quota) is None
+        ):
+            return _validated_active_unmounted_quota_window(root, document)
+        return _validated_writable_quota_paths(root, target_gid=target_gid)
+    if not allow_pre_active:
+        raise AssertionError("strict writable quota is not active")
+    quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+    resources = quota / "resources"
+    fixtures = quota / "fixtures"
+    tombstones = quota / ".tombstones"
+    if state != "intended":
+        raise AssertionError("strict writable quota acquisition state is invalid")
+    if _strict_exact_mount_record(quota) is None:
+        _validated_writable_quota_underlay(root, document)
+    else:
+        _validated_partial_writable_quota_mount(root, document)
+    return quota, resources, fixtures, tombstones, document
+
+
+def _root_mount_tmpfs(path: Path, runner_uid: int, runner_gid: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    mount_call = libc.mount
+    mount_call.argtypes = (
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    )
+    mount_call.restype = ctypes.c_int
+    options = (
+        f"mode=0700,size={_STRICT_WRITABLE_QUOTA_SIZE_BYTES},"
+        f"nr_inodes={_STRICT_WRITABLE_QUOTA_INODES},"
+        f"uid={runner_uid},gid={runner_gid}"
+    ).encode("ascii")
+    if (
+        mount_call(
+            _STRICT_WRITABLE_QUOTA_SOURCE.encode("ascii"),
+            os.fsencode(path),
+            b"tmpfs",
+            2 | 4,
+            options,
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno()
+        raise AssertionError(
+            f"strict writable quota mount failed: errno {error_number}"
+        )
+
+
+def _root_unmount(path: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    unmount_call = libc.umount2
+    unmount_call.argtypes = (ctypes.c_char_p, ctypes.c_int)
+    unmount_call.restype = ctypes.c_int
+    if unmount_call(os.fsencode(path), 0) != 0:
+        error_number = ctypes.get_errno()
+        raise AssertionError(
+            f"strict writable quota unmount failed: errno {error_number}"
+        )
+
+
+def _root_quota_main(arguments: Sequence[str]) -> int:
+    try:
+        if os.getuid() != 0 or os.geteuid() != 0:
+            raise AssertionError("strict writable quota broker is not root")
+        _bind_root_controller_parent()
+        if len(arguments) != 8 or arguments[0] not in ("create", "destroy"):
+            raise AssertionError("strict writable quota arguments are malformed")
+        operation = arguments[0]
+        root = Path(arguments[1])
+        try:
+            expected_root = (int(arguments[2]), int(arguments[3]))
+            runner_uid = int(arguments[4])
+            runner_gid = int(arguments[5])
+            target_uid = _parse_internal_identity(
+                "strict writable quota target UID", arguments[6]
+            )
+        except ValueError as error:
+            raise AssertionError(
+                "strict writable quota identity is malformed"
+            ) from error
+        watchdog_token = arguments[7]
+        if re.fullmatch(r"[0-9a-f]{32}", watchdog_token) is None:
+            raise AssertionError(
+                "strict writable quota authorization is malformed"
+            )
+        root_metadata = root.lstat()
+        quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+        document = _load_writable_quota_binding(root)
+        if (
+            not root.is_absolute()
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or (root_metadata.st_dev, root_metadata.st_ino) != expected_root
+            or root_metadata.st_uid != runner_uid
+            or runner_uid < 0
+            or runner_gid < 0
+            or stat.S_IMODE(root_metadata.st_mode) not in (0o700, 0o710)
+            or document.get("runner_uid") != runner_uid
+            or document.get("runner_gid") != runner_gid
+            or document.get("watchdog_token_sha256")
+            != hashlib.sha256(watchdog_token.encode("ascii")).hexdigest()
+        ):
+            raise AssertionError("strict writable quota root identity changed")
+        if operation == "create":
+            if document.get("state") != "intended":
+                raise AssertionError(
+                    "strict writable quota create state is invalid"
+                )
+            _validated_writable_quota_underlay(root, document)
+            _root_mount_tmpfs(quota, runner_uid, runner_gid)
+            for name in document["children"]:
+                child = quota / str(name)
+                child.mkdir(mode=0o700)
+                os.chown(child, runner_uid, runner_gid)
+                os.chmod(child, 0o700)
+            mounted = quota.lstat()
+            record = _strict_exact_mount_record(quota)
+            if record is None:
+                raise AssertionError(
+                    "strict writable quota mount proof is invalid"
+                )
+            _validate_strict_tmpfs_quota_record(record, mounted.st_dev)
+            document.update(
+                {
+                    "state": "active",
+                    "mounted_device": mounted.st_dev,
+                    "mounted_inode": mounted.st_ino,
+                    "mount_id": record["mount_id"],
+                    "major_minor": list(record["major_minor"]),
+                }
+            )
+            _validated_writable_quota_paths(
+                root, target_gid=target_uid, binding=document
+            )
+            _write_writable_quota_binding(root, document, create=False)
+            _validated_writable_quota_paths(root, target_gid=target_uid)
+        else:
+            _stable_uid_zero(target_uid)
+            record = _strict_exact_mount_record(quota)
+            state = document.get("state")
+            if state == "unmounted":
+                _validated_writable_quota_underlay(root, document)
+            else:
+                if state == "intended":
+                    if record is None:
+                        _validated_writable_quota_underlay(root, document)
+                    else:
+                        _validated_partial_writable_quota_mount(root, document)
+                elif state == "active":
+                    if record is None:
+                        _validated_writable_quota_underlay(root, document)
+                    else:
+                        _validated_writable_quota_paths(
+                            root,
+                            target_gid=target_uid,
+                        )
+                else:
+                    raise AssertionError(
+                        "strict writable quota cleanup state is invalid"
+                    )
+                if record is not None:
+                    _root_unmount(quota)
+                    _validated_writable_quota_underlay(root, document)
+                document.update(
+                    {
+                        "state": "unmounted",
+                        "mounted_device": None,
+                        "mounted_inode": None,
+                        "mount_id": None,
+                        "major_minor": None,
+                    }
+                )
+                _write_writable_quota_binding(root, document, create=False)
+        receipt = {
+            "status": "complete",
+            "operation": operation,
+            "binding": document,
+        }
+    except BaseException as error:
+        receipt = {
+            "status": "incomplete",
+            "error": f"{type(error).__name__}: {error}",
+        }
+    print(
+        _ROOT_QUOTA_RECEIPT_PREFIX
+        + json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    )
+    return 0
+
+
 def _strict_path_at_or_below(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
@@ -14515,32 +17937,92 @@ def _strict_validate_directory_mount_topology(
         raise AssertionError(boundary_error)
 
 
-def _strict_descriptor_mount_id(descriptor: int) -> int:
-    fdinfo_descriptor: int | None = None
+class _StatxTimestamp(ctypes.Structure):
+    _fields_ = (
+        ("seconds", ctypes.c_int64),
+        ("nanoseconds", ctypes.c_uint32),
+        ("reserved", ctypes.c_int32),
+    )
+
+
+class _StatxPrefix(ctypes.Structure):
+    _fields_ = (
+        ("mask", ctypes.c_uint32),
+        ("block_size", ctypes.c_uint32),
+        ("attributes", ctypes.c_uint64),
+        ("link_count", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32),
+        ("gid", ctypes.c_uint32),
+        ("mode", ctypes.c_uint16),
+        ("reserved", ctypes.c_uint16),
+        ("inode", ctypes.c_uint64),
+        ("size", ctypes.c_uint64),
+        ("blocks", ctypes.c_uint64),
+        ("attributes_mask", ctypes.c_uint64),
+        ("atime", _StatxTimestamp),
+        ("btime", _StatxTimestamp),
+        ("ctime", _StatxTimestamp),
+        ("mtime", _StatxTimestamp),
+        ("rdev_major", ctypes.c_uint32),
+        ("rdev_minor", ctypes.c_uint32),
+        ("dev_major", ctypes.c_uint32),
+        ("dev_minor", ctypes.c_uint32),
+        ("mount_id", ctypes.c_uint64),
+    )
+
+
+def _kernel_descriptor_mount_authority(
+    descriptor: int,
+) -> tuple[int, int, int]:
+    if sys.platform != "linux" or type(descriptor) is not int or descriptor < 0:
+        raise AssertionError("strict kernel mount authority is unavailable")
     try:
-        fdinfo_descriptor = os.open(
-            f"/proc/self/fdinfo/{descriptor}",
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        metadata = os.fstat(descriptor)
+        libc = ctypes.CDLL(None, use_errno=True)
+        fstatfs = libc.fstatfs
+        statx_call = libc.statx
+        fstatfs.argtypes = (ctypes.c_int, ctypes.c_void_p)
+        fstatfs.restype = ctypes.c_int
+        statx_call.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_void_p,
         )
-        data = os.read(fdinfo_descriptor, 4097)
-    except OSError as error:
-        raise AssertionError("strict writable root mount identity is unreadable") from error
-    finally:
-        if fdinfo_descriptor is not None:
-            os.close(fdinfo_descriptor)
-    if len(data) > 4096:
-        raise AssertionError("strict writable root mount identity is malformed")
-    try:
-        mount_ids = [
-            int(line.split()[1])
-            for line in data.decode("ascii").splitlines()
-            if line.startswith("mnt_id:")
-        ]
-    except (UnicodeError, IndexError, ValueError) as error:
-        raise AssertionError("strict writable root mount identity is malformed") from error
-    if len(mount_ids) != 1 or mount_ids[0] <= 0:
-        raise AssertionError("strict writable root mount identity is malformed")
-    return mount_ids[0]
+        statx_call.restype = ctypes.c_int
+        filesystem_buffer = (ctypes.c_byte * 256)()
+        statx_buffer = (ctypes.c_byte * 256)()
+        if fstatfs(descriptor, ctypes.byref(filesystem_buffer)) != 0:
+            raise OSError(ctypes.get_errno(), "fstatfs")
+        if statx_call(
+            descriptor,
+            b"",
+            _AT_EMPTY_PATH | _AT_SYMLINK_NOFOLLOW,
+            _STATX_MNT_ID,
+            ctypes.byref(statx_buffer),
+        ) != 0:
+            raise OSError(ctypes.get_errno(), "statx")
+    except (AttributeError, OSError) as error:
+        raise AssertionError("strict kernel mount authority is unreadable") from error
+    filesystem_magic = ctypes.cast(
+        ctypes.byref(filesystem_buffer), ctypes.POINTER(ctypes.c_long)
+    ).contents.value
+    statx_value = ctypes.cast(
+        ctypes.byref(statx_buffer), ctypes.POINTER(_StatxPrefix)
+    ).contents
+    if (
+        statx_value.mask & _STATX_MNT_ID != _STATX_MNT_ID
+        or statx_value.mount_id <= 0
+        or (statx_value.dev_major, statx_value.dev_minor)
+        != (os.major(metadata.st_dev), os.minor(metadata.st_dev))
+    ):
+        raise AssertionError("strict kernel mount authority is malformed")
+    return filesystem_magic, int(statx_value.mount_id), metadata.st_dev
+
+
+def _strict_descriptor_mount_id(descriptor: int) -> int:
+    return _kernel_descriptor_mount_authority(descriptor)[1]
 
 
 def _strict_writable_root_mount_binding(root: Path) -> int:
@@ -14686,6 +18168,103 @@ def _revalidate_strict_writable_root_bindings(
     return bindings
 
 
+def _revalidate_aggregate_writable_device(
+    value: object,
+    writable_bindings: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    expected_fields = {
+        "mountpoint",
+        "device",
+        "major_minor",
+        "mount_id",
+        "source",
+        "size_bytes",
+        "nr_inodes",
+        "flags",
+    }
+    if (
+        type(value) is not dict
+        or set(value) != expected_fields
+        or type(value.get("mountpoint")) is not str
+        or type(value.get("device")) is not int
+        or type(value.get("major_minor")) is not list
+        or len(value["major_minor"]) != 2
+        or any(type(item) is not int for item in value["major_minor"])
+        or type(value.get("mount_id")) is not int
+        or value.get("source") != _STRICT_WRITABLE_QUOTA_SOURCE
+        or value.get("size_bytes") != _STRICT_WRITABLE_QUOTA_SIZE_BYTES
+        or value.get("nr_inodes") != _STRICT_WRITABLE_QUOTA_INODES
+        or value.get("flags") != ["nodev", "nosuid"]
+        or not writable_bindings
+    ):
+        raise AssertionError(
+            "strict aggregate writable device binding is malformed"
+        )
+    mountpoint = Path(value["mountpoint"])
+    if (
+        not mountpoint.is_absolute()
+        or value["major_minor"]
+        != [os.major(int(value["device"])), os.minor(int(value["device"]))]
+    ):
+        raise AssertionError(
+            "strict aggregate writable device identity is malformed"
+        )
+    for binding in writable_bindings:
+        path_value = binding.get("path")
+        if (
+            type(path_value) is not str
+            or binding.get("device") != value["device"]
+            or not _strict_path_at_or_below(Path(path_value), mountpoint)
+        ):
+            raise AssertionError(
+                "strict writable root escaped its aggregate quota backing"
+            )
+    record = _strict_exact_mount_record(mountpoint)
+    filesystem = os.statvfs(mountpoint)
+    if (
+        record is None
+        or record["mount_id"] != value["mount_id"]
+        or list(record["major_minor"]) != value["major_minor"]
+        or record["filesystem"] != "tmpfs"
+        or record["source"] != _STRICT_WRITABLE_QUOTA_SOURCE
+        or not {"rw", "nosuid", "nodev"}.issubset(
+            record["options"]
+        )
+        or "noexec" in record["options"]
+        or filesystem.f_frsize <= 0
+        or filesystem.f_blocks <= 0
+        or filesystem.f_blocks * filesystem.f_frsize
+        > _STRICT_WRITABLE_QUOTA_SIZE_BYTES
+        or filesystem.f_files <= 0
+        or filesystem.f_files > _STRICT_WRITABLE_QUOTA_INODES
+    ):
+        raise AssertionError(
+            "strict aggregate writable quota policy changed"
+        )
+    return dict(value)
+
+
+def _aggregate_writable_device_binding(
+    session: Mapping[str, object],
+    writable_bindings: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    root = session.get("root")
+    if not isinstance(root, Path):
+        raise AssertionError("strict writable quota session root is malformed")
+    document = _load_writable_quota_binding(root)
+    value = {
+        "mountpoint": document["mountpoint"],
+        "device": document["mounted_device"],
+        "major_minor": document["major_minor"],
+        "mount_id": document["mount_id"],
+        "source": document["source"],
+        "size_bytes": document["size_bytes"],
+        "nr_inodes": document["nr_inodes"],
+        "flags": document["flags"],
+    }
+    return _revalidate_aggregate_writable_device(value, writable_bindings)
+
+
 def _strict_host_namespace_identity(namespace: str) -> str:
     if namespace not in ("mnt", "ipc", "net"):
         raise AssertionError("strict host namespace selector is malformed")
@@ -14716,8 +18295,6 @@ def _session_from_environment() -> dict[str, object] | None:
     entries = Path(registry_value)
     root = entries.parent
     control = root / "trusted-control"
-    resources = root / "resources"
-    tombstones = root / ".tombstones"
     session_lock = root / ".session.lock"
     watchdog_token_path = root / ".watchdog-token"
     controller_path = (
@@ -14725,16 +18302,16 @@ def _session_from_environment() -> dict[str, object] | None:
         / _TRUSTED_CONTENT_RELATIVE_ROOT
         / "skills/waited-delivery/tests/required_ci_candidate.py"
     )
-    realm_gid = int(_strict_realm()["gid"])
-    for path in (root, entries, control, resources, tombstones):
+    realm = _strict_realm()
+    realm_gid = int(realm["gid"])
+    for path in (root, entries, control):
         metadata = path.lstat()
         selected_mode = stat.S_IMODE(metadata.st_mode)
-        ancestor_policy = path in (root, resources)
-        vault_policy = path == tombstones
+        ancestor_policy = path == root
         if (
             not path.is_absolute()
             or not stat.S_ISDIR(metadata.st_mode)
-            or (not vault_policy and metadata.st_uid != os.getuid())
+            or metadata.st_uid != os.getuid()
             or (
                 ancestor_policy
                 and not (
@@ -14745,25 +18322,7 @@ def _session_from_environment() -> dict[str, object] | None:
                     )
                 )
             )
-            or (
-                vault_policy
-                and not (
-                    (
-                        metadata.st_uid == os.getuid()
-                        and selected_mode == 0o700
-                    )
-                    or (
-                        metadata.st_uid == 0
-                        and metadata.st_gid == os.getgid()
-                        and selected_mode == 0o710
-                    )
-                )
-            )
-            or (
-                not ancestor_policy
-                and not vault_policy
-                and selected_mode != 0o700
-            )
+            or (not ancestor_policy and selected_mode != 0o700)
         ):
             raise AssertionError("strict inherited isolation registry is unsafe")
     controller_metadata = controller_path.lstat()
@@ -14798,6 +18357,16 @@ def _session_from_environment() -> dict[str, object] | None:
         )
     ):
         raise AssertionError("strict inherited recovery controller is unsafe")
+    watchdog_authorized = supplied_watchdog_token == watchdog_token
+    quota, resources, fixtures, tombstones, quota_binding = (
+        _validated_writable_quota_acquisition(
+            root,
+            watchdog_token,
+            allow_pre_active=watchdog_authorized,
+            allow_active_unmounted_window=watchdog_authorized,
+            target_gid=int(realm["gid"]),
+        )
+    )
     return {
         "environment": {
             _ISOLATION_REGISTRY_ENV: str(entries),
@@ -14805,14 +18374,18 @@ def _session_from_environment() -> dict[str, object] | None:
         },
         "root": root,
         "entries": entries,
+        "quota": quota,
         "resources": resources,
+        "fixtures": fixtures,
         "tombstones": tombstones,
+        "quota_binding": quota_binding,
         "controller_path": controller_path,
         "token": token,
-        "target_uid": int(_strict_realm()["uid"]),
+        "target_uid": int(realm["uid"]),
         "closed": False,
         "inherited": True,
-        "watchdog_authorized": supplied_watchdog_token == watchdog_token,
+        "watchdog_authorized": watchdog_authorized,
+        "watchdog_token": watchdog_token,
     }
 
 
@@ -14830,6 +18403,73 @@ def _current_strict_session_unchecked() -> dict[str, object]:
 def _active_strict_session() -> dict[str, object]:
     session = _current_strict_session_unchecked()
     _assert_registry_watchdog_alive(session)
+    return session
+
+
+def _quota_acquisition_session(operation: str) -> dict[str, object]:
+    if operation not in ("create", "destroy"):
+        raise AssertionError("strict writable quota operation is invalid")
+    session = _current_strict_session_unchecked()
+    inherited = session.get("inherited")
+    if inherited is False:
+        _assert_registry_watchdog_alive(session)
+    elif inherited is not True or session.get("watchdog_authorized") is not True:
+        raise AssertionError(
+            "strict writable quota acquisition authority is unavailable"
+        )
+    root = session.get("root")
+    watchdog_token = session.get("watchdog_token")
+    target_uid = session.get("target_uid")
+    if (
+        not isinstance(root, Path)
+        or type(watchdog_token) is not str
+        or type(target_uid) is not int
+    ):
+        raise AssertionError("strict writable quota acquisition is malformed")
+    binding = _load_writable_quota_binding(root)
+    if binding.get("state") == "unmounted" and operation == "destroy":
+        if binding.get("watchdog_token_sha256") != hashlib.sha256(
+            watchdog_token.encode("ascii")
+        ).hexdigest():
+            raise AssertionError(
+                "strict writable quota acquisition token changed"
+            )
+        _validated_writable_quota_underlay(root, binding)
+        quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+        paths = (
+            quota,
+            quota / "resources",
+            quota / "fixtures",
+            quota / ".tombstones",
+        )
+    else:
+        quota, resources, fixtures, tombstones, binding = (
+            _validated_writable_quota_acquisition(
+                root,
+                watchdog_token,
+                allow_pre_active=True,
+                allow_active_unmounted_window=(operation == "destroy"),
+                target_gid=target_uid,
+            )
+        )
+        paths = (quota, resources, fixtures, tombstones)
+    allowed_states = {
+        "create": ("intended",),
+        "destroy": ("intended", "active", "unmounted"),
+    }
+    if binding.get("state") not in allowed_states[operation]:
+        raise AssertionError(
+            "strict writable quota acquisition transition is invalid"
+        )
+    session.update(
+        {
+            "quota": paths[0],
+            "resources": paths[1],
+            "fixtures": paths[2],
+            "tombstones": paths[3],
+            "quota_binding": binding,
+        }
+    )
     return session
 
 
@@ -14872,11 +18512,20 @@ def _register_trusted_root_chain(
             and direct_opt_root is not None
         )
         or (
+            selected_cleanup_kind == _STRICT_QUOTA_RESOURCE_CLEANUP_KIND
+            and direct_opt_root is not None
+        )
+        or (
             selected_cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND
             and type(direct_opt_root) is not dict
         )
         or selected_cleanup_kind
-        not in (None, "sealed-resource-v1", _STRICT_LIVE_IPC_CLEANUP_KIND)
+        not in (
+            None,
+            "sealed-resource-v1",
+            _STRICT_LIVE_IPC_CLEANUP_KIND,
+            _STRICT_QUOTA_RESOURCE_CLEANUP_KIND,
+        )
     ):
         raise AssertionError("strict registered cleanup binding is malformed")
     selected_session_id = uuid.uuid4().hex if session_id is None else session_id
@@ -14949,7 +18598,12 @@ def _registered_entry_matches_publication_attempt(
         or not isinstance(controller_path, Path)
         or type(cleanup_execution_root) is not bool
         or selected_cleanup_kind
-        not in (None, "sealed-resource-v1", _STRICT_LIVE_IPC_CLEANUP_KIND)
+        not in (
+            None,
+            "sealed-resource-v1",
+            _STRICT_LIVE_IPC_CLEANUP_KIND,
+            _STRICT_QUOTA_RESOURCE_CLEANUP_KIND,
+        )
         or (
             selected_cleanup_kind == _STRICT_LIVE_IPC_CLEANUP_KIND
             and type(direct_opt_root) is not dict
@@ -15452,6 +19106,70 @@ def _cleanup_registered_direct_opt_root(
     raise AssertionError("strict live IPC root still exists after cleanup")
 
 
+def _quota_disposable_resource_receipt(
+    document: Mapping[str, object],
+) -> dict[str, object]:
+    session = _active_strict_session()
+    resources = session.get("resources")
+    quota_binding = session.get("quota_binding")
+    root, identity = _registered_execution_root(document)
+    if (
+        not isinstance(resources, Path)
+        or type(quota_binding) is not dict
+        or quota_binding.get("state") != "active"
+        or type(quota_binding.get("mounted_device")) is not int
+        or type(quota_binding.get("mount_id")) is not int
+        or root.parent != resources
+        or not root.name
+        or root.name in (".", "..")
+        or "/" in root.name
+    ):
+        raise AssertionError(
+            "strict disposable resource containment binding is invalid"
+        )
+    try:
+        resolved = root.resolve(strict=True)
+        metadata = root.lstat()
+        parent_metadata = resources.lstat()
+        mount_id = _strict_writable_root_mount_binding(root)
+    except OSError as error:
+        raise AssertionError(
+            "strict disposable resource identity is unreadable"
+        ) from error
+    access_policy = (
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+    )
+    allowed_access_policies = {
+        (os.getuid(), os.getgid(), 0o700),
+        (os.getuid(), int(document["target_uid"]), 0o710),
+    }
+    if (
+        resolved != root
+        or not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != identity
+        or metadata.st_dev != quota_binding["mounted_device"]
+        or parent_metadata.st_dev != quota_binding["mounted_device"]
+        or mount_id != quota_binding["mount_id"]
+        or access_policy not in allowed_access_policies
+    ):
+        raise AssertionError(
+            "strict disposable resource identity, backing, or access policy changed"
+        )
+    return {
+        "kind": "quota-retained-v1",
+        "device": identity[0],
+        "inode": identity[1],
+        "parent_device": parent_metadata.st_dev,
+        "parent_inode": parent_metadata.st_ino,
+        "name": root.name,
+        "quota_device": int(quota_binding["mounted_device"]),
+        "quota_mount_id": int(quota_binding["mount_id"]),
+        "retained_until_unmount": True,
+    }
+
+
 def _cleanup_registered_execution_root(
     entry_path: Path,
     document: Mapping[str, object],
@@ -15468,6 +19186,31 @@ def _cleanup_registered_execution_root(
                 entry_path,
                 document,
                 recovery_profile=recovery_profile,
+        )
+        return
+    if document.get("cleanup_kind") == _STRICT_QUOTA_RESOURCE_CLEANUP_KIND:
+        if document.get("state") == "closing":
+            document = _transition_trusted_root_chain(
+                entry_path,
+                ("closing",),
+                "deleting",
+                execution_root_delete_nonce=uuid.uuid4().hex,
+            )
+        if document.get("state") != "deleting":
+            raise AssertionError(
+                "strict disposable resource is not deleting"
+            )
+        receipt = _quota_disposable_resource_receipt(document)
+        imported_receipt = document.get("execution_root_deleted")
+        if imported_receipt is None:
+            _update_trusted_root_chain(
+                entry_path,
+                "deleting",
+                execution_root_deleted=receipt,
+            )
+        elif imported_receipt != receipt:
+            raise AssertionError(
+                "strict disposable resource receipt changed"
             )
         return
     session = _active_strict_session()
@@ -15552,6 +19295,10 @@ def _mark_trusted_root_chain_closed(
         if outer_value is not None:
             outer = _parse_root_chain_identity(outer_value, "registered outer")
             _stable_host_session_zero(outer)
+        if _registered_scope_requires_cleanup(document):
+            raise AssertionError(
+                "strict systemd scope remains active after cleanup"
+            )
         _stable_uid_zero(int(document["target_uid"]))
         if recovery_profile == "-":
             _cleanup_registered_execution_root(entry_path, document)
@@ -15666,6 +19413,7 @@ def _recover_registered_entry(
                 "closing",
             )
         outer_value = document.get("outer")
+        session_inventory: Mapping[object, object] = {}
         if outer_value is not None:
             outer = _parse_root_chain_identity(outer_value, "registered outer")
             if outer[0] != outer[2] or outer[0] != outer[3]:
@@ -15676,17 +19424,20 @@ def _recover_registered_entry(
                 raise AssertionError(
                     "strict registered host session lost its generation anchor"
                 )
-            if session_inventory:
-                if not allow_recovery_broker:
-                    raise AssertionError(
-                        "strict recovery broker left its own registered session active"
-                    )
-                recovery_controller = Path(
-                    str(document["recovery_controller_path"])
+        broker_required = bool(session_inventory)
+        if not broker_required:
+            broker_required = _registered_scope_requires_cleanup(document)
+        if broker_required:
+            if not allow_recovery_broker:
+                raise AssertionError(
+                    "strict recovery broker left registered resources active"
                 )
-                _invoke_registered_session_cleanup(
-                    recovery_controller, entry_path, int(document["target_uid"])
-                )
+            recovery_controller = Path(
+                str(document["recovery_controller_path"])
+            )
+            _invoke_registered_session_cleanup(
+                recovery_controller, entry_path, int(document["target_uid"])
+            )
         if recovery_profile == "-":
             return _mark_trusted_root_chain_closed(entry_path)
         return _mark_trusted_root_chain_closed(
@@ -16274,28 +20025,15 @@ def _validate_registered_root_active(
         document.get("wrapper"), "wrapper"
     )
     target = _parse_process_identity_document(document.get("target"), "target")
-    handshake = document.get("root_handshake")
+    handshake = _validated_root_controller_handshake_document(
+        document.get("root_handshake")
+    )
     marker = document.get("target_marker")
     if (
         document.get("schema_version") != 1
         or document.get("nonce") != nonce
-        or type(handshake) is not dict
-        or set(handshake)
-        != {
-            "schema_version",
-            "phase",
-            "nonce",
-            "session_id",
-            "target_uid",
-            "controller",
-            "sudo_parent",
-            "wrapper",
-        }
-        or handshake.get("schema_version") != 2
         or handshake.get("phase") != "wrapper-bound"
         or handshake.get("nonce") != nonce
-        or re.fullmatch(r"[0-9a-f]{32}", str(handshake.get("session_id")))
-        is None
         or (
             expected_session_id is not None
             and handshake.get("session_id") != expected_session_id
@@ -16647,6 +20385,7 @@ def _run_registered_sudo_under_gate(
     recovery_broker: bool = False,
     trusted_fault_probe: tuple[Path, str, str, int] | None = None,
     diagnostic_phase: str = "registered-command",
+    quota_acquisition_operation: str | None = None,
 ) -> bytes:
     if type(input_bytes) is not bytes:
         raise AssertionError("strict registered sudo input is malformed")
@@ -16669,7 +20408,11 @@ def _run_registered_sudo_under_gate(
         or trusted_fault_probe[3] < 0
     ):
         raise AssertionError("strict registered outer fault probe is malformed")
-    session = _active_strict_session()
+    session = (
+        _active_strict_session()
+        if quota_acquisition_operation is None
+        else _quota_acquisition_session(quota_acquisition_operation)
+    )
     if trusted_fault_probe is not None and session.get("inherited") is not False:
         raise AssertionError(
             "strict registered outer fault probe requires an independent owner"
@@ -17099,6 +20842,7 @@ def _run_registered_sudo(
     recovery_broker: bool = False,
     trusted_fault_probe: tuple[Path, str, str, int] | None = None,
     diagnostic_phase: str = "registered-command",
+    quota_acquisition_operation: str | None = None,
 ) -> bytes:
     strict_isolation_platform_preflight()
     with _registry_session_gate(exclusive=False):
@@ -17115,6 +20859,7 @@ def _run_registered_sudo(
             recovery_broker=recovery_broker,
             trusted_fault_probe=trusted_fault_probe,
             diagnostic_phase=diagnostic_phase,
+            quota_acquisition_operation=quota_acquisition_operation,
         )
 
 
@@ -17473,6 +21218,264 @@ def _read_watchdog_line(
     raise AssertionError(f"strict registry watchdog {description} is malformed")
 
 
+def _empty_watchdog_recovery_summary() -> dict[str, object]:
+    return {
+        "direct_opt_root_count": 0,
+        "direct_opt_root_sha256": hashlib.sha256(b"[]").hexdigest(),
+        "direct_opt_root": None,
+    }
+
+
+def _watchdog_recovery_root_summary_is_exact(value: object) -> bool:
+    if type(value) is not dict or set(value) != {
+        "session_id",
+        "token",
+        "delete_nonce",
+        "parent_device",
+        "parent_inode",
+        "root_device",
+        "root_inode",
+        "deleted",
+        "witness_nonce",
+        "witness_last_record_sha256",
+        "witness_retired",
+    }:
+        return False
+    session_id = value.get("session_id")
+    token = value.get("token")
+    delete_nonce = value.get("delete_nonce")
+    witness_nonce = value.get("witness_nonce")
+    parent_device = value.get("parent_device")
+    parent_inode = value.get("parent_inode")
+    root_device = value.get("root_device")
+    root_inode = value.get("root_inode")
+    deleted = value.get("deleted")
+    witness_retired = value.get("witness_retired")
+    if (
+        any(
+            type(selected) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", selected) is None
+            for selected in (session_id, token, delete_nonce, witness_nonce)
+        )
+        or any(
+            type(selected) is not int or selected < 0
+            for selected in (parent_device, parent_inode)
+        )
+        or (root_device is None) != (root_inode is None)
+        or any(
+            selected is not None
+            and (type(selected) is not int or selected < 0)
+            for selected in (root_device, root_inode)
+        )
+        or type(deleted) is not dict
+        or set(deleted)
+        != {
+            "kind",
+            "parent_device",
+            "parent_inode",
+            "device",
+            "inode",
+            "name",
+        }
+        or deleted.get("kind") != "direct-empty-rmdir-v1"
+        or any(
+            type(deleted.get(field)) is not type(expected)
+            or deleted.get(field) != expected
+            for field, expected in (
+                ("parent_device", parent_device),
+                ("parent_inode", parent_inode),
+                ("device", root_device),
+                ("inode", root_inode),
+            )
+        )
+        or deleted.get("name") != _direct_opt_root_name(session_id)
+        or type(value.get("witness_last_record_sha256")) is not str
+        or re.fullmatch(
+            r"[0-9a-f]{64}", value["witness_last_record_sha256"]
+        )
+        is None
+        or type(witness_retired) is not dict
+        or set(witness_retired)
+        != {
+            "path",
+            "device",
+            "inode",
+            "uid",
+            "gid",
+            "mode",
+            "nlink",
+            "size",
+            "sha256",
+            "last_record_sha256",
+            "phase",
+            "absent",
+        }
+    ):
+        return False
+    expected_witness_path = str(
+        _strict_live_ipc_witness_namespace_path()
+        / _strict_live_ipc_witness_basename(session_id, witness_nonce)
+    )
+    return not (
+        witness_retired.get("path") != expected_witness_path
+        or any(
+            type(witness_retired.get(field)) is not int
+            or witness_retired[field] < 0
+            for field in ("device", "inode", "uid", "gid")
+        )
+        or witness_retired.get("uid") != _STRICT_LIVE_IPC_WITNESS_OWNER_UID
+        or witness_retired.get("gid") != _STRICT_LIVE_IPC_WITNESS_OWNER_GID
+        or type(witness_retired.get("mode")) is not int
+        or witness_retired["mode"] != _STRICT_LIVE_IPC_WITNESS_FILE_MODE
+        or type(witness_retired.get("nlink")) is not int
+        or witness_retired["nlink"] != 1
+        or type(witness_retired.get("size")) is not int
+        or not 0 < witness_retired["size"] <= _STRICT_LIVE_IPC_WITNESS_LIMIT_BYTES
+        or any(
+            type(witness_retired.get(field)) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", witness_retired[field]) is None
+            for field in ("sha256", "last_record_sha256")
+        )
+        or witness_retired.get("last_record_sha256")
+        != value["witness_last_record_sha256"]
+        or witness_retired.get("phase") != "deleted"
+        or witness_retired.get("absent") is not False
+    )
+
+
+def _validated_watchdog_completion_result(
+    value: object, watchdog_token: str, expected_reason: str
+) -> dict[str, object]:
+    if (
+        type(watchdog_token) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", watchdog_token) is None
+        or expected_reason not in ("controlled-cancel", "drain-request")
+        or type(value) is not dict
+        or set(value) != {"status", "token", "recovery", "terminal"}
+        or value.get("status") != "complete"
+        or value.get("token") != watchdog_token
+    ):
+        raise AssertionError(
+            "strict registry watchdog completion result is malformed"
+        )
+    recovery = value.get("recovery")
+    terminal = value.get("terminal")
+    if (
+        type(recovery) is not dict
+        or set(recovery)
+        != {
+            "direct_opt_root_count",
+            "direct_opt_root_sha256",
+            "direct_opt_root",
+        }
+        or type(terminal) is not dict
+        or set(terminal)
+        != {"reason", "elapsed_ns", "heartbeat_timeout_ns"}
+        or terminal.get("reason") != expected_reason
+        or type(terminal.get("elapsed_ns")) is not int
+        or terminal["elapsed_ns"] < 0
+        or type(terminal.get("heartbeat_timeout_ns")) is not int
+        or terminal["heartbeat_timeout_ns"]
+        != int(_STRICT_WATCHDOG_TIMEOUT_SECONDS * 1_000_000_000)
+    ):
+        raise AssertionError(
+            "strict registry watchdog completion result is malformed"
+        )
+    count = recovery.get("direct_opt_root_count")
+    digest = recovery.get("direct_opt_root_sha256")
+    root_summary = recovery.get("direct_opt_root")
+    if (
+        type(count) is not int
+        or not 0 <= count <= _STRICT_REGISTRY_ENTRY_LIMIT
+        or type(digest) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or (count == 0 and recovery != _empty_watchdog_recovery_summary())
+        or (count == 1 and not _watchdog_recovery_root_summary_is_exact(root_summary))
+        or (count != 1 and root_summary is not None)
+    ):
+        raise AssertionError(
+            "strict registry watchdog completion result is malformed"
+        )
+    if count == 1:
+        try:
+            canonical = json.dumps(
+                [root_summary], sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+        except (TypeError, UnicodeEncodeError) as error:
+            raise AssertionError(
+                "strict registry watchdog completion result is malformed"
+            ) from error
+        if digest != hashlib.sha256(canonical).hexdigest():
+            raise AssertionError(
+                "strict registry watchdog completion result is malformed"
+            )
+    # Multi-root receipts intentionally carry only a bounded count and digest;
+    # the process-bound pipe makes that digest an audit commitment, not a
+    # consumer-reconstructible list.
+    if expected_reason == "controlled-cancel" and (
+        terminal["elapsed_ns"] != 0
+        or recovery != _empty_watchdog_recovery_summary()
+    ):
+        raise AssertionError(
+            "strict registry watchdog completion result is malformed"
+        )
+    return value
+
+
+def _validated_watchdog_completion_line(
+    line: bytes, watchdog_token: str, expected_reason: str
+) -> dict[str, object]:
+    prefix = _WATCHDOG_RESULT_PREFIX.encode("ascii")
+    if not line.startswith(prefix) or not line.endswith(b"\n"):
+        raise AssertionError(
+            "strict registry watchdog completion result prefix is invalid"
+        )
+    payload = line[len(prefix) : -1]
+
+    def reject_pairs(pairs: Sequence[tuple[str, object]]) -> dict[str, object]:
+        selected: dict[str, object] = {}
+        for key, item in pairs:
+            if key in selected:
+                raise ValueError("duplicate JSON object key")
+            selected[key] = item
+        return selected
+
+    def reject_non_integer(_value: str) -> object:
+        raise ValueError("non-integer JSON number")
+
+    try:
+        result = json.loads(
+            payload,
+            object_pairs_hook=reject_pairs,
+            parse_constant=reject_non_integer,
+            parse_float=reject_non_integer,
+        )
+        canonical = json.dumps(
+            result,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        RecursionError,
+    ) as error:
+        raise AssertionError(
+            "strict registry watchdog completion result is malformed"
+        ) from error
+    if payload != canonical:
+        raise AssertionError(
+            "strict registry watchdog completion result is noncanonical"
+        )
+    return _validated_watchdog_completion_result(
+        result, watchdog_token, expected_reason
+    )
+
+
 def _registry_watchdog_heartbeat(
     stream: IO[bytes],
     stop_event: threading.Event,
@@ -17596,23 +21599,10 @@ def _drain_authorized_watchdog_launch(
             "authorized abort result",
         )
     process.wait(timeout=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS)
-    prefix = _WATCHDOG_RESULT_PREFIX.encode("ascii")
-    if not result_line.startswith(prefix):
-        raise AssertionError(
-            "strict authorized watchdog abort result prefix is invalid"
-        )
-    try:
-        result = json.loads(result_line[len(prefix) :])
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise AssertionError(
-            "strict authorized watchdog abort result is malformed"
-        ) from error
-    if (
-        type(result) is not dict
-        or result.get("status") != "complete"
-        or result.get("token") != watchdog_token
-        or process.returncode != 0
-    ):
+    _validated_watchdog_completion_line(
+        result_line, watchdog_token, "drain-request"
+    )
+    if process.returncode != 0:
         raise AssertionError(
             "strict authorized watchdog abort cleanup was incomplete"
         )
@@ -17816,6 +21806,39 @@ def _start_registry_watchdog(session: dict[str, object]) -> None:
         if isinstance(stop_event, threading.Event):
             stop_event.set()
         launch["phase"] = "retiring"
+        controlled_cancel_error: BaseException | None = None
+        controlled_cancelled = False
+        if (
+            isinstance(process, subprocess.Popen)
+            and process.poll() is None
+            and launch.get("authorized") is not True
+            and gate_write_fd >= 0
+            and process.stdout is not None
+        ):
+            try:
+                if os.write(gate_write_fd, b"X") != 1:
+                    raise AssertionError(
+                        "strict registry watchdog cancel frame was incomplete"
+                    )
+                os.close(gate_write_fd)
+                gate_write_fd = -1
+                launch["gate_write_fd"] = -1
+                result_line = _read_watchdog_line(
+                    process.stdout,
+                    _STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS,
+                    "controlled cancel result",
+                )
+                process.wait(timeout=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS)
+                _validated_watchdog_completion_line(
+                    result_line, watchdog_token, "controlled-cancel"
+                )
+                if process.returncode != 0:
+                    raise AssertionError(
+                        "strict registry watchdog controlled cancel was incomplete"
+                    )
+                controlled_cancelled = True
+            except BaseException as error:
+                controlled_cancel_error = error
         for descriptor in (gate_read_fd, gate_write_fd):
             if descriptor >= 0:
                 try:
@@ -17834,9 +21857,12 @@ def _start_registry_watchdog(session: dict[str, object]) -> None:
                 authorized_abort_error = error
         cleanup_failures = _retire_registry_watchdog_handles(
             session,
-            terminate=pidfd is not None
-            and launch.get("authorized") is not True,
+            terminate=False,
         )
+        if controlled_cancel_error is not None:
+            cleanup_failures.append(
+                f"watchdog controlled cancel: {controlled_cancel_error}"
+            )
         if authorized_abort_error is not None:
             cleanup_failures.append(
                 f"watchdog authorized abort: {authorized_abort_error}"
@@ -17855,6 +21881,17 @@ def _start_registry_watchdog(session: dict[str, object]) -> None:
                 "strict registry watchdog launch failed with a live gated child; "
                 f"recovery state retained: {launch_error}; "
                 + "; ".join(cleanup_failures)
+            ) from launch_error
+        if (
+            process is not None
+            and launch.get("authorized") is not True
+            and not controlled_cancelled
+        ):
+            session["watchdog_bootstrapping"] = True
+            raise AssertionError(
+                "strict registry watchdog cancel terminal state is unproved; "
+                "recovery authority retained: "
+                f"{launch_error}; " + "; ".join(cleanup_failures)
             ) from launch_error
         raise
 
@@ -18304,6 +22341,10 @@ def _watchdog_recovery_summary(
                 "witness_retired": dict(witness_retired),
             }
         )
+    if len(summaries) > _STRICT_REGISTRY_ENTRY_LIMIT:
+        raise AssertionError("strict watchdog recovery summary is excessive")
+    if not summaries:
+        return _empty_watchdog_recovery_summary()
     summaries.sort(key=lambda value: str(value["session_id"]))
     canonical = json.dumps(
         summaries, sort_keys=True, separators=(",", ":")
@@ -18318,7 +22359,9 @@ def _watchdog_recovery_summary(
 def _registry_watchdog_main(arguments: Sequence[str]) -> int:
     token = "unknown"
     result: dict[str, object]
-    recovery_responsibility = len(arguments) == 5
+    recovery_responsibility = (
+        len(arguments) == 5 and __name__ != "__main__"
+    )
     recovery_completed = False
     recovered_documents: tuple[dict[str, object], ...] = ()
     session: dict[str, object] | None = None
@@ -18356,24 +22399,52 @@ def _registry_watchdog_main(arguments: Sequence[str]) -> int:
                     "strict registry watchdog bootstrap gate is malformed"
                 )
             gate_fd = int(gate_value)
+            if __name__ == "__main__":
+                _lock_down_registry_watchdog_process()
             try:
                 readable, _, _ = select.select(
                     [gate_fd], [], [], _STRICT_WATCHDOG_TIMEOUT_SECONDS
                 )
-                gate = os.read(gate_fd, 1) if readable else b""
+                if not readable:
+                    raise AssertionError(
+                        "strict registry watchdog bootstrap gate timed out"
+                    )
+                gate = os.read(gate_fd, 1)
             finally:
                 os.close(gate_fd)
+            if gate == b"X":
+                result = {
+                    "status": "complete",
+                    "token": token,
+                    "recovery": _empty_watchdog_recovery_summary(),
+                    "terminal": {
+                        "reason": "controlled-cancel",
+                        "elapsed_ns": 0,
+                        "heartbeat_timeout_ns": int(
+                            _STRICT_WATCHDOG_TIMEOUT_SECONDS * 1_000_000_000
+                        ),
+                    },
+                }
+                print(
+                    _WATCHDOG_RESULT_PREFIX
+                    + json.dumps(result, sort_keys=True, separators=(",", ":")),
+                    flush=True,
+                )
+                return 0
+            if gate == b"":
+                recovery_responsibility = True
+                raise AssertionError(
+                    "strict registry watchdog owner was lost before authorization"
+                )
             if gate != b"G":
                 raise AssertionError(
-                    "strict registry watchdog bootstrap was not authorized"
+                    "strict registry watchdog bootstrap gate is malformed"
                 )
             recovery_responsibility = True
         elif __name__ == "__main__":
             raise AssertionError(
                 "strict registry watchdog bootstrap gate is required"
             )
-        if __name__ == "__main__":
-            _lock_down_registry_watchdog_process()
         strict_isolation_platform_preflight()
         session = _active_strict_session()
         if session.get("watchdog_authorized") is not True:
@@ -18629,14 +22700,10 @@ def _configure_registry_acquisition_at(
             root_fd, "trusted-control", 0o700
         )
         directory_fds.append(control_fd)
-        resources_fd = _open_or_create_registry_directory_at(
-            root_fd, "resources", 0o700
+        writable_fd = _open_or_create_registry_directory_at(
+            root_fd, _STRICT_WRITABLE_QUOTA_DIRECTORY, 0o700
         )
-        directory_fds.append(resources_fd)
-        tombstones_fd = _open_or_create_registry_directory_at(
-            root_fd, ".tombstones", 0o700
-        )
-        directory_fds.append(tombstones_fd)
+        directory_fds.append(writable_fd)
         controller_parent_fd = control_fd
         components = [
             *(
@@ -18729,14 +22796,90 @@ def _record_abandoned_registry_acquisition(
     _ABANDONED_REGISTRY_ACQUISITIONS.append(record)
 
 
+def _retire_unmounted_writable_quota_intent_without_root(
+    root: Path,
+) -> dict[str, object]:
+    document = _load_writable_quota_binding(root)
+    if document.get("state") == "unmounted":
+        _validated_writable_quota_underlay(root, document)
+        return document
+    if document.get("state") != "intended":
+        raise AssertionError(
+            "strict writable quota requires live recovery authority"
+        )
+    _validated_writable_quota_underlay(root, document)
+    document.update(
+        {
+            "state": "unmounted",
+            "mounted_device": None,
+            "mounted_inode": None,
+            "mount_id": None,
+            "major_minor": None,
+        }
+    )
+    _write_writable_quota_binding(root, document, create=False)
+    return _load_writable_quota_binding(root)
+
+
+def _registry_watchdog_is_ready_for_quota_recovery(
+    session: Mapping[str, object],
+) -> bool:
+    process = session.get("watchdog_process")
+    return bool(
+        isinstance(process, subprocess.Popen)
+        and process.poll() is None
+        and session.get("watchdog_bootstrapping") is None
+        and session.get("watchdog_closing") is False
+    )
+
+
+def _registry_watchdog_recovery_may_still_run(
+    session: Mapping[str, object],
+) -> bool:
+    process = session.get("watchdog_process")
+    launch = session.get("watchdog_launch")
+    launch_process = launch.get("process") if isinstance(launch, dict) else None
+    return any(
+        isinstance(selected, subprocess.Popen) and selected.poll() is None
+        for selected in (process, launch_process)
+    )
+
+
 def _settle_failed_registry_acquisition(
     session: dict[str, object], cause: BaseException
 ) -> None:
     global _STRICT_BACKEND_VALIDATED, _STRICT_SESSION
+    root = session.get("root")
+    controller_path = session.get("controller_path")
+    quota_cleanup_error: BaseException | None = None
+    if isinstance(root, Path) and _writable_quota_manifest_path(root).exists():
+        try:
+            if (
+                isinstance(controller_path, Path)
+                and _registry_watchdog_is_ready_for_quota_recovery(session)
+            ):
+                _invoke_root_quota_operation(controller_path, "destroy", root)
+            elif _registry_watchdog_recovery_may_still_run(session):
+                raise AssertionError(
+                    "strict writable quota watchdog recovery is still live"
+                )
+            else:
+                _retire_unmounted_writable_quota_intent_without_root(root)
+        except BaseException as error:
+            quota_cleanup_error = error
+    retained = session.get("acquisition_retained")
+    if quota_cleanup_error is not None:
+        if isinstance(retained, dict):
+            retained["phase"] = "quota-unresolved"
+        _STRICT_SESSION = session
+        raise AssertionError(
+            "strict registry acquisition failed and writable quota recovery "
+            "is incomplete; watchdog authority retained: "
+            f"{quota_cleanup_error}"
+        ) from cause
     watchdog_failures = _retire_registry_watchdog_handles(
         session, terminate=True
     )
-    retained = session.get("acquisition_retained")
     if watchdog_failures:
         if isinstance(retained, dict):
             retained["phase"] = "watchdog-unresolved"
@@ -18769,6 +22912,20 @@ def _consume_retained_registry_acquisition(
     session: dict[str, object],
 ) -> None:
     global _STRICT_BACKEND_VALIDATED, _STRICT_SESSION
+    root = session.get("root")
+    controller_path = session.get("controller_path")
+    if isinstance(root, Path) and _writable_quota_manifest_path(root).exists():
+        if (
+            isinstance(controller_path, Path)
+            and _registry_watchdog_is_ready_for_quota_recovery(session)
+        ):
+            _invoke_root_quota_operation(controller_path, "destroy", root)
+        elif _registry_watchdog_recovery_may_still_run(session):
+            raise AssertionError(
+                "strict retained quota watchdog recovery is still live"
+            )
+        else:
+            _retire_unmounted_writable_quota_intent_without_root(root)
     watchdog_failures = _retire_registry_watchdog_handles(
         session, terminate=True
     )
@@ -18838,8 +22995,10 @@ def _initialize_bound_registry_acquisition(
             raise AssertionError("strict registry acquisition binding is malformed")
         entries = root / "entries"
         control = root / "trusted-control"
-        resources = root / "resources"
-        tombstones = root / ".tombstones"
+        quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+        resources = quota / "resources"
+        fixtures = quota / "fixtures"
+        tombstones = quota / ".tombstones"
         controller_path = (
             control
             / _TRUSTED_CONTENT_RELATIVE_ROOT
@@ -18868,7 +23027,9 @@ def _initialize_bound_registry_acquisition(
                 },
                 "root": root,
                 "entries": entries,
+                "quota": quota,
                 "resources": resources,
+                "fixtures": fixtures,
                 "tombstones": tombstones,
                 "controller_path": controller_path,
                 "token": token,
@@ -18879,10 +23040,38 @@ def _initialize_bound_registry_acquisition(
                 "watchdog_token": watchdog_token,
             }
         )
+        quota_intent = _prepare_writable_quota_intent(
+            root,
+            runner_uid=os.getuid(),
+            runner_gid=os.getgid(),
+            watchdog_token=watchdog_token,
+        )
+        session["quota_binding"] = quota_intent
         _STRICT_BACKEND_VALIDATED = False
         _start_registry_watchdog(session)
         with _registry_session_gate(exclusive=True, session=session):
             _arm_registry_watchdog_owner_loss_authority(session)
+        _invoke_root_quota_operation(controller_path, "create", root)
+        (
+            selected_quota,
+            selected_resources,
+            selected_fixtures,
+            selected_tombstones,
+            quota_binding,
+        ) = _validated_writable_quota_paths(
+            root,
+            target_gid=int(realm["gid"]),
+        )
+        if (
+            selected_quota != quota
+            or selected_resources != resources
+            or selected_fixtures != fixtures
+            or selected_tombstones != tombstones
+        ):
+            raise AssertionError(
+                "strict writable quota path binding changed"
+            )
+        session["quota_binding"] = quota_binding
         selected_session = _active_strict_session()
     except BaseException as acquisition_error:
         _settle_failed_registry_acquisition(session, acquisition_error)
@@ -19119,6 +23308,18 @@ def _close_registry_through_watchdog(
         or process.stdout is None
     ):
         raise AssertionError("strict registry watchdog close state is malformed")
+    fixtures = session.get("fixtures")
+    if not isinstance(fixtures, Path):
+        raise AssertionError("strict writable fixture quota is malformed")
+    retained_fixtures = [
+        path
+        for path in _REGISTERED_FIXTURE_ROOTS
+        if path == fixtures or fixtures in path.parents
+    ]
+    if retained_fixtures:
+        raise AssertionError(
+            "strict writable fixture recovery fences remain registered"
+        )
     session["watchdog_closing"] = True
     stop_event.set()
     heartbeat.join(timeout=_STRICT_WATCHDOG_HEARTBEAT_SECONDS * 2)
@@ -19135,19 +23336,13 @@ def _close_registry_through_watchdog(
             "result",
         )
         process.wait(timeout=CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS)
-        expected_prefix = _WATCHDOG_RESULT_PREFIX.encode("ascii")
-        if not result_line.startswith(expected_prefix):
-            raise AssertionError("strict registry watchdog result prefix is invalid")
-        result = json.loads(result_line[len(expected_prefix) :])
-        if (
-            type(result) is not dict
-            or result.get("status") != "complete"
-            or result.get("token") != watchdog_token
-            or process.returncode != 0
-        ):
+        result = _validated_watchdog_completion_line(
+            result_line, watchdog_token, "drain-request"
+        )
+        if process.returncode != 0:
             raise AssertionError(
                 "strict registry watchdog cleanup was incomplete: "
-                f"{result.get('error') if isinstance(result, dict) else 'invalid'}"
+                f"{result.get('error', 'invalid')}"
             )
     except BaseException as error:
         cleanup_failures = _retire_registry_watchdog_handles(
@@ -19229,49 +23424,88 @@ def _cleanup_orphan_resource_roots(
         return
     if not isinstance(resources, Path):
         raise AssertionError("strict resource container is malformed")
-    registered_identities = {
-        (
-            int(document["execution_root"]["device"]),
-            int(document["execution_root"]["inode"]),
-        )
-        for document in documents
-        if document.get("cleanup_execution_root") is True
-        and isinstance(document.get("execution_root"), dict)
-    }
+    registered_documents: dict[tuple[int, int], Mapping[str, object]] = {}
+    for document in documents:
+        binding = document.get("execution_root")
+        if (
+            document.get("cleanup_execution_root") is True
+            and document.get("cleanup_kind")
+            == _STRICT_QUOTA_RESOURCE_CLEANUP_KIND
+            and isinstance(binding, dict)
+        ):
+            identity = (binding.get("device"), binding.get("inode"))
+            if (
+                type(identity[0]) is not int
+                or type(identity[1]) is not int
+                or identity in registered_documents
+            ):
+                raise AssertionError(
+                    "strict resource registry identity is ambiguous"
+                )
+            registered_documents[(int(identity[0]), int(identity[1]))] = document
     try:
-        children = list(resources.iterdir())
+        children = os.scandir(resources)
     except OSError as error:
         raise AssertionError("strict resource container is unreadable") from error
-    for child in children:
-        try:
-            metadata = child.lstat()
-            contents = list(child.iterdir())
-        except OSError as error:
-            raise AssertionError(
-                "strict orphan resource root is unreadable"
-            ) from error
-        identity = (metadata.st_dev, metadata.st_ino)
-        if identity in registered_identities:
-            raise AssertionError(
-                "strict closed resource root still exists in its container"
+    observed = 0
+    with children:
+        for entry in children:
+            observed += 1
+            if observed > _STRICT_WRITABLE_QUOTA_INODES:
+                raise AssertionError(
+                    "strict resource container entry limit was exceeded"
+                )
+            child = resources / entry.name
+            if not entry.name or entry.name in (".", "..") or "/" in entry.name:
+                raise AssertionError(
+                    "strict resource container entry name is invalid"
+                )
+            try:
+                metadata = child.lstat()
+                mount_id = _strict_writable_root_mount_binding(child)
+            except OSError as error:
+                raise AssertionError(
+                    "strict orphan resource root is unreadable"
+                ) from error
+            identity = (metadata.st_dev, metadata.st_ino)
+            document = registered_documents.get(identity)
+            if document is not None:
+                if (
+                    document.get("state") != "closed"
+                    or document.get("cleanup_kind")
+                    != _STRICT_QUOTA_RESOURCE_CLEANUP_KIND
+                    or document.get("execution_root_deleted")
+                    != _quota_disposable_resource_receipt(document)
+                ):
+                    raise AssertionError(
+                        "strict closed resource root has no disposable proof"
+                    )
+                continue
+            quota_binding = session.get("quota_binding")
+            target_uid = session.get("target_uid")
+            access_policy = (
+                metadata.st_uid,
+                metadata.st_gid,
+                stat.S_IMODE(metadata.st_mode),
             )
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o700
-            or child.resolve(strict=True) != child
-            or contents
-        ):
-            raise AssertionError(
-                "strict unregistered resource root is not an empty owner-only directory"
-            )
-        try:
-            child.rmdir()
-        except OSError as error:
-            raise AssertionError(
-                "strict orphan resource root cannot be removed"
-            ) from error
-    _fsync_directory(resources)
+            if (
+                type(quota_binding) is not dict
+                or quota_binding.get("state") != "active"
+                or type(target_uid) is not int
+                or not stat.S_ISDIR(metadata.st_mode)
+                or child.resolve(strict=True) != child
+                or metadata.st_dev != quota_binding.get("mounted_device")
+                or mount_id != quota_binding.get("mount_id")
+                or access_policy
+                not in {
+                    (os.getuid(), os.getgid(), 0o700),
+                    (os.getuid(), target_uid, 0o710),
+                }
+            ):
+                raise AssertionError(
+                    "strict unregistered resource root is not a safe "
+                    "quota-disposable directory"
+                )
 
 
 def _close_trusted_isolation_chains_under_gate(
@@ -19436,18 +23670,62 @@ def _close_trusted_isolation_chains_under_gate(
     final_documents = [
         _load_chain_registry_entry(entry_path) for entry_path in final_entries
     ]
-    _cleanup_orphan_resource_roots(session, final_documents)
-    tombstones = session.get("tombstones")
-    if not isinstance(tombstones, Path):
-        raise AssertionError("strict isolation tombstone vault is malformed")
-    _invoke_root_tree_operation(
-        controller_path,
-        "own-root",
-        tombstones,
-        os.getuid(),
-        os.getgid(),
-        "isolation-vault-release",
-    )
+    current_quota_binding = _load_writable_quota_binding(root)
+    if current_quota_binding.get("state") == "active":
+        quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
+        if _strict_exact_mount_record(quota) is None:
+            (
+                quota,
+                resources,
+                fixtures,
+                tombstones,
+                current_quota_binding,
+            ) = _validated_active_unmounted_quota_window(
+                root, current_quota_binding
+            )
+            session.update(
+                {
+                    "quota": quota,
+                    "resources": resources,
+                    "fixtures": fixtures,
+                    "tombstones": tombstones,
+                    "quota_binding": current_quota_binding,
+                }
+            )
+        else:
+            session["quota_binding"] = current_quota_binding
+            _cleanup_orphan_resource_roots(session, final_documents)
+            tombstones = session.get("tombstones")
+            if not isinstance(tombstones, Path):
+                raise AssertionError(
+                    "strict isolation tombstone vault is malformed"
+                )
+            _invoke_root_tree_operation(
+                controller_path,
+                "own-root",
+                tombstones,
+                os.getuid(),
+                os.getgid(),
+                "isolation-vault-release",
+            )
+    elif current_quota_binding.get("state") not in (
+        "intended",
+        "unmounted",
+    ):
+        raise AssertionError(
+            "strict writable quota cleanup state is malformed"
+        )
+    _invoke_root_quota_operation(controller_path, "destroy", root)
+    quota_binding = _load_writable_quota_binding(root)
+    quota = session.get("quota")
+    if (
+        quota_binding.get("state") != "unmounted"
+        or not isinstance(quota, Path)
+        or _strict_exact_mount_record(quota) is not None
+    ):
+        raise AssertionError(
+            "strict writable quota was not durably unmounted"
+        )
     try:
         shutil.rmtree(root)
     except OSError as error:
@@ -19503,6 +23781,74 @@ def _protect_strict_checkout_boundaries() -> None:
         raise AssertionError("trusted support source identity is not stable")
 
 
+def _revalidate_registered_fixture_root(
+    root: Path, binding: Mapping[str, object]
+) -> None:
+    expected_fields = {
+        "device",
+        "inode",
+        "parent_device",
+        "parent_inode",
+        "quota_device",
+        "quota_mount_id",
+        "runner_uid",
+        "runner_gid",
+        "target_uid",
+        "target_gid",
+    }
+    if (
+        type(binding) is not dict
+        or set(binding) != expected_fields
+        or any(type(binding.get(field)) is not int for field in expected_fields)
+    ):
+        raise AssertionError("strict candidate fixture binding is malformed")
+    session = _current_strict_session_unchecked()
+    fixtures = session.get("fixtures")
+    quota_binding = session.get("quota_binding")
+    if (
+        not isinstance(fixtures, Path)
+        or type(quota_binding) is not dict
+        or quota_binding.get("state") != "active"
+        or quota_binding.get("mounted_device") != binding["quota_device"]
+        or quota_binding.get("mount_id") != binding["quota_mount_id"]
+    ):
+        raise AssertionError("strict candidate fixture quota binding changed")
+    try:
+        resolved = root.resolve(strict=True)
+        metadata = root.lstat()
+        parent_metadata = fixtures.lstat()
+        mount_id = _strict_writable_root_mount_binding(root)
+    except OSError as error:
+        raise AssertionError("strict candidate fixture root is unreadable") from error
+    access_policy = (
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+    )
+    allowed_access_policies = {
+        (binding["runner_uid"], binding["runner_gid"], 0o700),
+        (binding["runner_uid"], binding["target_gid"], 0o2770),
+        (binding["target_uid"], binding["target_gid"], 0o700),
+    }
+    if (
+        resolved != root
+        or root.parent != fixtures
+        or not stat.S_ISDIR(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino)
+        != (binding["device"], binding["inode"])
+        or (parent_metadata.st_dev, parent_metadata.st_ino)
+        != (binding["parent_device"], binding["parent_inode"])
+        or metadata.st_dev != binding["quota_device"]
+        or parent_metadata.st_dev != binding["quota_device"]
+        or mount_id != binding["quota_mount_id"]
+        or access_policy not in allowed_access_policies
+    ):
+        raise AssertionError(
+            "strict candidate fixture identity, containment, backing, or "
+            "access policy changed"
+        )
+
+
 def _registered_fixture_root(path: Path) -> Path:
     resolved = path.resolve(strict=True)
     matches = [
@@ -19515,9 +23861,9 @@ def _registered_fixture_root(path: Path) -> Path:
             "strict candidate writable path is outside a registered fixture root"
         )
     root = matches[0]
-    metadata = root.lstat()
-    if (metadata.st_dev, metadata.st_ino) != _REGISTERED_FIXTURE_ROOTS[root]:
-        raise AssertionError("strict candidate fixture root identity changed")
+    _revalidate_registered_fixture_root(
+        root, _REGISTERED_FIXTURE_ROOTS[root]
+    )
     return root
 
 
@@ -19933,23 +24279,29 @@ def _prepare_isolation_resource_ancestors(
     session: Mapping[str, object],
 ) -> None:
     root = session.get("root")
+    quota = session.get("quota")
     resources = session.get("resources")
+    fixtures = session.get("fixtures")
     tombstones = session.get("tombstones")
     entries = session.get("entries")
     controller_path = session.get("controller_path")
     realm_gid = int(_strict_realm()["gid"])
     if (
         not isinstance(root, Path)
+        or not isinstance(quota, Path)
         or not isinstance(resources, Path)
+        or not isinstance(fixtures, Path)
         or not isinstance(tombstones, Path)
         or not isinstance(entries, Path)
         or not isinstance(controller_path, Path)
-        or resources.parent != root
-        or tombstones.parent != root
+        or quota.parent != root
+        or resources.parent != quota
+        or fixtures.parent != quota
+        or tombstones.parent != quota
         or entries.parent != root
     ):
         raise AssertionError("strict isolation resource ancestors are malformed")
-    for protected in (entries, root / "trusted-control"):
+    for protected in (entries, root / "trusted-control", quota, fixtures):
         metadata = protected.lstat()
         if (
             not stat.S_ISDIR(metadata.st_mode)
@@ -20150,6 +24502,7 @@ def _execution_snapshot(
                     target_uid,
                     execution_root=execution_root,
                     cleanup_execution_root=True,
+                    cleanup_kind=_STRICT_QUOTA_RESOURCE_CLEANUP_KIND,
                     session_id=resource_session_id,
                     publication_nonce=resource_publication_nonce,
                     published_callback=mark_resource_entry_owned,
@@ -20168,6 +24521,9 @@ def _execution_snapshot(
                                 publication_nonce=resource_publication_nonce,
                                 execution_root_binding=resource_root_binding,
                                 cleanup_execution_root=True,
+                                cleanup_kind=(
+                                    _STRICT_QUOTA_RESOURCE_CLEANUP_KIND
+                                ),
                             )
                         )
                     except BaseException as ownership_error:
@@ -20188,7 +24544,48 @@ def _execution_snapshot(
                             f"recovery was incomplete: {recovery_error}"
                         ) from registration_error
                 else:
-                    shutil.rmtree(execution_root)
+                    try:
+                        execution_root.rmdir()
+                    except OSError as retirement_error:
+                        if retirement_error.errno not in (
+                            errno.ENOTEMPTY,
+                            errno.EEXIST,
+                        ):
+                            raise AssertionError(
+                                "strict execution resource publication failed: "
+                                f"{registration_error}; empty-root retirement "
+                                f"was incomplete: {retirement_error}"
+                            ) from registration_error
+                        retained_binding = _execution_root_binding(
+                            execution_root
+                        )
+                        retained_metadata = execution_root.lstat()
+                        quota_binding = session.get("quota_binding")
+                        retained_is_quota_bound = (
+                            resource_root_binding is not None
+                            and retained_binding == resource_root_binding
+                            and execution_root.parent == resource_container
+                            and type(quota_binding) is dict
+                            and quota_binding.get("state") == "active"
+                            and retained_metadata.st_dev
+                            == quota_binding.get("mounted_device")
+                            and _strict_writable_root_mount_binding(
+                                execution_root
+                            )
+                            == quota_binding.get("mount_id")
+                            and (
+                                retained_metadata.st_uid,
+                                retained_metadata.st_gid,
+                                stat.S_IMODE(retained_metadata.st_mode),
+                            )
+                            == (os.getuid(), os.getgid(), 0o700)
+                        )
+                        if not retained_is_quota_bound:
+                            raise AssertionError(
+                                "strict execution resource publication failed: "
+                                f"{registration_error}; retained quota root "
+                                "identity or access policy changed"
+                            ) from registration_error
                 raise
         else:
             temporary = tempfile.TemporaryDirectory(
@@ -20541,6 +24938,9 @@ def _invoke_strict_controller(
     writable_root_bindings = _strict_writable_root_bindings(
         execution_root, tuple(Path(path) for path in writable_roots)
     )
+    aggregate_writable_device = _aggregate_writable_device_binding(
+        _active_strict_session(), writable_root_bindings
+    )
     read_root_bindings = _strict_host_read_root_bindings(
         exact_interpreter_binding,
         int(realm["uid"]),
@@ -20589,6 +24989,7 @@ def _invoke_strict_controller(
         "candidate_argv": exact_candidate_argv,
         "candidate_interpreter": exact_interpreter_binding,
         "writable_roots": writable_root_bindings,
+        "aggregate_writable_device": aggregate_writable_device,
         "read_roots": read_root_bindings,
         "host_mount_namespace": host_mount_namespace,
         "host_ipc_namespace": host_ipc_namespace,
@@ -20634,7 +25035,7 @@ def _invoke_strict_controller(
             str(config_path),
         ],
         timeout=(
-            timeout_seconds + CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS + 5
+            timeout_seconds + _ROOT_CONTROLLER_CLEANUP_RESERVE_SECONDS
             if outer_timeout_seconds is None
             else outer_timeout_seconds
         ),
@@ -20669,6 +25070,7 @@ def _invoke_registered_session_cleanup(
             token,
         ],
         recovery_broker=True,
+        timeout=_REGISTERED_RECOVERY_BROKER_TIMEOUT_SECONDS,
     )
     expected_prefix = _ROOT_CLEANUP_RECEIPT_PREFIX.encode("ascii")
     if not output.startswith(expected_prefix) or output.count(b"\n") != 1:
@@ -21846,6 +26248,132 @@ def _probe_independent_outer_owner_fault(
         temporary.cleanup()
 
 
+def _validate_strict_inner_controller_fault_result(
+    snapshot: Mapping[str, object],
+    *,
+    fault_marker: Path,
+    fault_point: str,
+    session_id: str,
+) -> None:
+    if fault_marker.exists():
+        raise AssertionError(
+            "strict root wrapper fault probe crossed the candidate barrier"
+        )
+    handshake_path = snapshot.get("handshake_path")
+    if not isinstance(handshake_path, Path):
+        raise AssertionError("strict fault probe handshake path is malformed")
+    handshake = _read_root_controller_handshake(handshake_path)
+    resource_scope = _validated_strict_inner_fault_scope(
+        handshake, fault_point
+    )
+    expected_phase = (
+        "controller-bound"
+        if "before-handshake" in fault_point
+        else "wrapper-bound"
+    )
+    if handshake.get("phase") != expected_phase:
+        raise AssertionError("strict fault probe handshake phase is wrong")
+    session = _active_strict_session()
+    entries = session.get("entries")
+    if not isinstance(entries, Path):
+        raise AssertionError("strict fault probe registry is malformed")
+    document = _load_chain_registry_entry(
+        entries / f"chain-{session_id}.json"
+    )
+    outer = document.get("outer")
+    if (
+        document.get("state") != "closed"
+        or type(outer) is not list
+        or len(outer) != 4
+        or any(type(value) is not int for value in outer)
+        or _host_session_inventory(outer[3])
+        or not _strict_exact_owner_is_terminal(
+            _parse_process_identity_document(
+                handshake.get("controller"), "fault controller"
+            )
+        )
+    ):
+        raise AssertionError(
+            "strict root wrapper fault process cleanup is incomplete"
+        )
+    deadline = time.monotonic() + _STRICT_WATCHDOG_TIMEOUT_SECONDS
+    if _query_systemd_scope_lifecycle(
+        str(resource_scope["unit"]), deadline=deadline
+    ) is not None or _bound_systemd_scope_present(
+        resource_scope, _STRICT_SYSTEMD_CGROUP_ROOT
+    ):
+        raise AssertionError(
+            "strict root wrapper fault scope cleanup is incomplete"
+        )
+
+
+def _exercise_strict_inner_controller_fault(
+    candidate_root: Path, candidate_sha: str, fault_point: str
+) -> None:
+    fault_session_id = uuid.uuid4().hex
+    fault_marker: Path | None = None
+    with _execution_snapshot(
+        candidate_root,
+        candidate_sha,
+        probe_source=(
+            b"from pathlib import Path\n"
+            b"import sys\n"
+            b"Path(sys.argv[1]).write_text('target-active\\n', encoding='ascii')\n"
+        ),
+    ) as snapshot:
+        candidate_paths = snapshot["candidate_paths"]
+        runtime_root = snapshot["runtime_root"]
+        if not isinstance(candidate_paths, dict) or not isinstance(runtime_root, Path):
+            raise AssertionError("strict fault probe snapshot is malformed")
+        probe_path = Path(next(iter(candidate_paths.values())))
+        fault_marker = runtime_root / "target-active"
+        environment = _closed_candidate_environment(
+            None, home=runtime_root, temporary_root=runtime_root
+        )
+        try:
+            _invoke_strict_controller(
+                snapshot,
+                [
+                    str(_STRICT_PRIMITIVES["python"]),
+                    "-I",
+                    "-B",
+                    "-S",
+                    str(probe_path),
+                    str(fault_marker),
+                ],
+                environment,
+                runtime_root,
+                b"",
+                timeout_seconds=1.0,
+                trusted_fault_point=fault_point,
+                outer_timeout_seconds=0.5,
+                registered_session_id=fault_session_id,
+            )
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("strict root wrapper fault probe unexpectedly passed")
+        _validate_strict_inner_controller_fault_result(
+            snapshot,
+            fault_marker=fault_marker,
+            fault_point=fault_point,
+            session_id=fault_session_id,
+        )
+    if fault_marker is None or _candidate_uid_inventory(
+        int(_strict_realm()["uid"])
+    ):
+        raise AssertionError("strict root wrapper fault probe left a process")
+
+
+def _exercise_strict_inner_controller_fault_matrix(
+    candidate_root: Path, candidate_sha: str
+) -> None:
+    for fault_point in _strict_inner_controller_fault_matrix():
+        _exercise_strict_inner_controller_fault(
+            candidate_root, candidate_sha, fault_point
+        )
+
+
 def _ensure_strict_backend() -> None:
     global _STRICT_BACKEND_VALIDATED
     strict_isolation_platform_preflight()
@@ -21930,48 +26458,7 @@ def _ensure_strict_backend() -> None:
             )
         if _candidate_uid_inventory(int(_strict_realm()["uid"])):
             raise AssertionError("strict candidate live probe left a process")
-    for fault_point in (
-        "after-wrapper-popen-before-handshake-sigkill",
-        "after-wrapper-popen-before-handshake-sigstop",
-        "after-wrapper-bound-before-barrier-sigkill",
-        "after-wrapper-bound-before-barrier-sigstop",
-    ):
-        with _execution_snapshot(
-            candidate_root,
-            candidate_sha,
-            probe_source=b"raise SystemExit(0)\n",
-        ) as snapshot:
-            candidate_paths = snapshot["candidate_paths"]
-            runtime_root = snapshot["runtime_root"]
-            if not isinstance(candidate_paths, dict) or not isinstance(runtime_root, Path):
-                raise AssertionError("strict fault probe snapshot is malformed")
-            probe_path = Path(next(iter(candidate_paths.values())))
-            environment = _closed_candidate_environment(
-                None, home=runtime_root, temporary_root=runtime_root
-            )
-            try:
-                _invoke_strict_controller(
-                    snapshot,
-                    [
-                        str(_STRICT_PRIMITIVES["python"]),
-                        "-I",
-                        "-B",
-                        "-S",
-                        str(probe_path),
-                    ],
-                    environment,
-                    runtime_root,
-                    b"",
-                    timeout_seconds=1.0,
-                    trusted_fault_point=fault_point,
-                    outer_timeout_seconds=0.5,
-                )
-            except AssertionError:
-                pass
-            else:
-                raise AssertionError("strict root wrapper fault probe unexpectedly passed")
-        if _candidate_uid_inventory(int(_strict_realm()["uid"])):
-            raise AssertionError("strict root wrapper fault probe left a process")
+    _exercise_strict_inner_controller_fault_matrix(candidate_root, candidate_sha)
     for boundary in (
         "after-outer-popen",
         "after-outer-bound",
@@ -21987,6 +26474,10 @@ def _ensure_strict_backend() -> None:
                 candidate_sha=candidate_sha,
             )
     _STRICT_BACKEND_VALIDATED = True
+
+
+def _strict_inner_controller_fault_matrix() -> tuple[str, ...]:
+    return _INNER_CONTROLLER_FAULT_POINTS
 
 
 def trusted_isolation_child_environment() -> dict[str, str]:
@@ -22486,6 +26977,8 @@ if __name__ == "__main__":
         raise SystemExit(_root_uid_cleanup_main(sys.argv[2]))
     if len(sys.argv) == 14 and sys.argv[1] == "--isolation-tree":
         raise SystemExit(_root_tree_main(sys.argv[2:]))
+    if len(sys.argv) == 10 and sys.argv[1] == "--isolation-quota":
+        raise SystemExit(_root_quota_main(sys.argv[2:]))
     if len(sys.argv) == 17 and sys.argv[1] == "--isolation-seal":
         raise SystemExit(_root_seal_execution_root_main(sys.argv[2:]))
     if len(sys.argv) == 15 and sys.argv[1] == "--isolation-owner-loss-arm":

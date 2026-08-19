@@ -156,6 +156,34 @@ evaluation. Self-hosted, shared-kernel, non-Linux, and direct harness launches
 cannot establish this workflow precondition and fail closed when the host
 still exposes a piped handler.
 
+The protected strict job is pinned to GitHub-hosted `ubuntu-24.04` and requires
+the host system manager exposed by absolute `/usr/bin/systemd-run` and
+`/usr/bin/systemctl`. Both binaries must return bounded, ASCII `--version`
+output with exact systemd major version 255 before any candidate scope is
+started. The corresponding runtime profile is
+`systemd-v255-cgroup-v2-v1`: `/sys/fs/cgroup` must be one kernel-authenticated,
+pure cgroup-v2 hierarchy, and the system manager must accept a transient scope
+with fixed memory, swap, task, and CPU limits plus accounting and group-kill
+properties. The memory contract uses a 768 MiB `MemoryHigh` pressure boundary
+under the fixed 1 GiB `MemoryMax` hard cap. The controller reads the manager
+properties, process membership, kernel cgroup identity, and limit files back
+before releasing the candidate barrier. It also requires the unit and bound
+leaf to disappear during bounded cleanup. A missing manager, version drift,
+hybrid or legacy cgroup hierarchy, property drift, unavailable controller,
+unreadable authority, or incomplete unit collection fails closed; there is no
+direct-cgroup or skip fallback.
+`ubuntu-24.04` is therefore a deployment prerequisite, not proof by label: each
+run must still pass these live checks on its disposable VM.
+
+Before exposing any candidate-writable path, the trusted root broker must also
+create and verify one executable `tmpfs` backing with fixed 64 MiB and 8,192
+inode ceilings. The execution root, runtime workspace, fixtures, and retained
+tombstones must all resolve to that same mounted device, while registry control
+state remains outside it. Normal completion and owner-loss recovery both require
+an ordinary verified unmount so hostile candidate trees are discarded as one
+bounded quota domain. Mount, capacity, backing-device, lifecycle, or cleanup
+drift fails closed; there is no unquotaed host-filesystem or skip fallback.
+
 The root bootstrap independently rejects every `|...` handler before it
 signals readiness or enters the candidate credential boundary because Linux
 does not enforce `RLIMIT_CORE` for core dumps delivered to a userspace pipe.

@@ -12,7 +12,7 @@ import io
 import importlib.abc
 import importlib.util
 import inspect
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import json
 import linecache
 import math
@@ -1689,6 +1689,33 @@ def _load_trusted_candidate_support():
 
 
 _CANDIDATE_SUPPORT = _load_trusted_candidate_support()
+
+
+def _watchdog_completion_line(
+    token: str, reason: str, *, elapsed_ns: int = 0
+) -> bytes:
+    result = {
+        "status": "complete",
+        "token": token,
+        "recovery": {
+            "direct_opt_root_count": 0,
+            "direct_opt_root_sha256": hashlib.sha256(b"[]").hexdigest(),
+            "direct_opt_root": None,
+        },
+        "terminal": {
+            "reason": reason,
+            "elapsed_ns": elapsed_ns,
+            "heartbeat_timeout_ns": int(
+                _CANDIDATE_SUPPORT._STRICT_WATCHDOG_TIMEOUT_SECONDS
+                * 1_000_000_000
+            ),
+        },
+    }
+    return (
+        _CANDIDATE_SUPPORT._WATCHDOG_RESULT_PREFIX
+        + json.dumps(result, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
 
 
 def distribution_contract_context(
@@ -4664,6 +4691,77 @@ def _validate_strict_live_runner_temp_access_policy(
     ) from None
 
 
+def _validated_systemd_live_metrics(
+    value: object, *, session_id: str, kind: str
+) -> dict[str, object]:
+    common = {"kind", "unit", "control_group", "caps"}
+    fields = {
+        "process-cpu": {
+            "nproc_soft",
+            "nproc_hard",
+            "forked",
+            "pids_max_delta",
+            "affinity_cpus",
+            "nr_throttled_delta",
+        },
+        "memory": {
+            "workers",
+            "bytes_per_worker",
+            "memory_high_delta",
+            "memory_max_delta",
+            "memory_oom_delta",
+            "memory_oom_kill_delta",
+        },
+    }
+    expected = fields.get(kind)
+    unit = f"required-ci-candidate-{session_id}.scope"
+    if type(value) is not dict or expected is None or set(value) != common | expected:
+        raise AssertionError("strict systemd live metrics are malformed")
+    control_group = value.get("control_group")
+    path = PurePosixPath(control_group) if type(control_group) is str else None
+    if (
+        value.get("kind") != kind
+        or value.get("unit") != unit
+        or path is None
+        or not str(control_group).startswith("/")
+        or str(path) != control_group
+        or path.name != unit
+        or value.get("caps")
+        != {
+            "cpu.max": "200000 100000",
+            "memory.high": "805306368",
+            "memory.max": "1073741824",
+            "memory.swap.max": "0",
+            "pids.max": "64",
+        }
+        or any(type(value.get(name)) is not int for name in expected)
+    ):
+        raise AssertionError("strict systemd live metrics changed")
+    if kind == "process-cpu":
+        if (
+            value["nproc_soft"] <= 64
+            or value["nproc_hard"] <= 64
+            or not 1 <= value["forked"] <= 64
+            or value["pids_max_delta"] <= 0
+            or value["affinity_cpus"] < 3
+            or value["nr_throttled_delta"] <= 0
+        ):
+            raise AssertionError("strict process/CPU aggregate proof failed")
+    elif (
+        value["workers"] < 2
+        or not 0 < value["bytes_per_worker"] < 805306368
+        or not 805306368
+        < value["workers"] * value["bytes_per_worker"]
+        < 1073741824
+        or value["memory_high_delta"] <= 0
+        or value["memory_max_delta"] != 0
+        or value["memory_oom_delta"] != 0
+        or value["memory_oom_kill_delta"] != 0
+    ):
+        raise AssertionError("strict memory aggregate proof failed")
+    return dict(value)
+
+
 def _strict_runtime_live_main() -> int:
     runner_output = io.StringIO()
     try:
@@ -5546,8 +5644,8 @@ def _validate_test_job(
     runs_key, runs_value, runs_line, runs_block = properties[0]
     if runs_key != "runs-on" or len(runs_block) != 1:
         raise AssertionError("test job runner must be a scalar")
-    if _plain_scalar(runs_value, runs_line) != "ubuntu-latest":
-        raise AssertionError("test job must run on ubuntu-latest")
+    if _plain_scalar(runs_value, runs_line) != "ubuntu-24.04":
+        raise AssertionError("test job must run on ubuntu-24.04")
 
     timeout_key, timeout_value, timeout_line, timeout_block = properties[1]
     if (
@@ -6899,37 +6997,6 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
             _finish_strict_live_cleanup([], b"core\n")
         revalidate.assert_called_once_with(b"core\n")
 
-        live_source = inspect.getsource(
-            TrustedCandidateTestSupervisorRegressionTests.
-            _exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read
-        )
-        live_tree = ast.parse(textwrap.dedent(live_source))
-        live_function = live_tree.body[0]
-        self.assertIsInstance(live_function, ast.FunctionDef)
-        finish_statements = [
-            node
-            for node in ast.walk(live_function)
-            if isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "_finish_strict_live_cleanup"
-        ]
-        self.assertEqual(len(finish_statements), 1)
-        finish_statement = finish_statements[0]
-        finalizers = [
-            node
-            for node in ast.walk(live_function)
-            if isinstance(node, ast.Try)
-            and finish_statement in node.finalbody
-        ]
-        self.assertEqual(len(finalizers), 1)
-        self.assertIn(finalizers[0], live_function.body)
-        self.assertIs(finalizers[0].finalbody[-1], finish_statement)
-        self.assertEqual(
-            ast.unparse(finish_statement),
-            "_finish_strict_live_cleanup(cleanup_errors, core_pattern_bytes)",
-        )
-
     def test_checkout_inputs_cannot_be_smuggled_through_the_step_name(self) -> None:
         for style in ("|", ">-"):
             with self.subTest(style=style):
@@ -7065,7 +7132,7 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
             "          ref: ${{ github.sha }}\n"
             "          persist-credentials: false\n"
             "  release: # hidden from the raw-line parser\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-24.04\n"
             "    steps:\n"
             "      - run: echo publish\n"
         )
@@ -7085,7 +7152,7 @@ class WorkflowHardeningRegressionTests(unittest.TestCase):
             "jobs:\n"
             "  # release: this remains a comment\n"
             "  test: # the only real job\n"
-            "    runs-on: ubuntu-latest\n"
+            "    runs-on: ubuntu-24.04\n"
             f"    timeout-minutes: {EXPECTED_TEST_TIMEOUT_MINUTES}\n"
             "    steps:\n"
             f"{REPOSITORY_GUARD}\n"
@@ -7109,7 +7176,7 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
     def required_workflow(
         *,
         job_properties: str = "",
-        runner: str = "ubuntu-latest",
+        runner: str = "ubuntu-24.04",
         timeout_minutes: str | None = EXPECTED_TEST_TIMEOUT_MINUTES,
         trailing_steps: str = REQUIRED_EXECUTION_STEPS,
     ) -> str:
@@ -8393,6 +8460,20 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             self.assertEqual(path.stat().st_nlink, 2)
 
     def test_runner_text_in_a_fake_node_does_not_satisfy_the_contract(self) -> None:
+        self.assertEqual(
+            len(validate_required_workflow(self.required_workflow())), 2
+        )
+        for runner in (
+            "ubuntu-latest",
+            "ubuntu-22.04",
+            "${{ vars.REQUIRED_CI_RUNNER }}",
+        ):
+            with self.subTest(runner=runner), self.assertRaisesRegex(
+                AssertionError, "ubuntu-24.04"
+            ):
+                validate_required_workflow(
+                    self.required_workflow(runner=runner)
+                )
         workflow = self.required_workflow(
             job_properties=(
                 "    env:\n"
@@ -8710,6 +8791,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             side_effect=lambda value: value,
         ), mock.patch.object(
             _CANDIDATE_SUPPORT,
+            "_revalidate_aggregate_writable_device",
+            side_effect=lambda value, _bindings: value,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
             "_revalidate_strict_host_read_root_bindings",
             side_effect=lambda value: value,
         ), mock.patch.object(
@@ -8921,30 +9006,40 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "tests_run": 1,
             },
         )
-        live_source = inspect.getsource(_strict_runtime_live_main)
-        after_acquire = live_source.split(
-            "registry = _CANDIDATE_SUPPORT.trusted_isolation_chain_registry()",
-            1,
-        )[1]
-        self.assertTrue(after_acquire.lstrip().startswith("try:"))
-
-    def test_strict_live_end_to_end_composes_both_authority_checks(self) -> None:
+    def test_strict_live_end_to_end_composes_all_authority_checks(self) -> None:
         trace: list[str] = []
-        self.assertEqual(
-            CI_STRICT_RUNTIME_LIVE_TEST_METHOD,
-            "test_strict_runtime_live_end_to_end",
-        )
-        with mock.patch.object(
-            type(self),
+        helpers = (
             "_exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read",
-            side_effect=lambda: trace.append("target-access"),
-        ), mock.patch.object(
-            type(self),
             "_exercise_real_watchdog_owner_sigkill_replays_registered_live_ipc_root",
-            side_effect=lambda: trace.append("owner-sigkill-watchdog"),
-        ):
+            "_exercise_strict_systemd_scope_aggregate_limits",
+        )
+        with contextlib.ExitStack() as stack:
+            for name in helpers:
+                stack.enter_context(
+                    mock.patch.object(
+                        type(self), name, side_effect=lambda value=name: trace.append(value)
+                    )
+                )
             self.test_strict_runtime_live_end_to_end()
-        self.assertEqual(trace, ["target-access", "owner-sigkill-watchdog"])
+        self.assertEqual(tuple(trace), helpers)
+        fault_trace: list[str] = []
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_exercise_strict_inner_controller_fault",
+            side_effect=lambda _root, _sha, point: fault_trace.append(point),
+        ):
+            _CANDIDATE_SUPPORT._exercise_strict_inner_controller_fault_matrix(
+                Path("/candidate"), "a" * 40
+            )
+        self.assertEqual(
+            tuple(fault_trace),
+            (
+                "after-wrapper-popen-before-handshake-sigkill",
+                "after-wrapper-popen-before-handshake-sigstop",
+                "after-wrapper-bound-before-barrier-sigkill",
+                "after-wrapper-bound-before-barrier-sigstop",
+            ),
+        )
 
     def test_strict_live_broker_witness_path_binds_session_and_nonce(
         self,
@@ -9084,91 +9179,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 _assert_strict_live_terminal_witness_progress(
                     initial, regressed
                 )
-
-    def test_real_watchdog_owner_wrapper_forwards_publication_callback(
-        self,
-    ) -> None:
-        method_tree = ast.parse(
-            textwrap.dedent(
-                inspect.getsource(
-                    type(self)._exercise_real_watchdog_owner_sigkill_replays_registered_live_ipc_root
-                )
-            )
-        )
-        owner_source_assignments = [
-            node
-            for node in ast.walk(method_tree)
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "owner_source"
-                for target in node.targets
-            )
-        ]
-        self.assertEqual(len(owner_source_assignments), 1)
-        owner_source_call = owner_source_assignments[0].value
-        self.assertIsInstance(owner_source_call, ast.Call)
-        assert isinstance(owner_source_call, ast.Call)
-        self.assertEqual(len(owner_source_call.args), 1)
-        owner_source = textwrap.dedent(
-            ast.literal_eval(owner_source_call.args[0])
-        )
-        owner_tree = ast.parse(owner_source)
-        wrapper_nodes = [
-            node
-            for node in owner_tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "pause_before_trusted_import"
-        ]
-        self.assertEqual(len(wrapper_nodes), 1)
-
-        callback_events: list[str] = []
-        write_calls: list[tuple[Path, Mapping[str, object], bool, object]] = []
-
-        def real_write(
-            path: Path,
-            document: Mapping[str, object],
-            *,
-            create: bool,
-            published_callback: object = None,
-        ) -> str:
-            write_calls.append(
-                (path, document, create, published_callback)
-            )
-            self.assertTrue(callable(published_callback))
-            published_callback()
-            return "published"
-
-        namespace: dict[str, object] = {"real_write": real_write}
-        exec(
-            compile(
-                ast.Module(body=wrapper_nodes, type_ignores=[]),
-                "<real-watchdog-owner-wrapper>",
-                "exec",
-            ),
-            namespace,
-        )
-        wrapper = namespace["pause_before_trusted_import"]
-        self.assertTrue(callable(wrapper))
-
-        def callback() -> None:
-            callback_events.append("published")
-
-        path = Path("/registry/entries/chain-fixture.json")
-        document = {"cleanup_kind": None}
-        self.assertEqual(
-            wrapper(
-                path,
-                document,
-                create=True,
-                published_callback=callback,
-            ),
-            "published",
-        )
-        self.assertEqual(
-            write_calls,
-            [(path, document, True, callback)],
-        )
-        self.assertEqual(callback_events, ["published"])
 
     def test_strict_live_entry_rejects_skip_after_cleanup(self) -> None:
         candidate_root = Path("/candidate")
@@ -10173,91 +10183,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         run_process.assert_not_called()
         popen_process.assert_not_called()
 
-    def test_root_controller_reprobes_pidfd_before_first_child_popen(self) -> None:
-        source = inspect.getsource(_CANDIDATE_SUPPORT._root_controller_main)
-
-        self.assertLess(
-            source.index("_probe_pidfd_capability()"),
-            source.index("subprocess.Popen("),
-        )
-
-    def test_root_controller_cleanup_is_mandatory_on_every_exit(self) -> None:
-        controller_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_controller_main
-        )
-        outer_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._invoke_strict_controller
-        )
-        registered_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
-        )
-        cleanup_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._invoke_registered_session_cleanup
-        )
-        self.assertIn("finally:", controller_source)
-        self.assertIn("_root_close_candidate_realm", controller_source)
-        self.assertIn("_run_registered_sudo", outer_source)
-        self.assertIn("finally:", registered_source)
-        self.assertIn("_recover_registered_entry", registered_source)
-        self.assertIn("recovery_broker=True", cleanup_source)
-        self.assertIn("--isolation-cleanup", cleanup_source)
-
-    def test_sudo_monitor_topology_uses_a_root_identity_handshake(self) -> None:
-        binder_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._bind_root_controller_parent
-        )
-        controller_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_controller_main
-        )
-        outer_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._invoke_strict_controller
-        )
-        cleanup_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._invoke_registered_session_cleanup
-        )
-        cleanup_main_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_cleanup_main
-        )
-
-        self.assertNotIn("expected_parent_pid", binder_source)
-        self.assertNotIn("expected_parent_value", controller_source)
-        self.assertIn("_write_root_controller_handshake", controller_source)
-        self.assertIn('config.get("handshake_path")', controller_source)
-        self.assertIn('"handshake_path"', outer_source)
-        self.assertIn("_run_registered_sudo", outer_source)
-        self.assertIn("str(entry_path)", cleanup_source)
-        self.assertIn("_root_close_registered_host_session", cleanup_main_source)
-        self.assertIn("_root_close_candidate_realm", cleanup_main_source)
-
-    def test_root_cleanup_signals_only_validated_pidfds(self) -> None:
-        candidate_signal_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_signal_identity
-        )
-        root_signal_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_signal_host_identity
-        )
-
-        for source in (candidate_signal_source, root_signal_source):
-            self.assertIn("os.pidfd_open", source)
-            self.assertIn("signal.pidfd_send_signal", source)
-            self.assertNotIn("os.kill(", source)
-
-    def test_trusted_parent_holds_the_candidate_realm_through_child_exit(
-        self,
-    ) -> None:
-        supervisor_source = inspect.getsource(
-            supervise_trusted_required_ci_tests
-        )
-        close_source = inspect.getsource(
-            _close_and_verify_trusted_isolation
-        )
-
-        self.assertIn("trusted_isolation_child_environment", supervisor_source)
-        self.assertIn("pass_fds=", supervisor_source)
-        self.assertIn("finally:", supervisor_source)
-        self.assertIn("_close_and_verify_trusted_isolation", supervisor_source)
-        self.assertIn("assert_candidate_isolation_quiescent", close_source)
-
     def test_registry_watchdog_replays_on_owner_eof_or_heartbeat_timeout(
         self,
     ) -> None:
@@ -10278,7 +10203,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 readable = ([42], [], []) if failure_mode == "eof" else ([], [], [])
                 read_result = b"" if failure_mode == "eof" else b"unused"
                 captured = io.StringIO()
-                trace: list[str] = []
+                trace = []
                 clients_quiescent = False
 
                 def signal_owner(
@@ -10470,46 +10395,303 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             ),
         )
 
-    def test_registry_watchdog_is_durable_before_registry_acquisition_returns(
+    def test_watchdog_bootstrap_gate_distinguishes_all_terminal_frames(
         self,
     ) -> None:
-        acquire_source = inspect.getsource(
-            _CANDIDATE_SUPPORT.trusted_isolation_chain_registry
+        parent_identity = (62101, 701, 62101, 62101)
+        token = "a" * 32
+        cases = (
+            ("timeout", ([], [], []), None, False, 1),
+            ("read-error", ([41], [], []), OSError("injected read failure"), False, 1),
+            ("owner-eof", ([41], [], []), b"", True, 1),
+            ("controlled-cancel", ([41], [], []), b"X", False, 0),
+            ("authorized", ([41], [], []), b"G", True, 1),
         )
-        initialize_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._initialize_bound_registry_acquisition
-        )
-        watchdog_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._registry_watchdog_main
-        )
-        watchdog_replay_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._registry_watchdog_replay
-        )
-        close_source = inspect.getsource(
-            _CANDIDATE_SUPPORT.close_trusted_isolation_chains
-        )
+        for name, selected, read_result, should_replay, expected_code in cases:
+            with self.subTest(name=name):
+                gate_read_fd, gate_write_fd = os.pipe()
+                os.close(gate_write_fd)
+                selected_fds = (
+                    [gate_read_fd] if selected[0] else [],
+                    [],
+                    [],
+                )
+                read_effect = (
+                    read_result
+                    if isinstance(read_result, BaseException)
+                    else None
+                )
+                read_value = b"" if read_effect is not None else read_result
+                captured = io.StringIO()
+                trace: list[str] = []
+                try:
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT, "__name__", "__main__"
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_lock_down_registry_watchdog_process",
+                        side_effect=lambda: trace.append("lockdown"),
+                    ) as lockdown, mock.patch.object(
+                        _CANDIDATE_SUPPORT.select,
+                        "select",
+                        return_value=selected_fds,
+                    ) as select_gate, mock.patch.object(
+                        _CANDIDATE_SUPPORT.os,
+                        "read",
+                        side_effect=read_effect,
+                        return_value=read_value,
+                    ) as read_gate, mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "strict_isolation_platform_preflight",
+                        side_effect=AssertionError("injected post-gate stop"),
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_registry_watchdog_replay_until_complete",
+                        return_value=(),
+                    ) as replay, contextlib.redirect_stdout(captured):
+                        returncode = _CANDIDATE_SUPPORT._registry_watchdog_main(
+                            tuple(
+                                str(value)
+                                for value in (
+                                    *parent_identity,
+                                    token,
+                                    gate_read_fd,
+                                )
+                            )
+                        )
+                finally:
+                    try:
+                        os.close(gate_read_fd)
+                    except OSError:
+                        pass
 
-        self.assertLess(
-            initialize_source.index("_start_registry_watchdog"),
-            initialize_source.index(
-                "_arm_registry_watchdog_owner_loss_authority"
+                self.assertEqual(returncode, expected_code, captured.getvalue())
+                lockdown.assert_called_once_with()
+                select_gate.assert_called_once()
+                if name == "timeout":
+                    read_gate.assert_not_called()
+                else:
+                    read_gate.assert_called_once_with(gate_read_fd, 1)
+                if should_replay:
+                    replay.assert_called_once_with(parent_identity, None)
+                else:
+                    replay.assert_not_called()
+
+    def test_watchdog_lockdown_failure_cannot_assume_recovery_authority(
+        self,
+    ) -> None:
+        gate_read_fd, gate_write_fd = os.pipe()
+        os.close(gate_write_fd)
+        captured = io.StringIO()
+        try:
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT, "__name__", "__main__"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_lock_down_registry_watchdog_process",
+                side_effect=AssertionError("injected lockdown failure"),
+            ) as lockdown, mock.patch.object(
+                _CANDIDATE_SUPPORT.select, "select"
+            ) as select_gate, mock.patch.object(
+                _CANDIDATE_SUPPORT.os, "read"
+            ) as read_gate, mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_registry_watchdog_replay_until_complete",
+                return_value=(),
+            ) as replay, contextlib.redirect_stdout(captured):
+                returncode = _CANDIDATE_SUPPORT._registry_watchdog_main(
+                    ("62102", "702", "62102", "62102", "b" * 32, str(gate_read_fd))
+                )
+        finally:
+            try:
+                os.close(gate_read_fd)
+            except OSError:
+                pass
+
+        self.assertEqual(returncode, 1, captured.getvalue())
+        lockdown.assert_called_once_with()
+        select_gate.assert_not_called()
+        read_gate.assert_not_called()
+        replay.assert_not_called()
+
+    def test_exact_owner_terminal_state_uses_full_identity_and_pidfd(
+        self,
+    ) -> None:
+        owner = (62103, 703, 1, 62103, 62103, (501, 501, 501, 501))
+
+        def classify(
+            observed: object,
+            readable: bool,
+        ) -> bool:
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                return_value=observed,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os,
+                "pidfd_open",
+                return_value=73,
+                create=True,
+            ) as pidfd_open, mock.patch.object(
+                _CANDIDATE_SUPPORT.select,
+                "select",
+                return_value=([73], [], []) if readable else ([], [], []),
+            ) as terminal_probe, mock.patch.object(
+                _CANDIDATE_SUPPORT.signal,
+                "pidfd_send_signal",
+                create=True,
+            ) as identity_probe, mock.patch.object(
+                _CANDIDATE_SUPPORT.os, "close"
+            ) as close_descriptor:
+                result = _CANDIDATE_SUPPORT._strict_exact_owner_is_terminal(
+                    owner
+                )
+            if observed is None:
+                pidfd_open.assert_not_called()
+                terminal_probe.assert_not_called()
+                identity_probe.assert_not_called()
+                close_descriptor.assert_not_called()
+            else:
+                pidfd_open.assert_called_once_with(owner[0], 0)
+                identity_probe.assert_called_once_with(73, 0, None, 0)
+                terminal_probe.assert_called_once_with([73], [], [], 0)
+                close_descriptor.assert_called_once_with(73)
+            return result
+
+        self.assertTrue(classify(owner, True), "a zombie owner is terminal")
+        self.assertFalse(classify(owner, False), "an exact live owner is live")
+        self.assertTrue(classify(None, False), "an absent owner is terminal")
+
+        for name, replacement in (
+            ("pid-reuse", (owner[0], owner[1] + 1, *owner[2:])),
+            (
+                "metadata-replacement",
+                (owner[0], owner[1], owner[2] + 1, *owner[3:]),
             ),
-        )
-        self.assertLess(
-            initialize_source.index(
-                "_arm_registry_watchdog_owner_loss_authority"
-            ),
-            initialize_source.index("_active_strict_session"),
-        )
-        self.assertIn(
-            "return _initialize_bound_registry_acquisition", acquire_source
-        )
-        self.assertIn("select.select", watchdog_source)
-        self.assertIn("_STRICT_WATCHDOG_TIMEOUT_SECONDS", watchdog_source)
-        self.assertIn("_registry_watchdog_replay", watchdog_source)
-        self.assertIn("_watchdog_close_runner_clients", watchdog_replay_source)
-        self.assertIn("close_trusted_isolation_chains(session)", watchdog_source)
-        self.assertIn("_close_registry_through_watchdog", close_source)
+        ):
+            with self.subTest(name=name), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity",
+                return_value=replacement,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os, "pidfd_open", create=True
+            ) as pidfd_open, self.assertRaisesRegex(
+                AssertionError, "owner identity changed"
+            ):
+                _CANDIDATE_SUPPORT._strict_exact_owner_is_terminal(owner)
+            pidfd_open.assert_not_called()
+
+    def test_owner_loss_authorization_binds_entries_below_registry_fd(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry_root = (
+                Path(temporary_directory).resolve(strict=True) / "registry"
+            )
+            registry_root.mkdir(mode=0o700)
+            registry_root.chmod(0o700)
+            entries = registry_root / "entries"
+            entries.mkdir(mode=0o700)
+            entries.chmod(0o700)
+            entries_metadata = entries.lstat()
+            registry_binding = {
+                "path": str(entries),
+                "device": entries_metadata.st_dev,
+                "inode": entries_metadata.st_ino,
+                "uid": entries_metadata.st_uid,
+                "gid": entries_metadata.st_gid,
+                "mode": stat.S_IMODE(entries_metadata.st_mode),
+            }
+            entry_path = entries / f"chain-{'1' * 32}.json"
+            witnessed_namespace = {
+                "path": str(
+                    _CANDIDATE_SUPPORT._strict_live_ipc_witness_namespace_path()
+                ),
+                "device": 31,
+                "inode": 32,
+                "uid": (
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_OWNER_UID
+                ),
+                "gid": (
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_OWNER_GID
+                ),
+                "mode": (
+                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_WITNESS_DIRECTORY_MODE
+                ),
+            }
+            entry_document = {
+                "state": "deleting",
+                "execution_root_delete_nonce": "a" * 32,
+                "registry_owner_uid": os.getuid(),
+                "token": "b" * 32,
+            }
+            direct_binding = {
+                "root": None,
+                "witness": {},
+                "name": "required-ci-host-ipc-" + "c" * 32,
+                "target_gid": os.getgid(),
+                "registry": dict(registry_binding),
+            }
+            detached = registry_root / "entries-detached"
+            original_directory_binding = (
+                _CANDIDATE_SUPPORT._directory_policy_binding
+            )
+            replaced = False
+
+            def replace_entries_after_root_binding(
+                path: Path,
+                descriptor: int,
+                *,
+                description: str,
+            ) -> dict[str, object]:
+                nonlocal replaced
+                binding = original_directory_binding(
+                    path, descriptor, description=description
+                )
+                if description == "strict owner-loss registry root":
+                    entries.rename(detached)
+                    entries.mkdir(mode=0o700)
+                    entries.chmod(0o700)
+                    replaced = True
+                return binding
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_direct_opt_root_document",
+                return_value=direct_binding,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_direct_opt_root_binding_is_exact",
+                return_value=True,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_directory_policy_binding",
+                side_effect=replace_entries_after_root_binding,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_owner_loss_watchdog_token",
+                side_effect=AssertionError(
+                    "advanced beyond an unbound replacement"
+                ),
+            ) as watchdog_token, self.assertRaisesRegex(
+                AssertionError,
+                "registry entries (?:binding changed|access policy is unsafe)",
+            ):
+                _CANDIDATE_SUPPORT._root_strict_owner_loss_cleanup_authorization(
+                    entry_path,
+                    entry_document,
+                    {},
+                    registry_binding,
+                    witnessed_namespace_binding=witnessed_namespace,
+                )
+
+            self.assertTrue(replaced)
+            watchdog_token.assert_not_called()
+            self.assertEqual(
+                (detached.stat().st_dev, detached.stat().st_ino),
+                (entries_metadata.st_dev, entries_metadata.st_ino),
+            )
+            self.assertNotEqual(entries.stat().st_ino, entries_metadata.st_ino)
 
     def test_owner_loss_authority_document_schema_is_exact(self) -> None:
         runner_uid = 501
@@ -11349,60 +11531,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     os.close(namespace_fd)
                 os.close(parent_fd)
 
-    def test_watchdog_owner_pid_reuse_skips_signal_but_still_replays(self) -> None:
-        token = "e" * 32
-        registry_token = "f" * 32
-        replacement = (123, 999, 123, 123, 123, (os.getuid(),) * 4)
-        session = {
-            "environment": {
-                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_ENV: "/tmp/entries",
-                _CANDIDATE_SUPPORT._ISOLATION_REGISTRY_TOKEN_ENV: registry_token,
-            },
-            "watchdog_authorized": True,
-        }
-        input_stream = mock.Mock()
-        input_stream.fileno.return_value = 42
-        captured = io.StringIO()
-        with mock.patch.object(
-            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_active_strict_session",
-            return_value=session,
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT,
-            "_process_identity",
-            return_value=replacement,
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT, "_root_signal_host_identity"
-        ) as signal_parent, mock.patch.object(
-            _CANDIDATE_SUPPORT, "_watchdog_close_runner_clients"
-        ) as close_clients, mock.patch.object(
-            _CANDIDATE_SUPPORT, "close_trusted_isolation_chains"
-        ) as close_registry, mock.patch.object(
-            _CANDIDATE_SUPPORT.select,
-            "select",
-            return_value=([42], [], []),
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT.os, "read", return_value=b""
-        ), mock.patch.object(
-            _CANDIDATE_SUPPORT.sys, "stdin", input_stream
-        ), contextlib.redirect_stdout(captured):
-            returncode = _CANDIDATE_SUPPORT._registry_watchdog_main(
-                ("123", "456", "123", "123", token)
-            )
-
-        self.assertEqual(returncode, 0, captured.getvalue())
-        signal_parent.assert_not_called()
-        close_clients.assert_called_once_with(
-            Path("/tmp/entries"), registry_token
-        )
-        close_registry.assert_called_once_with(
-            session,
-            recovery_profile=(
-                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
-            ),
-        )
 
     def test_watchdog_owner_loss_replay_persists_until_success(self) -> None:
         parent_identity = (123, 456, 123, 123)
@@ -11870,7 +11998,73 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(read_environment.call_count, 7)
         self.assertEqual(sleep.call_count, 4)
 
-    def test_watchdog_pidfd_failure_reaps_gated_launch_by_eof(
+    def test_watchdog_completion_receipt_requires_exact_schema(self) -> None:
+        token = "f" * 32
+        prefix = _CANDIDATE_SUPPORT._WATCHDOG_RESULT_PREFIX.encode("ascii")
+        cancel_line = _watchdog_completion_line(token, "controlled-cancel")
+        cancel = json.loads(cancel_line[len(prefix) :])
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._validated_watchdog_completion_line(
+                cancel_line, token, "controlled-cancel"
+            ),
+            cancel,
+        )
+        drain = json.loads(
+            _watchdog_completion_line(
+                token, "drain-request", elapsed_ns=1
+            )[len(prefix) :]
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._validated_watchdog_completion_result(
+                drain, token, "drain-request"
+            ),
+            drain,
+        )
+        missing = object()
+        mutations = (
+            (None, "extra", True),
+            (None, "recovery", missing),
+            ("terminal", "extra", True),
+            ("terminal", "reason", "drain-request"),
+            ("terminal", "elapsed_ns", True),
+            ("terminal", "heartbeat_timeout_ns", 1),
+            ("recovery", "extra", True),
+            ("recovery", "direct_opt_root_count", True),
+            ("recovery", "direct_opt_root_sha256", "0" * 64),
+            ("recovery", "direct_opt_root", {}),
+        )
+        for section, key, replacement in mutations:
+            mutant = json.loads(json.dumps(cancel))
+            selected = mutant if section is None else mutant[section]
+            if replacement is missing:
+                selected.pop(key)
+            else:
+                selected[key] = replacement
+            with self.subTest(section=section, key=key), self.assertRaises(
+                AssertionError
+            ):
+                _CANDIDATE_SUPPORT._validated_watchdog_completion_result(
+                    mutant, token, "controlled-cancel"
+                )
+        noncanonical = (
+            prefix + json.dumps(cancel, sort_keys=True).encode("ascii") + b"\n"
+        )
+        with self.assertRaisesRegex(AssertionError, "noncanonical"):
+            _CANDIDATE_SUPPORT._validated_watchdog_completion_line(
+                noncanonical, token, "controlled-cancel"
+            )
+        for malformed in (
+            cancel_line.replace(
+                b'{"recovery":', b'{"status":"complete","recovery":', 1
+            ),
+            cancel_line.replace(b'"elapsed_ns":0', b'"elapsed_ns":0.0', 1),
+        ):
+            with self.assertRaises(AssertionError):
+                _CANDIDATE_SUPPORT._validated_watchdog_completion_line(
+                    malformed, token, "controlled-cancel"
+                )
+
+    def test_watchdog_pidfd_failure_reaps_gated_launch_by_controlled_cancel(
         self,
     ) -> None:
         real_popen = subprocess.Popen
@@ -11893,6 +12087,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             def wait(self, timeout: float | None = None) -> int:
                 self.waited = True
                 if self.gate_fd >= 0:
+                    if os.read(self.gate_fd, 2) != b"X":
+                        raise AssertionError(
+                            "watchdog controlled cancel marker is inexact"
+                        )
                     os.close(self.gate_fd)
                     self.gate_fd = -1
                 self.returncode = 0
@@ -11911,6 +12109,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             os.getpid(),
             os.getpid(),
             (os.getuid(),) * 4,
+        )
+        cancel_result = _watchdog_completion_line(
+            str(session["watchdog_token"]), "controlled-cancel"
         )
         with mock.patch.object(
             _CANDIDATE_SUPPORT,
@@ -11946,7 +12147,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "pidfd_open",
             side_effect=OSError("injected pidfd exhaustion"),
             create=True,
-        ):
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_read_watchdog_line",
+            return_value=cancel_result,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_validated_watchdog_completion_line",
+            wraps=_CANDIDATE_SUPPORT._validated_watchdog_completion_line,
+        ) as validate_completion:
             with self.assertRaisesRegex(OSError, "pidfd exhaustion"):
                 _CANDIDATE_SUPPORT._start_registry_watchdog(session)
 
@@ -11957,6 +12166,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertTrue(stderr.closed)
         self.assertNotIn("watchdog_launch", session)
         self.assertNotIn("watchdog_process", session)
+        validate_completion.assert_called_once_with(
+            cancel_result, str(session["watchdog_token"]), "controlled-cancel"
+        )
 
     def test_watchdog_popen_return_window_backfills_exact_launch_state(
         self,
@@ -11981,6 +12193,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             def wait(self, timeout: float | None = None) -> int:
                 self.waited = True
                 if self.gate_fd >= 0:
+                    if os.read(self.gate_fd, 2) != b"X":
+                        raise AssertionError(
+                            "watchdog controlled cancel marker is inexact"
+                        )
                     os.close(self.gate_fd)
                     self.gate_fd = -1
                 self.returncode = 0
@@ -11999,6 +12215,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             os.getpid(),
             os.getpid(),
             (os.getuid(),) * 4,
+        )
+        cancel_result = _watchdog_completion_line(
+            str(session["watchdog_token"]), "controlled-cancel"
         )
         function = _CANDIDATE_SUPPORT._start_registry_watchdog
         source_lines, source_start = inspect.getsourcelines(function)
@@ -12046,7 +12265,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             _CANDIDATE_SUPPORT.subprocess,
             "Popen",
             GatedFixtureProcess,
-        ):
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_read_watchdog_line",
+            return_value=cancel_result,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_validated_watchdog_completion_line",
+            wraps=_CANDIDATE_SUPPORT._validated_watchdog_completion_line,
+        ) as validate_completion:
             sys.settrace(inject_after_popen)
             try:
                 with self.assertRaisesRegex(
@@ -12062,6 +12289,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0)
         self.assertTrue(stderr.closed)
         self.assertNotIn("watchdog_launch", session)
+        validate_completion.assert_called_once_with(
+            cancel_result, str(session["watchdog_token"]), "controlled-cancel"
+        )
 
     def test_authorized_watchdog_launch_abort_uses_drain_not_owner_loss(
         self,
@@ -12100,11 +12330,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "heartbeat": None,
         }
         token = "e" * 32
-        result = (
-            _CANDIDATE_SUPPORT._WATCHDOG_RESULT_PREFIX
-            + json.dumps({"status": "complete", "token": token})
-            + "\n"
-        ).encode("ascii")
+        result = _watchdog_completion_line(
+            token, "drain-request", elapsed_ns=1
+        )
         with mock.patch.object(
             _CANDIDATE_SUPPORT.subprocess,
             "Popen",
@@ -12121,7 +12349,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             _CANDIDATE_SUPPORT,
             "_read_watchdog_line",
             return_value=result,
-        ):
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_validated_watchdog_completion_line",
+            wraps=_CANDIDATE_SUPPORT._validated_watchdog_completion_line,
+        ) as validate_completion:
             _CANDIDATE_SUPPORT._drain_authorized_watchdog_launch(
                 launch, token
             )
@@ -12129,6 +12361,71 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(process.stdin.getvalue(), b"D\n")
         self.assertEqual(process.returncode, 0)
         pidfd_signal.assert_called_once_with(42, 0, None, 0)
+        validate_completion.assert_called_once_with(
+            result, token, "drain-request"
+        )
+
+    def test_watchdog_close_accepts_exact_drain_receipt(self) -> None:
+        real_popen = subprocess.Popen
+
+        class CloseFixtureProcess(real_popen):
+            def __init__(self) -> None:
+                self.pid = 62005
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.returncode: int | None = None
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.returncode = 0
+                return 0
+
+        process = CloseFixtureProcess()
+        heartbeat = threading.Thread(target=lambda: None)
+        heartbeat.start()
+        heartbeat.join()
+        token = "9" * 32
+        session: dict[str, object] = {
+            "root": Path("/tmp/watchdog-close-fixture"),
+            "fixtures": Path("/tmp/watchdog-close-fixture/fixtures"),
+            "watchdog_process": process,
+            "watchdog_pidfd": 42,
+            "watchdog_stderr": io.BytesIO(),
+            "watchdog_stop": threading.Event(),
+            "watchdog_write_lock": threading.Lock(),
+            "watchdog_heartbeat": heartbeat,
+            "watchdog_token": token,
+        }
+        result = _watchdog_completion_line(
+            token, "drain-request", elapsed_ns=1
+        )
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess, "Popen", CloseFixtureProcess
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_REGISTERED_FIXTURE_ROOTS",
+            {},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_read_watchdog_line",
+            return_value=result,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_validated_watchdog_completion_line",
+            wraps=_CANDIDATE_SUPPORT._validated_watchdog_completion_line,
+        ) as validate_completion, mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_retire_registry_watchdog_handles",
+            return_value=[],
+        ) as retire:
+            _CANDIDATE_SUPPORT._close_registry_through_watchdog(session)
+
+        self.assertEqual(process.stdin.getvalue(), b"D\n")
+        self.assertEqual(process.returncode, 0)
+        self.assertIs(session["closed"], True)
+        retire.assert_called_once_with(session, terminate=False)
+        validate_completion.assert_called_once_with(
+            result, token, "drain-request"
+        )
 
     def test_watchdog_gate_release_is_monotonic_before_post_write_fault(
         self,
@@ -12606,6 +12903,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             heartbeat.join()
             session = {
                 "root": root,
+                "fixtures": (
+                    root
+                    / _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_DIRECTORY
+                    / "fixtures"
+                ),
                 "watchdog_process": process,
                 "watchdog_pidfd": 42,
                 "watchdog_identity": (
@@ -12660,6 +12962,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             heartbeat.join()
             session = {
                 "root": root,
+                "fixtures": (
+                    root
+                    / _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_DIRECTORY
+                    / "fixtures"
+                ),
                 "watchdog_process": process,
                 "watchdog_pidfd": 42,
                 "watchdog_identity": (
@@ -12738,23 +13045,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             restart.assert_not_called()
             close_watchdog.assert_not_called()
             synchronous_close.assert_not_called()
-
-    def test_parent_registry_exists_before_backend_or_child_environment(self) -> None:
-        supervisor_source = inspect.getsource(
-            supervise_trusted_required_ci_tests
-        )
-        backend_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._ensure_strict_backend
-        )
-
-        self.assertLess(
-            supervisor_source.index("trusted_isolation_chain_registry"),
-            supervisor_source.index("trusted_isolation_child_environment"),
-        )
-        self.assertLess(
-            backend_source.index("_active_strict_session"),
-            backend_source.index("_run_registered_sudo"),
-        )
 
     def test_normal_namespace_probe_failure_reports_sanitized_receipt(
         self,
@@ -13276,22 +13566,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
         run_child.assert_called_once()
         cleanup.assert_called_once()
-
-    def test_structure_step_does_not_request_strict_mode_without_a_registry(
-        self,
-    ) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/required-ci.yml").read_text(
-            encoding="utf-8"
-        )
-        structure_step = workflow.split(
-            "      - name: Validate Required CI structure\n", 1
-        )[1].split("      - name: Run trusted Required CI tests\n", 1)[0]
-        supervisor_source = inspect.getsource(_trusted_test_supervisor_main)
-        child_source = inspect.getsource(_trusted_test_child_main)
-
-        self.assertNotIn(REQUIRED_CI_ISOLATION_MODE_ENV, structure_step)
-        self.assertIn("_require_strict_workflow_mode", supervisor_source)
-        self.assertIn("_require_strict_workflow_mode", child_source)
 
     def test_structure_step_uses_a_dedicated_static_validator_entry(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/required-ci.yml").read_text(
@@ -15854,6 +16128,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 Path(temporary_directory).resolve(strict=True) / "registry"
             )
             acquired_root.mkdir(mode=0o700)
+            trace: list[str] = []
             try:
                 with mock.patch.object(
                     _CANDIDATE_SUPPORT,
@@ -15875,17 +16150,24 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     return_value=str(acquired_root),
                 ), mock.patch.object(
                     _CANDIDATE_SUPPORT,
-                    "_ensure_strict_backend",
-                    side_effect=AssertionError("injected backend failure"),
-                ) as ensure_backend, mock.patch.object(
+                    "_prepare_writable_quota_intent",
+                    side_effect=lambda *_args, **_keywords: (
+                        trace.append("quota-intended")
+                        or {"state": "intended"}
+                    ),
+                ), mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "_start_registry_watchdog",
+                    side_effect=lambda _session: trace.append("watchdog-start"),
                 ) as start_watchdog, mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "_arm_registry_watchdog_owner_loss_authority",
-                    side_effect=lambda session: session.update(
-                        watchdog_owner_loss_authority={"fixture": True}
-                    ),
+                    side_effect=lambda session: (
+                        trace.append("watchdog-arm"),
+                        session.update(
+                            watchdog_owner_loss_authority={"fixture": True}
+                        ),
+                    )[-1],
                 ) as arm_watchdog:
                     with self.assertRaisesRegex(
                         AssertionError, "abandoned without path mutation"
@@ -15894,7 +16176,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
                     start_watchdog.assert_called_once()
                     arm_watchdog.assert_called_once()
-                    ensure_backend.assert_not_called()
+                    self.assertEqual(
+                        trace,
+                        ["quota-intended", "watchdog-start", "watchdog-arm"],
+                    )
                     self.assertTrue(acquired_root.is_dir())
                     self.assertIsNone(_CANDIDATE_SUPPORT._STRICT_SESSION)
                     self.assertEqual(
@@ -15925,6 +16210,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 _CANDIDATE_SUPPORT._write_registry_acquisition_file_at
             )
             injected = False
+            prepared_roots: list[Path] = []
+            created_roots: list[Path] = []
+            validated_roots: list[Path] = []
 
             def fail_after_first_lock_write(
                 directory_fd: int, name: str, source: bytes, mode: int
@@ -15934,6 +16222,37 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 if name == ".session.lock" and not injected:
                     injected = True
                     raise AssertionError("injected setup failure")
+
+            def prepare_quota(root: Path, **_keywords: object) -> dict[str, object]:
+                prepared_roots.append(root)
+                return {"state": "intended"}
+
+            def create_quota(
+                _controller: Path, operation: str, root: Path
+            ) -> dict[str, object]:
+                self.assertEqual(operation, "create")
+                created_roots.append(root)
+                return {
+                    "status": "complete",
+                    "operation": operation,
+                    "binding": {"state": "active"},
+                }
+
+            def validate_quota(
+                root: Path, *, target_gid: int | None = None, **_keywords: object
+            ) -> tuple[Path, Path, Path, Path, dict[str, object]]:
+                self.assertEqual(target_gid, 60000)
+                validated_roots.append(root)
+                quota = (
+                    root / _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_DIRECTORY
+                )
+                return (
+                    quota,
+                    quota / "resources",
+                    quota / "fixtures",
+                    quota / ".tombstones",
+                    {"state": "active"},
+                )
 
             try:
                 with mock.patch.object(
@@ -15971,6 +16290,18 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     _CANDIDATE_SUPPORT,
                     "_active_strict_session",
                     side_effect=lambda: _CANDIDATE_SUPPORT._STRICT_SESSION,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_prepare_writable_quota_intent",
+                    side_effect=prepare_quota,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_root_quota_operation",
+                    side_effect=create_quota,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_validated_writable_quota_paths",
+                    side_effect=validate_quota,
                 ):
                     with self.assertRaisesRegex(
                         AssertionError, "abandoned without path mutation"
@@ -15987,6 +16318,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 self.assertEqual(first_lock.read_bytes(), b"abandoned-sentinel")
                 self.assertEqual(resumed["root"], second_root)
                 self.assertTrue((second_root / ".session.lock").is_file())
+                self.assertEqual(prepared_roots, [second_root])
+                self.assertEqual(created_roots, [second_root])
+                self.assertEqual(validated_roots, [second_root])
             finally:
                 self.close_retained_acquisition_descriptors()
                 _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
@@ -16131,6 +16465,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 _CANDIDATE_SUPPORT._bind_empty_registry_acquisition_root
             )
             bind_attempt = 0
+            prepared_roots: list[Path] = []
+            created_roots: list[Path] = []
+            validated_roots: list[Path] = []
 
             def fail_first_bind(path: Path):
                 nonlocal bind_attempt
@@ -16138,6 +16475,37 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 if bind_attempt == 1:
                     raise OSError("injected descriptor exhaustion")
                 return original_bind(path)
+
+            def prepare_quota(root: Path, **_keywords: object) -> dict[str, object]:
+                prepared_roots.append(root)
+                return {"state": "intended"}
+
+            def create_quota(
+                _controller: Path, operation: str, root: Path
+            ) -> dict[str, object]:
+                self.assertEqual(operation, "create")
+                created_roots.append(root)
+                return {
+                    "status": "complete",
+                    "operation": operation,
+                    "binding": {"state": "active"},
+                }
+
+            def validate_quota(
+                root: Path, *, target_gid: int | None = None, **_keywords: object
+            ) -> tuple[Path, Path, Path, Path, dict[str, object]]:
+                self.assertEqual(target_gid, 60000)
+                validated_roots.append(root)
+                quota = (
+                    root / _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_DIRECTORY
+                )
+                return (
+                    quota,
+                    quota / "resources",
+                    quota / "fixtures",
+                    quota / ".tombstones",
+                    {"state": "active"},
+                )
 
             try:
                 with mock.patch.object(
@@ -16176,6 +16544,18 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     _CANDIDATE_SUPPORT,
                     "_active_strict_session",
                     side_effect=lambda: _CANDIDATE_SUPPORT._STRICT_SESSION,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_prepare_writable_quota_intent",
+                    side_effect=prepare_quota,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_invoke_root_quota_operation",
+                    side_effect=create_quota,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_validated_writable_quota_paths",
+                    side_effect=validate_quota,
                 ):
                     with self.assertRaisesRegex(
                         AssertionError,
@@ -16192,50 +16572,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 self.assertEqual(resumed["root"], second_root)
                 self.assertEqual(list(first_root.iterdir()), [])
                 self.assertTrue((second_root / ".session.lock").is_file())
+                self.assertEqual(prepared_roots, [second_root])
+                self.assertEqual(created_roots, [second_root])
+                self.assertEqual(validated_roots, [second_root])
             finally:
                 self.close_retained_acquisition_descriptors()
                 _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
                 _CANDIDATE_SUPPORT._STRICT_BACKEND_VALIDATED = previous_validated
-
-    def test_registry_acquisition_recovery_never_mutates_abandoned_namespace(
-        self,
-    ) -> None:
-        acquire_source = inspect.getsource(
-            _CANDIDATE_SUPPORT.trusted_isolation_chain_registry
-        )
-        initialize_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._initialize_bound_registry_acquisition
-        )
-        consumer_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._consume_retained_registry_acquisition
-        )
-
-        self.assertLess(
-            initialize_source.index("_start_registry_watchdog"),
-            initialize_source.index(
-                "_arm_registry_watchdog_owner_loss_authority"
-            ),
-        )
-        self.assertLess(
-            initialize_source.index(
-                "_arm_registry_watchdog_owner_loss_authority"
-            ),
-            initialize_source.index("_active_strict_session"),
-        )
-        self.assertIn("_configure_registry_acquisition_at", initialize_source)
-        self.assertNotIn("_resume_registry_acquisition", acquire_source)
-        for forbidden_call in (
-            "_bind_empty_registry_acquisition_root",
-            "os.stat",
-            ".resolve",
-            ".mkdir",
-            "_write_single_link_file",
-            "os.unlink",
-            "os.rmdir",
-            "os.rename",
-            "shutil.rmtree",
-        ):
-            self.assertNotIn(forbidden_call, consumer_source)
 
     def test_unresolved_watchdog_blocks_fresh_registry_acquisition(self) -> None:
         previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
@@ -16499,86 +16842,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         if error.errno != errno.EBADF:
                             raise
 
-    def test_supervisor_enters_cleanup_scope_immediately_after_registry_acquire(
-        self,
-    ) -> None:
-        source = inspect.getsource(supervise_trusted_required_ci_tests)
-        cleanup_scope = source.split(
-            "terminal_failures: list[_TerminalFailure] = []", 1
-        )[1]
-        acquire_index = cleanup_scope.index(
-            "trusted_isolation_chain_registry()"
-        )
-        registry_use_index = cleanup_scope.index(
-            'registry_environment ='
-        )
-        finally_index = cleanup_scope.index("finally:")
-        cleanup_index = cleanup_scope.index(
-            '"isolation-cleanup"',
-            finally_index,
-        )
-
-        self.assertTrue(cleanup_scope.lstrip().startswith("try:"))
-        self.assertLess(acquire_index, registry_use_index)
-        self.assertLess(registry_use_index, finally_index)
-        self.assertLess(finally_index, cleanup_index)
-        self.assertIn(
-            "_close_and_verify_trusted_isolation(",
-            cleanup_scope[cleanup_index:],
-        )
-
-    def test_execution_snapshot_registers_cleanup_before_first_mutation(
-        self,
-    ) -> None:
-        source = inspect.getsource(_CANDIDATE_SUPPORT._execution_snapshot)
-
-        self.assertIn("_register_trusted_root_chain", source)
-        self.assertLess(
-            source.index("_register_trusted_root_chain"),
-            source.index("_write_single_link_file"),
-        )
-        self.assertLess(
-            source.index("try:"),
-            source.index("_write_single_link_file"),
-        )
-        self.assertIn("_recover_registered_entry", source)
-
-    def test_strict_execution_root_allows_only_runner_and_realm_traversal(
-        self,
-    ) -> None:
-        snapshot_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._execution_snapshot
-        )
-        broker_source = inspect.getsource(_CANDIDATE_SUPPORT._root_tree_main)
-
-        self.assertIn('"own-root"', snapshot_source)
-        self.assertIn('"execution-root"', snapshot_source)
-        self.assertIn("os.getuid()", snapshot_source)
-        self.assertIn('operation == "own-root"', broker_source)
-        self.assertIn("os.fchown(descriptor, owner_uid, owner_gid)", broker_source)
-        self.assertIn("os.fchmod(descriptor, 0o710)", broker_source)
-        self.assertIn("_prepare_isolation_resource_ancestors", snapshot_source)
-        self.assertLess(
-            snapshot_source.index("_prepare_isolation_resource_ancestors"),
-            snapshot_source.index("tempfile.mkdtemp"),
-        )
-
-    def test_durable_deletion_receipt_is_fd_bound_and_runner_readable(self) -> None:
-        reader_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._read_durable_deletion_receipt_file
-        )
-        broker_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_seal_execution_root_main
-        )
-        self.assertIn("os.O_NOFOLLOW", reader_source)
-        self.assertGreaterEqual(reader_source.count("os.fstat"), 2)
-        self.assertIn("os.read", reader_source)
-        self.assertNotIn("read_bytes", reader_source)
-        self.assertIn("metadata.st_gid", reader_source)
-        self.assertIn("0o640", reader_source)
-        self.assertIn("expected_file_group", broker_source)
-        self.assertIn("expected_file_mode=0o640", broker_source)
-
     def test_incomplete_root_receipt_staging_is_retired_for_tombstone_replay(
         self,
     ) -> None:
@@ -16714,46 +16977,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertFalse(staged_path.exists())
             self.assertFalse(final_path.exists())
 
-    def test_all_privileged_launches_use_the_registered_outer_gate(self) -> None:
-        support_source = importlib.util.decode_source(
-            TRUSTED_CANDIDATE_SUPPORT_SOURCE
-        )
-        command_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._registered_sudo_command
-        )
-        launcher_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._run_registered_sudo
-        )
-        gated_launcher_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
-        )
-
-        self.assertEqual(support_source.count('_STRICT_PRIMITIVES["sudo"]'), 1)
-        self.assertIn('_STRICT_PRIMITIVES["sudo"]', command_source)
-        self.assertNotIn("def _run_sudo", support_source)
-        self.assertIn("_registry_session_gate", launcher_source)
-        self.assertIn("_REGISTERED_SUDO_WRAPPER_SOURCE", gated_launcher_source)
-        self.assertIn("start_new_session=True", gated_launcher_source)
-
-    def test_privileged_tree_changes_are_fd_anchored_and_never_recursive_by_path(
-        self,
-    ) -> None:
-        support_source = importlib.util.decode_source(
-            TRUSTED_CANDIDATE_SUPPORT_SOURCE
-        )
-
-        self.assertNotIn('"-hR"', support_source)
-        self.assertTrue(
-            hasattr(_CANDIDATE_SUPPORT, "_root_fd_tree_operation")
-        )
-        walker_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_fd_tree_operation
-        )
-        self.assertIn("os.O_NOFOLLOW", walker_source)
-        self.assertIn("st_nlink != 1", walker_source)
-        self.assertIn("os.fchown", walker_source)
-        self.assertNotIn("os.chown", walker_source)
-
     def test_fd_tree_walker_never_changes_a_hardlink_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             parent = Path(temporary_directory)
@@ -16790,6 +17013,766 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 (original.st_dev, original.st_ino, original.st_mode),
             )
 
+    def test_strict_tmpfs_quota_policy_is_exact_and_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            device = Path(temporary_directory).lstat().st_dev
+
+        def record(**updates: object) -> dict[str, object]:
+            value: dict[str, object] = {
+                "mount_id": 91,
+                "major_minor": (os.major(device), os.minor(device)),
+                "mountpoint": Path("/quota"),
+                "options": frozenset(("rw", "nosuid", "nodev")),
+                "filesystem": "tmpfs",
+                "source": _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_SOURCE,
+                "super_options": frozenset(
+                    ("rw", "size=65536k", "nr_inodes=8192")
+                ),
+            }
+            value.update(updates)
+            return value
+
+        _CANDIDATE_SUPPORT._validate_strict_tmpfs_quota_record(
+            record(), device
+        )
+        mutants = {
+            "noexec": record(
+                options=frozenset(("rw", "nosuid", "nodev", "noexec"))
+            ),
+            "missing-nodev": record(
+                options=frozenset(("rw", "nosuid"))
+            ),
+            "wrong-source": record(source="candidate-controlled"),
+            "wrong-size": record(
+                super_options=frozenset(
+                    ("rw", "size=131072k", "nr_inodes=8192")
+                )
+            ),
+            "wrong-inodes": record(
+                super_options=frozenset(
+                    ("rw", "size=65536k", "nr_inodes=16384")
+                )
+            ),
+            "wrong-device": record(major_minor=(0, 0)),
+        }
+        for name, mutant in mutants.items():
+            with self.subTest(name=name), self.assertRaises(AssertionError):
+                _CANDIDATE_SUPPORT._validate_strict_tmpfs_quota_record(
+                    mutant, device
+                )
+
+    def test_strict_writable_views_share_one_aggregate_backing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            mountpoint = Path(temporary_directory).resolve(strict=True)
+            views = tuple(mountpoint / name for name in ("runtime", "workspace"))
+            for view in views:
+                view.mkdir()
+            device = mountpoint.lstat().st_dev
+            value = {
+                "mountpoint": str(mountpoint),
+                "device": device,
+                "major_minor": [os.major(device), os.minor(device)],
+                "mount_id": 91,
+                "source": _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_SOURCE,
+                "size_bytes": 64 * 1024 * 1024,
+                "nr_inodes": 8192,
+                "flags": ["nodev", "nosuid"],
+            }
+            bindings = [
+                {
+                    "path": str(view),
+                    "device": device,
+                    "inode": view.lstat().st_ino,
+                    "host_mount_id": 91,
+                }
+                for view in views
+            ]
+            mount_record = {
+                "mount_id": 91,
+                "major_minor": (os.major(device), os.minor(device)),
+                "options": frozenset(("rw", "nosuid", "nodev")),
+                "filesystem": "tmpfs",
+                "source": _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_SOURCE,
+            }
+            filesystem = types.SimpleNamespace(
+                f_frsize=4096,
+                f_blocks=16384,
+                f_files=8192,
+            )
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_exact_mount_record",
+                return_value=mount_record,
+            ) as mount_probe, mock.patch.object(
+                _CANDIDATE_SUPPORT.os, "statvfs", return_value=filesystem
+            ) as filesystem_probe:
+                self.assertEqual(
+                    _CANDIDATE_SUPPORT._revalidate_aggregate_writable_device(
+                        value, bindings
+                    ),
+                    value,
+                )
+                for mutant in (
+                    [dict(bindings[0], device=device + 1), bindings[1]],
+                    [dict(bindings[0], path=str(mountpoint.parent)), bindings[1]],
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "escaped"
+                    ):
+                        _CANDIDATE_SUPPORT._revalidate_aggregate_writable_device(
+                            value, mutant
+                        )
+                record_mutants = {
+                    "noexec": dict(
+                        mount_record,
+                        options=frozenset(
+                            ("rw", "nosuid", "nodev", "noexec")
+                        ),
+                    ),
+                    "source": dict(mount_record, source="candidate-controlled"),
+                    "mount-id": dict(mount_record, mount_id=92),
+                    "major-minor": dict(mount_record, major_minor=(-1, -1)),
+                }
+                for name, mutant in record_mutants.items():
+                    with self.subTest(record_mutant=name), self.assertRaisesRegex(
+                        AssertionError, "quota policy changed"
+                    ):
+                        mount_probe.return_value = mutant
+                        _CANDIDATE_SUPPORT._revalidate_aggregate_writable_device(
+                            value, bindings
+                        )
+                mount_probe.return_value = mount_record
+                filesystem_mutants = {
+                    "byte-cap": types.SimpleNamespace(
+                        f_frsize=4096,
+                        f_blocks=16385,
+                        f_files=8192,
+                    ),
+                    "inode-cap": types.SimpleNamespace(
+                        f_frsize=4096,
+                        f_blocks=16384,
+                        f_files=8193,
+                    ),
+                }
+                for name, mutant in filesystem_mutants.items():
+                    with self.subTest(
+                        filesystem_mutant=name
+                    ), self.assertRaisesRegex(
+                        AssertionError, "quota policy changed"
+                    ):
+                        filesystem_probe.return_value = mutant
+                        _CANDIDATE_SUPPORT._revalidate_aggregate_writable_device(
+                            value, bindings
+                        )
+
+    def test_quota_cli_dispatches_exact_ten_argument_contract(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-S",
+                str(TRUSTED_CANDIDATE_SUPPORT_PATH),
+                "--isolation-quota",
+                "destroy",
+                "/definitely-missing-required-ci-quota",
+                "1",
+                "1",
+                str(os.getuid()),
+                str(os.getgid()),
+                "60000",
+                "a" * 32,
+            ],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+        prefix = _CANDIDATE_SUPPORT._ROOT_QUOTA_RECEIPT_PREFIX.encode("ascii")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(completed.stdout.count(prefix), 1)
+        self.assertEqual(completed.stdout.count(b"\n"), 1)
+        self.assertTrue(completed.stdout.startswith(prefix))
+        receipt = json.loads(completed.stdout[len(prefix) :])
+        self.assertEqual(receipt["status"], "incomplete")
+
+    def test_orphan_resource_identity_ignores_deleted_nonquota_documents(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            resources = Path(temporary_directory).resolve(strict=True)
+            child = resources / "required-ci-execution-reused"
+            child.mkdir(mode=0o700)
+            child.chmod(0o700)
+            metadata = child.lstat()
+            session = {
+                "resources": resources,
+                "target_uid": 60000,
+                "quota_binding": {
+                    "state": "active",
+                    "mounted_device": metadata.st_dev,
+                    "mount_id": 91,
+                },
+            }
+            legacy = {
+                "state": "closed",
+                "cleanup_execution_root": True,
+                "cleanup_kind": "sealed-resource-v1",
+                "execution_root": {
+                    "path": "/already-deleted/legacy",
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                },
+                "execution_root_deleted": None,
+            }
+            duplicate_legacy = dict(legacy)
+            duplicate_legacy["cleanup_kind"] = (
+                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_CLEANUP_KIND
+            )
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_writable_root_mount_binding",
+                return_value=91,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_quota_disposable_resource_receipt",
+                return_value={"retained_until_unmount": True},
+            ):
+                _CANDIDATE_SUPPORT._cleanup_orphan_resource_roots(
+                    session, (legacy, duplicate_legacy)
+                )
+
+                retained = dict(legacy)
+                retained["cleanup_kind"] = (
+                    _CANDIDATE_SUPPORT._STRICT_QUOTA_RESOURCE_CLEANUP_KIND
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "no disposable proof"
+                ):
+                    _CANDIDATE_SUPPORT._cleanup_orphan_resource_roots(
+                        session, (retained,)
+                    )
+                with self.assertRaisesRegex(
+                    AssertionError, "identity is ambiguous"
+                ):
+                    _CANDIDATE_SUPPORT._cleanup_orphan_resource_roots(
+                        session, (retained, dict(retained))
+                    )
+
+    def test_writable_quota_crash_replay_is_three_state_and_durable(
+        self,
+    ) -> None:
+        token = "ab" * 16
+        runner_uid = os.getuid()
+        runner_gid = os.getgid()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            root.chmod(0o700)
+            control = root / "trusted-control"
+            quota = root / _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_DIRECTORY
+            control.mkdir(mode=0o700)
+            quota.mkdir(mode=0o700)
+            control.chmod(0o700)
+            quota.chmod(0o700)
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_exact_mount_record",
+                return_value=None,
+            ):
+                intended = _CANDIDATE_SUPPORT._prepare_writable_quota_intent(
+                    root,
+                    runner_uid=runner_uid,
+                    runner_gid=runner_gid,
+                    watchdog_token=token,
+                )
+                selected = (
+                    _CANDIDATE_SUPPORT._validated_writable_quota_acquisition(
+                        root, token, allow_pre_active=True
+                    )
+                )
+                self.assertEqual(selected[-1]["state"], "intended")
+                with self.assertRaisesRegex(AssertionError, "not active"):
+                    _CANDIDATE_SUPPORT._validated_writable_quota_acquisition(
+                        root, token, allow_pre_active=False
+                    )
+                with self.assertRaisesRegex(AssertionError, "token"):
+                    _CANDIDATE_SUPPORT._validated_writable_quota_acquisition(
+                        root, "cd" * 16, allow_pre_active=True
+                    )
+
+            self.assertEqual(intended["flags"], ["nodev", "nosuid"])
+            self.assertEqual(
+                _CANDIDATE_SUPPORT._writable_quota_manifest_path(root).parent,
+                control,
+            )
+
+            def run_destroy(
+                mount_records: object,
+            ) -> dict[str, object]:
+                output = io.StringIO()
+                root_metadata = root.lstat()
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT.os, "getuid", return_value=0
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.os, "geteuid", return_value=0
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_bind_root_controller_parent"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_exact_mount_record",
+                    **mount_records,
+                ), contextlib.redirect_stdout(output):
+                    _CANDIDATE_SUPPORT._root_quota_main(
+                        (
+                            "destroy",
+                            str(root),
+                            str(root_metadata.st_dev),
+                            str(root_metadata.st_ino),
+                            str(runner_uid),
+                            str(runner_gid),
+                            "60000",
+                            token,
+                        )
+                    )
+                line = output.getvalue()
+                prefix = _CANDIDATE_SUPPORT._ROOT_QUOTA_RECEIPT_PREFIX
+                self.assertTrue(line.startswith(prefix))
+                return json.loads(line[len(prefix) :])
+
+            receipt = run_destroy({"return_value": None})
+            self.assertEqual(receipt["status"], "complete")
+            self.assertEqual(receipt["binding"]["state"], "unmounted")
+
+            persisted = _CANDIDATE_SUPPORT._load_writable_quota_binding(root)
+            receipt = run_destroy({"return_value": None})
+            self.assertEqual(receipt["status"], "complete")
+            self.assertEqual(receipt["binding"], persisted)
+            self.assertEqual(
+                _CANDIDATE_SUPPORT._load_writable_quota_binding(root),
+                persisted,
+            )
+
+            underlying = quota.lstat()
+            active = _CANDIDATE_SUPPORT._writable_quota_intent_document(
+                root,
+                underlying,
+                runner_uid=runner_uid,
+                runner_gid=runner_gid,
+                watchdog_token=token,
+            )
+            active.update(
+                {
+                    "state": "active",
+                    "mounted_device": underlying.st_dev,
+                    "mounted_inode": underlying.st_ino,
+                    "mount_id": 91,
+                    "major_minor": [
+                        os.major(underlying.st_dev),
+                        os.minor(underlying.st_dev),
+                    ],
+                }
+            )
+            _CANDIDATE_SUPPORT._write_writable_quota_binding(
+                root, active, create=False
+            )
+            receipt = run_destroy({"return_value": None})
+            self.assertEqual(receipt["status"], "complete")
+            self.assertEqual(receipt["binding"]["state"], "unmounted")
+
+    def test_quota_unmount_crash_window_replays_through_fresh_close(
+        self,
+    ) -> None:
+        token = "ac" * 16
+        runner_uid = os.getuid()
+        runner_gid = os.getgid()
+        previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory).resolve(strict=True)
+            root = parent / "registry"
+            entries = root / "entries"
+            control = root / "trusted-control"
+            quota = root / _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_DIRECTORY
+            for path in (root, entries, control, quota):
+                path.mkdir(mode=0o700)
+                path.chmod(0o700)
+            underlying = quota.lstat()
+            active = _CANDIDATE_SUPPORT._writable_quota_intent_document(
+                root,
+                underlying,
+                runner_uid=runner_uid,
+                runner_gid=runner_gid,
+                watchdog_token=token,
+            )
+            for name in active["children"]:
+                (quota / str(name)).mkdir(mode=0o700)
+            mounted = quota.lstat()
+            mount_record = {
+                "mount_id": 91,
+                "major_minor": (
+                    os.major(mounted.st_dev),
+                    os.minor(mounted.st_dev),
+                ),
+                "mountpoint": quota,
+                "options": frozenset(("rw", "nosuid", "nodev")),
+                "filesystem": "tmpfs",
+                "source": _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_SOURCE,
+                "super_options": frozenset(
+                    ("rw", "size=65536k", "nr_inodes=8192")
+                ),
+            }
+            active.update(
+                {
+                    "state": "active",
+                    "mounted_device": mounted.st_dev,
+                    "mounted_inode": mounted.st_ino,
+                    "mount_id": mount_record["mount_id"],
+                    "major_minor": list(mount_record["major_minor"]),
+                }
+            )
+            _CANDIDATE_SUPPORT._write_writable_quota_binding(
+                root, active, create=True
+            )
+            controller_path = control / "required_ci_candidate.py"
+            handshake_path = quota / "resources" / "handshake.json"
+            handshake_path.write_bytes(b"")
+            session = {
+                "root": root,
+                "entries": entries,
+                "controller_path": controller_path,
+                "token": token,
+                "target_uid": 60000,
+                "quota": quota,
+                "resources": quota / "resources",
+                "fixtures": quota / "fixtures",
+                "tombstones": quota / ".tombstones",
+                "watchdog_token": token,
+                "watchdog_authorized": True,
+                "inherited": True,
+                "closed": False,
+                "quota_binding": active,
+            }
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT, "_assert_registry_watchdog_alive"
+            ):
+                entry_path = _CANDIDATE_SUPPORT._register_trusted_root_chain(
+                    controller_path,
+                    handshake_path,
+                    60000,
+                    execution_root=quota / "resources",
+                )
+            outer = [60001, 1, 60001, 60001]
+            for previous, selected in (
+                ("prepared", "outer-bound"),
+                ("outer-bound", "root-authorized"),
+                ("root-authorized", "closing"),
+            ):
+                _CANDIDATE_SUPPORT._transition_trusted_root_chain(
+                    entry_path,
+                    (previous,),
+                    selected,
+                    **({"outer": outer} if previous == "prepared" else {}),
+                )
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT, "_stable_host_session_zero"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_stable_uid_zero"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_registered_scope_requires_cleanup",
+                return_value=False,
+            ):
+                self.assertEqual(
+                    _CANDIDATE_SUPPORT._mark_trusted_root_chain_closed(
+                        entry_path
+                    )["state"],
+                    "closed",
+                )
+
+            def unmount_then_interrupt(selected: Path) -> None:
+                self.assertEqual(selected, quota)
+                handshake_path.unlink()
+                for child in selected.iterdir():
+                    child.rmdir()
+
+            crash_output = io.StringIO()
+            root_metadata = root.lstat()
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT.os, "getuid", return_value=0
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os, "geteuid", return_value=0
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_bind_root_controller_parent"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_stable_uid_zero"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_exact_mount_record",
+                side_effect=(mount_record, None),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_validated_writable_quota_paths"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_root_unmount",
+                side_effect=unmount_then_interrupt,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_write_writable_quota_binding",
+                side_effect=AssertionError("injected post-unmount crash"),
+            ), contextlib.redirect_stdout(crash_output):
+                _CANDIDATE_SUPPORT._root_quota_main(
+                    (
+                        "destroy",
+                        str(root),
+                        str(root_metadata.st_dev),
+                        str(root_metadata.st_ino),
+                        str(runner_uid),
+                        str(runner_gid),
+                        "60000",
+                        token,
+                    )
+                )
+            self.assertIn("injected post-unmount crash", crash_output.getvalue())
+            persisted = _CANDIDATE_SUPPORT._load_writable_quota_binding(root)
+            self.assertEqual(persisted["state"], "active")
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_exact_mount_record",
+                return_value=None,
+            ):
+                _CANDIDATE_SUPPORT._validated_writable_quota_underlay(
+                    root, persisted
+                )
+                marker = quota / "unexpected-underlay-entry"
+                marker.write_text("candidate payload", encoding="utf-8")
+                with self.assertRaisesRegex(
+                    AssertionError, "underlay identity changed"
+                ):
+                    _CANDIDATE_SUPPORT._validated_writable_quota_acquisition(
+                        root,
+                        token,
+                        allow_pre_active=True,
+                        allow_active_unmounted_window=True,
+                    )
+                marker.unlink()
+
+                detached = root / "detached-candidate-writable"
+                quota.rename(detached)
+                quota.mkdir(mode=0o700)
+                quota.chmod(0o700)
+                try:
+                    with self.assertRaisesRegex(
+                        AssertionError, "underlay identity changed"
+                    ):
+                        _CANDIDATE_SUPPORT._validated_writable_quota_acquisition(
+                            root,
+                            token,
+                            allow_pre_active=True,
+                            allow_active_unmounted_window=True,
+                        )
+                finally:
+                    quota.rmdir()
+                    detached.rename(quota)
+
+                selected = (
+                    _CANDIDATE_SUPPORT._validated_writable_quota_acquisition(
+                        root,
+                        token,
+                        allow_pre_active=True,
+                        allow_active_unmounted_window=True,
+                    )
+                )
+                self.assertEqual(selected[:4], (
+                    quota,
+                    quota / "resources",
+                    quota / "fixtures",
+                    quota / ".tombstones",
+                ))
+                self.assertEqual(selected[-1], persisted)
+
+            session["quota_binding"] = persisted
+
+            def settle_quota(
+                command: Sequence[str], **_keywords: object
+            ) -> bytes:
+                self.assertIn("--isolation-quota", command)
+                document = _CANDIDATE_SUPPORT._load_writable_quota_binding(
+                    root
+                )
+                self.assertEqual(document["state"], "active")
+                document.update(
+                    {
+                        "state": "unmounted",
+                        "mounted_device": None,
+                        "mounted_inode": None,
+                        "mount_id": None,
+                        "major_minor": None,
+                    }
+                )
+                _CANDIDATE_SUPPORT._write_writable_quota_binding(
+                    root, document, create=False
+                )
+                return (
+                    _CANDIDATE_SUPPORT._ROOT_QUOTA_RECEIPT_PREFIX
+                    + json.dumps(
+                        {
+                            "status": "complete",
+                            "operation": "destroy",
+                            "binding": document,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("ascii")
+
+            _CANDIDATE_SUPPORT._STRICT_SESSION = session
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_invoke_root_uid_cleanup"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_strict_exact_mount_record",
+                    return_value=None,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_run_registered_sudo",
+                    side_effect=settle_quota,
+                ) as registered_sudo:
+                    closed = (
+                        _CANDIDATE_SUPPORT._close_trusted_isolation_chains_under_gate(
+                            session,
+                            recovery_profile=(
+                                _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
+                            ),
+                        )
+                    )
+                self.assertEqual([item["state"] for item in closed], ["closed"])
+                registered_sudo.assert_called_once()
+                self.assertFalse(root.exists())
+            finally:
+                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
+
+    def test_root_tree_budget_is_deadline_entry_depth_and_bytes_causal(
+        self,
+    ) -> None:
+        budget_type = _CANDIDATE_SUPPORT._RootTreeBudget
+        budget = budget_type(
+            deadline=time.monotonic() + 30,
+            entry_limit=2,
+            depth_limit=1,
+            logical_byte_limit=3,
+        )
+        budget.charge(depth=0, logical_bytes=2)
+        budget.charge(depth=1, logical_bytes=1)
+        with self.assertRaisesRegex(AssertionError, "entry limit"):
+            budget.charge(depth=0, logical_bytes=0)
+
+        depth_budget = budget_type(
+            deadline=time.monotonic() + 30,
+            entry_limit=3,
+            depth_limit=0,
+            logical_byte_limit=3,
+        )
+        with self.assertRaisesRegex(AssertionError, "depth limit"):
+            depth_budget.charge(depth=1, logical_bytes=0)
+
+        byte_budget = budget_type(
+            deadline=time.monotonic() + 30,
+            entry_limit=3,
+            depth_limit=1,
+            logical_byte_limit=1,
+        )
+        with self.assertRaisesRegex(AssertionError, "logical byte limit"):
+            byte_budget.charge(depth=0, logical_bytes=2)
+
+        expired_budget = budget_type(
+            deadline=time.monotonic() - 1,
+            entry_limit=3,
+            depth_limit=1,
+            logical_byte_limit=3,
+        )
+        with self.assertRaisesRegex(AssertionError, "deadline"):
+            expired_budget.charge(depth=0, logical_bytes=0)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            for directory_name in ("first", "second"):
+                directory = root / directory_name
+                directory.mkdir()
+                (directory / "leaf").write_bytes(b"x")
+            descriptor = os.open(
+                root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            shared_budget = budget_type(
+                deadline=time.monotonic() + 30,
+                entry_limit=3,
+                depth_limit=2,
+                logical_byte_limit=2,
+            )
+            try:
+                with mock.patch.object(os, "fchown"), mock.patch.object(
+                    os, "fchmod"
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "entry limit"
+                    ):
+                        _CANDIDATE_SUPPORT._root_fd_tree_operation(
+                            descriptor,
+                            os.getuid(),
+                            os.getgid(),
+                            "fixture-shared",
+                            budget=shared_budget,
+                        )
+            finally:
+                os.close(descriptor)
+
+    def test_fixture_registration_survives_failed_cleanup(self) -> None:
+        fixture = object.__new__(_CANDIDATE_SUPPORT._CandidateFixtureDirectory)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory).resolve(strict=True)
+            marker = path / "candidate-content"
+            marker.write_text("retained", encoding="utf-8")
+            fixture._path = path
+            fixture.name = str(path)
+            fixture._temporary = None
+            previous_roots = dict(_CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS)
+            _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS.clear()
+            _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS[path] = {
+                "fixture": 1
+            }
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_revalidate_registered_fixture_root",
+                    side_effect=[
+                        AssertionError("injected cleanup failure"),
+                        None,
+                    ],
+                ):
+                    with self.assertRaisesRegex(
+                        AssertionError, "cleanup failure"
+                    ):
+                        fixture.cleanup()
+                    self.assertIn(
+                        path, _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS
+                    )
+                    fixture.cleanup()
+                self.assertNotIn(
+                    path, _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS
+                )
+                self.assertEqual(marker.read_text(encoding="utf-8"), "retained")
+            finally:
+                _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS.clear()
+                _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS.update(
+                    previous_roots
+                )
+
     def test_fixture_prepare_preflights_all_roots_and_rolls_back_partial_ownership(
         self,
     ) -> None:
@@ -16801,11 +17784,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             previous_roots = dict(_CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS)
             _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS.clear()
             for root in roots:
-                metadata = root.lstat()
-                _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS[root] = (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                )
+                _CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS[root] = {
+                    "fixture": len(_CANDIDATE_SUPPORT._REGISTERED_FIXTURE_ROOTS)
+                }
             trace: list[str] = []
 
             def preflight(root: Path) -> list[Path]:
@@ -16831,6 +17812,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     _CANDIDATE_SUPPORT,
                     "_strict_realm",
                     return_value={"uid": 60000, "gid": 60000},
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_revalidate_registered_fixture_root",
                 ), mock.patch.object(
                     _CANDIDATE_SUPPORT,
                     "_fixture_tree_paths",
@@ -17444,65 +18428,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             for index in range(count)
         ]
         self.assertEqual(config_pairs.count(("core.attributesFile", "/dev/null")), 1)
-
-    def test_root_wrapper_is_bound_before_unshare_can_exec(self) -> None:
-        self.assertTrue(hasattr(_CANDIDATE_SUPPORT, "_ROOT_WRAPPER_SOURCE"))
-        wrapper_source = _CANDIDATE_SUPPORT._ROOT_WRAPPER_SOURCE
-        outer_wrapper_source = (
-            _CANDIDATE_SUPPORT._REGISTERED_SUDO_WRAPPER_SOURCE
-        )
-        controller_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_controller_main
-        )
-        registered_sudo_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
-        )
-
-        self.assertIn("PR_SET_PDEATHSIG", wrapper_source)
-        self.assertIn("controller_start_time", wrapper_source)
-        self.assertIn("barrier", wrapper_source)
-        self.assertIn("PR_SET_PDEATHSIG", outer_wrapper_source)
-        self.assertIn("parent_start_time", outer_wrapper_source)
-        self.assertIn("barrier", outer_wrapper_source)
-        self.assertIn("wrapper_pidfd", controller_source)
-        self.assertIn("_write_root_controller_handshake", controller_source)
-        self.assertLess(
-            controller_source.rindex("_write_root_controller_handshake"),
-            controller_source.index("release_wrapper_barrier"),
-        )
-        self.assertLess(
-            registered_sudo_source.index('"outer-bound"'),
-            registered_sudo_source.index('"root-authorized"'),
-        )
-        self.assertLess(
-            registered_sudo_source.index('"root-authorized"'),
-            registered_sudo_source.index("_release_wrapper_barrier"),
-        )
-
-    def test_prebound_outer_marker_is_recoverable_before_outer_binding(self) -> None:
-        registered_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
-        )
-        recovery_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._recover_registered_entry
-        )
-        discovery_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._discover_prepared_outer
-        )
-        wrapper_source = _CANDIDATE_SUPPORT._REGISTERED_SUDO_WRAPPER_SOURCE
-
-        self.assertLess(
-            registered_source.index("outer_marker=outer_marker"),
-            registered_source.index("process = subprocess.Popen("),
-        )
-        self.assertIn("outer_marker = sys.argv[7]", wrapper_source)
-        self.assertLess(
-            recovery_source.index("_discover_prepared_outer"),
-            recovery_source.index('"closing"'),
-        )
-        self.assertIn('process_path / "cmdline"', discovery_source)
-        self.assertIn("identity[0] != identity[4]", discovery_source)
-        self.assertIn("identity[5] != (os.getuid(),) * 4", discovery_source)
 
     def test_registered_sudo_pipe_failure_replays_published_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -18635,7 +19560,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 return_value={"uid": 60000, "gid": 60000},
             ), mock.patch.object(
                 _CANDIDATE_SUPPORT,
-                "_strict_writable_root_bindings",
+                "_active_strict_session",
+                return_value={"root": snapshot_root},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_strict_writable_root_bindings",
                 return_value=[
                     {
                         "path": str(execution_root),
@@ -18644,6 +19573,28 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         "host_mount_id": 3,
                     }
                 ],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_aggregate_writable_device_binding",
+                return_value={
+                    "mountpoint": str(
+                        snapshot_root
+                        / _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_DIRECTORY
+                    ),
+                    "device": 1,
+                    "major_minor": [0, 1],
+                    "mount_id": 4,
+                    "source": (
+                        _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_SOURCE
+                    ),
+                    "size_bytes": (
+                        _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_SIZE_BYTES
+                    ),
+                    "nr_inodes": (
+                        _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_INODES
+                    ),
+                    "flags": ["nodev", "nosuid"],
+                },
             ), mock.patch.object(
                 _CANDIDATE_SUPPORT,
                 "_strict_host_read_root_bindings",
@@ -18957,15 +19908,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertNotIn((leader[0], signal.SIGKILL), signaled)
         self.assertEqual(closed, 1)
 
-    def test_registered_outer_is_a_persistent_subreaper_anchor(self) -> None:
-        source = _CANDIDATE_SUPPORT._REGISTERED_SUDO_WRAPPER_SOURCE
-
-        self.assertIn("PR_SET_CHILD_SUBREAPER", source)
-        self.assertIn("os.fork()", source)
-        self.assertIn("os.waitpid(-1, 0)", source)
-        self.assertIn("PR_SET_PDEATHSIG, 0", source)
-        self.assertLess(source.index("os.fork()"), source.index("os.execve"))
-
     def test_registered_wrapper_maps_wait_statuses_without_python_39_api(
         self,
     ) -> None:
@@ -19007,64 +19949,1495 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     convert(malformed)
                 self.assertEqual(rejected.exception.code, 166)
 
-    def test_root_cleanup_drains_target_uid_before_waiting_for_anchor(self) -> None:
-        source = inspect.getsource(_CANDIDATE_SUPPORT._root_cleanup_main)
+    def test_systemd_scope_argv_and_unit_are_exact(self) -> None:
+        session_id = "a" * 32
+        wrapper = ["/usr/bin/python3", "-I", "-B", "-S", "-c", "wrapper"]
 
-        self.assertLess(
-            source.index("_root_close_candidate_realm"),
-            source.index("_root_close_registered_host_session"),
+        command = _CANDIDATE_SUPPORT._systemd_scope_command(
+            session_id, wrapper
         )
 
-    def test_live_backend_exercises_every_outer_launch_fault_boundary(self) -> None:
-        source = inspect.getsource(_CANDIDATE_SUPPORT._ensure_strict_backend)
-        probe_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
+        self.assertEqual(
+            command,
+            [
+                "/usr/bin/systemd-run",
+                "--system",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--no-ask-password",
+                "--slice-inherit",
+                "--expand-environment=no",
+                f"--unit=required-ci-candidate-{session_id}.scope",
+                "--property=MemoryHigh=805306368",
+                "--property=MemoryMax=1073741824",
+                "--property=MemorySwapMax=0",
+                "--property=TasksMax=64",
+                "--property=CPUQuota=200%",
+                "--property=CPUQuotaPeriodSec=100ms",
+                "--property=OOMPolicy=kill",
+                "--property=KillMode=control-group",
+                "--property=SendSIGKILL=yes",
+                "--property=TimeoutStopSec=5s",
+                "--property=Delegate=no",
+                "--property=MemoryAccounting=yes",
+                "--property=TasksAccounting=yes",
+                "--property=CPUAccounting=yes",
+                "--",
+                *wrapper,
+            ],
         )
-        for boundary in (
-            "after-outer-popen",
-            "after-outer-bound",
-            "after-root-authorized",
-            "after-root-authorized-barrier",
+        self.assertFalse(
+            {"--pipe", "--wait", "--pty", "--shell"}.intersection(command)
+        )
+
+    def test_systemd_scope_profile_requires_exact_v255_binaries(self) -> None:
+        valid = (
+            b"systemd 255 (255.4-1ubuntu8.10)\n"
+            b"+PAM +AUDIT +SELINUX default-hierarchy=unified\n"
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT._validated_systemd_version_output(valid), 255
+        )
+        for value in (
+            valid.replace(b" 255 ", b" 254 "),
+            valid.replace(b" 255 ", b" 256 "),
+            b"systemd 255-custom\n",
+            b"systemd 255 (255.4)\r\n",
+            b"systemd 255 (255.4)\n\xff\n",
         ):
-            with self.subTest(boundary=boundary):
-                self.assertIn(f'"{boundary}"', source)
-        self.assertIn("signal.SIGKILL", source)
-        self.assertIn("signal.SIGSTOP", source)
-        self.assertIn("_probe_independent_outer_owner_fault", source)
-        self.assertNotIn("_invoke_strict_controller", probe_source)
+            with self.subTest(value=value), self.assertRaises(AssertionError):
+                _CANDIDATE_SUPPORT._validated_systemd_version_output(value)
 
-    def test_outer_fault_probe_uses_an_independent_owner_and_pidfd_only(
+        calls: list[Path] = []
+
+        def run(path: Path) -> bytes:
+            calls.append(path)
+            return valid
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_run_systemd_version_command",
+            side_effect=run,
+        ):
+            _CANDIDATE_SUPPORT._validate_systemd_scope_runtime_profile()
+        self.assertEqual(
+            calls,
+            [Path("/usr/bin/systemd-run"), Path("/usr/bin/systemctl")],
+        )
+
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_drain_candidate_git_pipes",
+            side_effect=TimeoutError("injected version timeout"),
+        ), self.assertRaisesRegex(AssertionError, "timed out"):
+            _CANDIDATE_SUPPORT._run_systemd_version_command(
+                Path("/usr/bin/systemctl")
+            )
+        process.kill.assert_called_once_with()
+
+        real_popen = subprocess.Popen
+        launched: list[subprocess.Popen[bytes]] = []
+
+        def noisy_popen(_command: object, **options: object):
+            child = real_popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os\nfor _ in range(256): os.write(1, b'x' * 4096)",
+                ],
+                **options,
+            )
+            launched.append(child)
+            return child
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess,
+            "Popen",
+            side_effect=noisy_popen,
+        ), self.assertRaises(AssertionError):
+            _CANDIDATE_SUPPORT._run_systemd_version_command(
+                Path("/usr/bin/systemctl")
+            )
+        self.assertIsNotNone(launched[0].returncode)
+        self.assertNotEqual(launched[0].returncode, 0)
+
+        previous = _CANDIDATE_SUPPORT._STRICT_PLATFORM_VALIDATED
+        _CANDIDATE_SUPPORT._STRICT_PLATFORM_VALIDATED = False
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {REQUIRED_CI_ISOLATION_MODE_ENV: REQUIRED_CI_ISOLATION_MODE},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.sys, "platform", "linux"
+            ), mock.patch.object(
+                Path, "is_file", return_value=True
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.os, "pidfd_open", create=True
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.signal, "pidfd_send_signal", create=True
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_probe_pidfd_capability"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_validate_strict_primitive"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_validate_systemd_scope_runtime_profile"
+            ) as profile:
+                _CANDIDATE_SUPPORT.strict_isolation_platform_preflight()
+            profile.assert_called_once_with()
+        finally:
+            _CANDIDATE_SUPPORT._STRICT_PLATFORM_VALIDATED = previous
+
+    def test_systemd_live_metrics_require_aggregate_kernel_events(self) -> None:
+        session_id = "e" * 32
+        unit = f"required-ci-candidate-{session_id}.scope"
+        common = {
+            "unit": unit,
+            "control_group": f"/runner.slice/{unit}",
+            "caps": {
+                "cpu.max": "200000 100000",
+                "memory.high": "805306368",
+                "memory.max": "1073741824",
+                "memory.swap.max": "0",
+                "pids.max": "64",
+            },
+        }
+        process = {
+            **common,
+            "kind": "process-cpu",
+            "nproc_soft": 4096,
+            "nproc_hard": 4096,
+            "forked": 61,
+            "pids_max_delta": 1,
+            "affinity_cpus": 4,
+            "nr_throttled_delta": 1,
+        }
+        memory = {
+            **common,
+            "kind": "memory",
+            "workers": 4,
+            "bytes_per_worker": 205 * 1024 * 1024,
+            "memory_high_delta": 1,
+            "memory_max_delta": 0,
+            "memory_oom_delta": 0,
+            "memory_oom_kill_delta": 0,
+        }
+        self.assertEqual(
+            _validated_systemd_live_metrics(
+                process, session_id=session_id, kind="process-cpu"
+            ),
+            process,
+        )
+        self.assertEqual(
+            _validated_systemd_live_metrics(
+                memory, session_id=session_id, kind="memory"
+            ),
+            memory,
+        )
+        for document, field, value in (
+            (process, "pids_max_delta", 0),
+            (process, "nproc_soft", 64),
+            (process, "affinity_cpus", 2),
+            (process, "nr_throttled_delta", 0),
+            (memory, "workers", 1),
+            (memory, "bytes_per_worker", 1024),
+            (memory, "memory_high_delta", 0),
+            (memory, "memory_max_delta", 1),
+            (memory, "memory_oom_delta", 1),
+            (memory, "memory_oom_kill_delta", 1),
+        ):
+            mutated = {**document, field: value}
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                _validated_systemd_live_metrics(
+                    mutated, session_id=session_id, kind=str(document["kind"])
+                )
+        for cap in tuple(common["caps"]):
+            mutated = {**process, "caps": {**common["caps"], cap: "max"}}
+            with self.subTest(cap=cap), self.assertRaises(AssertionError):
+                _validated_systemd_live_metrics(
+                    mutated, session_id=session_id, kind="process-cpu"
+                )
+
+    def test_systemd_scope_binding_rejects_property_proc_and_kernel_drifts(
         self,
     ) -> None:
-        owner_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._outer_owner_fault_probe_main
+        session_id = "d" * 32
+        unit = f"required-ci-candidate-{session_id}.scope"
+        control_group = f"/runner.slice/workload.slice/{unit}"
+        properties = (
+            f"Id={unit}\n"
+            "LoadState=loaded\n"
+            "ActiveState=active\n"
+            f"ControlGroup={control_group}\n"
+            "MemoryHigh=805306368\n"
+            "MemoryMax=1073741824\n"
+            "MemorySwapMax=0\n"
+            "TasksMax=64\n"
+            "CPUQuotaPerSecUSec=2s\n"
+            "CPUQuotaPeriodUSec=100ms\n"
+            "OOMPolicy=kill\n"
+            "KillMode=control-group\n"
+            "SendSIGKILL=yes\n"
+            "TimeoutStopUSec=5s\n"
+            "Delegate=no\n"
+            "MemoryAccounting=yes\n"
+            "TasksAccounting=yes\n"
+            "CPUAccounting=yes\n"
+        ).encode("ascii")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cgroup_root = Path(temporary_directory).resolve(strict=True)
+            (cgroup_root / "cgroup.controllers").write_text(
+                "cpu memory pids\n", encoding="ascii"
+            )
+            scope_path = cgroup_root / control_group[1:]
+            scope_path.mkdir(parents=True)
+            files = {
+                "cgroup.type": "domain\n",
+                "cgroup.procs": "4321\n",
+                "cgroup.events": "populated 1\nfrozen 0\n",
+                "memory.high": "805306368\n",
+                "memory.max": "1073741824\n",
+                "memory.swap.max": "0\n",
+                "pids.max": "64\n",
+                "cpu.max": "200000 100000\n",
+            }
+            for name, value in files.items():
+                (scope_path / name).write_text(value, encoding="ascii")
+
+            root_metadata = cgroup_root.stat()
+            mount_record = {
+                "mount_id": 91,
+                "major_minor": (
+                    os.major(root_metadata.st_dev),
+                    os.minor(root_metadata.st_dev),
+                ),
+                "mountpoint": cgroup_root,
+                "options": frozenset(("rw", "nosuid", "nodev", "noexec")),
+                "filesystem": "cgroup2",
+                "source": "cgroup",
+                "super_options": frozenset(("rw",)),
+            }
+            root_inventory = {
+                91: {
+                    "mountpoint": cgroup_root,
+                    "major_minor": mount_record["major_minor"],
+                    "root": "/",
+                }
+            }
+            authority = {
+                "cgroup_root": cgroup_root,
+                "cgroup_mount_record": mount_record,
+                "cgroup_mount_inventory": root_inventory,
+                "expected_owner_uid": os.getuid(),
+                "expected_owner_gid": os.getgid(),
+                "cgroup_descriptor_mount_id": 91,
+            }
+
+            def validate(
+                output: bytes = properties,
+                membership: bytes = f"0::{control_group}\n".encode("ascii"),
+                kernel_authority: Callable[[int], tuple[int, int, int]] | None = None,
+            ) -> dict[str, object]:
+                probe = kernel_authority or (
+                    lambda fd: (
+                        _CANDIDATE_SUPPORT._CGROUP2_SUPER_MAGIC,
+                        91,
+                        os.fstat(fd).st_dev,
+                    )
+                )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_kernel_descriptor_mount_authority",
+                    side_effect=probe,
+                ):
+                    return _CANDIDATE_SUPPORT._validated_systemd_scope_binding(
+                        unit,
+                        4321,
+                        systemctl_output=output,
+                        proc_cgroup=membership,
+                        **authority,
+                    )
+
+            with self.assertRaisesRegex(AssertionError, "mount|topology"):
+                _CANDIDATE_SUPPORT._validated_systemd_scope_binding(
+                    unit,
+                    4321,
+                    systemctl_output=properties,
+                    proc_cgroup=f"0::{control_group}\n".encode("ascii"),
+                    cgroup_root=cgroup_root,
+                )
+            for key, value in (
+                ("filesystem", "tmpfs"),
+                ("source", "tmpfs"),
+                ("major_minor", (999, 999)),
+            ):
+                original = mount_record[key]
+                mount_record[key] = value
+                try:
+                    with self.subTest(mount_field=key), self.assertRaises(
+                        AssertionError
+                    ):
+                        validate()
+                finally:
+                    mount_record[key] = original
+            authority["expected_owner_uid"] = os.getuid() + 1
+            with self.assertRaises(AssertionError):
+                validate()
+            authority["expected_owner_uid"] = os.getuid()
+            authority["cgroup_descriptor_mount_id"] = 92
+            with self.assertRaises(AssertionError):
+                validate()
+            authority["cgroup_descriptor_mount_id"] = 91
+            with self.assertRaisesRegex(AssertionError, "identity"):
+                validate(
+                    kernel_authority=lambda fd: (
+                        _CANDIDATE_SUPPORT._CGROUP2_SUPER_MAGIC,
+                        92 if stat.S_ISREG(os.fstat(fd).st_mode) else 91,
+                        os.fstat(fd).st_dev,
+                    )
+                )
+            scope_path.chmod(0o777)
+            with self.assertRaisesRegex(AssertionError, "policy"):
+                validate()
+            scope_path.chmod(0o755)
+            authority["cgroup_mount_inventory"] = {
+                **root_inventory,
+                92: {
+                    "mountpoint": scope_path,
+                    "major_minor": (999, 998),
+                },
+            }
+            with self.assertRaisesRegex(AssertionError, "nested mount"):
+                validate()
+            authority["cgroup_mount_inventory"] = root_inventory
+
+            binding = validate()
+            metadata = scope_path.lstat()
+            self.assertEqual(
+                binding,
+                {
+                    "profile": "systemd-v255-cgroup-v2-v1",
+                    "unit": unit,
+                    "control_group": control_group,
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                },
+            )
+
+            original_read = _CANDIDATE_SUPPORT._read_systemd_cgroup_file_at
+            displaced_scope = scope_path.with_name(f"{unit}.displaced")
+            replaced = False
+
+            def replace_during_read(*args: object, **kwargs: object) -> bytes:
+                nonlocal replaced
+                result = original_read(*args, **kwargs)
+                if not replaced and args[1] == "cpu.max":
+                    scope_path.rename(displaced_scope)
+                    scope_path.mkdir()
+                    replaced = True
+                return result
+
+            try:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_read_systemd_cgroup_file_at",
+                    side_effect=replace_during_read,
+                ), self.assertRaisesRegex(AssertionError, "identity changed"):
+                    validate()
+            finally:
+                scope_path.rmdir()
+                displaced_scope.rename(scope_path)
+
+            property_mutants = [properties + b"MainPID=4321\n"]
+            expected_property_lines = properties.decode("ascii").splitlines()
+            for line in expected_property_lines:
+                name, value = line.split("=", 1)
+                mutant_value = f"{value}-mutant" if value else "mutant"
+                property_mutants.append(
+                    properties.replace(
+                        f"{name}={value}\n".encode("ascii"),
+                        f"{name}={mutant_value}\n".encode("ascii"),
+                    )
+                )
+            for mutant in property_mutants:
+                with self.subTest(mutant=mutant), self.assertRaises(
+                    AssertionError
+                ):
+                    validate(mutant)
+
+            with self.assertRaises(AssertionError):
+                validate(membership=b"0::/system.slice/other.scope\n")
+            kernel_mutants = {
+                "cgroup.type": "threaded\n",
+                "cgroup.procs": "4322\n",
+                "cgroup.events": "populated 1\nfrozen 1\n",
+                "memory.high": "805306369\n",
+                "memory.max": "max\n",
+                "memory.swap.max": "1\n",
+                "pids.max": "65\n",
+                "cpu.max": "200001 100000\n",
+            }
+            for name, mutant in kernel_mutants.items():
+                with self.subTest(kernel_file=name):
+                    selected = scope_path / name
+                    original = selected.read_text(encoding="ascii")
+                    selected.write_text(mutant, encoding="ascii")
+                    try:
+                        with self.assertRaises(AssertionError):
+                            validate()
+                    finally:
+                        selected.write_text(original, encoding="ascii")
+            (cgroup_root / "cgroup.controllers").write_text(
+                "memory pids\n", encoding="ascii"
+            )
+            with self.assertRaises(AssertionError):
+                validate()
+
+    def test_scope_binding_precedes_wrapper_handshake_and_barrier(self) -> None:
+        session_id = "f" * 32
+        intent = {
+            "profile": "systemd-v255-cgroup-v2-v1",
+            "unit": f"required-ci-candidate-{session_id}.scope",
+            "control_group": None,
+            "device": None,
+            "inode": None,
+        }
+        bound = {
+            **intent,
+            "control_group": f"/system.slice/{intent['unit']}",
+            "device": 51,
+            "inode": 52,
+        }
+        call = {
+            "nonce": "1" * 32,
+            "session_id": session_id,
+            "target_uid": 60000,
+            "sudo_parent": (101, 102, 101, 101),
+            "wrapper": (201, 202, 201, 201),
+            "wrapper_pid": 201,
+            "barrier_fd": 9,
+            "resource_scope": intent,
+            "wrapper_command": ["/root/python", "-I", "-c", "wrapper"],
+        }
+
+        for failure_stage in (None, "bind", "handshake"):
+            with self.subTest(failure_stage=failure_stage):
+                trace: list[str] = []
+
+                def bind(
+                    unit: str,
+                    pid: int,
+                    *,
+                    expected_wrapper: object,
+                    expected_command: object,
+                ) -> dict[str, object]:
+                    self.assertEqual((unit, pid), (intent["unit"], 201))
+                    self.assertEqual(expected_wrapper, (201, 202, 201, 201))
+                    self.assertEqual(expected_command, call["wrapper_command"])
+                    trace.append("bind")
+                    if failure_stage == "bind":
+                        raise AssertionError("injected bind failure")
+                    return bound
+
+                def write_handshake(path: Path, **options: object) -> None:
+                    self.assertEqual(path, Path("/root/handshake.json"))
+                    self.assertEqual(options["resource_scope"], bound)
+                    self.assertEqual(options["wrapper"], (201, 202, 201, 201))
+                    trace.append("handshake")
+                    if failure_stage == "handshake":
+                        raise AssertionError("injected handshake failure")
+
+                def release(_descriptor: int) -> None:
+                    self.assertEqual(_descriptor, 9)
+                    trace.append("barrier")
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_validated_running_systemd_scope",
+                    side_effect=bind,
+                    create=True,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_write_root_controller_handshake",
+                    side_effect=write_handshake,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_release_wrapper_barrier",
+                    side_effect=release,
+                ):
+                    if failure_stage is None:
+                        result = _CANDIDATE_SUPPORT._bind_scope_write_handshake_release(
+                            Path("/root/handshake.json"), **call
+                        )
+                        self.assertEqual(result, bound)
+                        self.assertEqual(trace, ["bind", "handshake", "barrier"])
+                    else:
+                        with self.assertRaisesRegex(
+                            AssertionError, f"injected {failure_stage}"
+                        ):
+                            _CANDIDATE_SUPPORT._bind_scope_write_handshake_release(
+                                Path("/root/handshake.json"), **call
+                            )
+                        self.assertNotIn("barrier", trace)
+
+        for fault_point, phase, wrapper in (
+            (
+                "after-wrapper-popen-before-handshake-sigkill",
+                "controller-bound",
+                None,
+            ),
+            (
+                "after-wrapper-bound-before-barrier-sigstop",
+                "wrapper-bound",
+                list(call["wrapper"]),
+            ),
+        ):
+            handshake = {
+                "schema_version": 3,
+                "phase": phase,
+                "nonce": call["nonce"],
+                "session_id": session_id,
+                "target_uid": 60000,
+                "controller": [301, 302, 301, 301],
+                "sudo_parent": list(call["sudo_parent"]),
+                "wrapper": wrapper,
+                "resource_scope": intent if wrapper is None else bound,
+                "fault_reached": {
+                    "point": fault_point,
+                    "wrapper": list(call["wrapper"]),
+                    "resource_scope": bound,
+                },
+            }
+            self.assertEqual(
+                _CANDIDATE_SUPPORT._validated_strict_inner_fault_scope(
+                    handshake, fault_point
+                ),
+                bound,
+            )
+            for mutation in (
+                {**handshake, "fault_reached": None},
+                {
+                    **handshake,
+                    "fault_reached": {
+                        **handshake["fault_reached"],
+                        "point": "after-wrapper-bound-before-barrier-sigkill",
+                    },
+                },
+                {
+                    **handshake,
+                    "fault_reached": {
+                        **handshake["fault_reached"],
+                        "resource_scope": intent,
+                    },
+                },
+            ):
+                with self.assertRaises(AssertionError):
+                    _CANDIDATE_SUPPORT._validated_strict_inner_fault_scope(
+                        mutation, fault_point
+                    )
+
+        identity = (201, 202, 101, 201, 201, (0, 0, 0, 0))
+        for observed, ready in (
+            ((201, 203, 101, 201, 201, (0, 0, 0, 0)), []),
+            (identity, [8]),
+        ):
+            with self.subTest(observed=observed, ready=ready), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_validated_root_wrapper_process",
+                return_value=contextlib.nullcontext((7, identity, 8, 91, 42)),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_root_systemctl",
+                return_value=(0, b"properties", b""),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_read_systemd_cgroup_file_at",
+                return_value=b"0::/scope\n",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity_from_proc_fd",
+                return_value=observed,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT.select,
+                "select",
+                return_value=(ready, [], []),
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_validated_systemd_scope_binding"
+            ) as bind_scope, self.assertRaisesRegex(
+                AssertionError, "wrapper identity changed"
+            ):
+                _CANDIDATE_SUPPORT._validated_running_systemd_scope(
+                    str(intent["unit"]),
+                    201,
+                    expected_wrapper=call["wrapper"],
+                    expected_command=call["wrapper_command"],
+                )
+            bind_scope.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            process = Path(temporary_directory)
+            command = ["/usr/bin/python3", "x" * (74 * 1024)]
+            expected = b"\0".join(os.fsencode(value) for value in command) + b"\0"
+            (process / "cmdline").write_bytes(expected)
+            descriptor = os.open(process, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                def authority(fd: int) -> tuple[int, int, int]:
+                    return (
+                        _CANDIDATE_SUPPORT._PROC_SUPER_MAGIC,
+                        91,
+                        os.fstat(fd).st_dev,
+                    )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_kernel_descriptor_mount_authority",
+                    side_effect=authority,
+                ):
+                    self.assertEqual(
+                        _CANDIDATE_SUPPORT._read_exact_systemd_process_command_at(
+                            descriptor,
+                            command,
+                            expected_owner_uid=os.getuid(),
+                            expected_owner_gid=os.getgid(),
+                            expected_parent_filesystem_magic=(
+                                _CANDIDATE_SUPPORT._PROC_SUPER_MAGIC
+                            ),
+                            expected_parent_mount_id=91,
+                            expected_parent_device=os.fstat(descriptor).st_dev,
+                        ),
+                        expected,
+                    )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_STRICT_SYSTEMD_PROCESS_COMMAND_LIMIT_BYTES",
+                    16 * 1024,
+                ), self.assertRaisesRegex(AssertionError, "fixed limit"):
+                    _CANDIDATE_SUPPORT._read_exact_systemd_process_command_at(
+                        descriptor, command
+                    )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_kernel_descriptor_mount_authority",
+                    side_effect=lambda fd: (
+                        _CANDIDATE_SUPPORT._PROC_SUPER_MAGIC,
+                        92 if stat.S_ISREG(os.fstat(fd).st_mode) else 91,
+                        os.fstat(fd).st_dev,
+                    ),
+                ), self.assertRaisesRegex(AssertionError, "identity"):
+                    _CANDIDATE_SUPPORT._read_exact_systemd_process_command_at(
+                        descriptor,
+                        command,
+                        expected_owner_uid=os.getuid(),
+                        expected_owner_gid=os.getgid(),
+                        expected_parent_filesystem_magic=(
+                            _CANDIDATE_SUPPORT._PROC_SUPER_MAGIC
+                        ),
+                        expected_parent_mount_id=91,
+                        expected_parent_device=os.fstat(descriptor).st_dev,
+                    )
+            finally:
+                os.close(descriptor)
+
+        expected_command = call["wrapper_command"]
+        initial_command = _CANDIDATE_SUPPORT._systemd_scope_command(
+            session_id, expected_command
         )
-        parent_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
+        common = (
+            mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_open_validated_root_wrapper_process",
+                return_value=contextlib.nullcontext((7, identity, 8, 91, 42)),
+            ),
+            mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_process_identity_from_proc_fd",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                _CANDIDATE_SUPPORT.select, "select", return_value=([], [], [])
+            ),
         )
-        pause_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._pause_at_outer_owner_fault_boundary
+        with contextlib.ExitStack() as stack:
+            for patcher in common:
+                stack.enter_context(patcher)
+            sample_phase = stack.enter_context(
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_sample_systemd_process_exec_phase",
+                    side_effect=(0, 1),
+                )
+            )
+            stack.enter_context(mock.patch.object(_CANDIDATE_SUPPORT.time, "sleep"))
+            stack.enter_context(
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_root_systemctl",
+                    return_value=(0, b"properties", b""),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_read_systemd_cgroup_file_at",
+                    return_value=b"membership",
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_validated_systemd_scope_binding",
+                    return_value=bound,
+                )
+            )
+            self.assertEqual(
+                _CANDIDATE_SUPPORT._validated_running_systemd_scope(
+                    str(intent["unit"]),
+                    201,
+                    expected_wrapper=call["wrapper"],
+                    expected_command=expected_command,
+                ),
+                bound,
+            )
+        self.assertEqual(
+            [item.args[1:] for item in sample_phase.call_args_list],
+            [(initial_command, expected_command)] * 2,
         )
 
-        self.assertIn("trusted_isolation_chain_registry()", owner_source)
-        self.assertLess(
-            owner_source.index('bootstrap != b"G"'),
-            owner_source.index("trusted_isolation_chain_registry()"),
+        executable_identities = {
+            _CANDIDATE_SUPPORT._STRICT_PRIMITIVES["systemd-run"]: (1, 1),
+            _CANDIDATE_SUPPORT._STRICT_PRIMITIVES["python"]: (2, 2),
+        }
+        for name, observed, command_phase, expected_phase in (
+            ("exec-between-samples", ((1, 1), (2, 2)), 0, None),
+            ("transient-empty", ((2, 2), (2, 2)), -1, None),
+        ):
+            with self.subTest(name=name), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_trusted_executable_identity",
+                side_effect=lambda path: executable_identities[path],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_systemd_process_executable_identity_at",
+                side_effect=observed,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_read_systemd_process_command_at",
+                return_value=command_phase,
+            ):
+                self.assertIs(
+                    _CANDIDATE_SUPPORT._sample_systemd_process_exec_phase(
+                        7,
+                        initial_command,
+                        expected_command,
+                        proc_mount_id=91,
+                        proc_device=42,
+                    ),
+                    expected_phase,
+                )
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_trusted_executable_identity",
+            side_effect=lambda path: executable_identities[path],
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_systemd_process_executable_identity_at",
+            side_effect=((1, 1), (1, 1)),
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_read_systemd_process_command_at",
+            side_effect=AssertionError("stable third argv"),
+        ), self.assertRaisesRegex(AssertionError, "third argv"):
+            _CANDIDATE_SUPPORT._sample_systemd_process_exec_phase(
+                7,
+                initial_command,
+                expected_command,
+                proc_mount_id=91,
+                proc_device=42,
+            )
+
+        for command_result, pattern in (
+            (0, "did not become bound"),
+            (AssertionError("inexact third argv"), "third argv"),
+        ):
+            with self.subTest(pattern=pattern), contextlib.ExitStack() as stack:
+                for patcher in common:
+                    stack.enter_context(patcher)
+                stack.enter_context(
+                    mock.patch.object(
+                        _CANDIDATE_SUPPORT,
+                        "_sample_systemd_process_exec_phase",
+                        return_value=command_result,
+                        side_effect=(
+                            command_result
+                            if isinstance(command_result, BaseException)
+                            else None
+                        ),
+                    )
+                )
+                if command_result == 0:
+                    stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT.time,
+                            "monotonic",
+                            side_effect=(0.0, 0.0, 1.0),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(_CANDIDATE_SUPPORT.time, "sleep")
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            _CANDIDATE_SUPPORT,
+                            "_STRICT_WATCHDOG_TIMEOUT_SECONDS",
+                            0.5,
+                        )
+                    )
+                with self.assertRaisesRegex(AssertionError, pattern):
+                    _CANDIDATE_SUPPORT._validated_running_systemd_scope(
+                        str(intent["unit"]),
+                        201,
+                        expected_wrapper=call["wrapper"],
+                        expected_command=expected_command,
+                    )
+
+    def test_systemd_scope_cleanup_handles_missing_unbound_and_bound_states(
+        self,
+    ) -> None:
+        session_id = "2" * 32
+        intent = {
+            "profile": "systemd-v255-cgroup-v2-v1",
+            "unit": f"required-ci-candidate-{session_id}.scope",
+            "control_group": None,
+            "device": None,
+            "inode": None,
+        }
+        bound = {
+            **intent,
+            "control_group": f"/system.slice/{intent['unit']}",
+            "device": 61,
+            "inode": 62,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            scope = root / str(bound["control_group"])[1:]
+            scope.mkdir(parents=True)
+            bound.update(device=scope.stat().st_dev, inode=scope.stat().st_ino)
+            (scope / "cgroup.kill").write_bytes(b"")
+            (scope / "cgroup.events").write_text(
+                "populated 0\nfrozen 0\n", encoding="ascii"
+            )
+            deadline = time.monotonic() + 5
+            with self.assertRaisesRegex(AssertionError, "mount|authority"):
+                _CANDIDATE_SUPPORT._root_kill_systemd_scope(
+                    bound, deadline=deadline, cgroup_root=root
+                )
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            scope_fd = os.open(scope, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                opened = contextlib.nullcontext(
+                    (root_fd, scope_fd, 91, scope.stat().st_dev)
+                )
+                def authority(fd: int) -> tuple[int, int, int]:
+                    return (
+                        _CANDIDATE_SUPPORT._CGROUP2_SUPER_MAGIC,
+                        91,
+                        os.fstat(fd).st_dev,
+                    )
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_open_bound_systemd_scope",
+                    return_value=opened,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_kernel_descriptor_mount_authority",
+                    side_effect=authority,
+                ):
+                    _CANDIDATE_SUPPORT._root_kill_systemd_scope(
+                        bound,
+                        deadline=deadline,
+                        cgroup_root=root,
+                        expected_owner_uid=os.getuid(),
+                        expected_owner_gid=os.getgid(),
+                    )
+                    self.assertEqual(
+                        (scope / "cgroup.kill").read_bytes(), b"1"
+                    )
+                    _CANDIDATE_SUPPORT._wait_systemd_scope_zero(
+                        bound,
+                        deadline=deadline,
+                        cgroup_root=root,
+                        expected_owner_uid=os.getuid(),
+                        expected_owner_gid=os.getgid(),
+                    )
+            finally:
+                os.close(scope_fd)
+                os.close(root_fd)
+
+    def test_systemd_scope_cleanup_uses_one_full_manager_snapshot(self) -> None:
+        session_id = "6" * 32
+        unit = f"required-ci-candidate-{session_id}.scope"
+        control_group = f"/runner.slice/{unit}"
+        expected_properties = (
+            "Id",
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "ControlGroup",
+            "MemoryHigh",
+            "MemoryMax",
+            "MemorySwapMax",
+            "TasksMax",
+            "CPUQuotaPerSecUSec",
+            "CPUQuotaPeriodUSec",
+            "OOMPolicy",
+            "KillMode",
+            "SendSIGKILL",
+            "TimeoutStopUSec",
+            "Delegate",
+            "MemoryAccounting",
+            "TasksAccounting",
+            "CPUAccounting",
         )
-        self.assertIn("--outer-owner-fault-probe", parent_source)
-        self.assertIn("start_new_session=True", parent_source)
-        self.assertIn("os.pidfd_open", parent_source)
-        self.assertLess(
-            parent_source.index("owner_pidfd = os.pidfd_open"),
-            parent_source.index('os.write(bootstrap_write_fd, b"G")'),
+
+        def loaded(active: str, substate: str) -> bytes:
+            return (
+                f"Id={unit}\nLoadState=loaded\nActiveState={active}\n"
+                f"SubState={substate}\nControlGroup={control_group}\n"
+                "MemoryHigh=805306368\nMemoryMax=1073741824\n"
+                "MemorySwapMax=0\nTasksMax=64\n"
+                "CPUQuotaPerSecUSec=2s\nCPUQuotaPeriodUSec=100ms\n"
+                "OOMPolicy=kill\nKillMode=control-group\nSendSIGKILL=yes\n"
+                "TimeoutStopUSec=5s\nDelegate=no\nMemoryAccounting=yes\n"
+                "TasksAccounting=yes\nCPUAccounting=yes\n"
+            ).encode("ascii")
+
+        absent = (
+            f"Id={unit}\nLoadState=not-found\nActiveState=inactive\n"
+            "SubState=dead\nControlGroup=\nMemoryHigh=[not set]\n"
+            "MemoryMax=[not set]\n"
+            "MemorySwapMax=[not set]\nTasksMax=infinity\n"
+            "CPUQuotaPerSecUSec=infinity\nCPUQuotaPeriodUSec=infinity\n"
+            "OOMPolicy=stop\nKillMode=control-group\nSendSIGKILL=yes\n"
+            "TimeoutStopUSec=infinity\nDelegate=no\nMemoryAccounting=no\n"
+            "TasksAccounting=no\nCPUAccounting=no\n"
+        ).encode("ascii")
+        outputs = (
+            loaded("active", "running"),
+            loaded("deactivating", "stop-sigterm"),
+            loaded("inactive", "dead"),
+            loaded("failed", "failed"),
+            absent,
         )
-        self.assertIn("_signal_process_pidfd", parent_source)
-        self.assertIn("process.returncode != -signal.SIGKILL", parent_source)
-        self.assertIn("os.read(pause_descriptor, 1)", pause_source)
-        self.assertNotIn("signal.pause", pause_source)
-        self.assertNotIn("_recover_registered_entry", parent_source)
-        self.assertNotIn("close_trusted_isolation_chains", parent_source)
-        self.assertNotIn("os.kill(", parent_source)
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_root_systemctl",
+            side_effect=[(0, output, b"") for output in outputs],
+        ) as systemctl:
+            observed = [
+                _CANDIDATE_SUPPORT._query_systemd_scope_lifecycle(
+                    unit, deadline=time.monotonic() + 5
+                )
+                for _ in outputs
+            ]
+        self.assertEqual(
+            [None if item is None else item["ActiveState"] for item in observed],
+            ["active", "deactivating", "inactive", "failed", None],
+        )
+        self.assertEqual(systemctl.call_count, len(outputs))
+        for selected in systemctl.call_args_list:
+            self.assertEqual(
+                selected.args[0][2],
+                f"--property={','.join(expected_properties)}",
+            )
+        intent = _CANDIDATE_SUPPORT._systemd_scope_intent(session_id)
+        bound = {
+            **intent,
+            "control_group": control_group,
+            "device": 91,
+            "inode": 92,
+        }
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_root_systemctl",
+            side_effect=(
+                (0, loaded("active", "running"), b""),
+                (0, loaded("deactivating", "stop-sigterm"), b""),
+            ),
+        ) as systemctl, mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_validated_systemd_scope_cleanup_path",
+            return_value=bound,
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "_systemd_scope_population", return_value=0
+        ):
+            self.assertEqual(
+                _CANDIDATE_SUPPORT._systemd_scope_cleanup_observation(
+                    intent, deadline=time.monotonic() + 5
+                ),
+                ("active", bound, 0),
+            )
+        systemctl.assert_called_once()
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_root_systemctl",
+            return_value=(
+                0,
+                loaded("reloading", "reload").replace(
+                    b"ControlGroup=", b"ControlGroup="
+                ),
+                b"",
+            ),
+        ), self.assertRaisesRegex(AssertionError, "unreadable"):
+            _CANDIDATE_SUPPORT._query_systemd_scope_lifecycle(
+                unit, deadline=time.monotonic() + 5
+            )
+        missing_base = (
+            f"Id={unit}\nLoadState=not-found\nActiveState=inactive\n"
+            "SubState=dead\nControlGroup=\n"
+        ).encode("ascii")
+        for malformed in (
+            missing_base,
+            absent + b"Unexpected=value\n",
+            absent.replace(b"LoadState=not-found", b"LoadState=loaded"),
+            absent.replace(b"ActiveState=inactive", b"ActiveState=failed"),
+        ):
+            with self.subTest(malformed=malformed[:80]), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_root_systemctl",
+                return_value=(0, malformed, b""),
+            ), self.assertRaisesRegex(AssertionError, "unreadable"):
+                _CANDIDATE_SUPPORT._query_systemd_scope_lifecycle(
+                    unit, deadline=time.monotonic() + 5
+                )
+
+    def test_systemd_scope_cleanup_rechecks_collect_races_to_terminal(
+        self,
+    ) -> None:
+        session_id = "7" * 32
+        intent = _CANDIDATE_SUPPORT._systemd_scope_intent(session_id)
+        bound = {
+            **intent,
+            "control_group": f"/runner.slice/{intent['unit']}",
+            "device": 81,
+            "inode": 82,
+        }
+        cases = (
+            (
+                "active-deactivating-absent",
+                bound,
+                [("active", bound, 0), ("deactivating", bound, 0), ("absent", None, None)],
+                False,
+                ["kill", "stop"],
+            ),
+            (
+                "kill-immediate-collect",
+                bound,
+                [("active", bound, 1), ("absent", None, None)],
+                False,
+                ["kill"],
+            ),
+            (
+                "path-only",
+                bound,
+                [("absent", bound, 1), ("absent", None, None)],
+                False,
+                ["kill"],
+            ),
+            (
+                "unit-only",
+                intent,
+                [("active", None, None), ("absent", None, None)],
+                False,
+                ["stop"],
+            ),
+            (
+                "stop-collect-race",
+                intent,
+                [
+                    ("active", None, None),
+                    ("absent", bound, 0),
+                    ("absent", None, None),
+                ],
+                True,
+                ["stop", "kill"],
+            ),
+        )
+        for name, selected, observations, stop_fails, expected in cases:
+            with self.subTest(name=name):
+                trace: list[str] = []
+
+                def stop(_unit: object, *, deadline: float) -> None:
+                    trace.append("stop")
+                    if stop_fails:
+                        raise AssertionError("injected collected-unit race")
+
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_systemd_scope_cleanup_observation",
+                    side_effect=observations,
+                    create=True,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_systemd_scope_cleanup_status",
+                    side_effect=AssertionError("split-query cleanup mutant"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_root_kill_systemd_scope",
+                    side_effect=lambda *_args, **_options: trace.append("kill"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_systemd_scope_stop",
+                    side_effect=stop,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_systemd_scope_reset_failed",
+                    side_effect=lambda *_args, **_options: trace.append("reset"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_wait_systemd_scope_zero",
+                    side_effect=AssertionError("blocking zero-wait mutant"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_wait_systemd_scope_absent",
+                    side_effect=AssertionError("blocking absence-wait mutant"),
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT.time, "sleep"
+                ):
+                    _CANDIDATE_SUPPORT._root_close_systemd_scope(
+                        selected, deadline=time.monotonic() + 5
+                    )
+                self.assertEqual(trace, expected)
+
+    def test_optional_scope_leaf_preserves_root_and_parent_authority(self) -> None:
+        session_id = "8" * 32
+        unit = f"required-ci-candidate-{session_id}.scope"
+        control_group = f"/runner.slice/{unit}"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve(strict=True)
+            parent = root / "runner.slice"
+            leaf = parent / unit
+            leaf.mkdir(parents=True)
+            root_metadata = root.stat()
+            record = {
+                "mount_id": 91,
+                "major_minor": (
+                    os.major(root_metadata.st_dev),
+                    os.minor(root_metadata.st_dev),
+                ),
+                "mountpoint": root,
+                "options": frozenset(("rw", "nosuid", "nodev", "noexec")),
+                "filesystem": "cgroup2",
+                "source": "cgroup",
+                "super_options": frozenset(("rw",)),
+            }
+            inventory = {
+                91: {
+                    "mountpoint": root,
+                    "major_minor": record["major_minor"],
+                    "root": "/",
+                }
+            }
+            def authority(fd: int) -> tuple[int, int, int]:
+                return (
+                    _CANDIDATE_SUPPORT._CGROUP2_SUPER_MAGIC,
+                    91,
+                    os.fstat(fd).st_dev,
+                )
+
+            def binding() -> dict[str, object]:
+                metadata = leaf.stat()
+                return {
+                    "profile": "systemd-v255-cgroup-v2-v1",
+                    "unit": unit,
+                    "control_group": control_group,
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                }
+
+            def present(selected: Mapping[str, object]) -> bool:
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_kernel_descriptor_mount_authority",
+                    side_effect=authority,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT, "_descriptor_acl_is_absent"
+                ):
+                    return _CANDIDATE_SUPPORT._bound_systemd_scope_present(
+                        selected,
+                        root,
+                        mount_record=record,
+                        mount_inventory=inventory,
+                        expected_owner_uid=os.getuid(),
+                        expected_owner_gid=os.getgid(),
+                        expected_descriptor_mount_id=91,
+                    )
+
+            selected = binding()
+            self.assertTrue(present(selected))
+            displaced_parent = root / "runner.slice-displaced"
+            original_stat = os.stat
+            original_open = os.open
+
+            for target, terminal, ancestor_change in (
+                (unit, False, None),
+                ("runner.slice", True, None),
+                (unit, True, "missing"),
+                (unit, True, "replaced"),
+            ):
+                for stage in ("pre-stat", "open", "reselect", "exit"):
+                    selected = binding()
+                    stats = 0
+
+                    def remove_target() -> None:
+                        if target == unit:
+                            leaf.rmdir()
+                            if ancestor_change is not None:
+                                parent.rename(displaced_parent)
+                                if ancestor_change == "replaced":
+                                    parent.mkdir()
+                        else:
+                            parent.rename(displaced_parent)
+
+                    def selected_stat(
+                        name: object, *args: object, **kwargs: object
+                    ):
+                        nonlocal stats
+                        if name == target:
+                            stats += 1
+                            if stats == {"pre-stat": 1, "reselect": 2, "exit": 3}.get(stage):
+                                remove_target()
+                        return original_stat(name, *args, **kwargs)
+
+                    def selected_open(
+                        name: object, *args: object, **kwargs: object
+                    ):
+                        if name == target and stage == "open":
+                            remove_target()
+                        return original_open(name, *args, **kwargs)
+
+                    with self.subTest(
+                        target=target,
+                        stage=stage,
+                        ancestor_change=ancestor_change,
+                    ):
+                        try:
+                            with mock.patch.object(
+                                os, "stat", side_effect=selected_stat
+                            ), mock.patch.object(
+                                os, "open", side_effect=selected_open
+                            ):
+                                if terminal:
+                                    with self.assertRaises(AssertionError):
+                                        present(selected)
+                                else:
+                                    self.assertFalse(present(selected))
+                        finally:
+                            if target == unit:
+                                if ancestor_change == "replaced":
+                                    parent.rmdir()
+                                if ancestor_change is not None:
+                                    displaced_parent.rename(parent)
+                                leaf.mkdir()
+                            else:
+                                displaced_parent.rename(parent)
+
+            selected = binding()
+            displaced_root = root.with_name(f"{root.name}-displaced")
+            root.rename(displaced_root)
+            try:
+                with self.assertRaisesRegex(AssertionError, "unreadable"):
+                    present(selected)
+            finally:
+                displaced_root.rename(root)
+
+            control = leaf / "cgroup.events"
+            control.write_bytes(b"populated 0\nfrozen 0\n")
+            vanished_leaf = parent / f"{unit}.vanished"
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_kernel_descriptor_mount_authority",
+                side_effect=authority,
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_descriptor_acl_is_absent"
+            ), self.assertRaises(
+                _CANDIDATE_SUPPORT._SystemdScopeLeafDisappeared
+            ):
+                with _CANDIDATE_SUPPORT._open_validated_cgroup2_scope(
+                    root,
+                    control_group,
+                    mount_record=record,
+                    mount_inventory=inventory,
+                    expected_owner_uid=os.getuid(),
+                    expected_owner_gid=os.getgid(),
+                    expected_descriptor_mount_id=91,
+                    allow_missing_leaf=True,
+                ) as (_, scope_fd, _, _, device):
+                    leaf.rename(vanished_leaf)
+                    (vanished_leaf / control.name).unlink()
+                    _CANDIDATE_SUPPORT._read_systemd_cgroup_file_at(
+                        scope_fd,
+                        control.name,
+                        control.name,
+                        expected_parent_filesystem_magic=(
+                            _CANDIDATE_SUPPORT._CGROUP2_SUPER_MAGIC
+                        ),
+                        expected_parent_mount_id=91,
+                        expected_parent_device=device,
+                    )
+            vanished_leaf.rename(leaf)
+
+            selected = binding()
+            displaced_leaf = parent / f"{unit}.displaced"
+            final_stats = 0
+
+            def replace_final(name: object, *args: object, **kwargs: object):
+                nonlocal final_stats
+                if name == unit:
+                    final_stats += 1
+                    if final_stats == 3:
+                        leaf.rename(displaced_leaf)
+                        leaf.mkdir()
+                return original_stat(name, *args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    os, "stat", side_effect=replace_final
+                ), self.assertRaisesRegex(AssertionError, "identity changed"):
+                    present(selected)
+            finally:
+                if leaf.exists():
+                    leaf.rmdir()
+                displaced_leaf.rename(leaf)
+
+    def test_systemd_scope_cleanup_and_outer_timeouts_have_fixed_margin(
+        self,
+    ) -> None:
+        class ControllerCaptured(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            snapshot_root = Path(temporary_directory).resolve(strict=True)
+            execution_root = snapshot_root / "execution"
+            control_root = snapshot_root / "control"
+            execution_root.mkdir()
+            control_root.mkdir()
+            snapshot = {
+                "config_path": snapshot_root / "config.json",
+                "controller_path": snapshot_root / "controller.py",
+                "handshake_path": snapshot_root / "handshake.json",
+                "execution_root": execution_root,
+                "control_root": control_root,
+            }
+            captured = []
+
+            def capture_controller(
+                *_args: object, **options: object
+            ) -> bytes:
+                captured.append(dict(options))
+                raise ControllerCaptured
+
+            with mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_realm",
+                return_value={"uid": 60000, "gid": 60000},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_active_strict_session",
+                return_value={"root": snapshot_root},
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_writable_root_bindings",
+                return_value=[
+                    {
+                        "path": str(execution_root),
+                        "device": 1,
+                        "inode": 2,
+                        "host_mount_id": 3,
+                    }
+                ],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_aggregate_writable_device_binding",
+                return_value={
+                    "mountpoint": "/quota",
+                    "device": 1,
+                    "major_minor": [0, 1],
+                    "mount_id": 3,
+                    "source": "required-ci-writable",
+                    "size_bytes": 64 * 1024 * 1024,
+                    "nr_inodes": 8192,
+                    "flags": ["nodev", "nosuid"],
+                },
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_host_read_root_bindings",
+                return_value=self.root_command_config()["read_roots"],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_assert_strict_bootstrap_nofile_capacity",
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_strict_host_namespace_identity",
+                side_effect=lambda namespace: {
+                    "mnt": "mnt:[101]",
+                    "ipc": "ipc:[102]",
+                    "net": "net:[103]",
+                }[namespace],
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
+            ), mock.patch.object(
+                _CANDIDATE_SUPPORT,
+                "_run_registered_sudo",
+                side_effect=capture_controller,
+            ):
+                for explicit_outer_timeout in (None, 0.5):
+                    if snapshot["config_path"].exists():
+                        snapshot["config_path"].chmod(0o600)
+                    with self.assertRaises(ControllerCaptured):
+                        _CANDIDATE_SUPPORT._invoke_strict_controller(
+                            snapshot,
+                            [
+                                str(
+                                    _CANDIDATE_SUPPORT._STRICT_PRIMITIVES[
+                                        "python"
+                                    ]
+                                ),
+                                "-I",
+                                "/probe.py",
+                            ],
+                            {},
+                            execution_root,
+                            b"",
+                            timeout_seconds=1,
+                            outer_timeout_seconds=explicit_outer_timeout,
+                        )
+
+        self.assertEqual(
+            [options["timeout"] for options in captured], [31, 0.5]
+        )
+
+        cleanup_output = (
+            _CANDIDATE_SUPPORT._ROOT_CLEANUP_RECEIPT_PREFIX
+            + '{"status":"complete"}\n'
+        ).encode("ascii")
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_active_strict_session",
+            return_value={"token": "f" * 32},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_run_registered_sudo",
+            return_value=cleanup_output,
+        ) as registered_sudo:
+            _CANDIDATE_SUPPORT._invoke_registered_session_cleanup(
+                Path("/root/controller.py"),
+                Path("/root/entries/chain.json"),
+                60000,
+            )
+        self.assertEqual(registered_sudo.call_args.kwargs["timeout"], 20)
 
     def test_after_target_active_outer_child_preserves_candidate_root_channel(
         self,
@@ -19718,39 +22091,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         )
                     read_diagnostic.assert_not_called()
 
-    def test_outer_fault_ack_binds_every_recovery_identity(self) -> None:
-        publish_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._publish_outer_owner_fault_ack
-        )
-        validate_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._validate_outer_owner_fault_ack
-        )
-        for field in (
-            '"nonce"',
-            '"boundary"',
-            '"owner"',
-            '"registry_root"',
-            '"entry"',
-            '"outer"',
-            '"watchdog"',
-        ):
-            with self.subTest(field=field):
-                self.assertIn(field, publish_source)
-                self.assertIn(field, validate_source)
-        self.assertIn("_load_chain_registry_entry", publish_source)
-        self.assertIn("root_metadata.st_dev", publish_source)
-        self.assertIn("root_metadata.st_ino", publish_source)
-        self.assertIn("watchdog_identity", publish_source)
-        self.assertIn("_chain_registry_lock(entry_path)", publish_source)
-        parent_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
-        )
-        absence_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._wait_exact_registry_root_absent
-        )
-        self.assertIn("os.O_DIRECTORY | os.O_NOFOLLOW", parent_source)
-        self.assertIn("bound_metadata.st_nlink != 0", absence_source)
-
     def test_outer_fault_ack_binds_prepared_registry_root_policy(
         self,
     ) -> None:
@@ -19824,7 +22164,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "schema_version": 1,
             "nonce": nonce,
             "root_handshake": {
-                "schema_version": 2,
+                "schema_version": 3,
                 "phase": "wrapper-bound",
                 "nonce": nonce,
                 "session_id": session_id,
@@ -19838,6 +22178,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 "wrapper": _CANDIDATE_SUPPORT._registered_process_binding(
                     wrapper_identity
                 ),
+                "resource_scope": {
+                    **_CANDIDATE_SUPPORT._systemd_scope_intent(session_id),
+                    "control_group": f"/system.slice/required-ci-candidate-{session_id}.scope",
+                    "device": 51,
+                    "inode": 52,
+                },
+                "fault_reached": None,
             },
             "target_marker": {
                 "schema_version": 1,
@@ -19863,13 +22210,19 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             control_root = Path(temporary_directory).resolve(strict=True)
             root = control_root / "registry"
             entries = root / "entries"
-            resources = root / "resources"
-            tombstones = root / ".tombstones"
+            quota = (
+                root / _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_DIRECTORY
+            )
+            resources = quota / "resources"
+            fixtures = quota / "fixtures"
+            tombstones = quota / ".tombstones"
             trusted_control = root / "trusted-control"
             for directory in (
                 root,
                 entries,
+                quota,
                 resources,
+                fixtures,
                 tombstones,
                 trusted_control,
             ):
@@ -19894,7 +22247,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             session = {
                 "root": root,
                 "entries": entries,
+                "quota": quota,
                 "resources": resources,
+                "fixtures": fixtures,
                 "tombstones": tombstones,
                 "controller_path": controller_path,
                 "target_uid": target_uid,
@@ -20749,94 +23104,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         )
         fstat.assert_called_once_with(72)
 
-    def test_outer_fault_recovery_uses_one_parent_owned_deadline(self) -> None:
-        self.assertEqual(
-            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS,
-            _CANDIDATE_SUPPORT.CANDIDATE_PROCESS_TIMEOUT_SECONDS
-            + _CANDIDATE_SUPPORT.CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS,
-        )
-        self.assertEqual(
-            _CANDIDATE_SUPPORT
-            ._OUTER_OWNER_RECOVERY_COMPLETION_TIMEOUT_SECONDS,
-            _CANDIDATE_SUPPORT._STRICT_WATCHDOG_TIMEOUT_SECONDS
-            + _CANDIDATE_SUPPORT._STRICT_WATCHDOG_RESULT_TIMEOUT_SECONDS
-            + _CANDIDATE_SUPPORT.CANDIDATE_PROCESS_REAP_TIMEOUT_SECONDS
-            + _CANDIDATE_SUPPORT._STRICT_ZERO_SCAN_STABILITY_SECONDS,
-        )
-        source = inspect.getsource(
-            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
-        )
-        deadline = source.index("recovery_deadline =")
-        owner_signal = source.index(
-            "_signal_process_pidfd(owner_pidfd, selected_signal)"
-        )
-        owner_wait = source.index("process.wait(timeout=owner_timeout_seconds)")
-        close_pause = source.index("os.close(pause_write_fd)")
-        combined_observer = source.index(
-            "_wait_outer_owner_watchdog_cleanup("
-        )
-        session_quiescence = source.index(
-            "_wait_outer_owner_session_quiescent("
-        )
-
-        self.assertLess(deadline, owner_signal)
-        self.assertLess(owner_signal, owner_wait)
-        self.assertLess(owner_wait, close_pause)
-        self.assertLess(close_pause, combined_observer)
-        self.assertLess(combined_observer, session_quiescence)
-        self.assertIn("deadline=recovery_deadline", source)
-        self.assertNotIn("_wait_exact_registry_root_absent(", source)
-        self.assertNotIn(
-            "_wait_process_pidfd_terminal(\n            watchdog_pidfd",
-            source,
-        )
-
-    def test_outer_fault_probe_reaches_real_target_active_boundary(self) -> None:
-        ensure_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._ensure_strict_backend
-        )
-        registered_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._run_registered_sudo_under_gate
-        )
-        controller_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_controller_main
-        )
-        owner_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._outer_owner_fault_probe_main
-        )
-        parent_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._probe_independent_outer_owner_fault
-        )
-
-        self.assertIn('"after-target-active"', ensure_source)
-        self.assertLess(
-            registered_source.index(
-                "_release_registered_wrapper_continuation"
-            ),
-            registered_source.index("_wait_registered_root_active"),
-        )
-        self.assertLess(
-            registered_source.index("_wait_registered_root_active"),
-            registered_source.index(
-                '"after-target-active"',
-                registered_source.index("_wait_registered_root_active"),
-            ),
-        )
-        self.assertIn("_write_root_controller_handshake", controller_source)
-        self.assertIn("_wait_root_target_active", controller_source)
-        self.assertIn("_publish_root_target_active", controller_source)
-        self.assertIn("active_owner_pidfd", controller_source)
-        self.assertIn("_mark_root_active_completed", controller_source)
-        self.assertIn("_TARGET_ACTIVE_PROBE_SOURCE", owner_source)
-        self.assertIn("_execution_snapshot", owner_source)
-        self.assertIn("_invoke_strict_controller", owner_source)
-        self.assertIn("root_active_pidfds", parent_source)
-        self.assertIn('description="root-active', parent_source)
-        self.assertIn("_assert_outer_owner_sentinel", parent_source)
-        self.assertEqual(
-            parent_source.count("_signal_process_pidfd(owner_pidfd"), 2
-        )
-
     def test_registered_sudo_preloads_bounded_stdin_before_active_wait(
         self,
     ) -> None:
@@ -21375,7 +23642,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             ),
         }
         root_handshake = {
-            "schema_version": 2,
+            "schema_version": 3,
             "phase": "wrapper-bound",
             "nonce": nonce,
             "session_id": "b" * 32,
@@ -21383,6 +23650,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "controller": [61002, 102, 61002, 61000],
             "sudo_parent": [61001, 101, 61001, 61000],
             "wrapper": [61003, 103, 61003, 61000],
+            "resource_scope": {
+                **_CANDIDATE_SUPPORT._systemd_scope_intent("b" * 32),
+                "control_group": f"/system.slice/required-ci-candidate-{'b' * 32}.scope",
+                "device": 61,
+                "inode": 62,
+            },
+            "fault_reached": None,
         }
         document = {
             "schema_version": 1,
@@ -21457,40 +23731,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(
             tuple(identity[0] for identity in accepted),
             (61001, 61002, 61003, 61004),
-        )
-
-    def test_namespace_process_cleanup_never_uses_a_bare_pid_kill(self) -> None:
-        controller_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_controller_main
-        )
-        test_cleanup_source = inspect.getsource(
-            type(self)._terminate_marked_process
-        )
-        pidfd_signal_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._signal_process_pidfd
-        )
-
-        self.assertNotIn("os.kill(process.pid", controller_source)
-        self.assertNotIn("os.kill(", test_cleanup_source)
-        self.assertIn("_signal_process_pidfd", controller_source)
-        self.assertIn("pidfd_send_signal", pidfd_signal_source)
-
-    def test_trusted_parent_closes_registered_root_chains_before_receipt(self) -> None:
-        supervisor_source = inspect.getsource(
-            supervise_trusted_required_ci_tests
-        )
-        close_source = inspect.getsource(
-            _close_and_verify_trusted_isolation
-        )
-
-        self.assertIn("trusted_isolation_chain_registry", supervisor_source)
-        self.assertIn("_close_and_verify_trusted_isolation", supervisor_source)
-        self.assertIn("finally:", supervisor_source)
-        self.assertIn("close_trusted_isolation_chains", close_source)
-        self.assertIn("assert_candidate_isolation_quiescent", close_source)
-        self.assertLess(
-            supervisor_source.index("_close_and_verify_trusted_isolation"),
-            supervisor_source.index("_validated_trusted_child_receipt"),
         )
 
     def test_parent_uid_proof_runs_even_when_registry_cleanup_fails(self) -> None:
@@ -21571,11 +23811,43 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     _CANDIDATE_SUPPORT, "_stable_host_session_zero"
                 ), mock.patch.object(
                     _CANDIDATE_SUPPORT, "_stable_uid_zero"
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_registered_scope_requires_cleanup",
+                    return_value=False,
                 ):
                     _CANDIDATE_SUPPORT._mark_trusted_root_chain_closed(
                         entry_path
                     )
                 closed = json.loads(entry_path.read_text(encoding="ascii"))
+                with mock.patch.object(
+                    _CANDIDATE_SUPPORT,
+                    "_registered_scope_requires_cleanup",
+                    side_effect=AssertionError("closed scope probe mutant"),
+                ) as scope_probe:
+                    self.assertEqual(
+                        _CANDIDATE_SUPPORT._mark_trusted_root_chain_closed(
+                            entry_path
+                        ),
+                        closed,
+                    )
+                scope_probe.assert_not_called()
+                for incomplete_state in ("closing", "deleting"):
+                    incomplete = {**closed, "state": incomplete_state}
+                    _CANDIDATE_SUPPORT._write_chain_registry_entry(
+                        entry_path, incomplete, create=False
+                    )
+                    with mock.patch.object(
+                        _CANDIDATE_SUPPORT, "_stable_host_session_zero"
+                    ), self.assertRaisesRegex(
+                        AssertionError, "handshake is unreadable"
+                    ):
+                        _CANDIDATE_SUPPORT._mark_trusted_root_chain_closed(
+                            entry_path
+                        )
+                _CANDIDATE_SUPPORT._write_chain_registry_entry(
+                    entry_path, closed, create=False
+                )
             finally:
                 _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
 
@@ -21726,11 +23998,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     def test_execution_snapshot_registration_failure_recovers_only_owned_root(
         self,
     ) -> None:
-        for publication_state in ("unpublished", "callback", "final-unmarked"):
+        for publication_state in (
+            "unpublished",
+            "unpublished-nonempty",
+            "callback",
+            "final-unmarked",
+        ):
             with self.subTest(publication_state=publication_state), tempfile.TemporaryDirectory() as temporary_directory:
                 root = Path(temporary_directory).resolve(strict=True)
                 resources = root / "resources"
                 resources.mkdir()
+                resources_metadata = resources.lstat()
                 session = {
                     "root": root,
                     "entries": root,
@@ -21739,11 +24017,26 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     "token": "b" * 32,
                     "target_uid": 60000,
                     "closed": False,
+                    "quota_binding": {
+                        "state": "active",
+                        "mounted_device": resources_metadata.st_dev,
+                        "mount_id": 91,
+                    },
                 }
                 trace: list[str] = []
+                created_root: Path | None = None
 
                 def register(*_args: object, **kwargs: object) -> Path:
+                    nonlocal created_root
                     trace.append("register")
+                    selected_root = kwargs.get("execution_root")
+                    self.assertIsInstance(selected_root, Path)
+                    created_root = selected_root
+                    if publication_state == "unpublished-nonempty":
+                        assert isinstance(selected_root, Path)
+                        (selected_root / "candidate-content").write_bytes(
+                            b"retained"
+                        )
                     if publication_state == "callback":
                         callback = kwargs.get("published_callback")
                         self.assertTrue(callable(callback))
@@ -21757,11 +24050,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 def recover(*_args: object, **_kwargs: object) -> None:
                     trace.append("recover")
 
-                original_rmtree = shutil.rmtree
+                original_rmdir = Path.rmdir
 
                 def remove(path: Path) -> None:
-                    trace.append("rmtree")
-                    original_rmtree(path)
+                    if path.parent == resources:
+                        trace.append("rmdir")
+                    original_rmdir(path)
 
                 with mock.patch.object(
                     _CANDIDATE_SUPPORT,
@@ -21780,6 +24074,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     "_prepare_isolation_resource_ancestors",
                 ), mock.patch.object(
                     _CANDIDATE_SUPPORT,
+                    "_strict_writable_root_mount_binding",
+                    return_value=91,
+                ), mock.patch.object(
+                    _CANDIDATE_SUPPORT,
                     "_register_trusted_root_chain",
                     side_effect=register,
                 ), mock.patch.object(
@@ -21792,8 +24090,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     side_effect=matches,
                     create=True,
                 ), mock.patch.object(
-                    shutil,
-                    "rmtree",
+                    Path,
+                    "rmdir",
+                    autospec=True,
                     side_effect=remove,
                 ):
                     with self.assertRaisesRegex(
@@ -21810,8 +24109,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     if publication_state == "callback"
                     else ["register", "attempt", "recover"]
                     if publication_state == "final-unmarked"
-                    else ["register", "attempt", "rmtree"],
+                    else ["register", "attempt", "rmdir"],
                 )
+                self.assertIsInstance(created_root, Path)
+                assert isinstance(created_root, Path)
+                if publication_state == "unpublished-nonempty":
+                    self.assertEqual(
+                        (created_root / "candidate-content").read_bytes(),
+                        b"retained",
+                    )
+                elif publication_state == "unpublished":
+                    self.assertFalse(created_root.exists())
 
     def test_execution_snapshot_recovers_exact_staged_resource_intent_before_delete(
         self,
@@ -21992,349 +24300,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             recover.assert_not_called()
             remove.assert_not_called()
 
-    def test_parent_registry_replays_cleanup_and_uid_zero_proof(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve(strict=True)
-            entries = root / "entries"
-            entries.mkdir(mode=0o700)
-            resources = root / "resources"
-            resources.mkdir(mode=0o700)
-            tombstones = root / ".tombstones"
-            tombstones.mkdir(mode=0o710)
-            session_lock = root / ".session.lock"
-            session_lock.write_bytes(b"")
-            session_lock.chmod(0o600)
-            controller_path = root / "controller.py"
-            controller_path.write_text("pass\n", encoding="utf-8")
-            execution_root = root / "execution"
-            execution_root.mkdir()
-            token = "b" * 32
-            registry = {
-                "root": root,
-                "entries": entries,
-                "resources": resources,
-                "tombstones": tombstones,
-                "controller_path": controller_path,
-                "token": token,
-                "target_uid": 60000,
-                "closed": False,
-                "inherited": True,
-                "watchdog_authorized": True,
-            }
-            calls: list[str] = []
-            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
-            _CANDIDATE_SUPPORT._STRICT_SESSION = registry
-            try:
-                _CANDIDATE_SUPPORT._register_trusted_root_chain(
-                    controller_path,
-                    None,
-                    60000,
-                    execution_root=execution_root,
-                )
 
-                def cleanup_uid(
-                    _selected_controller: Path, _target_uid: int
-                ) -> None:
-                    calls.append("uid")
 
-                def stable_uid(_target_uid: int) -> None:
-                    calls.append("stable")
-
-                with mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_invoke_root_uid_cleanup",
-                    side_effect=cleanup_uid,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_stable_uid_zero",
-                    side_effect=stable_uid,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
-                ):
-                    _CANDIDATE_SUPPORT.close_trusted_isolation_chains(
-                        registry
-                    )
-            finally:
-                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
-
-            self.assertEqual(calls, ["stable", "uid", "stable"])
-            self.assertFalse(root.exists())
-
-    def test_owner_replay_orders_process_uid_and_resource_to_a_fixpoint(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve(strict=True) / "registry"
-            root.mkdir()
-            entries = root / "entries"
-            entries.mkdir(mode=0o700)
-            resources = root / "resources"
-            resources.mkdir(mode=0o700)
-            tombstones = root / ".tombstones"
-            tombstones.mkdir(mode=0o710)
-            controller_path = root / "controller.py"
-            controller_path.write_text("pass\n", encoding="utf-8")
-            resource_path = entries / f"chain-{'0' * 32}.json"
-            process_path = entries / f"chain-{'f' * 32}.json"
-            spawned_path = entries / f"chain-{'e' * 32}.json"
-            documents: dict[Path, dict[str, object]] = {
-                resource_path: {
-                    "state": "closing",
-                    "cleanup_execution_root": True,
-                    "outer": None,
-                    "execution_root_delete_nonce": None,
-                    "execution_root_deleted": None,
-                },
-                process_path: {
-                    "state": "prepared",
-                    "cleanup_execution_root": False,
-                    "outer": None,
-                    "execution_root_delete_nonce": None,
-                    "execution_root_deleted": None,
-                },
-            }
-            session = {
-                "root": root,
-                "entries": entries,
-                "resources": resources,
-                "tombstones": tombstones,
-                "controller_path": controller_path,
-                "token": "a" * 32,
-                "target_uid": 60000,
-                "closed": False,
-                "watchdog_authorized": True,
-            }
-            trace: list[str] = []
-            spawned = False
-
-            def inventory(
-                _entries: Path, *, recover_staging: bool = False
-            ) -> list[Path]:
-                self.assertTrue(recover_staging)
-                return sorted(documents)
-
-            def load(entry_path: Path) -> dict[str, object]:
-                return documents[entry_path]
-
-            def recover(
-                entry_path: Path,
-                *,
-                allow_recovery_broker: bool,
-                recovery_profile: str,
-            ) -> None:
-                nonlocal spawned
-                self.assertTrue(allow_recovery_broker)
-                self.assertEqual(
-                    recovery_profile,
-                    _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE,
-                )
-                document = documents[entry_path]
-                if document["state"] == "closed":
-                    return
-                label = (
-                    "resource"
-                    if entry_path == resource_path
-                    else "spawned"
-                    if entry_path == spawned_path
-                    else "process"
-                )
-                trace.append(label)
-                document["state"] = "closed"
-                if entry_path == resource_path and not spawned:
-                    spawned = True
-                    documents[spawned_path] = {
-                        "state": "prepared",
-                        "cleanup_execution_root": False,
-                        "outer": None,
-                        "execution_root_delete_nonce": None,
-                        "execution_root_deleted": None,
-                    }
-
-            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
-            _CANDIDATE_SUPPORT._STRICT_SESSION = session
-            try:
-                with mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_chain_registry_entries",
-                    side_effect=inventory,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_load_chain_registry_entry",
-                    side_effect=load,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_recover_registered_entry",
-                    side_effect=recover,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_invoke_root_uid_cleanup",
-                    side_effect=lambda *_args: trace.append("uid"),
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_stable_uid_zero",
-                    side_effect=lambda *_args: trace.append("stable"),
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT, "_cleanup_orphan_resource_roots"
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
-                ):
-                    _CANDIDATE_SUPPORT._close_trusted_isolation_chains_under_gate(
-                        session,
-                        recovery_profile=(
-                            _CANDIDATE_SUPPORT._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
-                        ),
-                    )
-            finally:
-                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
-
-        self.assertEqual(
-            trace,
-            [
-                "process",
-                "uid",
-                "stable",
-                "resource",
-                "spawned",
-                "uid",
-                "stable",
-            ],
-        )
-
-    def test_resource_recovery_failure_restarts_at_process_and_uid_phases(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory).resolve(strict=True) / "registry"
-            root.mkdir()
-            entries = root / "entries"
-            entries.mkdir(mode=0o700)
-            resources = root / "resources"
-            resources.mkdir(mode=0o700)
-            tombstones = root / ".tombstones"
-            tombstones.mkdir(mode=0o710)
-            controller_path = root / "controller.py"
-            controller_path.write_text("pass\n", encoding="utf-8")
-            first_resource = entries / f"chain-{'0' * 32}.json"
-            second_resource = entries / f"chain-{'1' * 32}.json"
-            spawned_process = entries / f"chain-{'f' * 32}.json"
-            documents: dict[Path, dict[str, object]] = {
-                first_resource: {
-                    "state": "closing",
-                    "cleanup_execution_root": True,
-                    "outer": None,
-                    "execution_root_delete_nonce": None,
-                    "execution_root_deleted": None,
-                },
-                second_resource: {
-                    "state": "closing",
-                    "cleanup_execution_root": True,
-                    "outer": None,
-                    "execution_root_delete_nonce": None,
-                    "execution_root_deleted": None,
-                },
-            }
-            session = {
-                "root": root,
-                "entries": entries,
-                "resources": resources,
-                "tombstones": tombstones,
-                "controller_path": controller_path,
-                "token": "a" * 32,
-                "target_uid": 60000,
-                "closed": False,
-            }
-            trace: list[str] = []
-            injected_failure = False
-
-            def inventory(
-                _entries: Path, *, recover_staging: bool = False
-            ) -> list[Path]:
-                self.assertTrue(recover_staging)
-                return sorted(documents)
-
-            def load(entry_path: Path) -> dict[str, object]:
-                return documents[entry_path]
-
-            def recover(
-                entry_path: Path, *, allow_recovery_broker: bool
-            ) -> None:
-                nonlocal injected_failure
-                self.assertTrue(allow_recovery_broker)
-                document = documents[entry_path]
-                if document["state"] == "closed":
-                    return
-                if entry_path == first_resource and not injected_failure:
-                    injected_failure = True
-                    trace.append("first-resource-failed")
-                    documents[spawned_process] = {
-                        "state": "prepared",
-                        "cleanup_execution_root": False,
-                        "outer": None,
-                        "execution_root_delete_nonce": None,
-                        "execution_root_deleted": None,
-                    }
-                    raise AssertionError(
-                        "injected nested broker recovery failure"
-                    )
-                label = (
-                    "first-resource"
-                    if entry_path == first_resource
-                    else "second-resource"
-                    if entry_path == second_resource
-                    else "spawned-process"
-                )
-                trace.append(label)
-                document["state"] = "closed"
-
-            previous_session = _CANDIDATE_SUPPORT._STRICT_SESSION
-            _CANDIDATE_SUPPORT._STRICT_SESSION = session
-            try:
-                with mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_chain_registry_entries",
-                    side_effect=inventory,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_load_chain_registry_entry",
-                    side_effect=load,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_recover_registered_entry",
-                    side_effect=recover,
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_invoke_root_uid_cleanup",
-                    side_effect=lambda *_args: trace.append("uid"),
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT,
-                    "_stable_uid_zero",
-                    side_effect=lambda *_args: trace.append("stable"),
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT, "_cleanup_orphan_resource_roots"
-                ), mock.patch.object(
-                    _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
-                ):
-                    _CANDIDATE_SUPPORT._close_trusted_isolation_chains_under_gate(
-                        session
-                    )
-            finally:
-                _CANDIDATE_SUPPORT._STRICT_SESSION = previous_session
-
-        self.assertEqual(
-            trace,
-            [
-                "uid",
-                "stable",
-                "first-resource-failed",
-                "spawned-process",
-                "uid",
-                "stable",
-                "first-resource",
-                "second-resource",
-            ],
-        )
 
     def test_parent_registry_retains_recovery_state_on_cleanup_failure(
         self,
@@ -23029,50 +24996,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self.assertEqual(document["state"], "prepared")
         self.assertEqual(document["session_id"], session_id)
 
-    def test_root_deletion_receipt_separates_directory_and_file_ownership(
-        self,
-    ) -> None:
-        atomic_source = inspect.getsource(_CANDIDATE_SUPPORT._atomic_json_document)
-        broker_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_seal_execution_root_main
-        )
-        reader_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._read_durable_deletion_receipt_file
-        )
-
-        self.assertIn("expected_file_owner", atomic_source)
-        self.assertIn("expected_owner=runner_uid", broker_source)
-        self.assertIn("expected_file_owner=0", broker_source)
-        self.assertIn("expected_file_group=runner_gid", broker_source)
-        self.assertIn("expected_file_mode=0o640", broker_source)
-        self.assertIn("metadata.st_uid != 0", reader_source)
-
-    def test_root_seal_holds_bound_fd_through_receipt_and_optional_gc(self) -> None:
-        delete_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_fd_delete_contents
-        )
-        broker_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._root_seal_execution_root_main
-        )
-        gc_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._gc_bound_sealed_tombstone
-        )
-
-        self.assertLess(
-            delete_source.index("os.rmdir"),
-            delete_source.index("os.close(child_fd)"),
-        )
-        self.assertLess(
-            broker_source.index("_atomic_json_document"),
-            broker_source.index("_gc_bound_sealed_tombstone"),
-        )
-        self.assertLess(
-            gc_source.index("_fsync_directory(receipt_path.parent)"),
-            gc_source.index("os.rmdir(tombstone_name"),
-        )
-        self.assertIn("os.fstat(tombstone_fd)", gc_source)
-        self.assertIn("st_nlink", gc_source)
-
     def test_receipt_directory_fsync_failure_keeps_exact_tombstone(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve(strict=True)
@@ -23528,246 +25451,29 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     191
                 )
 
-    def test_strict_bootstrap_nofile_capacity_is_bound_before_launch(self) -> None:
-        bootstrap_source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
-        bootstrap_nodes = ast.parse(bootstrap_source).body
-        requirement_node = next(
-            node
-            for node in bootstrap_nodes
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "bootstrap_nofile_requirement"
+    def test_strict_bootstrap_nofile_policy_is_bound_to_launch_order(
+        self,
+    ) -> None:
+        bootstrap = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        config = self.root_command_config()
+        required = _CANDIDATE_SUPPORT._strict_bootstrap_nofile_requirement(
+            config["writable_roots"], config["read_roots"]
         )
-        limit_node = next(
-            node
-            for node in bootstrap_nodes
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "set_bootstrap_nofile_limit"
-        )
-        requirement_module = ast.Module(
-            body=[requirement_node, limit_node], type_ignores=[]
-        )
-        ast.fix_missing_locations(requirement_module)
-        namespace: dict[str, object] = {}
-        exec(
-            compile(
-                requirement_module,
-                "<strict-bootstrap-nofile-requirement>",
-                "exec",
-            ),
-            namespace,
-        )
-        embedded_requirement = namespace["bootstrap_nofile_requirement"]
-        writable = [{} for _ in range(64)]
-        readable = [
-            {"components": [{} for _ in range(24)]} for _ in range(32)
-        ]
-        self.assertEqual(embedded_requirement(writable, readable), 191)
-        cap_readable = [
-            {"components": [{} for _ in range(89)]} for _ in range(32)
-        ]
-        self.assertEqual(
-            embedded_requirement(writable, cap_readable),
-            _CANDIDATE_SUPPORT._STRICT_BOOTSTRAP_NOFILE_LIMIT,
-        )
-        over_cap_readable = [
-            {"components": [{} for _ in range(90)]} for _ in range(32)
-        ]
-        with self.assertRaises(SystemExit) as over_cap:
-            embedded_requirement(writable, over_cap_readable)
-        self.assertEqual(over_cap.exception.code, 150)
-
-        class FakeResource:
-            RLIMIT_NOFILE = 7
-            RLIM_INFINITY = -1
-
-            def __init__(self, hard_limit: int) -> None:
-                self.limit = (32, hard_limit)
-                self.calls: list[tuple[int, tuple[int, int]]] = []
-
-            def getrlimit(self, selected: int) -> tuple[int, int]:
-                self.assert_selected(selected)
-                return self.limit
-
-            def setrlimit(
-                self, selected: int, value: tuple[int, int]
-            ) -> None:
-                self.assert_selected(selected)
-                self.calls.append((selected, value))
-                self.limit = value
-
-            def assert_selected(self, selected: int) -> None:
-                if selected != self.RLIMIT_NOFILE:
-                    raise AssertionError("unexpected resource selector")
-
-        set_embedded_limit = namespace["set_bootstrap_nofile_limit"]
-        for hard_limit, accepted in ((190, False), (191, True), (192, True)):
-            with self.subTest(embedded_hard_limit=hard_limit):
-                fake_resource = FakeResource(hard_limit)
-                namespace["resource"] = fake_resource
-                if accepted:
-                    set_embedded_limit(191)
-                    self.assertEqual(fake_resource.limit, (191, 191))
-                    self.assertEqual(
-                        fake_resource.calls, [(fake_resource.RLIMIT_NOFILE, (191, 191))]
-                    )
-                else:
-                    with self.assertRaises(SystemExit) as rejected:
-                        set_embedded_limit(191)
-                    self.assertEqual(rejected.exception.code, 150)
-                    self.assertEqual(fake_resource.calls, [])
-
-        default_config = self.root_command_config()
-        with self.root_command_mount_contract(), mock.patch.object(
-            _CANDIDATE_SUPPORT.resource,
-            "getrlimit",
-            return_value=(32, 64),
+        with self.root_command_mount_contract():
+            command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
+                config, 1234, 9
+            )
+        index = command.index(bootstrap)
+        self.assertEqual(command[index + 2], str(required))
+        early = "set_bootstrap_nofile_limit(required_nofile)"
+        final = "resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))"
+        for before, after in (
+            (early, "os.open("),
+            ("activate_candidate_landlock(landlock_ruleset_fd)", final),
+            (final, "open_descriptors = set()"),
+            (final, "os.execve(continuation_argv[0]"),
         ):
-            low_command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
-                default_config, 1234, 9
-            )
-            high_command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
-                default_config, 1234, 300
-            )
-        for command, readiness in ((low_command, "9"), (high_command, "300")):
-            bootstrap_index = command.index(bootstrap_source)
-            self.assertEqual(command[bootstrap_index + 1], readiness)
-            self.assertEqual(command[bootstrap_index + 2], "64")
-
-        maximal_writable = [
-            {
-                "path": f"/writable-{index}",
-                "device": 1,
-                "inode": index + 1,
-                "host_mount_id": index + 100,
-            }
-            for index in range(64)
-        ]
-        maximal_readable = [
-            {
-                **self.root_command_config()["read_roots"][0],
-                "path": f"/read-{index}",
-                "components": [{} for _ in range(24)],
-                "host_mount_id": index + 200,
-            }
-            for index in range(32)
-        ]
-        maximal_config = self.root_command_config(
-            writable_roots=maximal_writable,
-            read_roots=maximal_readable,
-        )
-        with self.root_command_mount_contract(), mock.patch.object(
-            _CANDIDATE_SUPPORT.resource,
-            "getrlimit",
-            return_value=(64, 191),
-        ):
-            maximal_command = (
-                _CANDIDATE_SUPPORT._root_controller_candidate_command(
-                    maximal_config, 1234, 9
-                )
-            )
-        maximal_bootstrap_index = maximal_command.index(bootstrap_source)
-        self.assertEqual(maximal_command[maximal_bootstrap_index + 2], "191")
-
-        temp_limit = "set_bootstrap_nofile_limit(required_nofile)"
-        final_limit = "resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))"
-        self.assertIn(temp_limit, bootstrap_source)
-        self.assertIn(final_limit, bootstrap_source)
-        self.assertLess(
-            bootstrap_source.index(temp_limit),
-            bootstrap_source.index("os.open("),
-        )
-        self.assertLess(
-            bootstrap_source.index(temp_limit),
-            bootstrap_source.index(
-                "os.dup2(readiness_fd, NETWORK_INTERFACE_FD"
-            ),
-        )
-        self.assertLess(
-            bootstrap_source.index(
-                "activate_candidate_landlock(landlock_ruleset_fd)"
-            ),
-            bootstrap_source.index(final_limit),
-        )
-        self.assertLess(
-            bootstrap_source.index(final_limit),
-            bootstrap_source.index("open_descriptors = set()"),
-        )
-        invoke_source = inspect.getsource(
-            _CANDIDATE_SUPPORT._invoke_strict_controller
-        )
-        self.assertLess(
-            invoke_source.index("_assert_strict_bootstrap_nofile_capacity"),
-            invoke_source.index("_run_registered_sudo("),
-        )
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            snapshot_root = Path(temporary_directory).resolve(strict=True)
-            snapshot = {
-                "config_path": snapshot_root / "config.json",
-                "controller_path": snapshot_root / "controller.py",
-                "handshake_path": snapshot_root / "handshake.json",
-                "execution_root": snapshot_root,
-            }
-            writable_bindings = self.root_command_config()["writable_roots"]
-            read_bindings = self.root_command_config()["read_roots"]
-            with contextlib.ExitStack() as patch_stack:
-                patch_stack.enter_context(
-                    mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_strict_realm",
-                        return_value={"uid": 60000, "gid": 60000},
-                    )
-                )
-                patch_stack.enter_context(
-                    mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_strict_writable_root_bindings",
-                        return_value=writable_bindings,
-                    )
-                )
-                patch_stack.enter_context(
-                    mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_strict_host_read_root_bindings",
-                        return_value=read_bindings,
-                    )
-                )
-                patch_stack.enter_context(
-                    mock.patch.object(
-                        _CANDIDATE_SUPPORT.resource,
-                        "getrlimit",
-                        return_value=(32, 63),
-                    )
-                )
-                root_tree = patch_stack.enter_context(
-                    mock.patch.object(
-                        _CANDIDATE_SUPPORT, "_invoke_root_tree_operation"
-                    )
-                )
-                registered_sudo = patch_stack.enter_context(
-                    mock.patch.object(
-                        _CANDIDATE_SUPPORT, "_run_registered_sudo"
-                    )
-                )
-                popen = patch_stack.enter_context(
-                    mock.patch.object(_CANDIDATE_SUPPORT.subprocess, "Popen")
-                )
-                patch_stack.enter_context(
-                    self.assertRaisesRegex(
-                        AssertionError, "inherited hard limit is insufficient"
-                    )
-                )
-                _CANDIDATE_SUPPORT._invoke_strict_controller(
-                    snapshot,
-                    ["/usr/bin/python3", "-I", "/probe.py"],
-                    {},
-                    snapshot_root,
-                    b"",
-                    timeout_seconds=1,
-                )
-        root_tree.assert_not_called()
-        registered_sudo.assert_not_called()
-        popen.assert_not_called()
+            self.assertLess(bootstrap.index(before), bootstrap.index(after))
 
     def test_strict_bootstrap_nofile_allocator_honors_limit_boundary(
         self,
@@ -25137,8 +26843,14 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             _CANDIDATE_SUPPORT.os,
             "read",
             side_effect=(valid_mountinfo, b""),
-        ), mock.patch.object(_CANDIDATE_SUPPORT.os, "close"):
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.os, "close"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_assert_procfs_control_file_authority",
+        ) as procfs_authority:
             inventory = _CANDIDATE_SUPPORT._strict_mount_inventory()
+        procfs_authority.assert_called_once_with(11)
         self.assertEqual(
             inventory,
             {
@@ -25162,6 +26874,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             side_effect=(malformed_graph, b""),
         ), mock.patch.object(
             _CANDIDATE_SUPPORT.os, "close"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_assert_procfs_control_file_authority",
         ), self.assertRaisesRegex(
             AssertionError, "mount topology is malformed"
         ):
@@ -25711,8 +27426,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             controller_source,
         )
         self.assertLess(
-            controller_source.index("_release_wrapper_barrier"),
+            controller_source.index("_bind_scope_write_handshake_release"),
             controller_source.index("_wait_mount_namespace_ready"),
+        )
+        binding_source = inspect.getsource(
+            _CANDIDATE_SUPPORT._bind_scope_write_handshake_release
+        )
+        self.assertLess(
+            binding_source.index("_write_root_controller_handshake"),
+            binding_source.index("_release_wrapper_barrier"),
         )
         self.assertLess(
             controller_source.index("_wait_mount_namespace_ready"),
@@ -25936,8 +27658,29 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     "device": 1,
                     "inode": 2,
                     "host_mount_id": 3,
-                }
-            ],
+                    }
+                ],
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_active_strict_session",
+            return_value={"root": Path("/tmp/registry")},
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT,
+            "_aggregate_writable_device_binding",
+            return_value={
+                "mountpoint": "/tmp/registry/candidate-writable",
+                "device": 1,
+                "major_minor": [0, 1],
+                "mount_id": 4,
+                "source": _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_SOURCE,
+                "size_bytes": (
+                    _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_SIZE_BYTES
+                ),
+                "nr_inodes": (
+                    _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_INODES
+                ),
+                "flags": ["nodev", "nosuid"],
+            },
         ), mock.patch.object(
             _CANDIDATE_SUPPORT,
             "_strict_host_read_root_bindings",
@@ -37493,6 +39236,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         "_process_identity",
                         return_value=owner_identity,
                     ), mock.patch.object(
+                        _CANDIDATE_SUPPORT.os,
+                        "pidfd_open",
+                        return_value=73,
+                        create=True,
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT.select,
+                        "select",
+                        return_value=([], [], []),
+                    ), mock.patch.object(
+                        _CANDIDATE_SUPPORT.os, "close"
+                    ), mock.patch.object(
                         _CANDIDATE_SUPPORT,
                         "_strict_owner_loss_registered_clients_are_quiescent",
                     ) as client_scan, self.assertRaisesRegex(
@@ -37538,7 +39292,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         _CANDIDATE_SUPPORT,
                         "_strict_owner_loss_registered_clients_are_quiescent",
                     ) as client_scan, self.assertRaisesRegex(
-                        AssertionError, "owner is still alive"
+                        AssertionError, "owner identity changed"
                     ):
                         _CANDIDATE_SUPPORT._revalidate_strict_owner_loss_capability(
                             capability,
@@ -38222,7 +39976,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             ), mock.patch.object(
                 _CANDIDATE_SUPPORT,
                 "_directory_policy_binding",
-                return_value=registry_root_binding,
+                side_effect=lambda path, *_args, **_kwargs: dict(
+                    entries_binding
+                    if path == entries
+                    else witness_namespace
+                    if path == namespace
+                    else registry_root_binding
+                ),
             ), mock.patch.object(
                 _CANDIDATE_SUPPORT,
                 "_strict_owner_loss_watchdog_token",
@@ -44700,9 +46460,279 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     stream.close()
             captured_support_stack.close()
 
+    def _exercise_strict_systemd_scope_aggregate_limits(self) -> None:
+        if sys.platform != "linux":
+            self.skipTest("strict systemd aggregate probes require Linux")
+        self.assertEqual(
+            os.environ.get(REQUIRED_CI_ISOLATION_MODE_ENV),
+            REQUIRED_CI_ISOLATION_MODE,
+        )
+        _CANDIDATE_SUPPORT._ensure_strict_backend()
+        candidate_root, candidate_sha, _binding = (
+            _strict_runtime_live_candidate_binding()
+        )
+        source = textwrap.dedent(
+            r'''
+            import errno
+            import json
+            import os
+            from pathlib import Path
+            import resource
+            import signal
+            import sys
+            import time
+
+            def read(path):
+                value = path.read_text(encoding="ascii")
+                if not value.endswith("\n") or "\x00" in value or "\r" in value:
+                    raise SystemExit(70)
+                return value[:-1]
+
+            def counters(path):
+                result = {}
+                for line in read(path).splitlines():
+                    fields = line.split()
+                    if len(fields) != 2 or not fields[1].isdigit():
+                        raise SystemExit(71)
+                    result[fields[0]] = int(fields[1])
+                return result
+
+            if len(sys.argv) != 4 or sys.argv[1] not in ("process-cpu", "memory"):
+                raise SystemExit(72)
+            mode, expected_unit, stop_value = sys.argv[1:]
+            membership = read(Path("/proc/self/cgroup"))
+            fields = membership.split(":")
+            if len(fields) != 3 or fields[:2] != ["0", ""]:
+                raise SystemExit(73)
+            control_group = fields[2]
+            root = Path("/sys/fs/cgroup") / control_group[1:]
+            caps = {
+                name: read(root / name)
+                for name in (
+                    "cpu.max", "memory.high", "memory.max",
+                    "memory.swap.max", "pids.max",
+                )
+            }
+            if (
+                not control_group.startswith("/")
+                or root.name != expected_unit
+                or read(root / "cgroup.type") != "domain"
+                or caps != {
+                    "cpu.max": "200000 100000",
+                    "memory.high": "805306368",
+                    "memory.max": "1073741824",
+                    "memory.swap.max": "0",
+                    "pids.max": "64",
+                }
+            ):
+                raise SystemExit(74)
+
+            if mode == "process-cpu":
+                nproc_soft, nproc_hard = resource.getrlimit(resource.RLIMIT_NPROC)
+                before_pids = counters(root / "pids.events").get("max", 0)
+                children = []
+                limited = False
+                try:
+                    while len(children) < 128:
+                        try:
+                            pid = os.fork()
+                        except OSError as error:
+                            if error.errno != errno.EAGAIN:
+                                raise
+                            limited = True
+                            break
+                        if pid == 0:
+                            while True:
+                                signal.pause()
+                        children.append(pid)
+                    after_pids = counters(root / "pids.events").get("max", 0)
+                finally:
+                    for pid in children:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    for pid in children:
+                        os.waitpid(pid, 0)
+                if not limited:
+                    raise SystemExit(75)
+                affinity = len(os.sched_getaffinity(0))
+                if affinity < 3:
+                    raise SystemExit(76)
+                before_cpu = counters(root / "cpu.stat").get("nr_throttled", 0)
+                workers = []
+                for _ in range(min(8, affinity)):
+                    pid = os.fork()
+                    if pid == 0:
+                        deadline = time.monotonic() + 2.0
+                        value = 1
+                        while time.monotonic() < deadline:
+                            value = (value * 1664525 + 1013904223) & 0xffffffff
+                        os._exit(0 if value >= 0 else 77)
+                    workers.append(pid)
+                for pid in workers:
+                    waited, status = os.waitpid(pid, 0)
+                    if waited != pid or status != 0:
+                        raise SystemExit(78)
+                document = {
+                    "kind": mode,
+                    "unit": expected_unit,
+                    "control_group": control_group,
+                    "caps": caps,
+                    "nproc_soft": nproc_soft,
+                    "nproc_hard": nproc_hard,
+                    "forked": len(children),
+                    "pids_max_delta": after_pids - before_pids,
+                    "affinity_cpus": affinity,
+                    "nr_throttled_delta": (
+                        counters(root / "cpu.stat").get("nr_throttled", 0)
+                        - before_cpu
+                    ),
+                }
+            else:
+                stop = Path(stop_value)
+                worker_count = 4
+                bytes_per_worker = 205 * 1024 * 1024
+                before = counters(root / "memory.events")
+                workers = set()
+                try:
+                    for _ in range(worker_count):
+                        pid = os.fork()
+                        if pid == 0:
+                            blocks = []
+                            blocks_required = bytes_per_worker // (256 * 1024)
+                            for _ in range(blocks_required):
+                                if stop.exists():
+                                    os._exit(0)
+                                block = bytearray(256 * 1024)
+                                for offset in range(0, len(block), 4096):
+                                    block[offset] = 1
+                                blocks.append(block)
+                                time.sleep(0.002)
+                            os._exit(79)
+                        workers.add(pid)
+                    deadline = time.monotonic() + 15.0
+                    while time.monotonic() < deadline:
+                        observed = counters(root / "memory.events")
+                        if observed.get("high", 0) > before.get("high", 0):
+                            stop.write_text("stop\n", encoding="ascii")
+                            break
+                        time.sleep(0.002)
+                    else:
+                        raise SystemExit(80)
+                    for pid in tuple(workers):
+                        waited, status = os.waitpid(pid, 0)
+                        workers.remove(pid)
+                        if waited != pid or status != 0:
+                            raise SystemExit(81)
+                    after = counters(root / "memory.events")
+                finally:
+                    for pid in workers:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    for pid in workers:
+                        os.waitpid(pid, 0)
+                document = {
+                    "kind": mode,
+                    "unit": expected_unit,
+                    "control_group": control_group,
+                    "caps": caps,
+                    "workers": worker_count,
+                    "bytes_per_worker": bytes_per_worker,
+                    "memory_high_delta": after.get("high", 0) - before.get("high", 0),
+                    "memory_max_delta": after.get("max", 0) - before.get("max", 0),
+                    "memory_oom_delta": after.get("oom", 0) - before.get("oom", 0),
+                    "memory_oom_kill_delta": (
+                        after.get("oom_kill", 0) - before.get("oom_kill", 0)
+                    ),
+                }
+            print(json.dumps(document, sort_keys=True, separators=(",", ":")))
+            '''
+        ).encode("ascii")
+
+        def run(kind: str, timeout_seconds: float) -> dict[str, object]:
+            session_id = uuid.uuid4().hex
+            unit = f"required-ci-candidate-{session_id}.scope"
+            with _CANDIDATE_SUPPORT._execution_snapshot(
+                candidate_root, candidate_sha, probe_source=source
+            ) as snapshot:
+                runtime_root = snapshot["runtime_root"]
+                paths = snapshot["candidate_paths"]
+                self.assertIsInstance(runtime_root, Path)
+                self.assertIsInstance(paths, dict)
+                assert isinstance(runtime_root, Path)
+                assert isinstance(paths, dict)
+                probe_path = Path(next(iter(paths.values())))
+                receipt = _CANDIDATE_SUPPORT._invoke_strict_controller(
+                    snapshot,
+                    [
+                        str(_CANDIDATE_SUPPORT._STRICT_PRIMITIVES["python"]),
+                        *_CANDIDATE_SUPPORT._ROOT_PYTHON_ARGUMENTS,
+                        str(probe_path),
+                        kind,
+                        unit,
+                        str(runtime_root / "memory-stop"),
+                    ],
+                    _CANDIDATE_SUPPORT._closed_candidate_environment(
+                        None, home=runtime_root, temporary_root=runtime_root
+                    ),
+                    runtime_root,
+                    b"",
+                    timeout_seconds=timeout_seconds,
+                    registered_session_id=session_id,
+                )
+                self.assertEqual(receipt.get("status"), "completed", receipt)
+                self.assertEqual(receipt.get("cleanup_status"), "complete")
+                self.assertEqual(receipt.get("returncode"), 0, receipt)
+                self.assertIs(receipt.get("timed_out"), False)
+                self.assertIs(receipt.get("process_leak_observed"), False)
+                self.assertEqual(
+                    _CANDIDATE_SUPPORT._decode_strict_probe_output_text(
+                        receipt, "stderr_base64"
+                    ),
+                    "",
+                )
+                stdout = _CANDIDATE_SUPPORT._decode_strict_probe_output_text(
+                    receipt, "stdout_base64"
+                )
+                self.assertTrue(stdout.endswith("\n"))
+                self.assertEqual(stdout.count("\n"), 1)
+                metrics = _validated_systemd_live_metrics(
+                    json.loads(stdout), session_id=session_id, kind=kind
+                )
+                handshake = _CANDIDATE_SUPPORT._read_root_controller_handshake(
+                    Path(snapshot["handshake_path"])
+                )
+                self.assertEqual(handshake["phase"], "wrapper-bound")
+                scope = _CANDIDATE_SUPPORT._validated_systemd_scope_document(
+                    handshake["resource_scope"],
+                    session_id=session_id,
+                    allow_unbound=False,
+                )
+                self.assertEqual(scope["unit"], unit)
+            deadline = time.monotonic() + 5.0
+            self.assertIsNone(
+                _CANDIDATE_SUPPORT._query_systemd_scope_lifecycle(
+                    unit, deadline=deadline
+                )
+            )
+            self.assertFalse(
+                _CANDIDATE_SUPPORT._bound_systemd_scope_present(
+                    scope, _CANDIDATE_SUPPORT._STRICT_SYSTEMD_CGROUP_ROOT
+                )
+            )
+            return metrics
+
+        process_metrics = run("process-cpu", 15.0)
+        memory_metrics = run("memory", 25.0)
+        self.assertNotEqual(process_metrics["unit"], memory_metrics["unit"])
+
     def test_strict_runtime_live_end_to_end(self) -> None:
         self._exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read()
         self._exercise_real_watchdog_owner_sigkill_replays_registered_live_ipc_root()
+        self._exercise_strict_systemd_scope_aggregate_limits()
 
     def _exercise_strict_target_access_policy_blocks_snapshot_write_and_control_read(
         self,
@@ -47719,54 +49749,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     TRUSTED_CANDIDATE_SUPPORT_SOURCE,
                 )
 
-    def test_candidate_support_consumers_require_the_stable_selected_reader(
-        self,
-    ) -> None:
-        for function in (
-            _CANDIDATE_SUPPORT._session_from_environment,
-            _CANDIDATE_SUPPORT._protect_strict_checkout_boundaries,
-        ):
-            with self.subTest(function=function.__name__):
-                source = inspect.getsource(function)
-                self.assertIn("_read_selected_trusted_support(", source)
-                self.assertNotIn("controller_path.read_bytes(", source)
-                self.assertNotIn("controller_path.read_text(", source)
-                self.assertNotIn("_TRUSTED_SUPPORT_PATH.read_bytes(", source)
-                self.assertNotIn("_TRUSTED_SUPPORT_PATH.read_text(", source)
-
-    def test_control_plane_fixture_builders_never_reopen_logical_sources(
-        self,
-    ) -> None:
-        fixture_builders = (
-            self.prepare_roots,
-            self.prepare_structure_cli_split,
-            self.prepare_private_candidate_checkout,
-            self.prepare_hook_adapter_split,
-            self.test_ordinary_discovery_tolerates_benign_bytecode_cache_without_weakening_formal_entry,
-            self.test_local_formal_copy_never_relocates_shared_import_cache,
-            self.test_structure_cli_rejects_renamed_trusted_checkout_without_binding,
-            self.test_supervisor_rejects_empty_candidate_runtime_with_preserved_inventory,
-            self._exercise_real_watchdog_owner_sigkill_replays_registered_live_ipc_root,
-            self._terminate_marked_process,
-        )
-        forbidden = (
-            "copyfile(TRUSTED_CANDIDATE_SUPPORT_PATH",
-            "copyfile(Path(__file__)",
-            "TRUSTED_CANDIDATE_SUPPORT_PATH.read_bytes",
-            "TRUSTED_CANDIDATE_SUPPORT_PATH.read_text",
-            "Path(__file__).resolve(strict=True).read_bytes",
-            "Path(__file__).resolve(strict=True).read_text",
-            "str(TRUSTED_CANDIDATE_SUPPORT_PATH)",
-        )
-        for function in fixture_builders:
-            with self.subTest(function=function.__name__):
-                source = inspect.getsource(function)
-                self.assertEqual(
-                    [token for token in forbidden if token in source],
-                    [],
-                )
-
-
 class RequiredCiCallerRegressionTests(unittest.TestCase):
     @staticmethod
     def write_workflow(repo_root: Path, relative_path: str, workflow: str) -> None:
@@ -48010,6 +49992,7 @@ class RequiredCiWorkflowTests(unittest.TestCase):
         source_assignment_policy = {
             "required_ci_candidate.py": {
                 "_TRUSTED_SUPPORT_SOURCE": False,
+                "_STRICT_WRITABLE_QUOTA_SOURCE": False,
                 "_CONFIGURED_RUNTIME_BOOTSTRAP_SOURCE": True,
                 "_MOUNT_NAMESPACE_BOOTSTRAP_SOURCE": True,
                 "_CANDIDATE_BOOTSTRAP_SOURCE": True,
