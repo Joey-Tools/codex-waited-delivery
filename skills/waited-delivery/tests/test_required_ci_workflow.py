@@ -24553,22 +24553,22 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
     def test_parent_registry_retains_recovery_state_on_cleanup_failure(
         self,
     ) -> None:
-        support = _CANDIDATE_SUPPORT
-        patch = mock.patch.object
+        s = _CANDIDATE_SUPPORT
+        p = mock.patch.object
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory).resolve(strict=True)
             entries = root / "entries"
             entries.mkdir(mode=0o700)
-            support._write_single_link_file(root / ".session.lock", b"", 0o600)
-            controller_path = root / "controller.py"
-            controller_path.write_text("pass\n", encoding="utf-8")
+            s._write_single_link_file(root / ".session.lock", b"", 0o600)
+            controller = root / "controller.py"
+            controller.write_text("pass\n", encoding="utf-8")
             (root / "execution").mkdir()
             (root / "trusted-control").mkdir(mode=0o700)
-            quota = root / support._STRICT_WRITABLE_QUOTA_DIRECTORY
+            quota = root / s._STRICT_WRITABLE_QUOTA_DIRECTORY
             quota.mkdir(mode=0o700)
-            support._write_writable_quota_binding(
+            s._write_writable_quota_binding(
                 root,
-                support._writable_quota_intent_document(
+                s._writable_quota_intent_document(
                     root, quota.lstat(), runner_uid=os.getuid(), runner_gid=os.getgid(), watchdog_token="d" * 32
                 ),
                 create=True,
@@ -24576,35 +24576,36 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             registry = {
                 "root": root,
                 "entries": entries,
-                "controller_path": controller_path,
+                "controller_path": controller,
                 "token": "c" * 32,
                 "target_uid": 60000,
                 "closed": False,
                 "inherited": True,
                 "watchdog_authorized": True,
             }
-            previous_session = support._STRICT_SESSION
-            support._STRICT_SESSION = registry
+            previous = s._STRICT_SESSION
+            s._STRICT_SESSION = registry
             try:
-                entry_path = support._register_trusted_root_chain(
-                    controller_path,
+                entry = s._register_trusted_root_chain(
+                    controller,
                     None,
                     60000,
                     execution_root=root / "execution",
                 )
-                load = support._load_chain_registry_entry
-                live_kind = support._STRICT_LIVE_IPC_CLEANUP_KIND
+                load = s._load_chain_registry_entry
+                live = s._STRICT_LIVE_IPC_CLEANUP_KIND
                 calls = []
 
                 def fail_recovery(
-                    selected_entry: Path, *, allow_recovery_broker: bool
+                    selected_entry: Path, *, allow_recovery_broker: bool,
+                    **_options: object,
                 ) -> object:
                     self.assertTrue(allow_recovery_broker)
-                    if selected_entry == entry_path:
+                    if selected_entry == entry:
                         calls.append("entry")
                         if calls.count("entry") == 1:
                             return None
-                        raise AssertionError("first" if calls.count("entry") == 2 else "later")
+                        raise AssertionError("strict prepared outer command line is unreadable" if calls.count("entry") == 2 else "later")
                     return None
 
                 def cleanup_uid(
@@ -24612,11 +24613,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ) -> None:
                     calls.append("uid")
                     sequence = calls.count("uid")
-                    document = json.loads(entry_path.read_text(encoding="ascii"))
+                    document = json.loads(entry.read_text(encoding="ascii"))
                     document["state"] = "closed"
                     document["session_id"] = f"{sequence:032x}"
                     document["publication_nonce"] = f"{sequence + 16:032x}"
-                    support._write_chain_registry_entry(
+                    s._write_chain_registry_entry(
                         entries / f"chain-{sequence:032x}.json",
                         document,
                         create=True,
@@ -24625,55 +24626,59 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 def stable_uid(_target_uid: int) -> None:
                     calls.append("stable")
 
-                with patch(
-                    support,
+                with p(
+                    s,
                     "_recover_registered_entry",
                     side_effect=fail_recovery,
-                ), patch(support, "_STRICT_REGISTRY_ENTRY_LIMIT", 7), patch(
-                    support,
+                ), p(s, "_STRICT_REGISTRY_ENTRY_LIMIT", 7), p(
+                    s,
                     "_invoke_root_uid_cleanup",
                     side_effect=cleanup_uid,
-                ), patch(
-                    support,
+                ), p(
+                    s,
                     "_stable_uid_zero",
                     side_effect=stable_uid,
-                ), patch(
-                    support,
+                ), p(
+                    s,
                     "_load_chain_registry_entry",
-                    side_effect=lambda path: load(path) | ({"state": "closed", "cleanup_kind": live_kind} if path == entry_path else {}),
-                ), patch(
-                    support,
+                    side_effect=lambda path: load(path) | ({"state": "closed", "cleanup_kind": live} if path == entry else {}),
+                ), p(
+                    s,
                     "_direct_opt_root_document",
                     side_effect=lambda _document: {"witness": {"file": {"phase": "owned", "last_record_sha256": ("a" if calls.count("uid") == 1 else "b") * 64}, "retired": {} if calls.count("uid") > 3 else None}},
                 ):
                     with self.assertRaisesRegex(
                         AssertionError, "recovery state retained"
                     ) as caught:
-                        support.close_trusted_isolation_chains(registry)
+                        s.close_trusted_isolation_chains(
+                            registry,
+                            recovery_profile=s._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE,
+                        )
             finally:
-                support._STRICT_SESSION = previous_session
+                s._STRICT_SESSION = previous
 
             self.assertEqual(calls, ["entry", "uid", "stable"] * 6)
             self.assertTrue(root.is_dir())
-            retained = json.loads(entry_path.read_text(encoding="ascii"))
+            retained = json.loads(entry.read_text(encoding="ascii"))
             self.assertEqual(retained["state"], "prepared")
-            self.assertIn("first", str(caught.exception))
+            self.assertIn("command line is unreadable", str(caught.exception))
             self.assertNotIn("later", str(caught.exception))
             root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
             metadata = os.fstat(root_fd)
             try:
                 identity = (metadata.st_dev, metadata.st_ino)
-                diagnostic = support._outer_owner_retained_cleanup_state(root_fd, identity, str(retained["session_id"]))
+                diagnostic = s._outer_owner_retained_cleanup_state(root_fd, identity, str(retained["session_id"]))
+                suffix = ",failure=prepared-command-unreadable"
                 baseline = retained | {"state": "outer-bound", "outer": [1, 2, 1, 1]}
                 for changed, expected in ((baseline, "entry=outer-bound,outer=true,quota=intended"), (baseline | {"outer": []}, "entry=unreadable,outer=unreadable,quota=intended"), (baseline | {"session_id": "f" * 32}, "entry=unreadable,outer=unreadable,quota=intended"), (baseline | {"schema_version": 3}, "entry=unreadable,outer=unreadable,quota=intended"), (baseline | {"extra": True}, "entry=unreadable,outer=unreadable,quota=intended")):
-                    support._write_chain_registry_entry(entry_path, changed, create=False)
-                    self.assertEqual(support._outer_owner_retained_cleanup_state(root_fd, identity, str(retained["session_id"])), expected)
+                    s._write_chain_registry_entry(entry, changed, create=False)
+                    self.assertEqual(s._outer_owner_retained_cleanup_state(root_fd, identity, str(retained["session_id"])), expected + suffix)
             finally:
                 os.close(root_fd)
-            self.assertEqual(diagnostic, "entry=prepared,outer=false,quota=intended")
+            self.assertEqual(diagnostic, "entry=prepared,outer=false,quota=intended" + suffix)
             self.assertTrue(
-                support._registry_cleanup_obligation_is_terminal(
-                    {"state": "closed", "cleanup_kind": live_kind}, True
+                s._registry_cleanup_obligation_is_terminal(
+                    {"state": "closed", "cleanup_kind": live}, True
                 )
             )
 
@@ -26560,36 +26565,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         check(host_read_source, ('Path("/usr/lib") / multiarch', 'Path("/etc/ld.so.preload").lstat()', 'system_stdlib / "lib-dynload"', 'trusted_git.parent != Path("/usr/bin")'), ('Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',))
         check(candidate_source, ("read_network_interfaces(network_interface_fd)", 'status.get("Seccomp") != "2"', "Seccomp_filters", '"/proc/self/limits"'), ("os.listdir(trusted_root)", 'os.listdir("/sys/class/net")', "socket.if_nameindex", "resource.getrlimit"))
         check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")'), ('f"/proc/self/fdinfo/',))
-        install_function = next(
-            node
-            for node in ast.parse(bootstrap_source).body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "install_candidate_seccomp_filter"
-        )
-        architecture_assignment = next(
-            node
-            for node in install_function.body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name)
-                and target.id == "architecture"
-                for target in node.targets
-            )
-        )
+        install_function = next(node for node in ast.parse(bootstrap_source).body if isinstance(node, ast.FunctionDef) and node.name == "install_candidate_seccomp_filter")
+        architecture_assignment = next(node for node in install_function.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "architecture" for target in node.targets))
         architecture_call = architecture_assignment.value
         self.assertIsInstance(architecture_call, ast.Call)
         architecture_get = architecture_call.func
         self.assertIsInstance(architecture_get, ast.Attribute)
         architecture_mapping = architecture_get.value
         self.assertIsInstance(architecture_mapping, ast.Dict)
-        architectures = {
-            ast.literal_eval(key): ast.literal_eval(value)
-            for key, value in zip(
-                architecture_mapping.keys,
-                architecture_mapping.values,
-                strict=True,
-            )
-        }
+        architectures = {ast.literal_eval(key): ast.literal_eval(value) for key, value in zip(architecture_mapping.keys, architecture_mapping.values, strict=True)}
         self.assertEqual(architectures["x86_64"][3], 302)
         self.assertNotIn(302, architectures["x86_64"][4])
         self.assertEqual(architectures["aarch64"][3], 261)

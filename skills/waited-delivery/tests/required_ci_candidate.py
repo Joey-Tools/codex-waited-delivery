@@ -68,6 +68,7 @@ _STRICT_WRITABLE_QUOTA_SOURCE = "required-ci-candidate-writable"
 _STRICT_WRITABLE_QUOTA_SIZE_BYTES = 64 * 1024 * 1024
 _STRICT_WRITABLE_QUOTA_INODES = 8192
 _STRICT_WRITABLE_QUOTA_BINDING_NAME = ".candidate-writable.json"
+_STRICT_RECOVERY_FAILURE_PREFIX = ".recovery-failure-"
 _STRICT_ROOT_TREE_CLEANUP_SECONDS = 30.0
 _STRICT_ROOT_TREE_ENTRY_LIMIT = 8192
 _STRICT_ROOT_TREE_DEPTH_LIMIT = 64
@@ -19500,15 +19501,25 @@ def _recover_registered_entry(
         if document.get("state") == "prepared" and document.get("outer") is None:
             discovered_outer = _discover_prepared_outer(document)
             if discovered_outer is not None:
-                document = _update_trusted_root_chain(
-                    entry_path, "prepared", outer=discovered_outer
-                )
+                try:
+                    document = _update_trusted_root_chain(
+                        entry_path, "prepared", outer=discovered_outer
+                    )
+                except BaseException as error:
+                    raise _registered_recovery_phase_error(
+                        "prepared-outer-update", error
+                    ) from error
         if document.get("state") not in ("closing", "deleting"):
-            document = _transition_trusted_root_chain(
-                entry_path,
-                ("prepared", "outer-bound", "root-authorized"),
-                "closing",
-            )
+            try:
+                document = _transition_trusted_root_chain(
+                    entry_path,
+                    ("prepared", "outer-bound", "root-authorized"),
+                    "closing",
+                )
+            except BaseException as error:
+                raise _registered_recovery_phase_error(
+                    "closing-transition", error
+                ) from error
         outer_value = document.get("outer")
         session_inventory: Mapping[object, object] = {}
         if outer_value is not None:
@@ -23622,6 +23633,97 @@ def _registry_cleanup_obligation_is_terminal(
     )
 
 
+_REGISTRY_RECOVERY_FAILURE_CODES = frozenset(
+    {
+        "prepared-binding-malformed",
+        "prepared-inventory-unavailable",
+        "process-inventory-unreadable",
+        "process-uid-malformed",
+        "process-identity-malformed",
+        "prepared-command-unreadable",
+        "prepared-command-excessive",
+        "prepared-marker-ambiguous",
+        "prepared-outer-update",
+        "closing-transition",
+        "unclassified",
+    }
+)
+_REGISTRY_RECOVERY_FAILURE_MESSAGES = {
+    "strict prepared outer recovery binding is malformed": "prepared-binding-malformed",
+    "strict prepared outer inventory is unavailable": "prepared-inventory-unavailable",
+    "strict candidate process inventory is unreadable": "process-inventory-unreadable",
+    "strict candidate process UID inventory is malformed": "process-uid-malformed",
+    "strict candidate process identity is malformed": "process-identity-malformed",
+    "strict prepared outer command line is unreadable": "prepared-command-unreadable",
+    "strict prepared outer command line is excessive": "prepared-command-excessive",
+    "strict prepared outer recovery marker is ambiguous": "prepared-marker-ambiguous",
+}
+
+
+def _registry_recovery_failure_code(error: BaseException) -> str:
+    try:
+        phase_code = BaseException.__getattribute__(
+            error, "registry_recovery_code"
+        )
+    except (AttributeError, TypeError):
+        phase_code = None
+    if type(phase_code) is str and phase_code in _REGISTRY_RECOVERY_FAILURE_CODES:
+        return phase_code
+    return _REGISTRY_RECOVERY_FAILURE_MESSAGES.get(str(error), "unclassified")
+
+
+def _registered_recovery_phase_error(
+    code: str, error: BaseException
+) -> AssertionError:
+    if code not in _REGISTRY_RECOVERY_FAILURE_CODES or code == "unclassified":
+        raise AssertionError("strict registry recovery phase code is invalid")
+    failure = AssertionError(
+        f"strict registered recovery {code} failed: {error}"
+    )
+    failure.registry_recovery_code = code
+    return failure
+
+
+def _record_registry_recovery_failure(
+    root: Path, entry_path: Path, error: BaseException
+) -> None:
+    entry_match = _CHAIN_ENTRY_NAME_PATTERN.fullmatch(entry_path.name)
+    if entry_match is None or entry_path.parent != root / "entries":
+        raise AssertionError("strict registry recovery failure selector is malformed")
+    session_id = entry_match.group(1)
+    path = root / "trusted-control" / (
+        f"{_STRICT_RECOVERY_FAILURE_PREFIX}{session_id}.json"
+    )
+    document = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "code": _registry_recovery_failure_code(error),
+    }
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        _atomic_json_document(
+            path, document, expected_owner=os.getuid(), create=True
+        )
+        return
+    except OSError as record_error:
+        raise AssertionError(
+            "strict registry recovery failure receipt is unreadable"
+        ) from record_error
+    imported = _read_outer_owner_json(path, "recovery failure receipt")
+    if (
+        set(imported) != {"schema_version", "session_id", "code"}
+        or type(imported.get("schema_version")) is not int
+        or imported.get("schema_version") != 1
+        or imported.get("session_id") != session_id
+        or type(imported.get("code")) is not str
+        or imported.get("code") not in _REGISTRY_RECOVERY_FAILURE_CODES
+    ):
+        raise AssertionError(
+            "strict registry recovery failure receipt is malformed"
+        )
+
+
 def _close_trusted_isolation_chains_under_gate(
     registry: Mapping[str, object],
     *,
@@ -23715,6 +23817,16 @@ def _close_trusted_isolation_chains_under_gate(
                 )
             except BaseException as error:
                 round_failures.append(f"{entry_path.name}: {error}")
+                if (
+                    recovery_profile
+                    == _STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE
+                ):
+                    try:
+                        _record_registry_recovery_failure(
+                            root, entry_path, error
+                        )
+                    except BaseException:
+                        pass
         try:
             _invoke_root_uid_cleanup(controller_path, target_uid)
         except BaseException as error:
@@ -26031,6 +26143,27 @@ def _outer_owner_retained_cleanup_state(
         outer_present = "true" if outer is not None else "false"
     except AssertionError:
         pass
+    failure_code = "unreadable"
+    try:
+        failure = read_document(
+            "trusted-control",
+            f"{_STRICT_RECOVERY_FAILURE_PREFIX}{session_id}.json",
+            "retained recovery failure",
+        )
+        if (
+            set(failure) != {"schema_version", "session_id", "code"}
+            or type(failure.get("schema_version")) is not int
+            or failure.get("schema_version") != 1
+            or failure.get("session_id") != session_id
+            or type(failure.get("code")) is not str
+            or failure.get("code") not in _REGISTRY_RECOVERY_FAILURE_CODES
+        ):
+            raise AssertionError(
+                "strict outer owner retained recovery failure is malformed"
+            )
+        failure_code = str(failure["code"])
+    except AssertionError:
+        pass
     quota_state = "unreadable"
     try:
         quota = read_document(
@@ -26051,7 +26184,8 @@ def _outer_owner_retained_cleanup_state(
     except AssertionError:
         pass
     return (
-        f"entry={entry_state},outer={outer_present},quota={quota_state}"
+        f"entry={entry_state},outer={outer_present},quota={quota_state},"
+        f"failure={failure_code}"
     )
 
 
@@ -26090,7 +26224,10 @@ def _wait_outer_owner_watchdog_cleanup(
                 bound_descriptor, identity, session_id
             )
         except BaseException:
-            return "entry=unreadable,outer=unreadable,quota=unreadable"
+            return (
+                "entry=unreadable,outer=unreadable,quota=unreadable,"
+                "failure=unreadable"
+            )
 
     zero_count = 0
     while True:
