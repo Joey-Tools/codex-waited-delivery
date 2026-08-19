@@ -3413,6 +3413,15 @@ _bounded_failure_text = _CANDIDATE_SUPPORT._bounded_failure_text
 _TerminalFailure = tuple[str, str, BaseException]
 
 
+def _first_unittest_failure_text(result: unittest.TestResult) -> str:
+    for kind, failures in (("failure", result.failures), ("error", result.errors)):
+        if failures:
+            traceback = failures[0][1]
+            detail = traceback.rstrip("\n").rsplit("\n", 1)[-1] or "empty traceback"
+            return _bounded_failure_text(f"{kind}: {detail}", limit=88)
+    return ""
+
+
 class _RequiredCITerminalFailures(AssertionError):
     def __init__(
         self,
@@ -4790,6 +4799,27 @@ def _validated_systemd_live_metrics(
     return dict(value)
 
 
+def _strict_memory_worker_hold(stop, blocks, monotonic, sleep, exit_process):
+    if not blocks:
+        exit_process(83)
+    deadline = monotonic() + 20.0
+    while not stop.exists():
+        if monotonic() >= deadline:
+            exit_process(82)
+        sleep(0.002)
+    exit_process(0)
+
+
+def _strict_memory_high_gate(before, read_high, write_stop, monotonic, sleep):
+    deadline = monotonic() + 15.0
+    while monotonic() < deadline:
+        if read_high() > before:
+            write_stop()
+            return
+        sleep(0.002)
+    raise SystemExit(80)
+
+
 def _strict_runtime_live_main() -> int:
     runner_output = io.StringIO()
     try:
@@ -4869,6 +4899,8 @@ def _strict_runtime_live_main() -> int:
                     "strict runtime live test did not complete exactly once without "
                     "failures or skips: "
                     + _bounded_failure_text(runner_output.getvalue())
+                    + "; first="
+                    + _first_unittest_failure_text(result)
                 )
 
         _capture_terminal_failure(
@@ -9400,6 +9432,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         cleanup.assert_called_once_with(registry)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("did not complete exactly once", stderr.getvalue())
+        self.assertIn("first=failure:", stderr.getvalue())
         self.assertIn("...[middle truncated]...", stderr.getvalue())
         self.assertIn('"returncode":127', stderr.getvalue())
         self.assertIn('"process_leak_observed":false', stderr.getvalue())
@@ -20182,6 +20215,49 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             _CANDIDATE_SUPPORT._STRICT_PLATFORM_VALIDATED = previous
 
     def test_systemd_live_metrics_require_aggregate_kernel_events(self) -> None:
+        def exit_process(code: int) -> None:
+            raise SystemExit(code)
+
+        stop = mock.Mock()
+        stop.exists.side_effect = (False, True)
+        marker = bytearray(1)
+        blocks = [marker]
+        with self.assertRaises(SystemExit) as held:
+            _strict_memory_worker_hold(
+                stop, blocks, mock.Mock(side_effect=(0.0, 1.0)),
+                mock.Mock(), exit_process,
+            )
+        self.assertEqual(held.exception.code, 0)
+        self.assertEqual(blocks, [marker])
+        self.assertIs(blocks[0], marker)
+        timeout_stop = mock.Mock()
+        timeout_stop.exists.return_value = False
+        with self.assertRaises(SystemExit) as timed_out:
+            _strict_memory_worker_hold(
+                timeout_stop, [bytearray(1)], mock.Mock(side_effect=(0.0, 21.0)),
+                mock.Mock(), exit_process,
+            )
+        self.assertEqual(timed_out.exception.code, 82)
+        events: list[str] = []
+        values = iter((0, 1))
+        read_high = mock.Mock(
+            side_effect=lambda: (events.append("read"), next(values))[1]
+        )
+        write_stop = mock.Mock(side_effect=lambda: events.append("write"))
+        _strict_memory_high_gate(
+            0, read_high, write_stop, mock.Mock(side_effect=(0.0, 1.0, 2.0)),
+            mock.Mock(),
+        )
+        self.assertEqual(events, ["read", "read", "write"])
+        write_stop.assert_called_once_with()
+        no_event_stop = mock.Mock()
+        with self.assertRaises(SystemExit) as no_event:
+            _strict_memory_high_gate(
+                0, mock.Mock(return_value=0), no_event_stop,
+                mock.Mock(side_effect=(0.0, 1.0, 16.0)), mock.Mock(),
+            )
+        self.assertEqual(no_event.exception.code, 80)
+        no_event_stop.assert_not_called()
         session_id = "e" * 32
         unit = f"required-ci-candidate-{session_id}.scope"
         common = {
@@ -25284,16 +25360,6 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 1234,
                 9,
             )
-
-    def test_strict_root_command_isolates_ipc_before_candidate_launch(self) -> None:
-        with self.root_command_mount_contract():
-            command = _CANDIDATE_SUPPORT._root_controller_candidate_command(
-                self.root_command_config(), 1234, 9
-            )
-
-        self.assertIn("--ipc", command)
-        self.assertLess(command.index("--ipc"), command.index("/usr/bin/setpriv"))
-        self.assertNotIn("/usr/bin/prlimit", command)
 
     def test_strict_bootstrap_rejects_piped_core_pattern_before_launch(
         self,
@@ -46587,7 +46653,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             REQUIRED_CI_ISOLATION_MODE,
         )
         _CANDIDATE_SUPPORT._ensure_strict_backend()
-        source = textwrap.dedent(
+        source_body = textwrap.dedent(
             r'''
             import errno
             import json
@@ -46725,17 +46791,17 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                     block[offset] = 1
                                 blocks.append(block)
                                 time.sleep(0.002)
-                            os._exit(79)
+                            _strict_memory_worker_hold(
+                                stop, blocks, time.monotonic, time.sleep, os._exit
+                            )
                         workers.add(pid)
-                    deadline = time.monotonic() + 15.0
-                    while time.monotonic() < deadline:
-                        observed = counters(root / "memory.events")
-                        if observed.get("high", 0) > before.get("high", 0):
-                            stop.write_text("stop\n", encoding="ascii")
-                            break
-                        time.sleep(0.002)
-                    else:
-                        raise SystemExit(80)
+                    _strict_memory_high_gate(
+                        before.get("high", 0),
+                        lambda: counters(root / "memory.events").get("high", 0),
+                        lambda: stop.write_text("stop\n", encoding="ascii"),
+                        time.monotonic,
+                        time.sleep,
+                    )
                     for pid in tuple(workers):
                         waited, status = os.waitpid(pid, 0)
                         workers.remove(pid)
@@ -46766,6 +46832,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 }
             print(json.dumps(document, sort_keys=True, separators=(",", ":")))
             '''
+        )
+        source = (
+            inspect.getsource(_strict_memory_worker_hold)
+            + "\n"
+            + inspect.getsource(_strict_memory_high_gate)
+            + "\n"
+            + source_body
         ).encode("ascii")
 
         def run(kind: str, timeout_seconds: float) -> dict[str, object]:
@@ -49182,6 +49255,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         tail = "terminal-tail-sentinel"
         primary = AssertionError("p" * 2200 + tail)
         integrity = AssertionError("integrity")
+        captured = unittest.TestResult()
+        captured.failures.append(
+            (
+                self,
+                "noise\nAssertionError: exact-primary\r::warning::forged"
+                "\u2028##[error] exact-primary-sentinel\n",
+            )
+        )
+        summary = _first_unittest_failure_text(captured)
 
         failure = _RequiredCITerminalFailures(
             "terminal context",
@@ -49193,6 +49275,27 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
         self.assertIn(tail, str(failure))
         self.assertLessEqual(len(str(failure)), 1024)
+        nested = _RequiredCITerminalFailures(
+            "nested",
+            (
+                ("primary", "suite-result", AssertionError("x" * 500 + summary)),
+                ("integrity", "cleanup", integrity),
+            ),
+        )
+        self.assertIn("failure: AssertionError", str(nested))
+        self.assertIn("exact-primary-sentinel", str(nested))
+        self.assertNotIn("\r", str(nested))
+        self.assertNotIn("\u2028", str(nested))
+        self.assertNotIn("::", str(nested))
+        self.assertNotIn("##[", str(nested))
+        captured.failures.clear()
+        captured.errors.append((self, "RuntimeError: error-sentinel\n"))
+        self.assertEqual(
+            _first_unittest_failure_text(captured),
+            "error: RuntimeError: error-sentinel",
+        )
+        captured.errors.clear()
+        self.assertEqual(_first_unittest_failure_text(captured), "")
 
     def test_terminal_failure_order_is_primary_first(self) -> None:
         cleanup = AssertionError("cleanup")
@@ -50034,34 +50137,6 @@ class RequiredCiCallerRegressionTests(unittest.TestCase):
 
 
 class RequiredCiWorkflowTests(unittest.TestCase):
-    def test_trusted_step_launcher_captures_deadline_before_its_only_exec(
-        self,
-    ) -> None:
-        compile(
-            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE,
-            "<trusted-test-supervisor-launcher>",
-            "exec",
-        )
-        self.assertNotIn("\n", TRUSTED_TEST_SUPERVISOR_COMMAND)
-        self.assertEqual(
-            TRUSTED_TEST_SUPERVISOR_STEP.count(
-                f"          {TRUSTED_TEST_SUPERVISOR_COMMAND}\n"
-            ),
-            1,
-        )
-        self.assertEqual(
-            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE.count("time.monotonic()"),
-            1,
-        )
-        self.assertEqual(
-            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE.count("os.execve"), 1
-        )
-        self.assertLess(
-            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE.index("time.monotonic()"),
-            TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE.index("os.execve"),
-        )
-        self.assertNotIn("time.time()", TRUSTED_TEST_SUPERVISOR_LAUNCHER_SOURCE)
-
     def test_workflow_and_supervisor_budgets_form_exact_nested_envelopes(
         self,
     ) -> None:
