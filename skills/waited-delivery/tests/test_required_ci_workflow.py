@@ -37,7 +37,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from unittest import mock
 
 
-TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES = 2 * 1024 * 1024
+TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES = 5 * 1024 * 1024 // 2
 TRUSTED_TEST_CONTROL_PLANE_ENTRY_LIMIT = 256
 TRUSTED_TEST_CONTROL_PLANE_DEPTH_LIMIT = 8
 TRUSTED_TEST_CONTROL_PLANE_TOTAL_SOURCE_LIMIT_BYTES = 16 * 1024 * 1024
@@ -104,7 +104,8 @@ TRUSTED_TEST_CHILD_BOOTSTRAP_CODE = (
     "if _supervisor_fd_text == _bundle_fd_text:\n"
     "    raise AssertionError('trusted child bootstrap descriptors overlap')\n"
     "_captured = _read_payload(_supervisor_fd_text, "
-    "_supervisor_length_text, _supervisor_sha, 2 * 1024 * 1024)\n"
+    f"_supervisor_length_text, _supervisor_sha, "
+    f"{TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES})\n"
     "_suite_bundle = _read_payload(_bundle_fd_text, _bundle_length_text, "
     "_bundle_sha, 16 * 1024 * 1024)\n"
     "for _payload_fd_text in {_supervisor_fd_text, _bundle_fd_text}:\n"
@@ -15318,8 +15319,19 @@ sys.stdin.buffer.read(1)
             tests_root = Path(temporary_directory).resolve(strict=True)
             oversized = tests_root / "test_oversized.py"
             oversized.write_bytes(
-                b"x" * (TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES + 1)
+                b"x" * TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES
             )
+            captured = _test_control_plane_namespace_capture(
+                tests_root,
+                "trusted",
+                capture_names=None,
+            )
+            self.assertEqual(
+                len(captured[1][oversized.name]),
+                TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES,
+            )
+            with oversized.open("ab") as stream:
+                stream.write(b"x")
 
             with self.assertRaisesRegex(
                 AssertionError,
@@ -19017,6 +19029,45 @@ sys.stdin.buffer.read(1)
                     _CANDIDATE_SUPPORT._run_candidate_git(
                         root, "status", output_limit=4096
                     )
+
+    def test_candidate_git_archive_output_has_a_separate_exact_ceiling(
+        self,
+    ) -> None:
+        archive_limit = (
+            _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_ARCHIVE_LIMIT_BYTES
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT.CANDIDATE_GIT_OUTPUT_LIMIT_BYTES,
+            1024 * 1024,
+        )
+        self.assertEqual(archive_limit, 5 * 1024 * 1024)
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT, "candidate_git_argv", return_value=["git"]
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess,
+            "Popen",
+            side_effect=OSError("injected startup failure"),
+        ) as popen, self.assertRaisesRegex(
+            AssertionError, "validation could not start"
+        ):
+            _CANDIDATE_SUPPORT._run_candidate_git(
+                Path("/unused"), "archive", output_limit=archive_limit
+            )
+        popen.assert_called_once()
+
+        with mock.patch.object(
+            _CANDIDATE_SUPPORT, "strict_isolation_platform_preflight"
+        ), mock.patch.object(
+            _CANDIDATE_SUPPORT.subprocess, "Popen"
+        ) as popen, self.assertRaisesRegex(
+            AssertionError, "output limit is invalid"
+        ):
+            _CANDIDATE_SUPPORT._run_candidate_git(
+                Path("/unused"), "archive", output_limit=archive_limit + 1
+            )
+        popen.assert_not_called()
 
     def test_candidate_git_cleanup_revalidates_darwin_eperm_after_a_live_race(
         self,
@@ -31314,6 +31365,10 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
             source = (
                 f"open({str(canary)!r}, 'w').write('executed')\n"
             ).encode("utf-8")
+            source += b"#" + b"x" * (
+                TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES - len(source) - 2
+            ) + b"\n"
+            self.assertEqual(len(source), TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES)
             source_sha256 = hashlib.sha256(source).hexdigest()
             suite_bundle = b"captured-suite-bundle"
             suite_bundle_sha256 = hashlib.sha256(suite_bundle).hexdigest()
@@ -33218,15 +33273,14 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
                 too_many, object_format
             )
 
+        total_limit = (
+            _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES
+        )
+        first_size = total_limit // 2
         oversized = (
-            "100644 blob "
-            + blob_oid
-            + " "
-            + str(
-                _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES
-                + 1
-            )
-            + "\tlarge.bin\0"
+            f"100644 blob {blob_oid} {first_size}\tlarge-a.bin\0"
+            f"100644 blob {blob_oid} {total_limit - first_size + 1}"
+            "\tlarge-b.bin\0"
         ).encode("ascii")
         with self.assertRaisesRegex(AssertionError, "content exceeds.*total limit"):
             _CANDIDATE_SUPPORT._candidate_workspace_tree_inventory(
@@ -33291,13 +33345,39 @@ sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
             len(source) for source, _executable in workspace_sources.values()
         )
         headroom = _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_MINIMUM_HEADROOM_BYTES
+        growth = _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_GROWTH_RESERVE_BYTES
         self.assertLessEqual(
-            tracked_total + headroom,
+            tracked_total + headroom + growth,
             _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES,
         )
         self.assertEqual(
             _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_TOTAL_SIZE_LIMIT_BYTES,
-            14 * headroom,
+            16 * headroom,
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_SIZE_LIMIT_BYTES,
+            16 * headroom,
+        )
+        self.assertEqual(
+            TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES,
+            10 * headroom,
+        )
+        self.assertLessEqual(
+            len(TRUSTED_TEST_SUPERVISOR_BYTES) + headroom + growth,
+            TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES,
+        )
+        self.assertIn(
+            f"_supervisor_sha, {TRUSTED_REPOSITORY_FILE_SIZE_LIMIT_BYTES})",
+            TRUSTED_TEST_CHILD_BOOTSTRAP_CODE,
+        )
+        self.assertEqual(growth, headroom)
+        self.assertEqual(
+            _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_ARCHIVE_LIMIT_BYTES,
+            20 * headroom,
+        )
+        self.assertEqual(
+            _CANDIDATE_SUPPORT.CANDIDATE_GIT_MAX_OUTPUT_LIMIT_BYTES,
+            _CANDIDATE_SUPPORT.CANDIDATE_WORKSPACE_ARCHIVE_LIMIT_BYTES,
         )
         self.assertEqual(headroom, 256 * 1024)
 

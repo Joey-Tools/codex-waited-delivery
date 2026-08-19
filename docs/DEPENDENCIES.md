@@ -69,7 +69,7 @@ transitions and are not treated as mutations.
 
 Every namespace enumeration independently enforces the 256-entry bound, and
 the descriptor walk retains its eight-level depth bound. Each captured file is
-limited to 2 MiB and the complete captured source set is limited to 16 MiB.
+limited to 2.5 MiB and the complete captured source set is limited to 16 MiB.
 Cross-root validation derives the expected candidate leaf set before reading
 candidate content, so an unexpected leaf is metadata evidence to reject rather
 than an authorization to read more source.

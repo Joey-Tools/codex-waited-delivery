@@ -243,6 +243,7 @@ class SkillContractTest(unittest.TestCase):
             "256-entry bound",
             dependencies,
         )
+        self.assertIn("Each captured file is limited to 2.5 MiB", dependencies)
         self.assertIn("complete captured source set is limited to 16 MiB", dependencies)
         self.assertIn(
             "derives the expected candidate leaf set before reading candidate "
