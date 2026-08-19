@@ -439,14 +439,14 @@ def _strict_bootstrap_nofile_requirement(
             )
         component_depths.append(len(components))
     # The bootstrap simultaneously holds 2W writable source/bind FDs and R
-    # read-root FDs.  Landlock adds 31 fixed FDs, while component revalidation
+    # read-root FDs.  Landlock adds 33 fixed FDs, while component revalidation
     # adds D+7 instead.  The fixed ceiling admits the public W=64/R=32 maxima
     # through D=89 and turns deeper control-plane input into a prelaunch error.
     required = max(
         _STRICT_BOOTSTRAP_NOFILE_MINIMUM,
         (2 * len(writable_bindings))
         + len(read_bindings)
-        + max(31, max(component_depths) + 7),
+        + max(33, max(component_depths) + 7),
     )
     if required > _STRICT_BOOTSTRAP_NOFILE_LIMIT:
         raise AssertionError(
@@ -4005,13 +4005,13 @@ def bootstrap_nofile_requirement(writable_roots, read_roots):
         if type(components) is not list or not components:
             raise SystemExit(150)
         component_depths.append(len(components))
-    # Match the parent/root proof: 2W+R held FDs plus the greater of the 31
+    # Match the parent/root proof: 2W+R held FDs plus the greater of the 33
     # fixed Landlock FDs and D+7 component-revalidation FDs.
     required = max(
         64,
         (2 * len(writable_roots))
         + len(read_roots)
-        + max(31, max(component_depths) + 7),
+        + max(33, max(component_depths) + 7),
     )
     if required > 256:
         raise SystemExit(150)
@@ -4055,7 +4055,7 @@ def reject_mount_network_probe(stage, error=None):
     raise SystemExit(150)
 
 
-if len(sys.argv) < 9:
+if len(sys.argv) < 11:
     reject_mount_network_probe("arguments")
 try:
     readiness_fd = int(sys.argv[1])
@@ -4084,9 +4084,13 @@ try:
     read_roots = json.loads(sys.argv[7])
 except json.JSONDecodeError:
     raise SystemExit(150)
-continuation_argv = sys.argv[8:]
+scope_session_id = sys.argv[8]
+scope_unit = sys.argv[9]
+continuation_argv = sys.argv[10:]
 if required_nofile != bootstrap_nofile_requirement(
     writable_roots, read_roots
+) or re.fullmatch(r"[0-9a-f]{32}", scope_session_id) is None or scope_unit != (
+    f"required-ci-candidate-{scope_session_id}.scope"
 ):
     raise SystemExit(150)
 
@@ -4280,6 +4284,17 @@ NAMESPACE_READ_PATHS = (
     ("/proc/sys/kernel/core_pattern", "file"),
     ("/proc/sys/kernel/cap_last_cap", "file"),
     *((path, "file") for path, _ in IPC_SYSCTLS),
+)
+SYSTEMD_SCOPE_READ_FILES = (
+    "cgroup.type",
+    "cpu.max",
+    "cpu.stat",
+    "memory.events",
+    "memory.high",
+    "memory.max",
+    "memory.swap.max",
+    "pids.events",
+    "pids.max",
 )
 
 if (
@@ -4532,7 +4547,279 @@ def install_candidate_seccomp_filter():
         raise SystemExit(164)
 
 
-def prepare_candidate_landlock(descriptors, read_descriptors):
+def read_proc_cgroup():
+    descriptor = os.open(
+        "/proc/self/cgroup", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    try:
+        data = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+    if not data or len(data) > 4096:
+        raise SystemExit(175)
+    return data
+
+
+def require_descriptor_acl_absent(descriptor):
+    try:
+        attributes = os.listxattr(f"/proc/self/fd/{descriptor}")
+    except OSError:
+        raise SystemExit(175)
+    if {"system.posix_acl_access", "system.posix_acl_default"}.intersection(
+        attributes
+    ):
+        raise SystemExit(175)
+
+
+def parse_systemd_scope_components(membership, scope_unit):
+    try:
+        text = membership.decode("ascii")
+    except UnicodeDecodeError:
+        raise SystemExit(175)
+    if (
+        not text.endswith("\n")
+        or text.count("\n") != 1
+        or "\r" in text
+        or "\x00" in text
+    ):
+        raise SystemExit(175)
+    fields = text[:-1].split(":")
+    control_group = fields[2] if len(fields) == 3 else ""
+    components = control_group.split("/")[1:]
+    if (
+        fields[:2] != ["0", ""]
+        or not control_group.startswith("/")
+        or os.path.normpath(control_group) != control_group
+        or not 1 <= len(components) <= 16
+        or components[-1] != scope_unit
+        or any(
+            component in ("", ".", "..")
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in component
+            )
+            for component in components
+        )
+    ):
+        raise SystemExit(175)
+    return components
+
+
+def open_systemd_scope_read_descriptor(
+    scope_unit, inventory, target_uid, target_gid
+):
+    membership = read_proc_cgroup()
+    components = parse_systemd_scope_components(membership, scope_unit)
+    cgroup_root = "/sys/fs/cgroup"
+    scope_path = cgroup_root + "/" + "/".join(components)
+    matching_mounts = [
+        (mount_id, record)
+        for mount_id, record in inventory.items()
+        if record.get("mountpoint") == cgroup_root
+    ]
+    if len(matching_mounts) != 1:
+        raise SystemExit(175)
+    mount_id, mount_record = matching_mounts[0]
+    if (
+        type(mount_id) is not int
+        or mount_id <= 0
+        or mount_record.get("root") != "/"
+        or mount_record.get("filesystem") != "cgroup2"
+        or mount_record.get("source") not in ("cgroup", "cgroup2")
+        or not {"ro", "nosuid", "nodev", "noexec"}.issubset(
+            mount_record.get("options", ())
+        )
+        or {
+            candidate_id
+            for candidate_id, record in inventory.items()
+            if record.get("major_minor") == mount_record.get("major_minor")
+        }
+        != {mount_id}
+    ):
+        raise SystemExit(175)
+    o_path = getattr(os, "O_PATH", None)
+    if type(o_path) is not int:
+        raise SystemExit(152)
+    directory_flags = o_path | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    file_flags = o_path | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptors = []
+    chain = []
+    try:
+        root_selected = os.stat(cgroup_root, follow_symlinks=False)
+        root_descriptor = os.open(cgroup_root, directory_flags)
+        descriptors.append(root_descriptor)
+        root_opened = os.fstat(root_descriptor)
+        root_reselected = os.stat(cgroup_root, follow_symlinks=False)
+        protected_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_gid",
+        )
+        root_identity = tuple(
+            getattr(root_opened, field) for field in protected_fields
+        )
+        if (
+            not stat.S_ISDIR(root_opened.st_mode)
+            or root_opened.st_uid != 0
+            or root_opened.st_gid != 0
+            or descriptor_mount_id(root_descriptor) != mount_id
+            or mount_record.get("major_minor")
+            != (os.major(root_opened.st_dev), os.minor(root_opened.st_dev))
+            or any(
+                tuple(getattr(metadata, field) for field in protected_fields)
+                != root_identity
+                for metadata in (root_selected, root_reselected)
+            )
+            or not target_mode_allows(
+                root_opened, target_uid, target_gid, os.X_OK
+            )
+            or target_mode_allows(
+                root_opened, target_uid, target_gid, os.W_OK
+            )
+        ):
+            raise SystemExit(175)
+        require_descriptor_acl_absent(root_descriptor)
+        validate_directory_mount_topology(
+            scope_path, mount_id, root_opened.st_dev, inventory, 175
+        )
+        parent_descriptor = root_descriptor
+        for component in components:
+            selected = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            descriptor = os.open(
+                component, directory_flags, dir_fd=parent_descriptor
+            )
+            descriptors.append(descriptor)
+            opened = os.fstat(descriptor)
+            reselected = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            identity = tuple(
+                getattr(opened, field) for field in protected_fields
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != 0
+                or opened.st_gid != 0
+                or opened.st_dev != root_opened.st_dev
+                or descriptor_mount_id(descriptor) != mount_id
+                or any(
+                    tuple(
+                        getattr(metadata, field)
+                        for field in protected_fields
+                    )
+                    != identity
+                    for metadata in (selected, reselected)
+                )
+                or not target_mode_allows(
+                    opened, target_uid, target_gid, os.X_OK
+                )
+                or target_mode_allows(
+                    opened, target_uid, target_gid, os.W_OK
+                )
+            ):
+                raise SystemExit(175)
+            require_descriptor_acl_absent(descriptor)
+            chain.append(
+                (parent_descriptor, descriptor, component, identity)
+            )
+            parent_descriptor = descriptor
+        scope_descriptor = descriptors[-1]
+        for name in SYSTEMD_SCOPE_READ_FILES:
+            selected = os.stat(
+                name, dir_fd=scope_descriptor, follow_symlinks=False
+            )
+            descriptor = os.open(name, file_flags, dir_fd=scope_descriptor)
+            try:
+                opened = os.fstat(descriptor)
+                reselected = os.stat(
+                    name,
+                    dir_fd=scope_descriptor,
+                    follow_symlinks=False,
+                )
+                identity = tuple(
+                    getattr(opened, field)
+                    for field in (*protected_fields, "st_nlink")
+                )
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != 0
+                    or opened.st_gid != 0
+                    or opened.st_nlink != 1
+                    or opened.st_dev != root_opened.st_dev
+                    or descriptor_mount_id(descriptor) != mount_id
+                    or any(
+                        tuple(
+                            getattr(metadata, field)
+                            for field in (*protected_fields, "st_nlink")
+                        )
+                        != identity
+                        for metadata in (selected, reselected)
+                    )
+                    or not target_mode_allows(
+                        opened, target_uid, target_gid, os.R_OK
+                    )
+                    or target_mode_allows(
+                        opened, target_uid, target_gid, os.W_OK
+                    )
+                    or opened.st_mode & (stat.S_ISUID | stat.S_ISGID)
+                ):
+                    raise SystemExit(175)
+                require_descriptor_acl_absent(descriptor)
+            finally:
+                os.close(descriptor)
+        if read_proc_cgroup() != membership or mount_inventory() != inventory:
+            raise SystemExit(175)
+        root_reselected = os.stat(cgroup_root, follow_symlinks=False)
+        root_held = os.fstat(root_descriptor)
+        if any(
+            tuple(getattr(metadata, field) for field in protected_fields)
+            != root_identity
+            for metadata in (root_reselected, root_held)
+        ):
+            raise SystemExit(175)
+        for parent_descriptor, descriptor, component, identity in chain:
+            reselected = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            held = os.fstat(descriptor)
+            if any(
+                tuple(
+                    getattr(metadata, field) for field in protected_fields
+                )
+                != identity
+                for metadata in (reselected, held)
+            ):
+                raise SystemExit(175)
+        for descriptor in descriptors[:-1]:
+            os.close(descriptor)
+        return scope_descriptor
+    except BaseException:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def prepare_candidate_landlock(
+    descriptors,
+    read_descriptors,
+    scope_unit,
+    inventory,
+    target_uid,
+    target_gid,
+):
     # READ_FILE blocks direct reads from host-backed objects outside exact
     # parent-selected runtime roots.  Authorized runtime directories are an
     # explicit trust boundary whose target access is read/execute-only; a
@@ -4567,10 +4854,14 @@ def prepare_candidate_landlock(descriptors, read_descriptors):
     private_descriptors = []
     safe_device_descriptors = []
     namespace_read_descriptors = []
+    systemd_scope_descriptor = None
     try:
         o_path = getattr(os, "O_PATH", None)
         if type(o_path) is not int:
             raise SystemExit(152)
+        systemd_scope_descriptor = open_systemd_scope_read_descriptor(
+            scope_unit, inventory, target_uid, target_gid
+        )
         flags = o_path | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         for path, _ in PRIVATE_SURFACES:
             private_descriptors.append(os.open(path, flags))
@@ -4619,6 +4910,7 @@ def prepare_candidate_landlock(descriptors, read_descriptors):
                 (descriptor, LANDLOCK_ACCESS_FS_READ_FILE)
                 for descriptor in namespace_read_descriptors
             ),
+            (systemd_scope_descriptor, LANDLOCK_ACCESS_FS_READ_FILE),
         )
         for descriptor, allowed_access in rules:
             rule = LandlockPathBeneathAttr(
@@ -4645,8 +4937,10 @@ def prepare_candidate_landlock(descriptors, read_descriptors):
             *private_descriptors,
             *safe_device_descriptors,
             *namespace_read_descriptors,
+            systemd_scope_descriptor,
         ):
-            os.close(descriptor)
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def activate_candidate_landlock(ruleset_fd):
@@ -5716,8 +6010,15 @@ try:
     seal_network_interface_descriptor(
         final_inventory, host_network_namespace
     )
+    target_uid = read_roots[0]["target_uid"]
+    target_gid = read_roots[0]["target_gid"]
     landlock_ruleset_fd = prepare_candidate_landlock(
-        tuple(bound_descriptors), tuple(read_descriptors)
+        tuple(bound_descriptors),
+        tuple(read_descriptors),
+        scope_unit,
+        final_inventory,
+        target_uid,
+        target_gid,
     )
 finally:
     for descriptor in (*bound_descriptors, *source_descriptors):
@@ -7316,6 +7617,8 @@ def _root_controller_candidate_command(
     environment = config.get("environment")
     candidate_argv = config.get("candidate_argv")
     runtime_binding = config.get("candidate_interpreter")
+    session_id = config.get("session_id")
+    scope_unit = _systemd_scope_unit(session_id)
     if (
         type(uid) is not int
         or type(gid) is not int
@@ -7470,6 +7773,8 @@ def _root_controller_candidate_command(
         host_network_namespace,
         writable_root_json,
         read_root_json,
+        str(session_id),
+        scope_unit,
         str(_STRICT_PRIMITIVES["setpriv"]),
         f"--reuid={uid}",
         f"--regid={gid}",

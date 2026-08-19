@@ -9638,6 +9638,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             "environment": {},
             "candidate_argv": ["/usr/bin/python3", "-I", "/probe.py"],
             "candidate_interpreter": None,
+            "session_id": "a" * 32,
             "trusted_root": "/trusted",
             "trusted_sentinel": "/trusted/sentinel",
             "host_mount_namespace": "mnt:[101]",
@@ -12666,21 +12667,21 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         client_environment[s._ISOLATION_REGISTRY_TOKEN_ENV] = registry_token
         client_source = textwrap.dedent(
             f"""
-            import json
-            import os
-            import sys
+import json
+import os
+import sys
 
-            print(json.dumps({{
-                "registry": os.environ[
-                    {s._ISOLATION_REGISTRY_ENV!r}
-                ],
-                "token": os.environ[
-                    {s._ISOLATION_REGISTRY_TOKEN_ENV!r}
-                ],
-                "uid": os.getuid(),
-            }}), flush=True)
-            sys.stdin.buffer.read(1)
-            """
+print(json.dumps({{
+    "registry": os.environ[
+        {s._ISOLATION_REGISTRY_ENV!r}
+    ],
+    "token": os.environ[
+        {s._ISOLATION_REGISTRY_TOKEN_ENV!r}
+    ],
+    "uid": os.getuid(),
+}}), flush=True)
+sys.stdin.buffer.read(1)
+"""
         )
         client = subprocess.Popen(
             [sys.executable, "-I", "-B", "-c", client_source],
@@ -26428,7 +26429,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         candidate_bootstrap_index = command.index(
             _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE
         )
-        self.assertEqual(setpriv_index, bootstrap_command_index + 8)
+        self.assertEqual(setpriv_index, bootstrap_command_index + 10)
         self.assertLess(setpriv_index, candidate_bootstrap_index)
 
         bootstrap_nodes = ast.parse(bootstrap_source).body
@@ -26601,10 +26602,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             return writable, readable
 
         cases = (
-            (64, 32, 24, 191),
-            (16, 1, 24, 64),
-            (16, 2, 24, 65),
-            (16, 1, 25, 65),
+            (64, 32, 24, 193),
+            (16, 1, 24, 66),
+            (16, 2, 24, 67),
+            (16, 1, 25, 66),
         )
         for writable_count, read_count, depth, expected in cases:
             with self.subTest(
@@ -26645,19 +26646,19 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         with mock.patch.object(
             _CANDIDATE_SUPPORT.resource,
             "getrlimit",
-            return_value=(64, 190),
+            return_value=(64, 192),
         ), self.assertRaisesRegex(
             AssertionError, "inherited hard limit is insufficient"
         ):
-            _CANDIDATE_SUPPORT._assert_strict_bootstrap_nofile_capacity(191)
-        for hard_limit in (191, 192, _CANDIDATE_SUPPORT.resource.RLIM_INFINITY):
+            _CANDIDATE_SUPPORT._assert_strict_bootstrap_nofile_capacity(193)
+        for hard_limit in (193, 194, _CANDIDATE_SUPPORT.resource.RLIM_INFINITY):
             with self.subTest(hard_limit=hard_limit), mock.patch.object(
                 _CANDIDATE_SUPPORT.resource,
                 "getrlimit",
                 return_value=(32, hard_limit),
             ):
                 _CANDIDATE_SUPPORT._assert_strict_bootstrap_nofile_capacity(
-                    191
+                    193
                 )
 
     def test_strict_bootstrap_nofile_policy_is_bound_to_launch_order(
@@ -26684,52 +26685,157 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         ):
             self.assertLess(bootstrap.index(before), bootstrap.index(after))
 
+    def test_strict_systemd_scope_membership_parser_is_exact(self) -> None:
+        source = _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE
+        nodes = ast.parse(source).body
+        functions = {
+            node.name: node
+            for node in nodes
+            if isinstance(node, ast.FunctionDef)
+        }
+        files = next(
+            node.value
+            for node in nodes
+            if isinstance(node, ast.Assign)
+            and getattr(node.targets[0], "id", None) == "SYSTEMD_SCOPE_READ_FILES"
+        )
+        self.assertEqual(
+            ast.literal_eval(files),
+            (
+                "cgroup.type", "cpu.max", "cpu.stat", "memory.events",
+                "memory.high", "memory.max", "memory.swap.max",
+                "pids.events", "pids.max",
+            ),
+        )
+        for needle in (
+            "scope_session_id = sys.argv[8]",
+            "scope_unit = sys.argv[9]",
+            "continuation_argv = sys.argv[10:]",
+            're.fullmatch(r"[0-9a-f]{32}", scope_session_id)',
+            'f"required-ci-candidate-{scope_session_id}.scope"',
+            "max(33, max(component_depths) + 7)",
+        ):
+            self.assertEqual(source.count(needle), 1)
+        opener = functions["open_systemd_scope_read_descriptor"]
+        calls = [node for node in ast.walk(opener) if isinstance(node, ast.Call)]
+        permissions = [
+            call.args[-1].attr
+            for call in calls
+            if isinstance(call.func, ast.Name)
+            and call.func.id == "target_mode_allows"
+            and isinstance(call.args[-1], ast.Attribute)
+        ]
+        self.assertCountEqual(
+            permissions, ("X_OK", "W_OK", "X_OK", "W_OK", "R_OK", "W_OK")
+        )
+        self.assertEqual(
+            sum(
+                isinstance(call.func, ast.Name)
+                and call.func.id == "require_descriptor_acl_absent"
+                for call in calls
+            ),
+            3,
+        )
+        topology_calls = [
+            call
+            for call in calls
+            if isinstance(call.func, ast.Name)
+            and call.func.id == "validate_directory_mount_topology"
+        ]
+        self.assertEqual(
+            [tuple(ast.unparse(arg) for arg in call.args) for call in topology_calls],
+            [("scope_path", "mount_id", "root_opened.st_dev", "inventory", "175")],
+        )
+        self.assertEqual(
+            [
+                node.value.id
+                for node in ast.walk(opener)
+                if isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Name)
+            ],
+            ["scope_descriptor"],
+        )
+        self.assertNotIn('("/sys/fs/cgroup", "directory")', source)
+        module = ast.fix_missing_locations(
+            ast.Module(
+                body=[functions["parse_systemd_scope_components"]],
+                type_ignores=[],
+            )
+        )
+        namespace = {"os": os}
+        exec(compile(module, "<systemd-scope-membership>", "exec"), namespace)
+        parse = namespace["parse_systemd_scope_components"]
+        unit = f"required-ci-candidate-{'a' * 32}.scope"
+        self.assertEqual(
+            parse(f"0::/runner.slice/{unit}\n".encode(), unit),
+            ["runner.slice", unit],
+        )
+        malformed = (
+            b"", f"0::/system.slice/{unit}".encode(),
+            f"0::/system.slice/{unit}\n0::/x/{unit}\n".encode(),
+            f"0::/system.slice/{unit}\r\n".encode(),
+            f"1:name=systemd:/system.slice/{unit}\n".encode(),
+            f"0::system.slice/{unit}\n".encode(),
+            f"0::/system.slice//{unit}\n".encode(),
+            f"0::/system.slice/../{unit}\n".encode(),
+            f"0::/{'/'.join(['x'] * 16)}/{unit}\n".encode(),
+            f"0::/x\t/{unit}\n".encode(), f"0::/x\x7f/{unit}\n".encode(),
+            f"0:extra:/system.slice/{unit}\n".encode(),
+            b"0::/system.slice/wrong.scope\n", b"0::/\xff.scope\n",
+        )
+        for membership in malformed:
+            with self.subTest(membership=membership), self.assertRaises(
+                SystemExit
+            ) as caught:
+                parse(membership, unit)
+            self.assertEqual(caught.exception.code, 175)
+
     def test_strict_bootstrap_nofile_allocator_honors_limit_boundary(
         self,
     ) -> None:
         probe = textwrap.dedent(
             """\
-            import errno
-            import json
-            import os
-            import resource
-            import sys
+import errno
+import json
+import os
+import resource
+import sys
 
-            limit = int(sys.argv[1])
-            readiness = int(sys.argv[2])
-            source = os.open("/dev/null", os.O_WRONLY)
-            try:
-                os.dup2(source, readiness, inheritable=False)
-                os.dup2(source, 63, inheritable=False)
-            finally:
-                os.close(source)
-            resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limit))
-            if resource.getrlimit(resource.RLIMIT_NOFILE) != (limit, limit):
-                raise SystemExit(90)
-            os.fstat(readiness)
-            os.fstat(63)
-            opened = []
-            failure_errno = None
-            while True:
-                try:
-                    opened.append(
-                        os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
-                    )
-                except OSError as error:
-                    failure_errno = error.errno
-                    break
-            report = {
-                "failure_errno": failure_errno,
-                "maximum": max(opened),
-                "opened": len(opened),
-                "readiness_live": os.fstat(readiness).st_mode > 0,
-            }
-            for descriptor in opened:
-                os.close(descriptor)
-            os.close(readiness)
-            os.close(63)
-            sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
-            """
+limit = int(sys.argv[1])
+readiness = int(sys.argv[2])
+source = os.open("/dev/null", os.O_WRONLY)
+try:
+    os.dup2(source, readiness, inheritable=False)
+    os.dup2(source, 63, inheritable=False)
+finally:
+    os.close(source)
+resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limit))
+if resource.getrlimit(resource.RLIMIT_NOFILE) != (limit, limit):
+    raise SystemExit(90)
+os.fstat(readiness)
+os.fstat(63)
+opened = []
+failure_errno = None
+while True:
+    try:
+        opened.append(
+            os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+        )
+    except OSError as error:
+        failure_errno = error.errno
+        break
+report = {
+    "failure_errno": failure_errno,
+    "maximum": max(opened),
+    "opened": len(opened),
+    "readiness_live": os.fstat(readiness).st_mode > 0,
+}
+for descriptor in opened:
+    os.close(descriptor)
+os.close(readiness)
+os.close(63)
+sys.stdout.write(json.dumps(report, sort_keys=True) + "\\n")
+"""
         )
         for limit in (64, 65):
             for readiness in (9, 80):
@@ -27421,6 +27527,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         expected_read_binding = dict(self.root_command_config()["read_roots"][0])
         expected_read_binding.pop("host_mount_id")
         self.assertEqual(namespace_read_bindings, [expected_read_binding])
+        self.assertEqual(command[bootstrap_index + 8], "a" * 32)
+        self.assertEqual(
+            command[bootstrap_index + 9],
+            f"required-ci-candidate-{'a' * 32}.scope",
+        )
         parsed_bootstrap = ast.parse(bootstrap_source)
         validate_binding = next(
             node
@@ -27491,7 +27602,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         )
 
         check(bootstrap_source, (
-            "LANDLOCK_MINIMUM_ABI = 4", "LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2", "LANDLOCK_ACCESS_FS_WRITE_FILE", "LANDLOCK_ACCESS_FS_MAKE_FIFO", "LANDLOCK_ACCESS_FS_TRUNCATE", '"trusted-test-file": "file"', '"system-arch-library": "directory"', 'READ_ROOT_PURPOSES.get(document.get("purpose"))', "handled_access_fs=LANDLOCK_WRITE_ACCESS | LANDLOCK_ACCESS_FS_READ_FILE", "(descriptor, LANDLOCK_ACCESS_FS_READ_FILE)", "for descriptor in read_descriptors", '("/proc/self/cgroup", "file")', '("/proc/sys/kernel/cap_last_cap", "file")', '"/dev/null"', "os.major(null_metadata.st_rdev) != 1", "os.minor(null_metadata.st_rdev) != 3", "ctypes.sizeof(LandlockPathBeneathAttr) != 12", "0x7E020080", "errno.ENOSYS", "16, 41, 42", "29, 37, 97", "321,", "280,", "160,", "164,", "302,", "261,", "prlimit_syscall,", "SockFilter(BPF_JMP_JEQ_K, 0, 5, prlimit_syscall)", "SockFilter(BPF_LD_W_ABS, 0, 0, 32)", "SockFilter(BPF_LD_W_ABS, 0, 0, 36)", "72,", "25,", "SockFilter(BPF_LD_W_ABS, 0, 0, 24)", "SockFilter(BPF_JMP_JEQ_K, 0, 1, 1036)", *(str(value) for value in (41, 53, 86, 248, 265, 272, 307, 308, 425)),
+            "LANDLOCK_MINIMUM_ABI = 4", "LANDLOCK_ACCESS_FS_READ_FILE = 1 << 2", "LANDLOCK_ACCESS_FS_WRITE_FILE", "LANDLOCK_ACCESS_FS_MAKE_FIFO", "LANDLOCK_ACCESS_FS_TRUNCATE", '"trusted-test-file": "file"', '"system-arch-library": "directory"', 'READ_ROOT_PURPOSES.get(document.get("purpose"))', "handled_access_fs=LANDLOCK_WRITE_ACCESS | LANDLOCK_ACCESS_FS_READ_FILE", "(descriptor, LANDLOCK_ACCESS_FS_READ_FILE)", "for descriptor in read_descriptors", '("/proc/self/cgroup", "file")', "SYSTEMD_SCOPE_READ_FILES", "open_systemd_scope_read_descriptor", "(systemd_scope_descriptor, LANDLOCK_ACCESS_FS_READ_FILE)", "scope_unit != (", '("/proc/sys/kernel/cap_last_cap", "file")', '"/dev/null"', "os.major(null_metadata.st_rdev) != 1", "os.minor(null_metadata.st_rdev) != 3", "ctypes.sizeof(LandlockPathBeneathAttr) != 12", "0x7E020080", "errno.ENOSYS", "16, 41, 42", "29, 37, 97", "321,", "280,", "160,", "164,", "302,", "261,", "prlimit_syscall,", "SockFilter(BPF_JMP_JEQ_K, 0, 5, prlimit_syscall)", "SockFilter(BPF_LD_W_ABS, 0, 0, 32)", "SockFilter(BPF_LD_W_ABS, 0, 0, 36)", "72,", "25,", "SockFilter(BPF_LD_W_ABS, 0, 0, 24)", "SockFilter(BPF_JMP_JEQ_K, 0, 1, 1036)", *(str(value) for value in (41, 53, 86, 248, 265, 272, 307, 308, 425)),
         ), ("LANDLOCK_ACCESS_FS_IOCTL_DEV", "LANDLOCK_ACCESS_FS_READ_DIR", '("/proc/self/fdinfo", "directory")', '("/proc", "directory")', "FS_IOC_"))
         check(host_read_source, ('Path("/usr/lib") / multiarch', 'Path("/etc/ld.so.preload").lstat()', 'system_stdlib / "lib-dynload"', 'trusted_git.parent != Path("/usr/bin")'), ('Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',))
         check(candidate_source, ("read_network_interfaces(network_interface_fd)", 'status.get("Seccomp") != "2"', "Seccomp_filters", '"/proc/self/limits"'), ("os.listdir(trusted_root)", 'os.listdir("/sys/class/net")', "socket.if_nameindex", "resource.getrlimit"))
@@ -27845,6 +27956,20 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 initial_singleton_topology,
                 172,
             )
+        nested_topology = {
+            **initial_singleton_topology,
+            9: {
+                **initial_singleton_topology[7],
+                "parent_id": 7,
+                "major_minor": (0, 42),
+                "mountpoint": "/usr/lib/python3.12/foreign",
+            },
+        }
+        with self.assertRaises(SystemExit) as rejected:
+            topology_namespace["validate_directory_mount_topology"](
+                "/usr/lib/python3.12", 7, device, nested_topology, 172
+            )
+        self.assertEqual(rejected.exception.code, 172)
 
         read_validation = bootstrap_source.index(
             "read_descriptors.append(validate_read_root(document, initial_inventory))"
@@ -47129,129 +47254,129 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
         ready_prefix = b"REQUIRED_CI_WATCHDOG_OWNER_READY:"
         owner_source = textwrap.dedent(
-            """
-            import json
-            import os
-            from pathlib import Path
-            import runpy
-            import signal
-            import socket
-            import sys
+"""
+import json
+import os
+from pathlib import Path
+import runpy
+import signal
+import socket
+import sys
 
-            support = runpy.run_path(sys.argv[1])
-            registry = support["trusted_isolation_chain_registry"]()
-            real_write = support["_write_chain_registry_entry"]
-            support_globals = real_write.__globals__
-            if (
-                support["_registered_live_host_ipc_root"].__wrapped__.__globals__
-                is not support_globals
-                or support["_register_trusted_root_chain"].__globals__
-                is not support_globals
-                or support["_invoke_registered_opt_ipc_root"].__globals__
-                is not support_globals
-            ):
-                raise AssertionError("captured support globals are split")
+support = runpy.run_path(sys.argv[1])
+registry = support["trusted_isolation_chain_registry"]()
+real_write = support["_write_chain_registry_entry"]
+support_globals = real_write.__globals__
+if (
+    support["_registered_live_host_ipc_root"].__wrapped__.__globals__
+    is not support_globals
+    or support["_register_trusted_root_chain"].__globals__
+    is not support_globals
+    or support["_invoke_registered_opt_ipc_root"].__globals__
+    is not support_globals
+):
+    raise AssertionError("captured support globals are split")
 
-            def pause_before_trusted_import(
-                path,
-                document,
-                *,
-                create,
-                published_callback=None,
-            ):
-                direct = document.get("direct_opt_root")
-                witness = direct.get("witness") if isinstance(direct, dict) else None
-                witness_file = (
-                    witness.get("file") if isinstance(witness, dict) else None
-                )
-                if (
-                    create is False
-                    and document.get("cleanup_kind") == "direct-opt-root-v1"
-                    and document.get("state") == "prepared"
-                    and isinstance(direct.get("root"), dict)
-                    and isinstance(witness_file, dict)
-                    and witness_file.get("phase") == "root-bound"
-                ):
-                    before = support["_load_chain_registry_entry"](path)
-                    if (
-                        before["direct_opt_root"]["root"] is not None
-                        or before["direct_opt_root"]["witness"]["file"] is not None
-                    ):
-                        raise AssertionError(
-                            "trusted registry imported the root proof too early"
-                        )
-                    session = support["_active_strict_session"]()
-                    watchdog = session["watchdog_process"]
-                    heartbeat = session["watchdog_heartbeat"]
-                    if not heartbeat.is_alive():
-                        raise AssertionError("watchdog heartbeat is not active")
-                    root_path = Path(str(direct["root"]["path"]))
-                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    socket_path = root_path / "post-seal.sock"
-                    fifo_path = root_path / "post-seal.fifo"
-                    listener.bind(str(socket_path))
-                    socket_path.chmod(0o666)
-                    os.mkfifo(fifo_path, 0o666)
-                    fifo_path.chmod(0o666)
-                    residues = {}
-                    for residue_path, kind in (
-                        (socket_path, "socket"),
-                        (fifo_path, "fifo"),
-                    ):
-                        metadata = residue_path.lstat()
-                        residues[residue_path.name] = {
-                            "device": metadata.st_dev,
-                            "inode": metadata.st_ino,
-                            "uid": metadata.st_uid,
-                            "gid": metadata.st_gid,
-                            "mode": metadata.st_mode & 0o7777,
-                            "nlink": metadata.st_nlink,
-                            "size": metadata.st_size,
-                            "kind": kind,
-                        }
-                    marker = {
-                        "owner_pid": os.getpid(),
-                        "registry_root": str(registry["root"]),
-                        "entry_path": str(path),
-                        "session_id": document["session_id"],
-                        "registry_token": document["token"],
-                        "publication_nonce": document["publication_nonce"],
-                        "parent": direct["parent"],
-                        "root": direct["root"],
-                        "residues": residues,
-                        "witness": witness,
-                        "watchdog_pid": watchdog.pid,
-                        "watchdog_stdout_fd": watchdog.stdout.fileno(),
-                        "watchdog_token": session["watchdog_token"],
-                        "watchdog_identity": [
-                            *session["watchdog_identity"][:5],
-                            list(session["watchdog_identity"][5]),
-                        ],
-                    }
-                    print(
-                        "REQUIRED_CI_WATCHDOG_OWNER_READY:"
-                        + json.dumps(
-                            marker, sort_keys=True, separators=(",", ":")
-                        ),
-                        flush=True,
-                    )
-                    while True:
-                        signal.pause()
-                return real_write(
-                    path,
-                    document,
-                    create=create,
-                    published_callback=published_callback,
-                )
-
-            support_globals["_write_chain_registry_entry"] = (
-                pause_before_trusted_import
+def pause_before_trusted_import(
+    path,
+    document,
+    *,
+    create,
+    published_callback=None,
+):
+    direct = document.get("direct_opt_root")
+    witness = direct.get("witness") if isinstance(direct, dict) else None
+    witness_file = (
+        witness.get("file") if isinstance(witness, dict) else None
+    )
+    if (
+        create is False
+        and document.get("cleanup_kind") == "direct-opt-root-v1"
+        and document.get("state") == "prepared"
+        and isinstance(direct.get("root"), dict)
+        and isinstance(witness_file, dict)
+        and witness_file.get("phase") == "root-bound"
+    ):
+        before = support["_load_chain_registry_entry"](path)
+        if (
+            before["direct_opt_root"]["root"] is not None
+            or before["direct_opt_root"]["witness"]["file"] is not None
+        ):
+            raise AssertionError(
+                "trusted registry imported the root proof too early"
             )
-            with support["_registered_live_host_ipc_root"]():
-                raise AssertionError(
-                    "strict live IPC root reached the target before the crash seam"
-                )
-            """
+        session = support["_active_strict_session"]()
+        watchdog = session["watchdog_process"]
+        heartbeat = session["watchdog_heartbeat"]
+        if not heartbeat.is_alive():
+            raise AssertionError("watchdog heartbeat is not active")
+        root_path = Path(str(direct["root"]["path"]))
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        socket_path = root_path / "post-seal.sock"
+        fifo_path = root_path / "post-seal.fifo"
+        listener.bind(str(socket_path))
+        socket_path.chmod(0o666)
+        os.mkfifo(fifo_path, 0o666)
+        fifo_path.chmod(0o666)
+        residues = {}
+        for residue_path, kind in (
+            (socket_path, "socket"),
+            (fifo_path, "fifo"),
+        ):
+            metadata = residue_path.lstat()
+            residues[residue_path.name] = {
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "uid": metadata.st_uid,
+                "gid": metadata.st_gid,
+                "mode": metadata.st_mode & 0o7777,
+                "nlink": metadata.st_nlink,
+                "size": metadata.st_size,
+                "kind": kind,
+            }
+        marker = {
+            "owner_pid": os.getpid(),
+            "registry_root": str(registry["root"]),
+            "entry_path": str(path),
+            "session_id": document["session_id"],
+            "registry_token": document["token"],
+            "publication_nonce": document["publication_nonce"],
+            "parent": direct["parent"],
+            "root": direct["root"],
+            "residues": residues,
+            "witness": witness,
+            "watchdog_pid": watchdog.pid,
+            "watchdog_stdout_fd": watchdog.stdout.fileno(),
+            "watchdog_token": session["watchdog_token"],
+            "watchdog_identity": [
+                *session["watchdog_identity"][:5],
+                list(session["watchdog_identity"][5]),
+            ],
+        }
+        print(
+            "REQUIRED_CI_WATCHDOG_OWNER_READY:"
+            + json.dumps(
+                marker, sort_keys=True, separators=(",", ":")
+            ),
+            flush=True,
+        )
+        while True:
+            signal.pause()
+    return real_write(
+        path,
+        document,
+        create=create,
+        published_callback=published_callback,
+    )
+
+support_globals["_write_chain_registry_entry"] = (
+    pause_before_trusted_import
+)
+with support["_registered_live_host_ipc_root"]():
+    raise AssertionError(
+        "strict live IPC root reached the target before the crash seam"
+    )
+"""
         )
         owner_environment = _CANDIDATE_SUPPORT._minimal_supervisor_environment()
         owner_environment[_CANDIDATE_SUPPORT.ISOLATION_MODE_ENV] = (
@@ -47585,184 +47710,201 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         )
         _CANDIDATE_SUPPORT._ensure_strict_backend()
         source_body = textwrap.dedent(
-            r'''
-            import errno
-            import json
-            import os
-            from pathlib import Path
-            import resource
-            import signal
-            import sys
-            import time
+r'''
+import errno
+import json
+import os
+from pathlib import Path
+import resource
+import signal
+import sys
+import time
 
-            def read(path):
-                value = path.read_text(encoding="ascii")
-                if not value.endswith("\n") or "\x00" in value or "\r" in value:
-                    raise SystemExit(70)
-                return value[:-1]
+def read(path):
+    value = path.read_text(encoding="ascii")
+    if not value.endswith("\n") or "\x00" in value or "\r" in value:
+        raise SystemExit(70)
+    return value[:-1]
 
-            def counters(path):
-                result = {}
-                for line in read(path).splitlines():
-                    fields = line.split()
-                    if len(fields) != 2 or not fields[1].isdigit():
-                        raise SystemExit(71)
-                    result[fields[0]] = int(fields[1])
-                return result
+def counters(path):
+    result = {}
+    for line in read(path).splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[1].isdigit():
+            raise SystemExit(71)
+        result[fields[0]] = int(fields[1])
+    return result
 
-            if len(sys.argv) != 4 or sys.argv[1] not in ("process-cpu", "memory"):
-                raise SystemExit(72)
-            mode, expected_unit, stop_value = sys.argv[1:]
-            membership = read(Path("/proc/self/cgroup"))
-            fields = membership.split(":")
-            if len(fields) != 3 or fields[:2] != ["0", ""]:
-                raise SystemExit(73)
-            control_group = fields[2]
-            root = Path("/sys/fs/cgroup") / control_group[1:]
-            caps = {
-                name: read(root / name)
-                for name in (
-                    "cpu.max", "memory.high", "memory.max",
-                    "memory.swap.max", "pids.max",
+if len(sys.argv) != 4 or sys.argv[1] not in ("process-cpu", "memory"):
+    raise SystemExit(72)
+mode, expected_unit, stop_value = sys.argv[1:]
+membership = read(Path("/proc/self/cgroup"))
+fields = membership.split(":")
+if len(fields) != 3 or fields[:2] != ["0", ""]:
+    raise SystemExit(73)
+control_group = fields[2]
+root = Path("/sys/fs/cgroup") / control_group[1:]
+try:
+    read(Path("/sys/fs/cgroup/cgroup.controllers"))
+except PermissionError as error:
+    if error.errno != errno.EACCES:
+        raise SystemExit(83)
+else:
+    raise SystemExit(83)
+try:
+    write_descriptor = os.open(
+        root / "cpu.max", os.O_WRONLY | os.O_CLOEXEC
+    )
+except OSError as error:
+    if error.errno not in (errno.EACCES, errno.EROFS):
+        raise SystemExit(84)
+else:
+    os.close(write_descriptor)
+    raise SystemExit(84)
+caps = {
+    name: read(root / name)
+    for name in (
+        "cpu.max", "memory.high", "memory.max",
+        "memory.swap.max", "pids.max",
+    )
+}
+if (
+    not control_group.startswith("/")
+    or root.name != expected_unit
+    or read(root / "cgroup.type") != "domain"
+    or caps != {
+        "cpu.max": "200000 100000",
+        "memory.high": "805306368",
+        "memory.max": "1073741824",
+        "memory.swap.max": "0",
+        "pids.max": "64",
+    }
+):
+    raise SystemExit(74)
+
+if mode == "process-cpu":
+    nproc_soft, nproc_hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    before_pids = counters(root / "pids.events").get("max", 0)
+    children = []
+    limited = False
+    try:
+        while len(children) < 128:
+            try:
+                pid = os.fork()
+            except OSError as error:
+                if error.errno != errno.EAGAIN:
+                    raise
+                limited = True
+                break
+            if pid == 0:
+                while True:
+                    signal.pause()
+            children.append(pid)
+        after_pids = counters(root / "pids.events").get("max", 0)
+    finally:
+        for pid in children:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for pid in children:
+            os.waitpid(pid, 0)
+    if not limited:
+        raise SystemExit(75)
+    affinity = len(os.sched_getaffinity(0))
+    if affinity < 3:
+        raise SystemExit(76)
+    before_cpu = counters(root / "cpu.stat").get("nr_throttled", 0)
+    workers = []
+    for _ in range(min(8, affinity)):
+        pid = os.fork()
+        if pid == 0:
+            deadline = time.monotonic() + 2.0
+            value = 1
+            while time.monotonic() < deadline:
+                value = (value * 1664525 + 1013904223) & 0xffffffff
+            os._exit(0 if value >= 0 else 77)
+        workers.append(pid)
+    for pid in workers:
+        waited, status = os.waitpid(pid, 0)
+        if waited != pid or status != 0:
+            raise SystemExit(78)
+    document = {
+        "kind": mode,
+        "unit": expected_unit,
+        "control_group": control_group,
+        "caps": caps,
+        "nproc_soft": nproc_soft,
+        "nproc_hard": nproc_hard,
+        "forked": len(children),
+        "pids_max_delta": after_pids - before_pids,
+        "affinity_cpus": affinity,
+        "nr_throttled_delta": (
+            counters(root / "cpu.stat").get("nr_throttled", 0)
+            - before_cpu
+        ),
+    }
+else:
+    stop = Path(stop_value)
+    worker_count = 4
+    bytes_per_worker = 205 * 1024 * 1024
+    before = counters(root / "memory.events")
+    workers = set()
+    try:
+        for _ in range(worker_count):
+            pid = os.fork()
+            if pid == 0:
+                blocks = []
+                blocks_required = bytes_per_worker // (256 * 1024)
+                for _ in range(blocks_required):
+                    if stop.exists():
+                        os._exit(0)
+                    block = bytearray(256 * 1024)
+                    for offset in range(0, len(block), 4096):
+                        block[offset] = 1
+                    blocks.append(block)
+                    time.sleep(0.002)
+                _strict_memory_worker_hold(
+                    stop, blocks, time.monotonic, time.sleep, os._exit
                 )
-            }
-            if (
-                not control_group.startswith("/")
-                or root.name != expected_unit
-                or read(root / "cgroup.type") != "domain"
-                or caps != {
-                    "cpu.max": "200000 100000",
-                    "memory.high": "805306368",
-                    "memory.max": "1073741824",
-                    "memory.swap.max": "0",
-                    "pids.max": "64",
-                }
-            ):
-                raise SystemExit(74)
-
-            if mode == "process-cpu":
-                nproc_soft, nproc_hard = resource.getrlimit(resource.RLIMIT_NPROC)
-                before_pids = counters(root / "pids.events").get("max", 0)
-                children = []
-                limited = False
-                try:
-                    while len(children) < 128:
-                        try:
-                            pid = os.fork()
-                        except OSError as error:
-                            if error.errno != errno.EAGAIN:
-                                raise
-                            limited = True
-                            break
-                        if pid == 0:
-                            while True:
-                                signal.pause()
-                        children.append(pid)
-                    after_pids = counters(root / "pids.events").get("max", 0)
-                finally:
-                    for pid in children:
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    for pid in children:
-                        os.waitpid(pid, 0)
-                if not limited:
-                    raise SystemExit(75)
-                affinity = len(os.sched_getaffinity(0))
-                if affinity < 3:
-                    raise SystemExit(76)
-                before_cpu = counters(root / "cpu.stat").get("nr_throttled", 0)
-                workers = []
-                for _ in range(min(8, affinity)):
-                    pid = os.fork()
-                    if pid == 0:
-                        deadline = time.monotonic() + 2.0
-                        value = 1
-                        while time.monotonic() < deadline:
-                            value = (value * 1664525 + 1013904223) & 0xffffffff
-                        os._exit(0 if value >= 0 else 77)
-                    workers.append(pid)
-                for pid in workers:
-                    waited, status = os.waitpid(pid, 0)
-                    if waited != pid or status != 0:
-                        raise SystemExit(78)
-                document = {
-                    "kind": mode,
-                    "unit": expected_unit,
-                    "control_group": control_group,
-                    "caps": caps,
-                    "nproc_soft": nproc_soft,
-                    "nproc_hard": nproc_hard,
-                    "forked": len(children),
-                    "pids_max_delta": after_pids - before_pids,
-                    "affinity_cpus": affinity,
-                    "nr_throttled_delta": (
-                        counters(root / "cpu.stat").get("nr_throttled", 0)
-                        - before_cpu
-                    ),
-                }
-            else:
-                stop = Path(stop_value)
-                worker_count = 4
-                bytes_per_worker = 205 * 1024 * 1024
-                before = counters(root / "memory.events")
-                workers = set()
-                try:
-                    for _ in range(worker_count):
-                        pid = os.fork()
-                        if pid == 0:
-                            blocks = []
-                            blocks_required = bytes_per_worker // (256 * 1024)
-                            for _ in range(blocks_required):
-                                if stop.exists():
-                                    os._exit(0)
-                                block = bytearray(256 * 1024)
-                                for offset in range(0, len(block), 4096):
-                                    block[offset] = 1
-                                blocks.append(block)
-                                time.sleep(0.002)
-                            _strict_memory_worker_hold(
-                                stop, blocks, time.monotonic, time.sleep, os._exit
-                            )
-                        workers.add(pid)
-                    _strict_memory_high_gate(
-                        before.get("high", 0),
-                        lambda: counters(root / "memory.events").get("high", 0),
-                        lambda: stop.write_text("stop\n", encoding="ascii"),
-                        time.monotonic,
-                        time.sleep,
-                    )
-                    for pid in tuple(workers):
-                        waited, status = os.waitpid(pid, 0)
-                        workers.remove(pid)
-                        if waited != pid or status != 0:
-                            raise SystemExit(81)
-                    after = counters(root / "memory.events")
-                finally:
-                    for pid in workers:
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    for pid in workers:
-                        os.waitpid(pid, 0)
-                document = {
-                    "kind": mode,
-                    "unit": expected_unit,
-                    "control_group": control_group,
-                    "caps": caps,
-                    "workers": worker_count,
-                    "bytes_per_worker": bytes_per_worker,
-                    "memory_high_delta": after.get("high", 0) - before.get("high", 0),
-                    "memory_max_delta": after.get("max", 0) - before.get("max", 0),
-                    "memory_oom_delta": after.get("oom", 0) - before.get("oom", 0),
-                    "memory_oom_kill_delta": (
-                        after.get("oom_kill", 0) - before.get("oom_kill", 0)
-                    ),
-                }
-            print(json.dumps(document, sort_keys=True, separators=(",", ":")))
-            '''
+            workers.add(pid)
+        _strict_memory_high_gate(
+            before.get("high", 0),
+            lambda: counters(root / "memory.events").get("high", 0),
+            lambda: stop.write_text("stop\n", encoding="ascii"),
+            time.monotonic,
+            time.sleep,
+        )
+        for pid in tuple(workers):
+            waited, status = os.waitpid(pid, 0)
+            workers.remove(pid)
+            if waited != pid or status != 0:
+                raise SystemExit(81)
+        after = counters(root / "memory.events")
+    finally:
+        for pid in workers:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for pid in workers:
+            os.waitpid(pid, 0)
+    document = {
+        "kind": mode,
+        "unit": expected_unit,
+        "control_group": control_group,
+        "caps": caps,
+        "workers": worker_count,
+        "bytes_per_worker": bytes_per_worker,
+        "memory_high_delta": after.get("high", 0) - before.get("high", 0),
+        "memory_max_delta": after.get("max", 0) - before.get("max", 0),
+        "memory_oom_delta": after.get("oom", 0) - before.get("oom", 0),
+        "memory_oom_kill_delta": (
+            after.get("oom_kill", 0) - before.get("oom_kill", 0)
+        ),
+    }
+print(json.dumps(document, sort_keys=True, separators=(",", ":")))
+'''
         )
         source = (
             inspect.getsource(_strict_memory_worker_hold)
@@ -48050,107 +48192,107 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         rw_hint_baseline: bytes | None = None
         completed: subprocess.CompletedProcess[str] | None = None
         helper_source = inspect.cleandoc(
-            r'''
-            import json
-            import os
-            from pathlib import Path
-            import select
-            import signal
-            import socket
-            import sys
-            import time
+r'''
+import json
+import os
+from pathlib import Path
+import select
+import signal
+import socket
+import sys
+import time
 
-            if len(sys.argv) != 6 or sys.argv[1] not in ("normal", "hang"):
-                raise SystemExit(70)
-            mode = sys.argv[1]
-            socket_path = Path(sys.argv[2])
-            fifo_path = Path(sys.argv[3])
-            go_marker = Path(sys.argv[4])
-            ready_marker = Path(sys.argv[5])
-            if mode == "hang":
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if len(sys.argv) != 6 or sys.argv[1] not in ("normal", "hang"):
+    raise SystemExit(70)
+mode = sys.argv[1]
+socket_path = Path(sys.argv[2])
+fifo_path = Path(sys.argv[3])
+go_marker = Path(sys.argv[4])
+ready_marker = Path(sys.argv[5])
+if mode == "hang":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
-            deadline = time.monotonic() + 15.0
-            while not go_marker.exists():
-                readable, _, _ = select.select([0], [], [], 0.05)
-                if readable:
-                    os.read(0, 16)
-                    raise SystemExit(71)
-                if time.monotonic() >= deadline:
-                    raise SystemExit(72)
-            if go_marker.read_text(encoding="utf-8") != "go\n":
-                raise SystemExit(73)
+deadline = time.monotonic() + 15.0
+while not go_marker.exists():
+    readable, _, _ = select.select([0], [], [], 0.05)
+    if readable:
+        os.read(0, 16)
+        raise SystemExit(71)
+    if time.monotonic() >= deadline:
+        raise SystemExit(72)
+if go_marker.read_text(encoding="utf-8") != "go\n":
+    raise SystemExit(73)
 
-            received = []
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-                server.bind(str(socket_path))
-                socket_path.chmod(0o666)
-                os.mkfifo(fifo_path, 0o666)
-                fifo_path.chmod(0o666)
-                fifo_descriptor = os.open(
-                    fifo_path, os.O_RDWR | os.O_NONBLOCK
-                )
-                try:
-                    fifo_prefill = b"host-fifo-byte"
-                    if os.write(fifo_descriptor, fifo_prefill) != len(fifo_prefill):
-                        raise SystemExit(74)
-                    server.listen(1)
-                    server.settimeout(0.05)
-                    nodes = {}
-                    for path in (socket_path, fifo_path):
-                        metadata = path.lstat()
-                        nodes[str(path)] = [
-                            metadata.st_dev,
-                            metadata.st_ino,
-                            metadata.st_mode,
-                            metadata.st_uid,
-                        ]
-                    print(
-                        json.dumps(
-                            {
-                                "go_observed": True,
-                                "nodes": nodes,
-                                "pid": os.getpid(),
-                                "status": "ready",
-                            },
-                            sort_keys=True,
-                        ),
-                        flush=True,
-                    )
-                    ready_marker.write_text("ready\n", encoding="utf-8")
-                    while True:
-                        readable, _, _ = select.select([0], [], [], 0.05)
-                        if readable:
-                            command = os.read(0, 16)
-                            if mode == "normal":
-                                break
-                            time.sleep(0.05)
-                        try:
-                            connection, _ = server.accept()
-                        except TimeoutError:
-                            pass
-                        else:
-                            with connection:
-                                connection.settimeout(0.5)
-                                received.append(connection.recv(16).hex())
-                    try:
-                        fifo_remaining = os.read(fifo_descriptor, len(fifo_prefill))
-                    except BlockingIOError:
-                        fifo_remaining = b""
-                finally:
-                    os.close(fifo_descriptor)
-            print(
-                json.dumps(
-                    {
-                        "fifo_remaining": fifo_remaining.hex(),
-                        "received": received,
-                        "status": "completed",
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-            '''
+received = []
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+    server.bind(str(socket_path))
+    socket_path.chmod(0o666)
+    os.mkfifo(fifo_path, 0o666)
+    fifo_path.chmod(0o666)
+    fifo_descriptor = os.open(
+        fifo_path, os.O_RDWR | os.O_NONBLOCK
+    )
+    try:
+        fifo_prefill = b"host-fifo-byte"
+        if os.write(fifo_descriptor, fifo_prefill) != len(fifo_prefill):
+            raise SystemExit(74)
+        server.listen(1)
+        server.settimeout(0.05)
+        nodes = {}
+        for path in (socket_path, fifo_path):
+            metadata = path.lstat()
+            nodes[str(path)] = [
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+            ]
+        print(
+            json.dumps(
+                {
+                    "go_observed": True,
+                    "nodes": nodes,
+                    "pid": os.getpid(),
+                    "status": "ready",
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        ready_marker.write_text("ready\n", encoding="utf-8")
+        while True:
+            readable, _, _ = select.select([0], [], [], 0.05)
+            if readable:
+                command = os.read(0, 16)
+                if mode == "normal":
+                    break
+                time.sleep(0.05)
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                pass
+            else:
+                with connection:
+                    connection.settimeout(0.5)
+                    received.append(connection.recv(16).hex())
+        try:
+            fifo_remaining = os.read(fifo_descriptor, len(fifo_prefill))
+        except BlockingIOError:
+            fifo_remaining = b""
+    finally:
+        os.close(fifo_descriptor)
+print(
+    json.dumps(
+        {
+            "fifo_remaining": fifo_remaining.hex(),
+            "received": received,
+            "status": "completed",
+        },
+        sort_keys=True,
+    ),
+    flush=True,
+)
+'''
         ) + "\n"
 
         def start_host_ipc_helper(
@@ -49676,53 +49818,53 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             script = distribution_tests_root(trusted_root) / Path(__file__).name
             bootstrap = textwrap.dedent(
                 f"""
-                import pathlib
-                import stat
-                import sys
+import pathlib
+import stat
+import sys
 
-                script = pathlib.Path({str(script)!r})
-                trusted_root = pathlib.Path({str(trusted_root)!r})
-                decoy_root = pathlib.Path({str(decoy_root)!r})
-                held_root = pathlib.Path({str(held_root)!r})
-                marker = pathlib.Path({str(marker)!r})
-                swapped = False
+script = pathlib.Path({str(script)!r})
+trusted_root = pathlib.Path({str(trusted_root)!r})
+decoy_root = pathlib.Path({str(decoy_root)!r})
+held_root = pathlib.Path({str(held_root)!r})
+marker = pathlib.Path({str(marker)!r})
+swapped = False
 
-                def trace(frame, event, argument):
-                    global swapped
-                    del argument
-                    if (
-                        not swapped
-                        and event == "return"
-                        and frame.f_code.co_name
-                            == "_prepare_formal_checkout_boundary"
-                        and frame.f_locals.get("description")
-                            == "trusted checkout"
-                    ):
-                        prepared_mode = stat.S_IMODE(
-                            trusted_root.stat().st_mode
-                        )
-                        trusted_root.rename(held_root)
-                        decoy_root.rename(trusted_root)
-                        trusted_root.chmod(prepared_mode)
-                        marker.write_text("swapped", encoding="utf-8")
-                        swapped = True
-                    return trace
+def trace(frame, event, argument):
+    global swapped
+    del argument
+    if (
+        not swapped
+        and event == "return"
+        and frame.f_code.co_name
+            == "_prepare_formal_checkout_boundary"
+        and frame.f_locals.get("description")
+            == "trusted checkout"
+    ):
+        prepared_mode = stat.S_IMODE(
+            trusted_root.stat().st_mode
+        )
+        trusted_root.rename(held_root)
+        decoy_root.rename(trusted_root)
+        trusted_root.chmod(prepared_mode)
+        marker.write_text("swapped", encoding="utf-8")
+        swapped = True
+    return trace
 
-                sys.argv = [
-                    str(script),
-                    {TRUSTED_STRUCTURE_VALIDATOR_FLAG!r},
-                ]
-                namespace = {{
-                    "__name__": "__main__",
-                    "__file__": str(script),
-                    "__package__": None,
-                }}
-                sys.settrace(trace)
-                exec(
-                    compile(script.read_bytes(), str(script), "exec"),
-                    namespace,
-                )
-                """
+sys.argv = [
+    str(script),
+    {TRUSTED_STRUCTURE_VALIDATOR_FLAG!r},
+]
+namespace = {{
+    "__name__": "__main__",
+    "__file__": str(script),
+    "__package__": None,
+}}
+sys.settrace(trace)
+exec(
+    compile(script.read_bytes(), str(script), "exec"),
+    namespace,
+)
+"""
             )
             environment = os.environ.copy()
             environment.update(
@@ -49773,48 +49915,48 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             ) + 1
             bootstrap = textwrap.dedent(
                 f"""
-                import pathlib
-                import stat
-                import sys
+import pathlib
+import stat
+import sys
 
-                script = pathlib.Path({str(script)!r})
-                tests_root = pathlib.Path({str(tests_root)!r})
-                held_root = pathlib.Path({str(held_root)!r})
-                marker = pathlib.Path({str(marker)!r})
-                target_line = {target_line!r}
-                replaced = False
+script = pathlib.Path({str(script)!r})
+tests_root = pathlib.Path({str(tests_root)!r})
+held_root = pathlib.Path({str(held_root)!r})
+marker = pathlib.Path({str(marker)!r})
+target_line = {target_line!r}
+replaced = False
 
-                def trace(frame, event, argument):
-                    global replaced
-                    del argument
-                    if (
-                        not replaced
-                        and event == "line"
-                        and frame.f_code.co_filename == str(script)
-                        and frame.f_lineno == target_line
-                    ):
-                        mode = stat.S_IMODE(tests_root.stat().st_mode)
-                        tests_root.rename(held_root)
-                        tests_root.mkdir(mode=mode)
-                        tests_root.chmod(mode)
-                        for entry in sorted(held_root.iterdir()):
-                            entry.rename(tests_root / entry.name)
-                        marker.write_text("replaced", encoding="utf-8")
-                        replaced = True
-                    return trace
+def trace(frame, event, argument):
+    global replaced
+    del argument
+    if (
+        not replaced
+        and event == "line"
+        and frame.f_code.co_filename == str(script)
+        and frame.f_lineno == target_line
+    ):
+        mode = stat.S_IMODE(tests_root.stat().st_mode)
+        tests_root.rename(held_root)
+        tests_root.mkdir(mode=mode)
+        tests_root.chmod(mode)
+        for entry in sorted(held_root.iterdir()):
+            entry.rename(tests_root / entry.name)
+        marker.write_text("replaced", encoding="utf-8")
+        replaced = True
+    return trace
 
-                sys.argv = [str(script), {TRUSTED_STRUCTURE_VALIDATOR_FLAG!r}]
-                namespace = {{
-                    "__name__": "__main__",
-                    "__file__": str(script),
-                    "__package__": None,
-                }}
-                sys.settrace(trace)
-                exec(
-                    compile(script.read_bytes(), str(script), "exec"),
-                    namespace,
-                )
-                """
+sys.argv = [str(script), {TRUSTED_STRUCTURE_VALIDATOR_FLAG!r}]
+namespace = {{
+    "__name__": "__main__",
+    "__file__": str(script),
+    "__package__": None,
+}}
+sys.settrace(trace)
+exec(
+    compile(script.read_bytes(), str(script), "exec"),
+    namespace,
+)
+"""
             )
             environment = os.environ.copy()
             environment.update(
