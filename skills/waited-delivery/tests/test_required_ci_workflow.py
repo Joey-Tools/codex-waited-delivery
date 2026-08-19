@@ -48036,13 +48036,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                             )
                             first_line = completed.stdout.splitlines()[:1]
                             expected_prefix = f"usage: {name} "
-                            if (
-                                completed.stderr
-                                or len(completed.stdout.encode("utf-8")) > 65536
-                                or len(first_line) != 1
-                                or not first_line[0].startswith(expected_prefix)
-                            ):
-                                raise SystemExit("entrypoint-help")
+                            failure = (
+                                "stderr" if completed.stderr else
+                                "size" if len(completed.stdout.encode("utf-8")) > 65536 else
+                                "line" if len(first_line) != 1 else
+                                "prefix" if not first_line[0].startswith(expected_prefix) else
+                                None
+                            )
+                            if failure is not None:
+                                raise SystemExit(f"entrypoint-help:{name}:{failure}")
                             entrypoint_usage[name] = first_line[0]
 
                         zstd_payload = b"required-ci-zstd-round-trip\n" * 32
