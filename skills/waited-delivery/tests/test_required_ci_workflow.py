@@ -20233,6 +20233,14 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             mock.Mock(),
         )
         self.assertEqual(events, ["read", "read", "write"])
+        self.assertIn(
+            "resource.RLIMIT_NPROC: 4096",
+            _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
+        )
+        self.assertIn(
+            '"Max processes": ("4096", "4096", "processes")',
+            _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE,
+        )
         write_stop.assert_called_once_with()
         no_event_stop = mock.Mock()
         with self.assertRaises(SystemExit) as no_event:

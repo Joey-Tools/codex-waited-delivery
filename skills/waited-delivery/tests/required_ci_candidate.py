@@ -5910,7 +5910,7 @@ expected_limit_rows = {
     "Max file size": ("1048576", "1048576", "bytes"),
     "Max msgqueue size": ("8388608", "8388608", "bytes"),
     "Max open files": ("64", "64", "files"),
-    "Max processes": ("64", "64", "processes"),
+    "Max processes": ("4096", "4096", "processes"),
 }
 limits_descriptor = None
 try:
