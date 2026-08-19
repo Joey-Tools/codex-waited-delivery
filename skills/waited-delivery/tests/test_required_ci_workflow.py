@@ -10628,11 +10628,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         def classify(
             observed: object,
             readable: bool,
+            root_chain: bool = False,
         ) -> bool:
+            selected = (*observed[:5], (0, 0, 0, 0)) if root_chain and observed else observed
             with mock.patch.object(
                 _CANDIDATE_SUPPORT,
                 "_process_identity",
-                return_value=observed,
+                return_value=selected,
             ), mock.patch.object(
                 _CANDIDATE_SUPPORT.os,
                 "pidfd_open",
@@ -10649,8 +10651,12 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             ) as identity_probe, mock.patch.object(
                 _CANDIDATE_SUPPORT.os, "close"
             ) as close_descriptor:
-                result = _CANDIDATE_SUPPORT._strict_exact_owner_is_terminal(
-                    owner
+                result = (
+                    _CANDIDATE_SUPPORT._strict_root_chain_is_terminal(
+                        (owner[0], owner[1], owner[3], owner[4])
+                    )
+                    if root_chain
+                    else _CANDIDATE_SUPPORT._strict_exact_owner_is_terminal(owner)
                 )
             if observed is None:
                 pidfd_open.assert_not_called()
@@ -10664,9 +10670,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 close_descriptor.assert_called_once_with(73)
             return result
 
-        self.assertTrue(classify(owner, True), "a zombie owner is terminal")
-        self.assertFalse(classify(owner, False), "an exact live owner is live")
-        self.assertTrue(classify(None, False), "an absent owner is terminal")
+        for root_chain in (False, True):
+            self.assertTrue(classify(owner, True, root_chain))
+            self.assertFalse(classify(owner, False, root_chain))
+            self.assertTrue(classify(None, False, root_chain))
 
         for name, replacement in (
             ("pid-reuse", (owner[0], owner[1] + 1, *owner[2:])),
@@ -20233,14 +20240,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             mock.Mock(),
         )
         self.assertEqual(events, ["read", "read", "write"])
-        self.assertIn(
-            "resource.RLIMIT_NPROC: 4096",
-            _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE,
-        )
-        self.assertIn(
-            '"Max processes": ("4096", "4096", "processes")',
-            _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE,
-        )
+        self.assertIn("resource.RLIMIT_NPROC: 4096", _CANDIDATE_SUPPORT._MOUNT_NAMESPACE_BOOTSTRAP_SOURCE)
+        self.assertIn('"Max processes": ("4096", "4096", "processes")', _CANDIDATE_SUPPORT._CANDIDATE_BOOTSTRAP_SOURCE)
         write_stop.assert_called_once_with()
         no_event_stop = mock.Mock()
         with self.assertRaises(SystemExit) as no_event:

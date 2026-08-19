@@ -3554,6 +3554,26 @@ def _strict_exact_owner_is_terminal(
                 ) from error
 
 
+def _strict_root_chain_is_terminal(
+    expected: tuple[int, int, int, int],
+) -> bool:
+    if (
+        type(expected) is not tuple
+        or len(expected) != 4
+        or any(type(value) is not int or value <= 0 for value in expected)
+    ):
+        raise AssertionError("strict root chain identity is malformed")
+    observed = _process_identity(Path("/proc") / str(expected[0]))
+    if observed is None or observed[1] != expected[1]:
+        return True
+    if (
+        (observed[0], observed[1], observed[3], observed[4]) != expected
+        or observed[5] != (0, 0, 0, 0)
+    ):
+        raise AssertionError("strict root chain identity changed")
+    return _strict_exact_owner_is_terminal(observed)
+
+
 def _strict_owner_loss_watchdog_binding_matches(
     observed: tuple[
         int, int, int, int, int, tuple[int, int, int, int]
@@ -26429,17 +26449,26 @@ def _validate_strict_inner_controller_fault_result(
     )
     if handshake.get("phase") != expected_phase:
         raise AssertionError("strict fault probe handshake phase is wrong")
+    controller = _parse_root_chain_identity(
+        handshake.get("controller"), "fault controller"
+    )
+    sudo_parent = _parse_root_chain_identity(
+        handshake.get("sudo_parent"), "fault sudo parent"
+    )
+    fault = handshake.get("fault_reached")
+    if type(fault) is not dict:
+        raise AssertionError("strict fault probe handshake proof is malformed")
+    wrapper = _parse_root_chain_identity(
+        fault.get("wrapper"), "fault wrapper"
+    )
     outer = document.get("outer")
     if (
         type(outer) is not list
         or len(outer) != 4
         or any(type(value) is not int for value in outer)
+        or any(identity[3] != outer[3] for identity in (sudo_parent, controller, wrapper))
         or _host_session_inventory(outer[3])
-        or not _strict_exact_owner_is_terminal(
-            _parse_process_identity_document(
-                handshake.get("controller"), "fault controller"
-            )
-        )
+        or not _strict_root_chain_is_terminal(controller)
     ):
         raise AssertionError(
             "strict root wrapper fault process cleanup is incomplete"
