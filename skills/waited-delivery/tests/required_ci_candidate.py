@@ -19205,12 +19205,19 @@ def _quota_disposable_resource_receipt(
     document: Mapping[str, object],
 ) -> dict[str, object]:
     session = _active_strict_session()
+    session_root = session.get("root")
     resources = session.get("resources")
-    quota_binding = session.get("quota_binding")
     root, identity = _registered_execution_root(document)
     if (
-        not isinstance(resources, Path)
-        or type(quota_binding) is not dict
+        not isinstance(session_root, Path)
+        or not isinstance(resources, Path)
+    ):
+        raise AssertionError(
+            "strict disposable resource containment binding is invalid"
+        )
+    quota_binding = _load_writable_quota_binding(session_root)
+    if (
+        type(quota_binding) is not dict
         or quota_binding.get("state") != "active"
         or type(quota_binding.get("mounted_device")) is not int
         or type(quota_binding.get("mount_id")) is not int

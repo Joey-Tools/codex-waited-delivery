@@ -17327,7 +17327,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            resources = Path(temporary_directory).resolve(strict=True)
+            registry = Path(temporary_directory).resolve(strict=True)
+            resources = registry / _CANDIDATE_SUPPORT._STRICT_WRITABLE_QUOTA_DIRECTORY / "resources"
+            resources.mkdir(parents=True)
             child = resources / "required-ci-execution-reused"
             child.mkdir(mode=0o700)
             child.chmod(0o700)
@@ -17341,6 +17343,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     "mount_id": 91,
                 },
             }
+            durable = dict(session["quota_binding"])
+            stale = session | {"root": registry, "quota_binding": {"state": "intended"}}
+            resource = {"target_uid": 60000, "execution_root": {
+                "path": str(child), "device": metadata.st_dev,
+                "inode": metadata.st_ino}}
+            with mock.patch.object(_CANDIDATE_SUPPORT, "_active_strict_session", return_value=stale), mock.patch.object(_CANDIDATE_SUPPORT, "_load_writable_quota_binding", return_value=durable) as load_quota, mock.patch.object(_CANDIDATE_SUPPORT, "_strict_writable_root_mount_binding", return_value=91):
+                receipt = _CANDIDATE_SUPPORT._quota_disposable_resource_receipt(resource)
+            self.assertEqual(receipt["quota_mount_id"], 91)
+            load_quota.assert_called_once_with(registry)
             legacy = {
                 "state": "closed",
                 "cleanup_execution_root": True,
