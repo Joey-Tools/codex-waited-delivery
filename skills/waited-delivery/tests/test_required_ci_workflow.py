@@ -1980,6 +1980,12 @@ def _snapshot_permission_probe_is_meaningful() -> bool:
     return mode == REQUIRED_CI_ISOLATION_MODE or os.geteuid() != 0
 
 
+TRUSTED_CHECKOUT_ACTION = (
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+)
+TRUSTED_PYTHON_SETUP_ACTION = (
+    "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+)
 REPOSITORY_GUARD = (
     "      - name: Reject unexpected repository\n"
     f"        if: ${{{{ github.repository != '{EXPECTED_REPOSITORY}' }}}}\n"
@@ -2154,7 +2160,7 @@ CI_STRICT_RUNTIME_LIVE_JOB = (
 )
 CANDIDATE_CHECKOUT_STEP = (
     "      - name: Check out candidate\n"
-    "        uses: actions/checkout@v4\n"
+    f"        uses: {TRUSTED_CHECKOUT_ACTION}\n"
     f"        timeout-minutes: {TRUSTED_CANDIDATE_CHECKOUT_TIMEOUT_MINUTES}\n"
     "        with:\n"
     f"          repository: {EXPECTED_REPOSITORY}\n"
@@ -2164,7 +2170,7 @@ CANDIDATE_CHECKOUT_STEP = (
 )
 TRUSTED_CHECKOUT_STEP = (
     "      - name: Check out trusted Required CI source\n"
-    "        uses: actions/checkout@v4\n"
+    f"        uses: {TRUSTED_CHECKOUT_ACTION}\n"
     f"        timeout-minutes: {TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES}\n"
     "        with:\n"
     "          # GitHub.com job workflow identity pins this reusable leaf's own source.\n"
@@ -2174,7 +2180,7 @@ TRUSTED_CHECKOUT_STEP = (
     "          persist-credentials: false\n"
 )
 PYTHON_SETUP_STEP = (
-    "      - uses: actions/setup-python@v5\n"
+    f"      - uses: {TRUSTED_PYTHON_SETUP_ACTION}\n"
     f"        timeout-minutes: {TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES}\n"
     "        with:\n"
     '          python-version: "3.x"\n'
@@ -5718,7 +5724,9 @@ def _validate_test_job(
         candidate_checkout["name"], "Check out candidate", "candidate checkout name"
     )
     _require_scalar(
-        candidate_checkout["uses"], "actions/checkout@v4", "candidate checkout action"
+        candidate_checkout["uses"],
+        TRUSTED_CHECKOUT_ACTION,
+        "candidate checkout action",
     )
     _require_exact_timeout(
         candidate_checkout["timeout-minutes"],
@@ -5744,7 +5752,7 @@ def _validate_test_job(
     )
     _require_scalar(
         trusted_checkout["uses"],
-        "actions/checkout@v4",
+        TRUSTED_CHECKOUT_ACTION,
         "trusted checkout action",
     )
     _require_exact_timeout(
@@ -5764,7 +5772,7 @@ def _validate_test_job(
         ["uses", "timeout-minutes", "with"],
         "Python setup step",
     )
-    _require_scalar(setup["uses"], "actions/setup-python@v5", "Python setup action")
+    _require_scalar(setup["uses"], TRUSTED_PYTHON_SETUP_ACTION, "Python setup action")
     _require_exact_timeout(
         setup["timeout-minutes"],
         TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES,
@@ -7356,12 +7364,12 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
             (
                 "trusted checkout",
                 "      - name: Check out trusted Required CI source\n",
-                "      - uses: actions/setup-python@v5\n",
+                f"      - uses: {TRUSTED_PYTHON_SETUP_ACTION}\n",
                 TRUSTED_SOURCE_CHECKOUT_TIMEOUT_MINUTES,
             ),
             (
                 "Python setup",
-                "      - uses: actions/setup-python@v5\n",
+                f"      - uses: {TRUSTED_PYTHON_SETUP_ACTION}\n",
                 "      - name: Harden strict live runtime roots\n",
                 TRUSTED_PYTHON_SETUP_TIMEOUT_MINUTES,
             ),
@@ -7426,6 +7434,19 @@ class RequiredJobExecutionRegressionTests(unittest.TestCase):
     def test_candidate_and_trusted_checkouts_are_exact_and_ordered(self) -> None:
         workflow = self.required_workflow()
         fixtures = {
+            "candidate checkout uses floating tag": workflow.replace(
+                TRUSTED_CHECKOUT_ACTION, "actions/checkout@v4", 1
+            ),
+            "trusted checkout uses floating tag": workflow.replace(
+                TRUSTED_CHECKOUT_STEP,
+                TRUSTED_CHECKOUT_STEP.replace(
+                    TRUSTED_CHECKOUT_ACTION, "actions/checkout@v4", 1
+                ),
+                1,
+            ),
+            "Python setup uses floating tag": workflow.replace(
+                TRUSTED_PYTHON_SETUP_ACTION, "actions/setup-python@v5", 1
+            ),
             "missing trusted checkout": workflow.replace(
                 TRUSTED_CHECKOUT_STEP, "", 1
             ),

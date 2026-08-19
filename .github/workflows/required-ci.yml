@@ -16,7 +16,7 @@ jobs:
         timeout-minutes: 1
         run: exit 1
       - name: Check out candidate
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         timeout-minutes: 3
         with:
           repository: Joey-Tools/codex-waited-delivery
@@ -24,7 +24,7 @@ jobs:
           path: .candidate
           persist-credentials: false
       - name: Check out trusted Required CI source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         timeout-minutes: 3
         with:
           # GitHub.com job workflow identity pins this reusable leaf's own source.
@@ -32,7 +32,7 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .required-ci
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         timeout-minutes: 3
         with:
           python-version: "3.x"
