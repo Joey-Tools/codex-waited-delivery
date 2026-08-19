@@ -18,6 +18,7 @@ import linecache
 import math
 import os
 import re
+import runpy
 import shutil
 import signal
 import stat
@@ -1527,7 +1528,11 @@ def _owner_private_captured_support_path() -> Iterator[Path]:
             raise AssertionError(
                 "captured support staging root is not owner-private"
             )
-        path = root / "required_ci_candidate.py"
+        parent = root
+        for name in ("skills", "waited-delivery", "tests"):
+            parent /= name
+            parent.mkdir(mode=0o700)
+        path = parent / "required_ci_candidate.py"
         descriptor: int | None = None
         try:
             descriptor = os.open(
@@ -9605,6 +9610,26 @@ _STRICT_TARGET_ACCESS_PROGRAM = inspect.cleandoc(
 
 
 class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
+    def test_owner_captured_support_preserves_distribution_context(self) -> None:
+        with _owner_private_captured_support_path() as path:
+            self.assertEqual(
+                path.parts[-4:],
+                ("skills", "waited-delivery", "tests", path.name),
+            )
+            support = runpy.run_path(str(path))
+            support_globals = support["_write_chain_registry_entry"].__globals__
+            self.assertEqual(support["_TRUSTED_CHECKOUT_ROOT"], path.parents[3])
+            self.assertIsNot(support_globals, support)
+            for name in (
+                "_register_trusted_root_chain",
+                "_invoke_registered_opt_ipc_root",
+            ):
+                self.assertIs(support[name].__globals__, support_globals)
+            self.assertIs(
+                support["_registered_live_host_ipc_root"].__wrapped__.__globals__,
+                support_globals,
+            )
+
     @staticmethod
     def root_command_config(**updates: object) -> dict[str, object]:
         config: dict[str, object] = {
@@ -27470,7 +27495,7 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         ), ("LANDLOCK_ACCESS_FS_IOCTL_DEV", "LANDLOCK_ACCESS_FS_READ_DIR", '("/proc/self/fdinfo", "directory")', '("/proc", "directory")', "FS_IOC_"))
         check(host_read_source, ('Path("/usr/lib") / multiarch', 'Path("/etc/ld.so.preload").lstat()', 'system_stdlib / "lib-dynload"', 'trusted_git.parent != Path("/usr/bin")'), ('Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',))
         check(candidate_source, ("read_network_interfaces(network_interface_fd)", 'status.get("Seccomp") != "2"', "Seccomp_filters", '"/proc/self/limits"'), ("os.listdir(trusted_root)", 'os.listdir("/sys/class/net")', "socket.if_nameindex", "resource.getrlimit"))
-        check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")', "relative_path.name != runner_path.name", "TRUSTED_CONTENT_ROOT / relative_path", '"final-checks="', "real_write.__globals__", "__wrapped__.__globals__", 'support["_register_trusted_root_chain"]', 'support_globals["_write_chain_registry_entry"]'), ('f"/proc/self/fdinfo/',))
+        check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")', "relative_path.name != runner_path.name", "TRUSTED_CONTENT_ROOT / relative_path", '"final-checks="', "real_write.__globals__", "__wrapped__.__globals__", 'support["_register_trusted_root_chain"]', 'support["_invoke_registered_opt_ipc_root"]', 'support_globals["_write_chain_registry_entry"]'), ('f"/proc/self/fdinfo/',))
         install = next(node for node in ast.parse(bootstrap_source).body if isinstance(node, ast.FunctionDef) and node.name == "install_candidate_seccomp_filter")
         call = next(node for node in install.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "architecture" for target in node.targets)).value
         for value, kind in ((call, ast.Call), (call.func, ast.Attribute), (call.func.value, ast.Dict)):
@@ -47121,6 +47146,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 support["_registered_live_host_ipc_root"].__wrapped__.__globals__
                 is not support_globals
                 or support["_register_trusted_root_chain"].__globals__
+                is not support_globals
+                or support["_invoke_registered_opt_ipc_root"].__globals__
                 is not support_globals
             ):
                 raise AssertionError("captured support globals are split")
