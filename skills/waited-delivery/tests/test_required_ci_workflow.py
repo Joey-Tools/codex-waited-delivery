@@ -26602,13 +26602,13 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
         ), ("LANDLOCK_ACCESS_FS_IOCTL_DEV", "LANDLOCK_ACCESS_FS_READ_DIR", '("/proc/self/fdinfo", "directory")', '("/proc", "directory")', "FS_IOC_"))
         check(host_read_source, ('Path("/usr/lib") / multiarch', 'Path("/etc/ld.so.preload").lstat()', 'system_stdlib / "lib-dynload"', 'trusted_git.parent != Path("/usr/bin")'), ('Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")',))
         check(candidate_source, ("read_network_interfaces(network_interface_fd)", 'status.get("Seccomp") != "2"', "Seccomp_filters", '"/proc/self/limits"'), ("os.listdir(trusted_root)", 'os.listdir("/sys/class/net")', "socket.if_nameindex", "resource.getrlimit"))
-        check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")'), ('f"/proc/self/fdinfo/',))
+        check(live_source, ("fifo_path, os.O_RDWR | os.O_NONBLOCK", 'fifo_prefill = b"host-fifo-byte"', "fifo_read_errno = operation_errno", "readable_roots=(rw_hint_path,)", 'record["mountpoint"] == "/dev/shm"', "len(dev_shm_mounts) != 1", 'record["mountpoint"] == "/dev/null"', "len(devnull_mounts) != 1", '"/tmp/required-ci-alias-probe-target"', 'self.assertEqual(listener_fifo_remaining, b"host-fifo-byte")', "relative_path.name != runner_path.name", "TRUSTED_CONTENT_ROOT / relative_path"), ('f"/proc/self/fdinfo/',))
         install = next(node for node in ast.parse(bootstrap_source).body if isinstance(node, ast.FunctionDef) and node.name == "install_candidate_seccomp_filter")
         call = next(node for node in install.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "architecture" for target in node.targets)).value
         for value, kind in ((call, ast.Call), (call.func, ast.Attribute), (call.func.value, ast.Dict)):
             self.assertIsInstance(value, kind)
         architecture_mapping = call.func.value
-        architectures = {ast.literal_eval(key): ast.literal_eval(value) for key, value in zip(architecture_mapping.keys, architecture_mapping.values, strict=True)}
+        architectures = {ast.literal_eval(key): ast.literal_eval(value) for key, value in zip(architecture_mapping.keys, architecture_mapping.values)}
         self.assertEqual(architectures["x86_64"][3], 302)
         self.assertNotIn(302, architectures["x86_64"][4])
         self.assertEqual(architectures["aarch64"][3], 261)
@@ -44184,59 +44184,31 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         )
                     )
                     output = io.StringIO()
-                    with _CANDIDATE_SUPPORT._chain_registry_lock(
-                        entry_path
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_TRUSTED_SUPPORT_PATH",
-                        controller,
-                    ), mock.patch.object(
-                        os, "getuid", return_value=0
-                    ), mock.patch.object(
-                        os, "geteuid", return_value=0
-                    ), mock.patch.object(
-                        os, "open", side_effect=track_open
-                    ), mock.patch.object(
-                        os, "fstat", side_effect=record_stable_open_fd
-                    ), mock.patch.object(
-                        os, "pread", side_effect=drift_after_preliminary_read
-                    ), mock.patch.object(
-                        os, "stat", side_effect=record_selected_path
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_load_chain_registry_entry",
-                        side_effect=record_bound_load,
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_process_identity",
-                        return_value=invocation_launcher,
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_bind_root_controller_parent",
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_strict_owner_loss_registered_broker_ancestry",
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_root_registered_opt_ipc_witness_operation",
-                        witness_operation,
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_root_registered_opt_ipc_root_operation",
-                        root_operation,
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_root_open_or_create_strict_live_ipc_witness",
-                        open_witness,
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_append_strict_live_ipc_witness_record",
-                        append_witness,
-                    ), mock.patch.object(
-                        _CANDIDATE_SUPPORT,
-                        "_write_chain_registry_entry",
-                        registry_write,
-                    ), contextlib.redirect_stdout(output):
+                    p = mock.patch.object
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(
+                            _CANDIDATE_SUPPORT._chain_registry_lock(entry_path)
+                        )
+                        for manager in (
+                            p(_CANDIDATE_SUPPORT, "_TRUSTED_SUPPORT_PATH", controller),
+                            p(os, "getuid", return_value=0),
+                            p(os, "geteuid", return_value=0),
+                            p(os, "open", side_effect=track_open),
+                            p(os, "fstat", side_effect=record_stable_open_fd),
+                            p(os, "pread", side_effect=drift_after_preliminary_read),
+                            p(os, "stat", side_effect=record_selected_path),
+                            p(_CANDIDATE_SUPPORT, "_load_chain_registry_entry", side_effect=record_bound_load),
+                            p(_CANDIDATE_SUPPORT, "_process_identity", return_value=invocation_launcher),
+                            p(_CANDIDATE_SUPPORT, "_bind_root_controller_parent"),
+                            p(_CANDIDATE_SUPPORT, "_strict_owner_loss_registered_broker_ancestry"),
+                            p(_CANDIDATE_SUPPORT, "_root_registered_opt_ipc_witness_operation", witness_operation),
+                            p(_CANDIDATE_SUPPORT, "_root_registered_opt_ipc_root_operation", root_operation),
+                            p(_CANDIDATE_SUPPORT, "_root_open_or_create_strict_live_ipc_witness", open_witness),
+                            p(_CANDIDATE_SUPPORT, "_append_strict_live_ipc_witness_record", append_witness),
+                            p(_CANDIDATE_SUPPORT, "_write_chain_registry_entry", registry_write),
+                            contextlib.redirect_stdout(output),
+                        ):
+                            stack.enter_context(manager)
                         self.assertEqual(
                             _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_main(
                                 arguments
@@ -45897,40 +45869,24 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                                         os.write(marker_write_fd, b"F")
 
                             try:
-                                with mock.patch.object(
-                                    _CANDIDATE_SUPPORT,
-                                    "_TRUSTED_SUPPORT_PATH",
-                                    controller,
-                                ), mock.patch.object(
-                                    os, "getuid", return_value=0
-                                ), mock.patch.object(
-                                    os,
-                                    "geteuid",
-                                    side_effect=root_then_witness_owner,
-                                ), mock.patch.multiple(
-                                    _CANDIDATE_SUPPORT,
-                                    _bind_root_controller_parent=mock.DEFAULT,
-                                    _root_open_registered_opt_ipc_invocation=mock.Mock(
-                                        side_effect=open_crash_invocation
-                                    ),
-                                    _strict_owner_loss_registered_broker_ancestry=mock.DEFAULT,
-                                ), mock.patch.object(
-                                    _CANDIDATE_SUPPORT,
-                                    "_append_strict_live_ipc_witness_record",
-                                    side_effect=pause_before_deleted_record,
-                                ), mock.patch.object(
-                                    os,
-                                    "fsync",
-                                    side_effect=observe_parent_fsync,
-                                ), mock.patch.object(
-                                    os,
-                                    "close",
-                                    side_effect=close_with_generation,
-                                ), mock.patch.object(
-                                    os,
-                                    "fstat",
-                                    side_effect=linux_directory_unlink_metadata,
-                                ):
+                                p = mock.patch.object
+                                with contextlib.ExitStack() as stack:
+                                    for manager in (
+                                        p(_CANDIDATE_SUPPORT, "_TRUSTED_SUPPORT_PATH", controller),
+                                        p(os, "getuid", return_value=0),
+                                        p(os, "geteuid", side_effect=root_then_witness_owner),
+                                        mock.patch.multiple(
+                                            _CANDIDATE_SUPPORT,
+                                            _bind_root_controller_parent=mock.DEFAULT,
+                                            _root_open_registered_opt_ipc_invocation=mock.Mock(side_effect=open_crash_invocation),
+                                            _strict_owner_loss_registered_broker_ancestry=mock.DEFAULT,
+                                        ),
+                                        p(_CANDIDATE_SUPPORT, "_append_strict_live_ipc_witness_record", side_effect=pause_before_deleted_record),
+                                        p(os, "fsync", side_effect=observe_parent_fsync),
+                                        p(os, "close", side_effect=close_with_generation),
+                                        p(os, "fstat", side_effect=linux_directory_unlink_metadata),
+                                    ):
+                                        stack.enter_context(manager)
                                     child_result = (
                                         _CANDIDATE_SUPPORT._root_registered_opt_ipc_root_main(
                                             broker_arguments
@@ -47535,8 +47491,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     env=git_environment,
                     timeout=5,
                 )
+                candidate_content_root = distribution_content_root(candidate_root)
                 runner_path = (
-                    distribution_content_root(candidate_root)
+                    candidate_content_root
                     / "skills/waited-delivery/scripts/waited_delivery_runner.py"
                 )
                 candidate_source = inspect.cleandoc(
@@ -48337,6 +48294,11 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     candidate_source + "\n",
                     encoding="utf-8",
                 )
+                for relative_path in _CANDIDATE_SUPPORT.CANDIDATE_SCRIPT_RELATIVE_PATHS:
+                    if relative_path.name != runner_path.name:
+                        (candidate_content_root / relative_path).write_bytes(
+                            (TRUSTED_CONTENT_ROOT / relative_path).read_bytes()
+                        )
                 candidate_sha = self.initialize_candidate_checkout(candidate_root)
                 listener_process, listener_identity = start_host_ipc_helper(
                     socket_path,
@@ -50072,10 +50034,11 @@ class RequiredCiWorkflowTests(unittest.TestCase):
                 runtime_sources.append((f"{filename}:{name}", embedded))
 
         for description, source in runtime_sources:
+            parsed = ast.parse(source)
             forbidden = sorted(
                 {
                     node.attr
-                    for node in ast.walk(ast.parse(source))
+                    for node in ast.walk(parsed)
                     if isinstance(node, ast.Attribute)
                     and node.attr
                     in {
@@ -50085,11 +50048,19 @@ class RequiredCiWorkflowTests(unittest.TestCase):
                         "waitstatus_to_exitcode",
                     }
                 }
+                | {
+                    "zip(strict=)"
+                    for node in ast.walk(parsed)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "zip"
+                    and any(key.arg == "strict" for key in node.keywords)
+                }
             )
             self.assertEqual(
                 forbidden,
                 [],
-                f"{description} must avoid Python 3.9-only runtime APIs",
+                f"{description} uses post-3.9 API",
             )
 
         if DISTRIBUTION_PROFILE == "canonical":
@@ -50172,6 +50143,31 @@ class RequiredCiWorkflowTests(unittest.TestCase):
             [],
             "workflow tests must avoid Python 3.10-only parenthesized "
             "multiple-context-manager syntax",
+        )
+        oversized = []
+
+        def audit_static_blocks(node: ast.AST, depth: int = 0) -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                depth = 0
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                added = len(node.items)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                added = 1
+            elif isinstance(node, ast.Try):
+                added = 1 + bool(node.handlers and node.finalbody)
+            else:
+                added = 0
+            depth += added
+            if added and depth > 20:
+                oversized.append((node.lineno, added, depth))
+            for child in ast.iter_child_nodes(node):
+                audit_static_blocks(child, depth)
+
+        audit_static_blocks(ast.parse(source))
+        self.assertEqual(
+            oversized,
+            [],
+            "workflow tests exceed the CPython static-block limit",
         )
 
     def test_trusted_checkout_requires_an_explicit_candidate_root(self) -> None:

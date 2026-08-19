@@ -5655,9 +5655,7 @@ try:
             != (document["device"], document["inode"])
         ):
             raise SystemExit(161)
-    for document, descriptor in zip(
-        read_roots, read_descriptors, strict=True
-    ):
+    for document, descriptor in zip(read_roots, read_descriptors):
         revalidate_held_read_root(document, descriptor)
     seal_network_interface_descriptor(
         final_inventory, host_network_namespace
@@ -20200,7 +20198,6 @@ def _validate_registered_root_active(
     for identity, description in zip(
         identities,
         ("sudo parent", "controller", "wrapper", "target"),
-        strict=True,
     ):
         observed = _process_identity(Path("/proc") / str(identity[0]))
         if observed != identity:
@@ -23969,7 +23966,6 @@ def _close_trusted_isolation_chains_under_gate(
                     current_entries,
                     current_documents,
                     terminal,
-                    strict=True,
                 )
                 if not is_terminal
             )
