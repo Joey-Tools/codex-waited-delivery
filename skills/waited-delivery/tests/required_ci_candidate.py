@@ -69,6 +69,7 @@ _STRICT_WRITABLE_QUOTA_SIZE_BYTES = 64 * 1024 * 1024
 _STRICT_WRITABLE_QUOTA_INODES = 8192
 _STRICT_WRITABLE_QUOTA_BINDING_NAME = ".candidate-writable.json"
 _STRICT_RECOVERY_FAILURE_PREFIX = ".recovery-failure-"
+_STRICT_RECOVERY_PHASE_NAME = ".recovery-phase.json"
 _STRICT_ROOT_TREE_CLEANUP_SECONDS = 30.0
 _STRICT_ROOT_TREE_ENTRY_LIMIT = 8192
 _STRICT_ROOT_TREE_DEPTH_LIMIT = 64
@@ -23665,6 +23666,19 @@ _REGISTRY_RECOVERY_FAILURE_CODES = frozenset(
         "unclassified",
     }
 )
+_REGISTRY_RECOVERY_PHASES = frozenset(
+    {
+        "resource-entry-recovery",
+        "final-entry-inventory",
+        "quota-binding-load",
+        "quota-mount-revalidation",
+        "quota-active-window-revalidation",
+        "quota-resource-revalidation",
+        "quota-tombstone-release",
+        "quota-destroy",
+        "quota-unmount-revalidation",
+    }
+)
 _REGISTRY_RECOVERY_FAILURE_MESSAGES = {
     "strict prepared outer recovery binding is malformed": "prepared-binding-malformed",
     "strict prepared outer inventory is unavailable": "prepared-inventory-unavailable",
@@ -23741,6 +23755,47 @@ def _record_registry_recovery_failure(
         )
 
 
+def _record_registry_recovery_phase(
+    root: Path, phase: str, error: BaseException
+) -> None:
+    if phase not in _REGISTRY_RECOVERY_PHASES:
+        raise AssertionError("strict registry recovery phase is invalid")
+    path = root / "trusted-control" / _STRICT_RECOVERY_PHASE_NAME
+    document = {
+        "schema_version": 1,
+        "phase": phase,
+        "code": _registry_recovery_failure_code(error),
+    }
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as record_error:
+        raise AssertionError(
+            "strict registry recovery phase receipt is unreadable"
+        ) from record_error
+    else:
+        imported = _read_outer_owner_json(
+            path, "registry recovery phase receipt"
+        )
+        if (
+            set(imported) != {"schema_version", "phase", "code"}
+            or type(imported.get("schema_version")) is not int
+            or imported.get("schema_version") != 1
+            or type(imported.get("phase")) is not str
+            or imported.get("phase") not in _REGISTRY_RECOVERY_PHASES
+            or type(imported.get("code")) is not str
+            or imported.get("code") not in _REGISTRY_RECOVERY_FAILURE_CODES
+        ):
+            raise AssertionError(
+                "strict registry recovery phase receipt is malformed"
+            )
+        return
+    _atomic_json_document(
+        path, document, expected_owner=os.getuid(), create=True
+    )
+
+
 def _close_trusted_isolation_chains_under_gate(
     registry: Mapping[str, object],
     *,
@@ -23780,6 +23835,22 @@ def _close_trusted_isolation_chains_under_gate(
         if recovery_profile == "-"
         else {"recovery_profile": recovery_profile}
     )
+
+    def record_failure_phase(phase: str, error: BaseException) -> None:
+        if recovery_profile != _STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE:
+            return
+        try:
+            _record_registry_recovery_phase(root, phase, error)
+        except BaseException:
+            pass
+
+    @contextmanager
+    def cleanup_phase(phase: str) -> Iterator[None]:
+        try:
+            yield
+        except BaseException as error:
+            record_failure_phase(phase, error)
+            raise
 
     def witness_status(
         document: Mapping[str, object],
@@ -23862,6 +23933,7 @@ def _close_trusted_isolation_chains_under_gate(
                     )
                 except BaseException as error:
                     round_failures.append(f"{entry_path.name}: {error}")
+                    record_failure_phase("resource-entry-recovery", error)
                     break
         try:
             current_entries = _chain_registry_entries(
@@ -23920,23 +23992,28 @@ def _close_trusted_isolation_chains_under_gate(
             "strict parent isolation cleanup was incomplete; recovery state retained: "
             + "; ".join(failures)
         )
-    final_entries = _chain_registry_entries(entries, recover_staging=True)
-    final_documents = [
-        _load_chain_registry_entry(entry_path) for entry_path in final_entries
-    ]
-    current_quota_binding = _load_writable_quota_binding(root)
+    with cleanup_phase("final-entry-inventory"):
+        final_entries = _chain_registry_entries(entries, recover_staging=True)
+        final_documents = [
+            _load_chain_registry_entry(entry_path) for entry_path in final_entries
+        ]
+    with cleanup_phase("quota-binding-load"):
+        current_quota_binding = _load_writable_quota_binding(root)
     if current_quota_binding.get("state") == "active":
         quota = root / _STRICT_WRITABLE_QUOTA_DIRECTORY
-        if _strict_exact_mount_record(quota) is None:
-            (
-                quota,
-                resources,
-                fixtures,
-                tombstones,
-                current_quota_binding,
-            ) = _validated_active_unmounted_quota_window(
-                root, current_quota_binding
-            )
+        with cleanup_phase("quota-mount-revalidation"):
+            quota_is_unmounted = _strict_exact_mount_record(quota) is None
+        if quota_is_unmounted:
+            with cleanup_phase("quota-active-window-revalidation"):
+                (
+                    quota,
+                    resources,
+                    fixtures,
+                    tombstones,
+                    current_quota_binding,
+                ) = _validated_active_unmounted_quota_window(
+                    root, current_quota_binding
+                )
             session.update(
                 {
                     "quota": quota,
@@ -23948,38 +24025,43 @@ def _close_trusted_isolation_chains_under_gate(
             )
         else:
             session["quota_binding"] = current_quota_binding
-            _cleanup_orphan_resource_roots(session, final_documents)
-            tombstones = session.get("tombstones")
-            if not isinstance(tombstones, Path):
-                raise AssertionError(
-                    "strict isolation tombstone vault is malformed"
+            with cleanup_phase("quota-resource-revalidation"):
+                _cleanup_orphan_resource_roots(session, final_documents)
+            with cleanup_phase("quota-tombstone-release"):
+                tombstones = session.get("tombstones")
+                if not isinstance(tombstones, Path):
+                    raise AssertionError(
+                        "strict isolation tombstone vault is malformed"
+                    )
+                _invoke_root_tree_operation(
+                    controller_path,
+                    "own-root",
+                    tombstones,
+                    os.getuid(),
+                    os.getgid(),
+                    "isolation-vault-release",
                 )
-            _invoke_root_tree_operation(
-                controller_path,
-                "own-root",
-                tombstones,
-                os.getuid(),
-                os.getgid(),
-                "isolation-vault-release",
-            )
     elif current_quota_binding.get("state") not in (
         "intended",
         "unmounted",
     ):
-        raise AssertionError(
-            "strict writable quota cleanup state is malformed"
-        )
-    _invoke_root_quota_operation(controller_path, "destroy", root)
-    quota_binding = _load_writable_quota_binding(root)
-    quota = session.get("quota")
-    if (
-        quota_binding.get("state") != "unmounted"
-        or not isinstance(quota, Path)
-        or _strict_exact_mount_record(quota) is not None
-    ):
-        raise AssertionError(
-            "strict writable quota was not durably unmounted"
-        )
+        with cleanup_phase("quota-binding-load"):
+            raise AssertionError(
+                "strict writable quota cleanup state is malformed"
+            )
+    with cleanup_phase("quota-destroy"):
+        _invoke_root_quota_operation(controller_path, "destroy", root)
+    with cleanup_phase("quota-unmount-revalidation"):
+        quota_binding = _load_writable_quota_binding(root)
+        quota = session.get("quota")
+        if (
+            quota_binding.get("state") != "unmounted"
+            or not isinstance(quota, Path)
+            or _strict_exact_mount_record(quota) is not None
+        ):
+            raise AssertionError(
+                "strict writable quota was not durably unmounted"
+            )
     try:
         shutil.rmtree(root)
     except OSError as error:
@@ -26181,6 +26263,28 @@ def _outer_owner_retained_cleanup_state(
         failure_code = str(failure["code"])
     except AssertionError:
         pass
+    resource_phase = "unreadable"
+    try:
+        phase = read_document(
+            "trusted-control",
+            _STRICT_RECOVERY_PHASE_NAME,
+            "retained resource recovery phase",
+        )
+        if (
+            set(phase) != {"schema_version", "phase", "code"}
+            or type(phase.get("schema_version")) is not int
+            or phase.get("schema_version") != 1
+            or type(phase.get("phase")) is not str
+            or phase.get("phase") not in _REGISTRY_RECOVERY_PHASES
+            or type(phase.get("code")) is not str
+            or phase.get("code") not in _REGISTRY_RECOVERY_FAILURE_CODES
+        ):
+            raise AssertionError(
+                "strict outer owner retained resource phase is malformed"
+            )
+        resource_phase = f"{phase['phase']}:{phase['code']}"
+    except AssertionError:
+        pass
     quota_state = "unreadable"
     try:
         quota = read_document(
@@ -26202,7 +26306,7 @@ def _outer_owner_retained_cleanup_state(
         pass
     return (
         f"entry={entry_state},outer={outer_present},quota={quota_state},"
-        f"failure={failure_code}"
+        f"failure={failure_code},resource-phase={resource_phase}"
     )
 
 
@@ -26243,7 +26347,7 @@ def _wait_outer_owner_watchdog_cleanup(
         except BaseException:
             return (
                 "entry=unreadable,outer=unreadable,quota=unreadable,"
-                "failure=unreadable"
+                "failure=unreadable,resource-phase=unreadable"
             )
 
     zero_count = 0

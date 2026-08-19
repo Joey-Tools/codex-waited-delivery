@@ -23287,6 +23287,15 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             self.assertIn(marker, str(error))
             self.assertEqual(fstat.call_count, fstat_count)
             retained.assert_called_once_with(72, (101, 202), "a" * 32)
+        fallback = "failure=unreadable,resource-phase=unreadable"
+        with mock.patch.object(
+            support, "_outer_owner_retained_cleanup_state",
+            side_effect=AssertionError("diagnostic"),
+        ):
+            error, *_ = self._run_outer_owner_cleanup_observer_fixture(
+                terminal_at=0.0
+            )
+        self.assertIn(fallback, str(error))
 
     def test_outer_fault_combined_observer_rejects_live_path_replacement(
         self,
@@ -24577,7 +24586,8 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
             controller = root / "controller.py"
             controller.write_text("pass\n", encoding="utf-8")
             (root / "execution").mkdir()
-            (root / "trusted-control").mkdir(mode=0o700)
+            control = root / "trusted-control"
+            control.mkdir(mode=0o700)
             quota = root / s._STRICT_WRITABLE_QUOTA_DIRECTORY
             quota.mkdir(mode=0o700)
             s._write_writable_quota_binding(
@@ -24587,16 +24597,9 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 ),
                 create=True,
             )
-            registry = {
-                "root": root,
-                "entries": entries,
-                "controller_path": controller,
-                "token": "c" * 32,
-                "target_uid": 60000,
-                "closed": False,
-                "inherited": True,
-                "watchdog_authorized": True,
-            }
+            registry = dict(root=root, entries=entries, controller_path=controller,
+                token="c" * 32, target_uid=60000, closed=False, inherited=True,
+                watchdog_authorized=True)
             previous = s._STRICT_SESSION
             s._STRICT_SESSION = registry
             try:
@@ -24607,24 +24610,29 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     execution_root=root / "execution",
                 )
                 load = s._load_chain_registry_entry
+                res = entries / f"chain-{'e' * 32}.json"
+                s._write_chain_registry_entry(res, load(entry) | {
+                    "session_id": "e" * 32, "publication_nonce": "f" * 32,
+                    "cleanup_execution_root": True, "cleanup_kind":
+                    s._STRICT_QUOTA_RESOURCE_CLEANUP_KIND}, create=True)
                 live = s._STRICT_LIVE_IPC_CLEANUP_KIND
                 calls = []
 
-                def fail_recovery(
-                    selected_entry: Path, *, allow_recovery_broker: bool,
-                    **_options: object,
-                ) -> object:
+                def fail_recovery(selected_entry, *, allow_recovery_broker,
+                    **_options):
                     self.assertTrue(allow_recovery_broker)
+                    if selected_entry == res:
+                        return None
                     if selected_entry == entry:
                         calls.append("entry")
                         if calls.count("entry") == 1:
+                            raise AssertionError("strict prepared outer command line is unreadable")
+                        if calls.count("entry") == 2:
                             return None
-                        raise AssertionError("strict prepared outer command line is unreadable" if calls.count("entry") == 2 else "later")
+                        raise AssertionError("later")
                     return None
 
-                def cleanup_uid(
-                    _selected_controller: Path, _target_uid: int
-                ) -> None:
+                def cleanup_uid(_controller, _uid):
                     calls.append("uid")
                     sequence = calls.count("uid")
                     document = json.loads(entry.read_text(encoding="ascii"))
@@ -24637,30 +24645,10 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         create=True,
                     )
 
-                def stable_uid(_target_uid: int) -> None:
+                def stable_uid(_target_uid):
                     calls.append("stable")
 
-                with p(
-                    s,
-                    "_recover_registered_entry",
-                    side_effect=fail_recovery,
-                ), p(s, "_STRICT_REGISTRY_ENTRY_LIMIT", 7), p(
-                    s,
-                    "_invoke_root_uid_cleanup",
-                    side_effect=cleanup_uid,
-                ), p(
-                    s,
-                    "_stable_uid_zero",
-                    side_effect=stable_uid,
-                ), p(
-                    s,
-                    "_load_chain_registry_entry",
-                    side_effect=lambda path: load(path) | ({"state": "closed", "cleanup_kind": live} if path == entry else {}),
-                ), p(
-                    s,
-                    "_direct_opt_root_document",
-                    side_effect=lambda _document: {"witness": {"file": {"phase": "owned", "last_record_sha256": ("a" if calls.count("uid") == 1 else "b") * 64}, "retired": {} if calls.count("uid") > 3 else None}},
-                ):
+                with p(s, "_recover_registered_entry", side_effect=fail_recovery), p(s, "_STRICT_REGISTRY_ENTRY_LIMIT", 7), p(s, "_invoke_root_uid_cleanup", side_effect=cleanup_uid), p(s, "_stable_uid_zero", side_effect=stable_uid), p(s, "_load_chain_registry_entry", side_effect=lambda path: load(path) | ({"state": "closed", "cleanup_kind": live} if path == entry else {})), p(s, "_direct_opt_root_document", side_effect=lambda _document: {"witness": {"file": {"phase": "owned", "last_record_sha256": ("a" if calls.count("uid") == 1 else "b") * 64}, "retired": {} if calls.count("uid") > 3 else None}}):
                     with self.assertRaisesRegex(
                         AssertionError, "recovery state retained"
                     ) as caught:
@@ -24673,31 +24661,53 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
 
             self.assertEqual(calls, ["entry", "uid", "stable"] * 6)
             self.assertTrue(root.is_dir())
-            retained = json.loads(entry.read_text(encoding="ascii"))
-            self.assertEqual(retained["state"], "prepared")
+            doc = json.loads(entry.read_text(encoding="ascii"))
+            self.assertEqual(doc["state"], "prepared")
             self.assertIn("command line is unreadable", str(caught.exception))
             self.assertNotIn("later", str(caught.exception))
             root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-            metadata = os.fstat(root_fd)
+            md = os.fstat(root_fd)
+            ident = (md.st_dev, md.st_ino)
             try:
-                identity = (metadata.st_dev, metadata.st_ino)
                 state = s._outer_owner_retained_cleanup_state
-                sid = str(retained["session_id"])
-                diagnostic = state(root_fd, identity, sid)
-                suffix = ",failure=prepared-command-unreadable"
-                baseline = retained | {"state": "outer-bound", "outer": [1, 2, 1, 1]}
-                unreadable = "entry=unreadable,outer=unreadable,quota=intended"
-                for changed, expected in ((baseline, "entry=outer-bound,outer=true,quota=intended"), (baseline | {"outer": []}, unreadable), (baseline | {"session_id": "f" * 32}, unreadable), (baseline | {"schema_version": 3}, unreadable), (baseline | {"extra": True}, unreadable)):
+                sid = str(doc["session_id"])
+                result = state(root_fd, ident, sid)
+                suffix = ",failure=prepared-command-unreadable,resource-phase=unreadable"
+                baseline = doc | {"state": "outer-bound", "outer": [1, 2, 1, 1]}
+                bad = "entry=unreadable,outer=unreadable,quota=intended"
+                for changed, expected in ((baseline, "entry=outer-bound,outer=true,quota=intended"), (baseline | {"outer": []}, bad), (baseline | {"session_id": "f" * 32}, bad), (baseline | {"schema_version": 3}, bad), (baseline | {"extra": True}, bad)):
                     s._write_chain_registry_entry(entry, changed, create=False)
-                    self.assertEqual(state(root_fd, identity, sid), expected + suffix)
+                    self.assertEqual(state(root_fd, ident, sid), expected + suffix)
+                self.assertEqual(result, "entry=prepared,outer=false,quota=intended" + suffix)
+                doc["state"] = "closed"
+                s._write_chain_registry_entry(entry, doc, create=False)
+                with p(s, "_STRICT_SESSION", registry):
+                    resource_doc = load(res)
+                with p(s, "_STRICT_SESSION", registry), p(s, "_chain_registry_entries", return_value=[res]), p(s, "_load_chain_registry_entry", return_value=resource_doc), p(s, "_recover_registered_entry", side_effect=AssertionError("resource")), p(s, "_invoke_root_uid_cleanup"), p(s, "_stable_uid_zero"), p(s, "_record_registry_recovery_phase", side_effect=OSError("phase")), self.assertRaisesRegex(AssertionError, "recovery state retained"):
+                    s._close_trusted_isolation_chains_under_gate(registry, recovery_profile=s._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE)
+                self.assertTrue(state(root_fd, ident, sid).endswith("failure=prepared-command-unreadable,resource-phase=unreadable"))
+                s._record_registry_recovery_phase(root, "resource-entry-recovery", AssertionError("resource"))
+                self.assertTrue(state(root_fd, ident, sid).endswith("failure=prepared-command-unreadable,resource-phase=resource-entry-recovery:unclassified"))
+                phase = control / s._STRICT_RECOVERY_PHASE_NAME
+                phase_before = (phase.lstat().st_ino, phase.read_bytes())
+                attempts = []
+                def transient_resource(_entry, **_options):
+                    attempts.append(None)
+                    if len(attempts) == 1:
+                        raise AssertionError("resource")
+                with p(s, "_STRICT_SESSION", registry), p(s, "_chain_registry_entries", return_value=[res]), p(s, "_load_chain_registry_entry", side_effect=lambda _path: resource_doc | {"state": "closed" if len(attempts) > 1 else "prepared"}), p(s, "_recover_registered_entry", side_effect=transient_resource), p(s, "_invoke_root_uid_cleanup"), p(s, "_stable_uid_zero"), p(s, "_load_writable_quota_binding", return_value={"state": "unmounted"}), p(s, "_invoke_root_quota_operation", side_effect=AssertionError("quota")), self.assertRaisesRegex(AssertionError, "quota"):
+                    s._close_trusted_isolation_chains_under_gate(registry, recovery_profile=s._STRICT_LIVE_IPC_OWNER_LOSS_CLEANUP_PROFILE)
+                self.assertEqual(len(attempts), 2)
+                self.assertTrue(state(root_fd, ident, sid).endswith("failure=prepared-command-unreadable,resource-phase=resource-entry-recovery:unclassified"))
+                self.assertEqual((phase.lstat().st_ino, phase.read_bytes()), phase_before)
+                malformed = json.loads(phase.read_text(encoding="ascii"))
+                malformed["extra"] = True
+                phase.write_text(json.dumps(malformed), encoding="ascii")
+                self.assertTrue(state(root_fd, ident, sid).endswith("failure=prepared-command-unreadable,resource-phase=unreadable"))
             finally:
                 os.close(root_fd)
-            self.assertEqual(diagnostic, "entry=prepared,outer=false,quota=intended" + suffix)
-            self.assertTrue(
-                s._registry_cleanup_obligation_is_terminal(
-                    {"state": "closed", "cleanup_kind": live}, True
-                )
-            )
+            self.assertTrue(s._registry_cleanup_obligation_is_terminal(
+                {"state": "closed", "cleanup_kind": live}, True))
 
     def test_execution_root_delete_failure_retains_closing_state_for_replay(
         self,
@@ -30332,6 +30342,25 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                     TRUSTED_TEST_CHILD_FLAG,
                     str(trusted_root),
                 ]
+
+                def run_child(
+                    command: Sequence[str], pass_fds: tuple[int, ...]
+                ) -> subprocess.CompletedProcess[str]:
+                    return subprocess.run(
+                        command, cwd=temporary_root, env=os.environ.copy(),
+                        pass_fds=pass_fds, stdin=subprocess.DEVNULL,
+                        capture_output=True, text=True, check=False, timeout=30,
+                    )
+
+                def assert_rejected(
+                    command: Sequence[str], pass_fds: tuple[int, ...]
+                ) -> None:
+                    reset_canary()
+                    self.assertNotEqual(
+                        run_child(command, pass_fds).returncode, 0
+                    )
+                    self.assertFalse(canary.exists())
+
                 mutations: dict[str, tuple[int, str]] = {
                     "digest": (8, "0" * 64),
                     "bundle digest": (11, "0" * 64),
@@ -30348,59 +30377,25 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                 }
                 for name, (index, replacement) in mutations.items():
                     with self.subTest(name=name):
-                        reset_canary()
                         command = valid_command.copy()
                         command[index] = replacement
-                        completed = subprocess.run(
+                        assert_rejected(
                             command,
-                            cwd=temporary_root,
-                            env=os.environ.copy(),
-                            pass_fds=(
-                                source_descriptor,
-                                suite_bundle_descriptor,
-                            ),
-                            stdin=subprocess.DEVNULL,
-                            capture_output=True,
-                            text=True,
-                            check=False,
-                            timeout=30,
+                            (source_descriptor, suite_bundle_descriptor),
                         )
-                        self.assertNotEqual(completed.returncode, 0)
-                        self.assertFalse(canary.exists())
 
-                reset_canary()
-                extra_argument = subprocess.run(
+                assert_rejected(
                     [*valid_command, "unexpected"],
-                    cwd=temporary_root,
-                    env=os.environ.copy(),
-                    pass_fds=(source_descriptor, suite_bundle_descriptor),
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=30,
+                    (source_descriptor, suite_bundle_descriptor),
                 )
-                self.assertNotEqual(extra_argument.returncode, 0)
-                self.assertFalse(canary.exists())
 
-                reset_canary()
                 same_descriptor_command = valid_command.copy()
                 same_descriptor_command[9] = str(source_descriptor)
                 same_descriptor_command[10] = str(len(source))
                 same_descriptor_command[11] = source_sha256
-                same_descriptor = subprocess.run(
-                    same_descriptor_command,
-                    cwd=temporary_root,
-                    env=os.environ.copy(),
-                    pass_fds=(source_descriptor,),
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=30,
+                assert_rejected(
+                    same_descriptor_command, (source_descriptor,)
                 )
-                self.assertNotEqual(same_descriptor.returncode, 0)
-                self.assertFalse(canary.exists())
 
                 def malformed_descriptor(
                     name: str,
@@ -30435,130 +30430,42 @@ class TrustedCandidateTestSupervisorRegressionTests(unittest.TestCase):
                         if writer >= 0:
                             os.close(writer)
 
-                malformed_descriptors = {
-                    "linked": malformed_descriptor(
-                        "linked",
-                        payload=source,
-                        mode=0o400,
-                        flags=os.O_RDONLY | os.O_NONBLOCK,
-                        retain_link=True,
-                    ),
-                    "wrong-mode": malformed_descriptor(
-                        "wrong-mode",
-                        payload=source,
-                        mode=0o600,
-                        flags=os.O_RDONLY | os.O_NONBLOCK,
-                        retain_link=False,
-                    ),
-                    "writable": malformed_descriptor(
-                        "writable",
-                        payload=source,
-                        mode=0o400,
-                        flags=os.O_RDWR | os.O_NONBLOCK,
-                        retain_link=False,
-                    ),
-                    "blocking": malformed_descriptor(
-                        "blocking",
-                        payload=source,
-                        mode=0o400,
-                        flags=os.O_RDONLY,
-                        retain_link=False,
-                    ),
+                policies = {
+                    "linked": (0o400, os.O_RDONLY | os.O_NONBLOCK, True),
+                    "wrong-mode": (0o600, os.O_RDONLY | os.O_NONBLOCK, False),
+                    "writable": (0o400, os.O_RDWR | os.O_NONBLOCK, False),
+                    "blocking": (0o400, os.O_RDONLY, False),
                 }
-                try:
-                    for name, malformed_fd in malformed_descriptors.items():
-                        with self.subTest(descriptor_policy=name):
-                            reset_canary()
-                            command = valid_command.copy()
-                            command[6] = str(malformed_fd)
-                            completed = subprocess.run(
-                                command,
-                                cwd=temporary_root,
-                                env=os.environ.copy(),
-                                pass_fds=(
-                                    malformed_fd,
-                                    suite_bundle_descriptor,
-                                ),
-                                stdin=subprocess.DEVNULL,
-                                capture_output=True,
-                                text=True,
-                                check=False,
-                                timeout=30,
-                            )
-                            self.assertNotEqual(completed.returncode, 0)
-                            self.assertFalse(canary.exists())
-                finally:
-                    for malformed_fd in malformed_descriptors.values():
-                        os.close(malformed_fd)
-
-                malformed_bundle_descriptors = {
-                    "linked": malformed_descriptor(
-                        "bundle-linked",
-                        payload=suite_bundle,
-                        mode=0o400,
-                        flags=os.O_RDONLY | os.O_NONBLOCK,
-                        retain_link=True,
-                    ),
-                    "wrong-mode": malformed_descriptor(
-                        "bundle-wrong-mode",
-                        payload=suite_bundle,
-                        mode=0o600,
-                        flags=os.O_RDONLY | os.O_NONBLOCK,
-                        retain_link=False,
-                    ),
-                    "writable": malformed_descriptor(
-                        "bundle-writable",
-                        payload=suite_bundle,
-                        mode=0o400,
-                        flags=os.O_RDWR | os.O_NONBLOCK,
-                        retain_link=False,
-                    ),
-                    "blocking": malformed_descriptor(
-                        "bundle-blocking",
-                        payload=suite_bundle,
-                        mode=0o400,
-                        flags=os.O_RDONLY,
-                        retain_link=False,
-                    ),
-                }
-                try:
-                    for name, malformed_fd in (
-                        malformed_bundle_descriptors.items()
-                    ):
-                        with self.subTest(bundle_descriptor_policy=name):
-                            reset_canary()
-                            command = valid_command.copy()
-                            command[9] = str(malformed_fd)
-                            completed = subprocess.run(
-                                command,
-                                cwd=temporary_root,
-                                env=os.environ.copy(),
-                                pass_fds=(source_descriptor, malformed_fd),
-                                stdin=subprocess.DEVNULL,
-                                capture_output=True,
-                                text=True,
-                                check=False,
-                                timeout=30,
-                            )
-                            self.assertNotEqual(completed.returncode, 0)
-                            self.assertFalse(canary.exists())
-                finally:
-                    for malformed_fd in (
-                        malformed_bundle_descriptors.values()
-                    ):
-                        os.close(malformed_fd)
+                for label, payload, index, prefix in (
+                    ("descriptor_policy", source, 6, ""),
+                    ("bundle_descriptor_policy", suite_bundle, 9, "bundle-"),
+                ):
+                    malformed = {
+                        name: malformed_descriptor(
+                            prefix + name, payload=payload, mode=mode,
+                            flags=flags, retain_link=retain_link,
+                        )
+                        for name, (mode, flags, retain_link) in policies.items()
+                    }
+                    try:
+                        for name, descriptor in malformed.items():
+                            with self.subTest(**{label: name}):
+                                command = valid_command.copy()
+                                command[index] = str(descriptor)
+                                pass_fds = (
+                                    (descriptor, suite_bundle_descriptor)
+                                    if index == 6
+                                    else (source_descriptor, descriptor)
+                                )
+                                assert_rejected(command, pass_fds)
+                    finally:
+                        for descriptor in malformed.values():
+                            os.close(descriptor)
 
                 reset_canary()
-                completed = subprocess.run(
+                completed = run_child(
                     valid_command,
-                    cwd=temporary_root,
-                    env=os.environ.copy(),
-                    pass_fds=(source_descriptor, suite_bundle_descriptor),
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=30,
+                    (source_descriptor, suite_bundle_descriptor),
                 )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
